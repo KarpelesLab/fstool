@@ -814,23 +814,17 @@ fn encode_extent_record(fork: u8, cnid: u32, start: u16, ext: &ExtRec) -> Vec<u8
 /// `records`. `key_len_max` is the B-tree's `bthKeyLen`. Returns the node images
 /// in node-number order (node 0 = header).
 fn build_btree(records: &[Vec<u8>], key_len_max: u16) -> Result<Vec<[u8; NODE]>> {
+    // An empty B-tree (e.g. an extents-overflow file with no overflow records)
+    // is a single header node with no root/first/last leaf — *not* a header
+    // plus an empty leaf, which `fsck` rejects.
+    if records.is_empty() {
+        return Ok(vec![write_header_node(0, 0, 0, 0, 0, 1, key_len_max)]);
+    }
+
     // Pack the leaves first; their node numbers start at 1 (0 = header).
     let leaves = pack_level(records, ND_LEAF, 1);
-    let leaf_count = leaves.len().max(1);
-
-    // A single empty/one-node leaf level needs at least one leaf node.
-    let mut levels: Vec<Vec<PackedNode>> = Vec::new();
-    if leaves.is_empty() {
-        // Empty tree: one empty leaf node.
-        levels.push(vec![PackedNode {
-            first_key: Vec::new(),
-            records: Vec::new(),
-            kind: ND_LEAF,
-            height: 1,
-        }]);
-    } else {
-        levels.push(leaves);
-    }
+    let leaf_count = leaves.len();
+    let mut levels: Vec<Vec<PackedNode>> = vec![leaves];
 
     // Build index levels until the top level has a single node.
     let mut height = 2u8;
