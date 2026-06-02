@@ -57,7 +57,7 @@ pub enum FsKind {
     Exfat,
     /// HFS+ — read-only.
     HfsPlus,
-    /// Classic HFS (Mac OS ≤ 8) — read-only.
+    /// Classic HFS (Mac OS ≤ 8) — read + write (create / in-place add/remove).
     Hfs,
     /// APFS — read-only, single-leaf-tree case only.
     Apfs,
@@ -367,6 +367,11 @@ impl AnyFs {
     pub fn open_writable(dev: &mut dyn BlockDevice) -> Result<Self> {
         match detect_fs(dev)? {
             FsKind::Apfs => Ok(Self::Apfs(Box::new(Apfs::open_writable(dev)?))),
+            // Classic HFS opens read-only by default; the in-place writer is a
+            // distinct path that loads the catalog into a mutable form.
+            FsKind::Hfs => Ok(Self::Hfs(Box::new(crate::fs::hfs::Hfs::open_writable(
+                dev,
+            )?))),
             // Every other backend's open() already returns a mutable
             // handle (ext journals, FAT/exFAT/NTFS rewrite, …), so
             // just defer to the existing dispatch.
@@ -843,12 +848,16 @@ impl AnyFs {
             Self::Ext(ext) => ext.flush(dev),
             Self::Fat32(fat) => fat.flush(dev),
             Self::Grf(g) => crate::fs::Filesystem::flush(g.as_mut(), dev),
-            // Read-only handles have nothing to flush.
+            // Classic HFS buffers its catalog in memory and persists it (and the
+            // bitmap + MDB) only on flush; route to the real implementation.
+            // (A read-only HFS handle has no writer, so its flush is a no-op.)
+            Self::Hfs(hfs) => crate::fs::Filesystem::flush(hfs.as_mut(), dev),
+            // Read-only / immediate-write handles have nothing buffered to
+            // flush.
             Self::Tar(_)
             | Self::Xfs(_)
             | Self::Exfat(_)
             | Self::HfsPlus(_)
-            | Self::Hfs(_)
             | Self::Apfs(_)
             | Self::Ntfs(_)
             | Self::F2fs(_)

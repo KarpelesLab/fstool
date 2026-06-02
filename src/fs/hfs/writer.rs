@@ -118,11 +118,11 @@ pub(super) struct HfsWriter {
     pub volume_name: String,
     /// Volume creation date (Mac epoch).
     pub create_date: u32,
-    /// Catalog file extent + byte size (re-allocated each flush).
-    cat_extent: (u16, u16),
+    /// Catalog file extents (up to 3) + byte size, re-allocated each flush.
+    cat_extents: ExtRec,
     cat_size: u32,
-    /// Extents-overflow file extent + byte size.
-    ext_extent: (u16, u16),
+    /// Extents-overflow file extents (up to 3) + byte size.
+    ext_extents: ExtRec,
     ext_size: u32,
 }
 
@@ -174,9 +174,9 @@ impl HfsWriter {
             overflow: BTreeMap::new(),
             volume_name: opts.volume_name.clone(),
             create_date: create,
-            cat_extent: (0, 0),
+            cat_extents: [(0, 0); 3],
             cat_size: 0,
-            ext_extent: (0, 0),
+            ext_extents: [(0, 0); 3],
             ext_size: 0,
         };
 
@@ -299,9 +299,8 @@ impl HfsWriter {
         Ok(cnid)
     }
 
-    /// Split a canonical path into `(parent_cnid, leaf_name_bytes)`, erroring if
-    /// the target already exists.
-    fn parent_and_leaf(&self, path: &str) -> Result<(u32, Vec<u8>)> {
+    /// Split a canonical path into `(parent_cnid, leaf_name_bytes)`.
+    fn split_parent_leaf(&self, path: &str) -> Result<(u32, Vec<u8>)> {
         let trimmed = path.trim_end_matches('/');
         let (parent_path, leaf) = match trimmed.rsplit_once('/') {
             Some((p, l)) => (p, l),
@@ -309,7 +308,7 @@ impl HfsWriter {
         };
         if leaf.is_empty() {
             return Err(Error::InvalidArgument(
-                "hfs: cannot create the root path".into(),
+                "hfs: cannot target the root path".into(),
             ));
         }
         let parent = self.resolve_dir(parent_path)?;
@@ -319,6 +318,12 @@ impl HfsWriter {
                 "hfs: name exceeds 31 MacRoman bytes".into(),
             ));
         }
+        Ok((parent, name))
+    }
+
+    /// Like [`Self::split_parent_leaf`] but errors if the target already exists.
+    fn parent_and_leaf(&self, path: &str) -> Result<(u32, Vec<u8>)> {
+        let (parent, name) = self.split_parent_leaf(path)?;
         if self.catalog.contains_key(&OwnedKey {
             parid: parent,
             name: name.clone(),
@@ -328,6 +333,107 @@ impl HfsWriter {
             )));
         }
         Ok((parent, name))
+    }
+
+    /// Remove a file or empty directory at canonical `path`, freeing a file's
+    /// data-fork blocks (inline + extents-overflow).
+    pub fn remove(&mut self, path: &str) -> Result<()> {
+        let (parent, name) = self.split_parent_leaf(path)?;
+        let key = OwnedKey {
+            parid: parent,
+            name,
+        };
+        let body = self
+            .catalog
+            .get(&key)
+            .ok_or_else(|| Error::InvalidArgument(format!("hfs: no such path {path:?}")))?;
+        match body.first().copied() {
+            Some(CDR_DIR) => {
+                let valence = u16::from_be_bytes([body[4], body[5]]);
+                if valence != 0 {
+                    return Err(Error::InvalidArgument(format!(
+                        "hfs: directory {path:?} is not empty"
+                    )));
+                }
+                let cnid = u32::from_be_bytes([body[6], body[7], body[8], body[9]]);
+                self.catalog.remove(&key);
+                self.catalog.remove(&OwnedKey {
+                    parid: cnid,
+                    name: Vec::new(),
+                });
+            }
+            Some(CDR_FILE) => {
+                let cnid = u32::from_be_bytes([body[20], body[21], body[22], body[23]]);
+                let ext = super::ext_rec(body, 74);
+                self.catalog.remove(&key);
+                for (s, c) in ext {
+                    self.free_run(s, c);
+                }
+                // Free any extents-overflow runs for this file's data fork.
+                let keys: Vec<_> = self
+                    .overflow
+                    .range((0x00u8, cnid, 0u16)..=(0x00u8, cnid, u16::MAX))
+                    .map(|(&k, _)| k)
+                    .collect();
+                for k in keys {
+                    if let Some(grp) = self.overflow.remove(&k) {
+                        for (s, c) in grp {
+                            self.free_run(s, c);
+                        }
+                    }
+                }
+            }
+            _ => {
+                return Err(Error::InvalidArgument(format!(
+                    "hfs: {path:?} is not a removable file or directory"
+                )));
+            }
+        }
+        self.bump_valence(parent, -1)?;
+        Ok(())
+    }
+
+    /// Build a writer around an existing volume's loaded state (used by
+    /// `Hfs::open_writable`). The catalog/extents files' current extents are
+    /// recorded so the first flush re-allocates them cleanly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn adopt(
+        block_size: u32,
+        alloc_base: u64,
+        vbm_start: u64,
+        total_blocks: u16,
+        total_sectors: u64,
+        bitmap: Vec<u8>,
+        free_blocks: u16,
+        next_cnid: u32,
+        catalog: BTreeMap<OwnedKey, Vec<u8>>,
+        overflow: BTreeMap<(u8, u32, u16), ExtRec>,
+        volume_name: String,
+        create_date: u32,
+        cat_extents: ExtRec,
+        cat_size: u32,
+        ext_extents: ExtRec,
+        ext_size: u32,
+    ) -> Self {
+        HfsWriter {
+            block_size,
+            alloc_base,
+            vbm_start,
+            total_blocks,
+            total_sectors,
+            bitmap,
+            next_alloc: 0,
+            free_blocks,
+            next_cnid,
+            catalog,
+            overflow,
+            volume_name,
+            create_date,
+            cat_extents,
+            cat_size,
+            ext_extents,
+            ext_size,
+        }
     }
 
     fn bump_valence(&mut self, dir_cnid: u32, delta: i32) -> Result<()> {
@@ -488,13 +594,11 @@ impl HfsWriter {
     /// the (primary + alternate) MDB, and write everything to `dev`.
     pub fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         // Free the previous B-tree files so a re-flush re-allocates cleanly.
-        if self.cat_extent.1 > 0 {
-            self.free_run(self.cat_extent.0, self.cat_extent.1);
-            self.cat_extent = (0, 0);
+        for (s, c) in std::mem::take(&mut self.cat_extents) {
+            self.free_run(s, c);
         }
-        if self.ext_extent.1 > 0 {
-            self.free_run(self.ext_extent.0, self.ext_extent.1);
-            self.ext_extent = (0, 0);
+        for (s, c) in std::mem::take(&mut self.ext_extents) {
+            self.free_run(s, c);
         }
 
         // Build the extents-overflow B-tree (leaf records sorted by key).
@@ -513,19 +617,20 @@ impl HfsWriter {
             .collect();
         let cat_nodes = build_btree(&cat_records, 37)?;
 
-        // Allocate contiguous blocks for each B-tree file and write the nodes.
+        // Allocate blocks (up to 3 extents each — what the MDB can record) for
+        // each B-tree file and write the nodes across them.
         let bs = u64::from(self.block_size);
         let ext_blocks = ((ext_nodes.len() * NODE) as u64).div_ceil(bs) as u16;
         let cat_blocks = ((cat_nodes.len() * NODE) as u64).div_ceil(bs) as u16;
-        let ext_run = self.alloc_one_run(ext_blocks)?;
-        let cat_run = self.alloc_one_run(cat_blocks)?;
-        self.ext_extent = ext_run;
-        self.ext_size = u32::from(ext_run.1) * self.block_size;
-        self.cat_extent = cat_run;
-        self.cat_size = u32::from(cat_run.1) * self.block_size;
+        let ext_extents = self.alloc_btree_file(ext_blocks)?;
+        let cat_extents = self.alloc_btree_file(cat_blocks)?;
+        self.ext_extents = ext_extents;
+        self.ext_size = ext_blocks as u32 * self.block_size;
+        self.cat_extents = cat_extents;
+        self.cat_size = cat_blocks as u32 * self.block_size;
 
-        write_nodes(dev, self.alloc_base + u64::from(ext_run.0) * bs, &ext_nodes)?;
-        write_nodes(dev, self.alloc_base + u64::from(cat_run.0) * bs, &cat_nodes)?;
+        write_nodes_across(dev, self.alloc_base, bs, &ext_extents, &ext_nodes)?;
+        write_nodes_across(dev, self.alloc_base, bs, &cat_extents, &cat_nodes)?;
 
         // Volume bitmap.
         dev.write_at(self.vbm_start * 512, &self.bitmap)?;
@@ -538,14 +643,21 @@ impl HfsWriter {
         Ok(())
     }
 
-    fn alloc_one_run(&mut self, n: u16) -> Result<(u16, u16)> {
+    /// Allocate `n` blocks for a B-tree file as at most 3 extents (the MDB's
+    /// `drCTExtRec`/`drXTExtRec` hold 3); error if the free space is too
+    /// fragmented to fit in 3.
+    fn alloc_btree_file(&mut self, n: u16) -> Result<ExtRec> {
         let runs = self.allocate(n)?;
-        match runs.as_slice() {
-            [single] => Ok(*single),
-            _ => Err(Error::Unsupported(
-                "hfs: B-tree file needs more than one extent (volume too fragmented)".into(),
-            )),
+        if runs.len() > 3 {
+            return Err(Error::Unsupported(
+                "hfs: B-tree file needs more than 3 extents (volume too fragmented)".into(),
+            ));
         }
+        let mut ext: ExtRec = [(0, 0); 3];
+        for (slot, run) in ext.iter_mut().zip(runs) {
+            *slot = run;
+        }
+        Ok(ext)
     }
 
     fn encode_mdb(&self) -> [u8; 162] {
@@ -569,10 +681,10 @@ impl HfsWriter {
         m[37..37 + vn.len()].copy_from_slice(&vn);
         // Extents-overflow file (drXTFlSize @130, drXTExtRec @134).
         put_u32(&mut m, 130, self.ext_size);
-        put_ext(&mut m, 134, &[self.ext_extent, (0, 0), (0, 0)]);
+        put_ext(&mut m, 134, &self.ext_extents);
         // Catalog file (drCTFlSize @146, drCTExtRec @150).
         put_u32(&mut m, 146, self.cat_size);
-        put_ext(&mut m, 150, &[self.cat_extent, (0, 0), (0, 0)]);
+        put_ext(&mut m, 150, &self.cat_extents);
         m
     }
 }
@@ -853,9 +965,30 @@ fn write_header_node(
     node
 }
 
-fn write_nodes(dev: &mut dyn BlockDevice, off: u64, nodes: &[[u8; NODE]]) -> Result<()> {
-    for (i, n) in nodes.iter().enumerate() {
-        dev.write_at(off + (i * NODE) as u64, n)?;
+/// Write `nodes` (512-byte each) sequentially across a B-tree file's `extents`
+/// (block runs). A node never straddles a run because every run is a whole
+/// number of allocation blocks and the block size is a multiple of 512.
+fn write_nodes_across(
+    dev: &mut dyn BlockDevice,
+    alloc_base: u64,
+    bs: u64,
+    extents: &ExtRec,
+    nodes: &[[u8; NODE]],
+) -> Result<()> {
+    let mut node_i = 0usize;
+    for &(start, count) in extents {
+        if count == 0 {
+            continue;
+        }
+        let run_off = alloc_base + u64::from(start) * bs;
+        let nodes_in_run = (u64::from(count) * bs / NODE as u64) as usize;
+        for slot in 0..nodes_in_run {
+            if node_i >= nodes.len() {
+                return Ok(());
+            }
+            dev.write_at(run_off + (slot * NODE) as u64, &nodes[node_i])?;
+            node_i += 1;
+        }
     }
     Ok(())
 }

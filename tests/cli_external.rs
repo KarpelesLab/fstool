@@ -1774,21 +1774,161 @@ fn cli_create_hfs_round_trip() {
     assert!(cat.status.success());
     assert_eq!(cat.stdout, blob, "blob.bin data fork differs");
 
-    // Optional real-checker validation (macOS runner). `-n` = answer no /
-    // read-only; exit 0 means clean.
-    if which("fsck_hfs") {
-        let chk = Command::new("fsck_hfs")
-            .args(["-n", "-f"])
-            .arg(img.path())
-            .output()
-            .unwrap();
-        assert!(
-            chk.status.success(),
-            "fsck_hfs flagged the volume:\n{}\n{}",
-            String::from_utf8_lossy(&chk.stdout),
-            String::from_utf8_lossy(&chk.stderr)
-        );
+    // Optional real-checker validation on the macOS runner. `fsck_hfs` needs a
+    // device node (it ioctls for the block size), so attach the raw image via
+    // `hdiutil` to get `/dev/diskN`, fsck the raw device, then detach. Any
+    // infrastructure hiccup (tool missing, attach refused) skips; we only assert
+    // on an actual `fsck_hfs` verdict — exit 0 means a clean volume.
+    if which("fsck_hfs") && which("hdiutil") {
+        validate_hfs_with_fsck(img.path());
     } else {
-        eprintln!("skipping fsck_hfs oracle: not installed (Linux fsck.hfsplus segfaults on HFS)");
+        eprintln!("skipping fsck_hfs oracle: macOS-only (Linux fsck.hfsplus segfaults on HFS)");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn validate_hfs_with_fsck(img: &std::path::Path) {
+    let attach = Command::new("hdiutil")
+        .args([
+            "attach",
+            "-nomount",
+            "-imagekey",
+            "diskimage-class=CRawDiskImage",
+        ])
+        .arg(img)
+        .output()
+        .unwrap();
+    if !attach.status.success() {
+        eprintln!(
+            "skipping fsck_hfs: hdiutil attach failed: {}",
+            String::from_utf8_lossy(&attach.stderr)
+        );
+        return;
+    }
+    let out = String::from_utf8_lossy(&attach.stdout);
+    let dev = out
+        .split_whitespace()
+        .find(|t| t.starts_with("/dev/disk"))
+        .unwrap_or("")
+        .to_string();
+    if !dev.starts_with("/dev/disk") {
+        eprintln!("skipping fsck_hfs: no device node in hdiutil output:\n{out}");
+        return;
+    }
+    let raw = dev.replace("/dev/disk", "/dev/rdisk");
+    let chk = Command::new("fsck_hfs")
+        .args(["-n", "-f"])
+        .arg(&raw)
+        .output();
+    let _ = Command::new("hdiutil").arg("detach").arg(&dev).output();
+    let chk = chk.unwrap();
+    assert!(
+        chk.status.success(),
+        "fsck_hfs flagged the volume:\n{}\n{}",
+        String::from_utf8_lossy(&chk.stdout),
+        String::from_utf8_lossy(&chk.stderr)
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+fn validate_hfs_with_fsck(_img: &std::path::Path) {}
+
+/// In-place mutation of an existing classic-HFS image: `fstool add` and `rm`
+/// each open the volume writable, mutate, flush, and persist across separate
+/// invocations, leaving unrelated files intact.
+#[test]
+fn cli_hfs_in_place_add_and_remove() {
+    let bin = FSTOOL;
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join("old.txt"), b"to be removed\n").unwrap();
+    std::fs::create_dir_all(src.path().join("keep")).unwrap();
+    std::fs::write(src.path().join("keep/inner.txt"), b"survivor\n").unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+    let ok = Command::new(bin)
+        .args(["create", "-t", "hfs"])
+        .arg(src.path())
+        .arg("-o")
+        .arg(img.path())
+        .args(["--size", "4MiB"])
+        .output()
+        .unwrap();
+    assert!(
+        ok.status.success(),
+        "create failed: {}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+
+    // add a new file (separate process → exercises open_writable + flush).
+    let host = NamedTempFile::new().unwrap();
+    std::fs::write(host.path(), b"freshly added\n").unwrap();
+    let add = Command::new(bin)
+        .arg("add")
+        .arg(img.path())
+        .arg(host.path())
+        .arg("/added.txt")
+        .output()
+        .unwrap();
+    assert!(
+        add.status.success(),
+        "add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    // remove an existing file (another separate process).
+    let rm = Command::new(bin)
+        .arg("rm")
+        .arg(img.path())
+        .arg("/old.txt")
+        .output()
+        .unwrap();
+    assert!(
+        rm.status.success(),
+        "rm failed: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+
+    // Reopen read-only and confirm persistence.
+    let listing = String::from_utf8_lossy(
+        &Command::new(bin)
+            .args(["ls", "-R"])
+            .arg(img.path())
+            .arg("/")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .into_owned();
+    assert!(
+        listing.contains("added.txt"),
+        "added.txt missing:\n{listing}"
+    );
+    assert!(
+        !listing.contains("old.txt"),
+        "old.txt should be gone:\n{listing}"
+    );
+    assert!(
+        listing.contains("inner.txt"),
+        "preserved file missing:\n{listing}"
+    );
+
+    let cat = Command::new(bin)
+        .arg("cat")
+        .arg(img.path())
+        .arg("/added.txt")
+        .output()
+        .unwrap();
+    assert_eq!(cat.stdout, b"freshly added\n");
+    let cat2 = Command::new(bin)
+        .arg("cat")
+        .arg(img.path())
+        .arg("/keep/inner.txt")
+        .output()
+        .unwrap();
+    assert_eq!(cat2.stdout, b"survivor\n");
+
+    // fsck the mutated volume too (macOS runner only).
+    if which("fsck_hfs") && which("hdiutil") {
+        validate_hfs_with_fsck(img.path());
     }
 }

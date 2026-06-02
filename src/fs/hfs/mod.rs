@@ -525,6 +525,79 @@ impl Hfs {
         Ok(Self::from_writer(w))
     }
 
+    /// Open an existing classic-HFS volume **for in-place mutation**: load its
+    /// catalog (including thread records) and extents-overflow into the writer's
+    /// in-memory maps plus the volume bitmap, so `create_*`/`remove`/`flush`
+    /// work on it.
+    pub fn open_writable(dev: &mut dyn BlockDevice) -> Result<Self> {
+        let ro = Hfs::open(dev)?;
+        let dev_len = dev.total_size();
+        let total_sectors = dev_len / 512;
+        let mut m = [0u8; 512];
+        dev.read_at(MDB_OFFSET, &mut m)?;
+
+        let block_size = be32(&m, 20);
+        let vbm_start = be16(&m, 14) as u64;
+        let total_blocks = be16(&m, 18);
+        let free_blocks = be16(&m, 34);
+        let next_cnid = be32(&m, 30).max(16);
+        let cat_ext = ext_rec(&m, 150);
+        let cat_size = be32(&m, 146);
+        let xt_ext = ext_rec(&m, 134);
+        let xt_size = be32(&m, 130);
+
+        // Volume bitmap (one read covering all the block bits).
+        let mut bitmap = vec![0u8; (total_blocks as usize).div_ceil(8)];
+        dev.read_at(vbm_start * 512, &mut bitmap)?;
+
+        // Walk the catalog, capturing every record (file/dir/thread) by key.
+        let cat_extents = ro.full_extents(4, 0, &cat_ext, cat_size as u64);
+        let cat_bytes = ro.read_fork(dev, &cat_extents, cat_size as u64, dev_len)?;
+        let mut catalog = std::collections::BTreeMap::new();
+        Self::walk_leaves(&cat_bytes, |key, data| {
+            if key.len() < 6 || data.is_empty() {
+                return Ok(());
+            }
+            let parid = be32(key, 1);
+            let name_len = (key[5] as usize).min(31);
+            if 6 + name_len > key.len() {
+                return Ok(());
+            }
+            catalog.insert(
+                writer::OwnedKey {
+                    parid,
+                    name: key[6..6 + name_len].to_vec(),
+                },
+                data.to_vec(),
+            );
+            Ok(())
+        })?;
+
+        // The read-only open already parsed the extents-overflow records.
+        let overflow: std::collections::BTreeMap<_, _> =
+            ro.overflow.iter().map(|(&k, &v)| (k, v)).collect();
+
+        let w = writer::HfsWriter::adopt(
+            block_size,
+            ro.alloc_base,
+            vbm_start,
+            total_blocks,
+            total_sectors,
+            bitmap,
+            free_blocks,
+            next_cnid,
+            catalog,
+            overflow,
+            ro.volume_name.clone(),
+            be32(&m, 2),
+            cat_ext,
+            cat_size,
+            xt_ext,
+            xt_size,
+        );
+        Ok(Self::from_writer(w))
+    }
+
     /// Build a writable `Hfs` around an [`writer::HfsWriter`], seeding the read
     /// index from its catalog.
     fn from_writer(w: writer::HfsWriter) -> Self {
@@ -735,11 +808,17 @@ impl Filesystem for Hfs {
         })
     }
 
-    fn remove(&mut self, _dev: &mut dyn BlockDevice, _path: &Path) -> Result<()> {
-        Err(Error::Immutable {
+    fn remove(&mut self, _dev: &mut dyn BlockDevice, path: &Path) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| Error::InvalidArgument("hfs: non-UTF-8 path".into()))?;
+        let w = self.writer.as_mut().ok_or(Error::Immutable {
             kind: "hfs",
             op: "rm",
-        })
+        })?;
+        w.remove(s)?;
+        self.rebuild_index();
+        Ok(())
     }
 
     fn list(&mut self, _dev: &mut dyn BlockDevice, path: &Path) -> Result<Vec<DirEntry>> {
@@ -1045,6 +1124,70 @@ mod tests {
 
         assert_eq!(read_all(&mut fs, &mut dev, "/hello.txt"), hello);
         assert_eq!(read_all(&mut fs, &mut dev, "/sub/deep.txt"), b"deep\n");
+    }
+
+    /// In-place mutation: build a volume, reopen it writable, add a file +
+    /// directory and remove another, flush, then reopen read-only and confirm
+    /// the changes persisted and unrelated files are intact.
+    #[test]
+    fn in_place_mutation_round_trip() {
+        use crate::fs::{FileMeta, FileSource, Filesystem};
+
+        let mut dev = MemoryBackend::new(4 * 1024 * 1024);
+        let opts = super::writer::HfsFormatOpts {
+            volume_name: "InPlace".into(),
+            block_size: None,
+        };
+        {
+            let mut w = super::writer::HfsWriter::format(&mut dev, &opts).unwrap();
+            w.insert_dir("/keep", 0).unwrap();
+            w.insert_file(&mut dev, "/old.txt", &mut &b"old\n"[..], 4, 0)
+                .unwrap();
+            w.insert_file(&mut dev, "/keep/inner.txt", &mut &b"inner\n"[..], 6, 0)
+                .unwrap();
+            w.flush(&mut dev).unwrap();
+        }
+
+        let meta = FileMeta {
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            atime: 0,
+            ctime: 0,
+        };
+        let mut fs = Hfs::open_writable(&mut dev).unwrap();
+        let data = b"brand new content\n".to_vec();
+        fs.create_file(
+            &mut dev,
+            Path::new("/new.txt"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(data.clone())),
+                len: data.len() as u64,
+            },
+            meta,
+        )
+        .unwrap();
+        fs.create_dir(&mut dev, Path::new("/newdir"), meta).unwrap();
+        fs.remove(&mut dev, Path::new("/old.txt")).unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        let mut ro = Hfs::open(&mut dev).unwrap();
+        let root: Vec<String> = ro
+            .list(&mut dev, Path::new("/"))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(root.contains(&"new.txt".to_string()), "{root:?}");
+        assert!(root.contains(&"newdir".to_string()), "{root:?}");
+        assert!(root.contains(&"keep".to_string()), "{root:?}");
+        assert!(
+            !root.contains(&"old.txt".to_string()),
+            "old.txt should be gone: {root:?}"
+        );
+        assert_eq!(read_all(&mut ro, &mut dev, "/new.txt"), data);
+        assert_eq!(read_all(&mut ro, &mut dev, "/keep/inner.txt"), b"inner\n");
     }
 
     /// The resource fork is read from its own extents (`filRLgLen` @ +36,
