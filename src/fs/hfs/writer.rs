@@ -207,6 +207,30 @@ impl HfsWriter {
             .count() as u16
     }
 
+    /// Volume-wide catalog counts for the MDB: `(total files, total dirs
+    /// excluding root, dirs directly in root)`.
+    fn counts(&self) -> (u32, u32, u16) {
+        let mut files = 0u32;
+        let mut dirs = 0u32;
+        let mut root_dirs = 0u16;
+        for (key, body) in &self.catalog {
+            match body.first().copied() {
+                Some(CDR_FILE) => files += 1,
+                Some(CDR_DIR) => {
+                    let cnid = u32::from_be_bytes([body[6], body[7], body[8], body[9]]);
+                    if cnid != ROOT_CNID {
+                        dirs += 1;
+                    }
+                    if key.parid == ROOT_CNID {
+                        root_dirs += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        (files, dirs, root_dirs)
+    }
+
     // ---- allocation -----------------------------------------------------
 
     fn bit_used(&self, b: u16) -> bool {
@@ -675,6 +699,12 @@ impl HfsWriter {
         put_u16(&mut m, 28, (self.alloc_base / 512) as u16); // drAlBlSt
         put_u32(&mut m, 30, self.next_cnid); // drNxtCNID
         put_u16(&mut m, 34, self.free_blocks); // drFreeBks
+        // Volume-wide counts (validated by fsck): drNmRtDirs @82, drFilCnt @84,
+        // drDirCnt @88.
+        let (files, dirs, root_dirs) = self.counts();
+        put_u16(&mut m, 82, root_dirs);
+        put_u32(&mut m, 84, files);
+        put_u32(&mut m, 88, dirs);
         // drVN: Str27 at +36.
         let vn = macroman::encode(&self.volume_name).unwrap_or_default();
         m[36] = vn.len() as u8;
@@ -731,11 +761,16 @@ fn encode_file(
 }
 
 fn encode_thread(parent: u32, name: &[u8]) -> Vec<u8> {
-    let mut t = vec![0u8; 14 + 1 + name.len()];
+    // Fixed 46-byte thread record: cdrType(1) + cdrResrv2(1) + thdResrv(8) +
+    // thdParID(4) + thdCName as a full Str31 (1 length byte + 31). Classic HFS
+    // pads the name to the full Str31 so every catalog record is even-length and
+    // word-aligned — `fsck` requires it.
+    let mut t = vec![0u8; 46];
     t[0] = CDR_DIR_THREAD;
     put_u32(&mut t, 10, parent); // thdParID
-    t[14] = name.len() as u8; // thdCName (Str31)
-    t[15..15 + name.len()].copy_from_slice(name);
+    let n = name.len().min(31);
+    t[14] = n as u8; // thdCName length
+    t[15..15 + n].copy_from_slice(&name[..n]);
     t
 }
 
