@@ -462,10 +462,9 @@ impl HfsWriter {
 
     fn bump_valence(&mut self, dir_cnid: u32, delta: i32) -> Result<()> {
         // The directory record is keyed (its-parent, its-name); find it via the
-        // thread record (keyed by the dir's own CNID).
-        if dir_cnid == ROOT_CNID {
-            return Ok(()); // root valence is derived in the MDB write
-        }
+        // thread record (keyed by the dir's own CNID). This works for the root
+        // too — its thread (parID 2) points at (parID 1, volume name) — and
+        // `fsck` validates the root record's `dirVal`.
         let thread = self
             .catalog
             .get(&OwnedKey {
@@ -761,14 +760,13 @@ fn encode_file(
 }
 
 fn encode_thread(parent: u32, name: &[u8]) -> Vec<u8> {
-    // Fixed 46-byte thread record: cdrType(1) + cdrResrv2(1) + thdResrv(8) +
-    // thdParID(4) + thdCName as a full Str31 (1 length byte + 31). Classic HFS
-    // pads the name to the full Str31 so every catalog record is even-length and
-    // word-aligned — `fsck` requires it.
-    let mut t = vec![0u8; 46];
+    // Thread record: cdrType(1) + cdrResrv2(1) + thdResrv(8) + thdParID(4) +
+    // thdCName (Str: 1 length byte + the name). Variable length; the whole
+    // catalog record is even-padded by `encode_leaf_record`.
+    let n = name.len().min(31);
+    let mut t = vec![0u8; 14 + 1 + n];
     t[0] = CDR_DIR_THREAD;
     put_u32(&mut t, 10, parent); // thdParID
-    let n = name.len().min(31);
     t[14] = n as u8; // thdCName length
     t[15..15 + n].copy_from_slice(&name[..n]);
     t
@@ -782,7 +780,8 @@ fn put_ext(v: &mut [u8], o: usize, e: &[(u16, u16); 3]) {
 }
 
 /// Encode a catalog leaf record: keyLen(1) + resrv(1) + parID(4) + Str31 name,
-/// padded to even, then the record body. Matches the reader's `leaf_record`.
+/// padded to even, then the record body. The whole record is finally padded to
+/// an even length so the next record stays word-aligned (HFS requires it).
 fn encode_leaf_record(key: &OwnedKey, body: &[u8]) -> Vec<u8> {
     let key_len = 6 + key.name.len();
     let mut r = vec![0u8; round_up_even(1 + key_len)];
@@ -791,6 +790,9 @@ fn encode_leaf_record(key: &OwnedKey, body: &[u8]) -> Vec<u8> {
     r[6] = key.name.len() as u8;
     r[7..7 + key.name.len()].copy_from_slice(&key.name);
     r.extend_from_slice(body);
+    if !r.len().is_multiple_of(2) {
+        r.push(0);
+    }
     r
 }
 
