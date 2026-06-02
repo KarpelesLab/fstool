@@ -747,8 +747,7 @@ fn encode_file(
 ) -> Vec<u8> {
     let mut d = vec![0u8; 102];
     d[0] = CDR_FILE;
-    d[4..8].copy_from_slice(b"????"); // FInfo fdType
-    d[8..12].copy_from_slice(b"????"); // FInfo fdCreator
+    // FInfo (fdType / fdCreator) left zero: a generic untyped document.
     put_u32(&mut d, 20, cnid); // filFlNum
     put_u16(&mut d, 24, extents[0].0); // filStBlk
     put_u32(&mut d, 26, size as u32); // filLgLen (data fork)
@@ -761,10 +760,10 @@ fn encode_file(
 
 fn encode_thread(parent: u32, name: &[u8]) -> Vec<u8> {
     // Thread record: cdrType(1) + cdrResrv2(1) + thdResrv(8) + thdParID(4) +
-    // thdCName (Str: 1 length byte + the name). Variable length; the whole
-    // catalog record is even-padded by `encode_leaf_record`.
+    // thdCName as a full Str31 (1 length byte + 31). Classic HFS / `fsck` expect
+    // the fixed 46-byte CatalogThread struct (the genuine volumes confirm this).
     let n = name.len().min(31);
-    let mut t = vec![0u8; 14 + 1 + n];
+    let mut t = vec![0u8; 46];
     t[0] = CDR_DIR_THREAD;
     put_u32(&mut t, 10, parent); // thdParID
     t[14] = n as u8; // thdCName length
