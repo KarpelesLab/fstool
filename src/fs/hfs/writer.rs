@@ -749,7 +749,8 @@ fn encode_file(
     d[0] = CDR_FILE;
     // FInfo (fdType / fdCreator) left zero: a generic untyped document.
     put_u32(&mut d, 20, cnid); // filFlNum
-    put_u16(&mut d, 24, extents[0].0); // filStBlk
+    // filStBlk (@24) / filRStBlk (@34) are runtime first-block caches and must
+    // be 0 on disk — fsck_hfs flags a non-zero value (E_CatalogFlagsNotZero).
     put_u32(&mut d, 26, size as u32); // filLgLen (data fork)
     put_u32(&mut d, 30, u32::from(total_blocks) * block_size); // filPyLen
     put_u32(&mut d, 44, mac_time); // filCrDat
