@@ -1720,3 +1720,75 @@ fn cli_path_style_flag_is_a_noop_on_ext() {
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&default.stdout), run("unix"));
 }
+
+/// `fstool create -t hfs` builds a classic-HFS volume that reads back through
+/// fstool byte-for-byte. When a *working* HFS checker is present (macOS
+/// `fsck_hfs` — the Linux `fsck.hfsplus` segfaults on classic HFS and is
+/// deliberately not used), the volume is validated against it too.
+#[test]
+fn cli_create_hfs_round_trip() {
+    let bin = FSTOOL;
+    let src = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(src.path().join("docs")).unwrap();
+    std::fs::write(src.path().join("readme.txt"), b"hello classic HFS\n").unwrap();
+    std::fs::write(src.path().join("docs/note.txt"), b"a nested note\n").unwrap();
+    // A binary blob to confirm an exact data-fork round-trip.
+    let blob: Vec<u8> = (0..9000u32).map(|i| (i * 7) as u8).collect();
+    std::fs::write(src.path().join("blob.bin"), &blob).unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+    let out = Command::new(bin)
+        .args(["create", "-t", "hfs"])
+        .arg(src.path())
+        .args(["-o"])
+        .arg(img.path())
+        .args(["--label", "TestHFS", "--size", "8MiB"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "create -t hfs failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Listing shows the tree.
+    let ls = Command::new(bin)
+        .args(["ls", "-R"])
+        .arg(img.path())
+        .arg("/")
+        .output()
+        .unwrap();
+    assert!(ls.status.success());
+    let listing = String::from_utf8_lossy(&ls.stdout);
+    for name in ["readme.txt", "docs", "note.txt", "blob.bin"] {
+        assert!(listing.contains(name), "missing {name} in:\n{listing}");
+    }
+
+    // The binary blob round-trips exactly.
+    let cat = Command::new(bin)
+        .arg("cat")
+        .arg(img.path())
+        .arg("/blob.bin")
+        .output()
+        .unwrap();
+    assert!(cat.status.success());
+    assert_eq!(cat.stdout, blob, "blob.bin data fork differs");
+
+    // Optional real-checker validation (macOS runner). `-n` = answer no /
+    // read-only; exit 0 means clean.
+    if which("fsck_hfs") {
+        let chk = Command::new("fsck_hfs")
+            .args(["-n", "-f"])
+            .arg(img.path())
+            .output()
+            .unwrap();
+        assert!(
+            chk.status.success(),
+            "fsck_hfs flagged the volume:\n{}\n{}",
+            String::from_utf8_lossy(&chk.stdout),
+            String::from_utf8_lossy(&chk.stderr)
+        );
+    } else {
+        eprintln!("skipping fsck_hfs oracle: not installed (Linux fsck.hfsplus segfaults on HFS)");
+    }
+}

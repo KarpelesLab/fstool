@@ -202,6 +202,7 @@ fn build_bare_fs(fs: &FilesystemSpec, output: &Path) -> Result<()> {
             output,
             hfs_plus_format_opts(fs)?,
         ),
+        "hfs" => build_bare_via_trait::<crate::fs::hfs::Hfs>(fs, output, hfs_format_opts(fs)?),
         "ntfs" => build_bare_via_trait::<crate::fs::ntfs::Ntfs>(fs, output, ntfs_format_opts(fs)?),
         "f2fs" => build_bare_via_trait::<crate::fs::f2fs::F2fs>(fs, output, f2fs_format_opts(fs)?),
         "squashfs" => build_bare_via_trait::<crate::fs::squashfs::Squashfs>(
@@ -363,6 +364,23 @@ fn format_in_partition_via_trait<F: crate::fs::FilesystemFactory>(
     }
     fs_obj.flush(dev)?;
     Ok(())
+}
+
+fn hfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::hfs::HfsFormatOpts> {
+    // Classic HFS has no `[filesystem.options]` knobs yet; the volume name and
+    // allocation-block size come from the flat fields.
+    if fs.options.as_ref().is_some_and(|t| !t.is_empty()) {
+        return Err(crate::Error::InvalidArgument(
+            "hfs: no [filesystem.options] keys are supported".into(),
+        ));
+    }
+    Ok(crate::fs::hfs::HfsFormatOpts {
+        volume_name: fs
+            .volume_label
+            .clone()
+            .unwrap_or_else(|| "Untitled".to_string()),
+        block_size: fs.block_size,
+    })
 }
 
 fn hfs_plus_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::hfs_plus::FormatOpts> {
@@ -728,6 +746,13 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
                     &mut slice,
                     fs,
                     hfs_plus_format_opts(fs)?,
+                )?;
+            }
+            "hfs" => {
+                format_in_partition_via_trait::<crate::fs::hfs::Hfs>(
+                    &mut slice,
+                    fs,
+                    hfs_format_opts(fs)?,
                 )?;
             }
             "ntfs" => {

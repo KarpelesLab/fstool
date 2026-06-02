@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(hfs)* classic-HFS **writer** — `fstool create -t hfs`, `build`, and `repack`
+  now generate fresh classic-HFS volumes. Ports the HFS+ writer's design (catalog
+  held as an in-memory `BTreeMap`, on-disk B-trees rebuilt by greedy 512-byte
+  node packing) with HFS specifics: MacRoman names + case-insensitive catalog
+  collation, MDB + volume bitmap, 3 inline extents. New `src/fs/hfs/writer.rs`
+  and `macroman::encode`/`cmp_ci`. Validated by round-tripping through the reader
+  (incl. a strict B-tree key-order check) and, on macOS CI, `fsck_hfs`. In-place
+  add/remove on an existing image lands in a follow-up.
+
 ## [0.4.10](https://github.com/KarpelesLab/fstool/compare/v0.4.9...v0.4.10) - 2026-05-30
 
 ### Added

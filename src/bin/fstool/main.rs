@@ -2174,6 +2174,26 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             |o, m| o.apply_options(m),
             DEFAULT_MIN_SIZE,
         )?,
+        "hfs" => create_via_factory::<fstool::fs::hfs::Hfs>(
+            "hfs",
+            source.as_ref(),
+            args.output,
+            args.size,
+            opts,
+            is_device,
+            qcow2_cluster_size,
+            fstool::fs::hfs::HfsFormatOpts::default(),
+            |o: &mut fstool::fs::hfs::HfsFormatOpts, m| {
+                if let Some(s) = m.take_str("volume_label") {
+                    o.volume_name = s;
+                }
+                if let Some(b) = m.take_u32("block_size")? {
+                    o.block_size = Some(b);
+                }
+                Ok(())
+            },
+            DEFAULT_MIN_SIZE,
+        )?,
         "ntfs" => create_via_factory::<fstool::fs::ntfs::Ntfs>(
             "ntfs",
             source.as_ref(),

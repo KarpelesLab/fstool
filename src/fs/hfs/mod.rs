@@ -18,6 +18,9 @@
 
 use crate::macroman;
 
+mod writer;
+pub use writer::HfsFormatOpts;
+
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -77,7 +80,9 @@ struct Node {
     rsrc_inline: ExtRec,
 }
 
-/// Classic HFS volume (read-only, in-memory catalog).
+/// Classic HFS volume. Read-only when opened via [`Hfs::open`]; gains write
+/// capability (the `writer` is `Some`) after [`Hfs::format`] (and, in a later
+/// phase, an in-place writable open).
 pub struct Hfs {
     /// Allocation block size in bytes (`drAlBlkSiz`).
     block_size: u32,
@@ -85,10 +90,13 @@ pub struct Hfs {
     alloc_base: u64,
     /// Volume name (`drVN`, MacRoman-decoded).
     pub volume_name: String,
-    /// parentCNID → children.
+    /// parentCNID → children. The read index; kept in sync with `writer`'s
+    /// catalog after each mutation.
     children: HashMap<u32, Vec<Node>>,
     /// Extents-overflow map: (forkType, CNID, startBlock) → 3 extents.
     overflow: HashMap<(u8, u32, u16), ExtRec>,
+    /// Present (and authoritative for mutation) when the volume is writable.
+    writer: Option<writer::HfsWriter>,
 }
 
 impl Hfs {
@@ -146,6 +154,7 @@ impl Hfs {
             volume_name,
             children: HashMap::new(),
             overflow: HashMap::new(),
+            writer: None,
         };
 
         // 1) Read the extents-overflow file (inline extents only — it can't
@@ -510,10 +519,70 @@ impl Hfs {
         }
     }
 
-    pub fn format(_dev: &mut dyn BlockDevice, _opts: &()) -> Result<Self> {
-        Err(Error::Unsupported(
-            "hfs: creating classic HFS volumes is not supported".into(),
-        ))
+    /// Format a fresh, empty, **writable** classic-HFS volume on `dev`.
+    pub fn format(dev: &mut dyn BlockDevice, opts: &writer::HfsFormatOpts) -> Result<Self> {
+        let w = writer::HfsWriter::format(dev, opts)?;
+        Ok(Self::from_writer(w))
+    }
+
+    /// Build a writable `Hfs` around an [`writer::HfsWriter`], seeding the read
+    /// index from its catalog.
+    fn from_writer(w: writer::HfsWriter) -> Self {
+        let mut hfs = Hfs {
+            block_size: w.block_size,
+            alloc_base: w.alloc_base,
+            volume_name: w.volume_name.clone(),
+            children: HashMap::new(),
+            overflow: HashMap::new(),
+            writer: Some(w),
+        };
+        hfs.rebuild_index();
+        hfs
+    }
+
+    /// Rebuild the read index (`children` / `overflow`) from the writer's
+    /// in-memory catalog, so `list`/`cat` reflect pending mutations. Cheap on
+    /// the small volumes classic HFS targets.
+    fn rebuild_index(&mut self) {
+        let Some(w) = self.writer.as_ref() else {
+            return;
+        };
+        let mut children: HashMap<u32, Vec<Node>> = HashMap::new();
+        for (key, body) in &w.catalog {
+            if body.is_empty() {
+                continue;
+            }
+            let name = macroman::decode(&key.name).replace('/', ":");
+            match body[0] {
+                1 if body.len() >= 18 => {
+                    children.entry(key.parid).or_default().push(Node {
+                        name,
+                        cnid: be32(body, 6),
+                        is_dir: true,
+                        size: 0,
+                        mtime: be32(body, 14),
+                        inline: [(0, 0); 3],
+                        rsrc_size: 0,
+                        rsrc_inline: [(0, 0); 3],
+                    });
+                }
+                2 if body.len() >= 98 => {
+                    children.entry(key.parid).or_default().push(Node {
+                        name,
+                        cnid: be32(body, 20),
+                        is_dir: false,
+                        size: be32(body, 26) as u64,
+                        mtime: be32(body, 48),
+                        inline: ext_rec(body, 74),
+                        rsrc_size: be32(body, 36) as u64,
+                        rsrc_inline: ext_rec(body, 86),
+                    });
+                }
+                _ => {}
+            }
+        }
+        self.children = children;
+        self.overflow = w.overflow.iter().map(|(&k, &v)| (k, v)).collect();
     }
 }
 
@@ -588,7 +657,7 @@ impl crate::fs::FileReadHandle for HfsFileReader<'_> {
 }
 
 impl crate::fs::FilesystemFactory for Hfs {
-    type FormatOpts = ();
+    type FormatOpts = writer::HfsFormatOpts;
     fn format(dev: &mut dyn BlockDevice, opts: &Self::FormatOpts) -> Result<Self> {
         Self::format(dev, opts)
     }
@@ -600,27 +669,41 @@ impl crate::fs::FilesystemFactory for Hfs {
 impl Filesystem for Hfs {
     fn create_file(
         &mut self,
-        _dev: &mut dyn BlockDevice,
-        _path: &Path,
-        _src: crate::fs::FileSource,
-        _meta: crate::fs::FileMeta,
+        dev: &mut dyn BlockDevice,
+        path: &Path,
+        src: crate::fs::FileSource,
+        meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        Err(Error::Immutable {
+        let s = path
+            .to_str()
+            .ok_or_else(|| Error::InvalidArgument("hfs: non-UTF-8 path".into()))?;
+        let w = self.writer.as_mut().ok_or(Error::Immutable {
             kind: "hfs",
             op: "add",
-        })
+        })?;
+        let len = src.len()?;
+        let (mut reader, _) = src.open()?;
+        w.insert_file(dev, s, &mut reader, len, meta.mtime)?;
+        self.rebuild_index();
+        Ok(())
     }
 
     fn create_dir(
         &mut self,
         _dev: &mut dyn BlockDevice,
-        _path: &Path,
-        _meta: crate::fs::FileMeta,
+        path: &Path,
+        meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        Err(Error::Immutable {
+        let s = path
+            .to_str()
+            .ok_or_else(|| Error::InvalidArgument("hfs: non-UTF-8 path".into()))?;
+        let w = self.writer.as_mut().ok_or(Error::Immutable {
             kind: "hfs",
             op: "mkdir",
-        })
+        })?;
+        w.insert_dir(s, meta.mtime)?;
+        self.rebuild_index();
+        Ok(())
     }
 
     fn create_symlink(
@@ -630,10 +713,11 @@ impl Filesystem for Hfs {
         _target: &Path,
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        Err(Error::Immutable {
-            kind: "hfs",
-            op: "symlink",
-        })
+        // Classic HFS has no POSIX symlinks; the repack sink treats this as a
+        // skippable entry.
+        Err(Error::Unsupported(
+            "hfs: classic HFS has no symbolic links".into(),
+        ))
     }
 
     fn create_device(
@@ -713,7 +797,11 @@ impl Filesystem for Hfs {
         })
     }
 
-    fn flush(&mut self, _dev: &mut dyn BlockDevice) -> Result<()> {
+    fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        if let Some(w) = self.writer.as_mut() {
+            w.flush(dev)?;
+            self.rebuild_index();
+        }
         Ok(())
     }
 
@@ -744,7 +832,11 @@ impl Filesystem for Hfs {
     }
 
     fn mutation_capability(&self) -> MutationCapability {
-        MutationCapability::Immutable
+        if self.writer.is_some() {
+            MutationCapability::Mutable
+        } else {
+            MutationCapability::Immutable
+        }
     }
 }
 
@@ -900,6 +992,59 @@ mod tests {
         let mut out = Vec::new();
         std::io::Read::read_to_end(&mut r, &mut out).unwrap();
         out
+    }
+
+    /// Format a fresh HFS volume with the writer, add a dir + two files, flush,
+    /// then read it all back through the reader.
+    #[test]
+    fn writer_round_trip() {
+        let mut dev = MemoryBackend::new(4 * 1024 * 1024);
+        let opts = super::writer::HfsFormatOpts {
+            volume_name: "WriteTest".into(),
+            block_size: None,
+        };
+        let mut w = super::writer::HfsWriter::format(&mut dev, &opts).unwrap();
+        w.insert_dir("/sub", 0).unwrap();
+        let hello = b"hello from the HFS writer\n";
+        w.insert_file(
+            &mut dev,
+            "/hello.txt",
+            &mut &hello[..],
+            hello.len() as u64,
+            0,
+        )
+        .unwrap();
+        w.insert_file(&mut dev, "/sub/deep.txt", &mut &b"deep\n"[..], 5, 0)
+            .unwrap();
+        w.flush(&mut dev).unwrap();
+
+        let mut fs = Hfs::open(&mut dev).unwrap();
+        assert_eq!(fs.volume_name, "WriteTest");
+        let root: Vec<_> = fs
+            .list(&mut dev, Path::new("/"))
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.name, e.kind))
+            .collect();
+        assert!(
+            root.contains(&("hello.txt".into(), EntryKind::Regular)),
+            "root = {root:?}"
+        );
+        assert!(
+            root.contains(&("sub".into(), EntryKind::Dir)),
+            "root = {root:?}"
+        );
+
+        let sub: Vec<_> = fs
+            .list(&mut dev, Path::new("/sub"))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(sub, vec!["deep.txt"]);
+
+        assert_eq!(read_all(&mut fs, &mut dev, "/hello.txt"), hello);
+        assert_eq!(read_all(&mut fs, &mut dev, "/sub/deep.txt"), b"deep\n");
     }
 
     /// The resource fork is read from its own extents (`filRLgLen` @ +36,
