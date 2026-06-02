@@ -810,7 +810,9 @@ fn build_btree(records: &[Vec<u8>], key_len_max: u16) -> Result<Vec<[u8; NODE]>>
         let idx_records: Vec<Vec<u8>> = child_level
             .iter()
             .enumerate()
-            .map(|(i, n)| encode_index_record(&n.first_key, child_start + i as u32))
+            .map(|(i, n)| {
+                encode_index_record(&n.first_key, child_start + i as u32, key_len_max as usize)
+            })
             .collect();
         let idx_nodes = pack_level(&idx_records, ND_INDEX, height);
         levels.push(idx_nodes);
@@ -893,17 +895,22 @@ fn finish_node(cur: &mut Vec<Vec<u8>>, kind: u8, height: u8) -> PackedNode {
     }
 }
 
-/// The key region (keyLen byte + key bytes) of an encoded record.
+/// The key **content** (the bytes after the keyLen byte) of an encoded record.
 fn key_of(rec: &[u8]) -> Vec<u8> {
     let kl = rec[0] as usize;
-    rec[..round_up_even(1 + kl)].to_vec()
+    rec[1..1 + kl].to_vec()
 }
 
-/// An index record: the (already even-padded) key region followed by a 4-byte
-/// child node pointer.
-fn encode_index_record(key_region: &[u8], child: u32) -> Vec<u8> {
-    let mut r = key_region.to_vec();
-    r.extend_from_slice(&child.to_be_bytes());
+/// An HFS index record: a **fixed-length** key (keyLen byte = `key_len`, the
+/// B-tree's `bthKeyLen`, with the key content zero-padded to that length)
+/// followed by a 4-byte child node pointer. Classic HFS index nodes use
+/// max-length keys — `fsck` rejects variable-length ones.
+fn encode_index_record(key_content: &[u8], child: u32, key_len: usize) -> Vec<u8> {
+    let mut r = vec![0u8; 1 + key_len + 4];
+    r[0] = key_len as u8;
+    let n = key_content.len().min(key_len);
+    r[1..1 + n].copy_from_slice(&key_content[..n]);
+    r[1 + key_len..].copy_from_slice(&child.to_be_bytes());
     r
 }
 
@@ -1080,10 +1087,28 @@ mod tests {
         // Header node consistency.
         assert_eq!(nodes[0][8], ND_HEADER);
         let depth = u16::from_be_bytes([nodes[0][14], nodes[0][15]]);
+        let bth_root = u32::from_be_bytes(nodes[0][16..20].try_into().unwrap());
         let bth_fnode = u32::from_be_bytes(nodes[0][24..28].try_into().unwrap());
         let nnodes = u32::from_be_bytes(nodes[0][36..40].try_into().unwrap());
         assert_eq!(nnodes as usize, nodes.len(), "bthNNodes != node count");
         assert!(depth >= 2, "expected an index level (depth {depth})");
+
+        // The root index node must use FIXED-length keys (keyLen == bthKeyLen),
+        // as classic HFS requires and `fsck` enforces.
+        let root = &nodes[bth_root as usize];
+        assert_eq!(root[8], ND_INDEX, "root should be an index node");
+        let rnrecs = u16::from_be_bytes([root[10], root[11]]) as usize;
+        for r in 0..rnrecs {
+            let off = u16::from_be_bytes([root[NODE - 2 * (r + 1)], root[NODE - 2 * (r + 1) + 1]])
+                as usize;
+            assert_eq!(
+                root[off], 37,
+                "index record key must be fixed at bthKeyLen=37"
+            );
+            // Child pointer at off + 1 + keyLen references a real node.
+            let child = u32::from_be_bytes(root[off + 38..off + 42].try_into().unwrap());
+            assert!((child as usize) < nodes.len(), "index child out of range");
+        }
 
         // Walk the leaf chain via ndFLink, collecting every key in order.
         let mut all: Vec<(u32, Vec<u8>)> = Vec::new();
