@@ -280,6 +280,47 @@ impl Refcount {
         Ok(new_cluster)
     }
 
+    /// Decrement the refcount of every host cluster overlapping the byte
+    /// range `[start_byte, start_byte + len)` by one, freeing (refcount → 0)
+    /// any that reach zero. Used when copying a compressed cluster out: each
+    /// compressed cluster contributes one reference to every host cluster its
+    /// (byte-granular) payload touches, so several compressed clusters can
+    /// share a host cluster with refcount > 1 — decrementing keeps that exact.
+    pub fn release_range<F: Read + Write + Seek>(
+        &mut self,
+        file: &mut F,
+        start_byte: u64,
+        len: u64,
+    ) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let first = start_byte / self.cluster_size;
+        let last = (start_byte + len - 1) / self.cluster_size;
+        let epb = self.entries_per_block();
+        for cluster in first..=last {
+            let block_idx = (cluster / epb) as usize;
+            if block_idx >= self.table.len() {
+                continue;
+            }
+            let block_off = self.table[block_idx];
+            if block_off == 0 {
+                continue;
+            }
+            self.load_block(file, block_off)?;
+            let block = self.block_cache.get_mut(&block_off).unwrap();
+            let i = (cluster % epb) as usize;
+            if block.entries[i] > 0 {
+                block.entries[i] -= 1;
+                block.dirty = true;
+                if block.entries[i] == 0 && cluster < self.next_free_hint {
+                    self.next_free_hint = cluster; // make it reusable
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Write every dirty refcount block back, then the refcount table.
     pub fn flush<F: Write + Seek>(&mut self, file: &mut F) -> Result<()> {
         for (&off, block) in self.block_cache.iter_mut() {

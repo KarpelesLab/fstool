@@ -208,6 +208,58 @@ fn read_back_zstd_compressed() {
     assert_eq!(all, expect, "zstd-compressed read mismatch");
 }
 
+/// Writing into a compressed cluster copies it out to a plain cluster
+/// (COW): the edit sticks, untouched compressed clusters survive byte-exact,
+/// and `qemu-img check` stays clean (refcounts intact).
+#[test]
+fn cow_write_into_compressed_cluster() {
+    if !which("qemu-img") {
+        eprintln!("skipping: qemu-img not installed");
+        return;
+    }
+    let (raw, mut expect) = compressible_source();
+    let qcow = NamedTempFile::new().unwrap();
+    let out = Command::new("qemu-img")
+        .args(["convert", "-f", "raw", "-O", "qcow2", "-c"])
+        .arg(raw.path())
+        .arg(qcow.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "convert -c failed");
+
+    // Overwrite a 100-byte window inside the first (compressed) cluster and a
+    // window inside the later compressed region at 2 MiB.
+    let patch = [0x5Au8; 100];
+    {
+        let mut back = Qcow2Backend::open(qcow.path()).unwrap();
+        back.write_at(10, &patch).unwrap();
+        back.write_at(2_000_100, &patch).unwrap();
+        back.sync().unwrap();
+    }
+    expect[10..110].copy_from_slice(&patch);
+    expect[2_000_100..2_000_200].copy_from_slice(&patch);
+
+    // qemu-img check: structural + refcount validation.
+    let check = Command::new("qemu-img")
+        .arg("check")
+        .arg(qcow.path())
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "qemu-img check failed after COW:\n{}\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    // Reopen and confirm the whole image matches (edits applied, rest intact).
+    let mut back = Qcow2Backend::open(qcow.path()).unwrap();
+    let mut all = Vec::new();
+    use std::io::Read as _;
+    back.read_to_end(&mut all).unwrap();
+    assert_eq!(all, expect, "post-COW image mismatch");
+}
+
 /// Qcow2Backend::create makes a fresh image that qemu-img validates.
 #[test]
 fn create_then_qemu_img_check() {

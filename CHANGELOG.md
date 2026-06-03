@@ -18,7 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   field are parsed, and a one-cluster decompression cache keeps sequential
   sub-cluster reads cheap. New `src/block/qcow2/compress.rs`; bumps `compcol`
   to 0.6 for its `deflate` window knobs. Cross-checked byte-exact against
-  `qemu-img`-produced zlib and zstd images.
+  `qemu-img`-produced zlib and zstd images. Writing into a compressed cluster
+  copies it out to a plain cluster first (qemu's behaviour) — decompress,
+  allocate, repoint the L2 entry, and release the old cluster's (possibly
+  shared) host-range refcounts — so `add`/shell edits of a compressed image
+  work and stay `qemu-img check`-clean.
 
 - *(affs)* in-place mutation for **Amiga OFS/FFS**: `Affs::open_writable` loads
   an existing `.adf` (every directory plus the bytes of every file) into the

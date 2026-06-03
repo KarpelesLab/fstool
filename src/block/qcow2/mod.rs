@@ -292,6 +292,7 @@ impl Qcow2Backend {
             let take = ((cs - in_cluster) as usize).min(buf.len());
             let (chunk, rest) = buf.split_at(take);
             let cluster_start = offset - in_cluster;
+            let mapping = self.l1l2.map(&mut self.file, cluster_start)?;
             // Sparse fast path: writing zeros to a cluster that has no
             // physical mapping is a no-op — an unallocated qcow2 cluster
             // already reads back as zero, so allocating one just to fill
@@ -299,20 +300,67 @@ impl Qcow2Backend {
             // This is what made an 8 GiB ext2 repacked into qcow2 take
             // 8 GiB on disk: `Ext::format_with` calls `dev.zero_range`
             // across the whole image before formatting.
-            if chunk.iter().all(|&b| b == 0)
-                && self.l1l2.lookup(&mut self.file, cluster_start)?.is_none()
-            {
+            if chunk.iter().all(|&b| b == 0) && matches!(mapping, Mapping::Unallocated) {
                 offset += take as u64;
                 buf = rest;
                 continue;
             }
-            let phys = self.ensure_mapping(cluster_start)?;
+            let phys = match mapping {
+                // Writing to a compressed cluster: copy it out to a fresh
+                // plain cluster first (qemu's behaviour), then write into that.
+                Mapping::Compressed {
+                    host_offset,
+                    byte_len,
+                } => self.cow_compressed_cluster(cluster_start, host_offset, byte_len)?,
+                _ => self.ensure_mapping(cluster_start)?,
+            };
             self.file.seek(SeekFrom::Start(phys + in_cluster))?;
             self.file.write_all(chunk)?;
             offset += take as u64;
             buf = rest;
         }
         Ok(())
+    }
+
+    /// Copy a compressed cluster out to a freshly allocated *plain* cluster:
+    /// decompress it, write the bytes verbatim, repoint the L2 entry, and
+    /// release the old compressed cluster's host-range refcounts. Returns the
+    /// new plain cluster's physical byte offset, ready for the caller to write
+    /// the actual (partial) update into.
+    fn cow_compressed_cluster(
+        &mut self,
+        cluster_start: u64,
+        host_offset: u64,
+        byte_len: u64,
+    ) -> Result<u64> {
+        self.fill_decomp_cache(cluster_start, host_offset, byte_len)?;
+        let content = self.decomp_cache.as_ref().unwrap().1.clone();
+
+        let data_cluster = self
+            .refcount
+            .alloc_cluster(&mut self.file, &mut self.file_len)?;
+        let new_off = data_cluster * self.cluster_size;
+        let new_end = new_off + self.cluster_size;
+        if new_end > self.file_len {
+            self.file_len = new_end;
+        }
+        self.file.set_len(self.file_len)?;
+        self.file.seek(SeekFrom::Start(new_off))?;
+        self.file.write_all(&content)?;
+
+        // Repoint the L2 entry at the new plain cluster.
+        let (l1_idx, l2_idx, _) = self.l1l2.split_addr(cluster_start);
+        let l2_off = self.l1l2.l1[l1_idx] & l1l2::OFFSET_MASK;
+        self.l1l2.set_l2_entry(l2_off, l2_idx, new_off | COPIED)?;
+
+        // Drop the old compressed cluster's references (it may have shared
+        // host clusters with neighbours, which keep a positive refcount).
+        self.refcount
+            .release_range(&mut self.file, host_offset, byte_len)?;
+        // The cluster is now plain; invalidate the decompressed-bytes cache so
+        // the subsequent in-place write isn't shadowed by stale data.
+        self.decomp_cache = None;
+        Ok(new_off)
     }
 
     /// Make sure the cluster covering virtual offset `vaddr_cluster_aligned`
@@ -552,7 +600,17 @@ impl BlockDevice for Qcow2Backend {
             let in_cluster = cur & (cs - 1);
             let take = (cs - in_cluster).min(end - cur);
             let cluster_start = cur - in_cluster;
-            if let Some(phys) = self.l1l2.lookup(&mut self.file, cluster_start)? {
+            let phys = match self.l1l2.map(&mut self.file, cluster_start)? {
+                Mapping::Unallocated => None,
+                Mapping::Normal(phys) => Some(phys),
+                // A compressed cluster carries real data; copy it out to a
+                // plain cluster so we can zero the requested sub-range in place.
+                Mapping::Compressed {
+                    host_offset,
+                    byte_len,
+                } => Some(self.cow_compressed_cluster(cluster_start, host_offset, byte_len)?),
+            };
+            if let Some(phys) = phys {
                 self.file.seek(SeekFrom::Start(phys + in_cluster))?;
                 let mut remaining = take;
                 while remaining > 0 {
