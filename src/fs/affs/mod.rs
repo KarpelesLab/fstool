@@ -20,8 +20,8 @@
 //! Layout offsets follow adflib's `adf_blk.h` structs; the reader is
 //! cross-checked against the Linux kernel `affs` driver.
 //!
-//! Writing goes through [`writer`]: [`Affs::format`] generates a fresh volume
-//! and [`Affs::open_writable`] loads an existing one into an in-memory tree
+//! Writing goes through the `writer` submodule: [`Affs::format`] generates a
+//! fresh volume and [`Affs::open_writable`] loads an existing one into a tree
 //! that `add`/`mkdir`/`rm` mutate and `flush` re-serialises block-by-block.
 //! A read-only handle ([`Affs::open`]) reports
 //! [`MutationCapability::Immutable`]; a writable one reports `Mutable`.
