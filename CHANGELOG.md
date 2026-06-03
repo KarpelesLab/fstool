@@ -24,6 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared) host-range refcounts — so `add`/shell edits of a compressed image
   work and stay `qemu-img check`-clean.
 
+- *(qcow2)* **produce** compressed qcow2 images: a `--compress[=SPEC]` flag on
+  `create` / `build` / `repack` / `convert` (`--compress`, `--compress=9`,
+  `--compress=zstd`, `--compress=zstd:9`) serialises a fresh compressed image —
+  each non-zero cluster compressed once (zeros stay sparse), payloads packed
+  byte-granularly, with L1/L2/refcount tables (and exact shared-host-cluster
+  refcounts) and a header carrying `compression_type` (+ the COMPRESSION_TYPE
+  incompatible bit for zstd). Deflate uses a 4 KiB match window so qemu reads
+  it. Validated with `qemu-img check` + `qemu-img convert -O raw` byte-exact,
+  for both codecs.
+
 - *(affs)* in-place mutation for **Amiga OFS/FFS**: `Affs::open_writable` loads
   an existing `.adf` (every directory plus the bytes of every file) into the
   in-memory tree, so `fstool add` / `rm` and shell `put` / `mkdir` / `rm` edit a

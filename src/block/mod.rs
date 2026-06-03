@@ -163,7 +163,7 @@ pub fn create_image(
     virtual_size: u64,
     opts: &CreateOpts,
 ) -> crate::Result<Box<dyn BlockDevice>> {
-    if is_qcow2_extension(path) {
+    if is_qcow2_path(path) {
         Ok(Box::new(Qcow2Backend::create(
             path,
             virtual_size,
@@ -174,7 +174,9 @@ pub fn create_image(
     }
 }
 
-fn is_qcow2_extension(path: &Path) -> bool {
+/// True when `path`'s extension marks it as a qcow2 image (`.qcow2` /
+/// `.qcow` / `.q2`). Used by the create/finalize paths to decide the backend.
+pub fn is_qcow2_path(path: &Path) -> bool {
     let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
         return false;
     };

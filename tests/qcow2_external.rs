@@ -260,6 +260,81 @@ fn cow_write_into_compressed_cluster() {
     assert_eq!(all, expect, "post-COW image mismatch");
 }
 
+/// Produce a compressed qcow2 with our serializer; qemu-img must validate
+/// it (check clean) and decode it back to the original bytes.
+fn write_compressed_roundtrip(ctype: u8) {
+    if !which("qemu-img") {
+        eprintln!("skipping: qemu-img not installed");
+        return;
+    }
+    let (raw, expect) = compressible_source();
+    let src_dev = fstool::block::FileBackend::open(raw.path()).unwrap();
+    let out = NamedTempFile::new().unwrap();
+    let mut src: Box<dyn BlockDevice> = Box::new(src_dev);
+    let written = fstool::block::qcow2::compress::write_compressed_image(
+        src.as_mut(),
+        out.path(),
+        65536,
+        ctype,
+        6,
+    )
+    .unwrap();
+    assert!(
+        written < expect.len() as u64,
+        "compressed output ({written}) should be smaller than the {} source",
+        expect.len()
+    );
+
+    // qemu-img check: structural + refcount validation.
+    let check = Command::new("qemu-img")
+        .arg("check")
+        .arg(out.path())
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "qemu-img check failed:\n{}\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    // qemu decodes it back to the original raw bytes.
+    let back = NamedTempFile::new().unwrap();
+    let conv = Command::new("qemu-img")
+        .args(["convert", "-O", "raw"])
+        .arg(out.path())
+        .arg(back.path())
+        .output()
+        .unwrap();
+    assert!(
+        conv.status.success(),
+        "qemu-img convert -O raw failed:\n{}",
+        String::from_utf8_lossy(&conv.stderr)
+    );
+    let got = std::fs::read(back.path()).unwrap();
+    assert_eq!(got, expect, "qemu round-trip mismatch");
+
+    // Our own reader also reads it byte-exact.
+    let mut ours = Qcow2Backend::open(out.path()).unwrap();
+    let mut all = Vec::new();
+    use std::io::Read as _;
+    ours.read_to_end(&mut all).unwrap();
+    assert_eq!(
+        all, expect,
+        "our reader mismatch on our own compressed image"
+    );
+}
+
+#[test]
+fn write_compressed_zlib_roundtrip() {
+    write_compressed_roundtrip(0);
+}
+
+#[test]
+fn write_compressed_zstd_roundtrip() {
+    write_compressed_roundtrip(1);
+}
+
 /// Qcow2Backend::create makes a fresh image that qemu-img validates.
 #[test]
 fn create_then_qemu_img_check() {

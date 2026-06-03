@@ -165,10 +165,13 @@ through the TOML spec — see "[filesystem.options]" below.
 - **qcow2** — `Qcow2Backend` reads QEMU v2 / v3 images and writes fresh v3
   ones with allocate-on-write. **Compressed clusters** are read transparently
   (zlib/deflate and zstd, decoded with a 4 KiB window to match qemu and bound
-  RAM); a write to a compressed cluster copies it out to a plain cluster.
-  Path-based factories (`block::open_image`, `block::create_image`)
-  auto-dispatch by qcow2 magic or file extension, so
-  `fstool create -t ext4 src -o out.qcow2` Just Works.
+  RAM); a write to a compressed cluster copies it out to a plain cluster. To
+  *produce* a compressed image, pass `--compress` to `create` / `build` /
+  `repack` / `convert` (e.g. `--compress`, `--compress=9`, `--compress=zstd`,
+  `--compress=zstd:9`); the result passes `qemu-img check`. Path-based
+  factories (`block::open_image`, `block::create_image`) auto-dispatch by qcow2
+  magic or file extension, so `fstool create -t ext4 src -o out.qcow2` Just
+  Works.
 
 ## TOML spec
 

@@ -100,6 +100,10 @@ enum Command {
         /// `-O compression=zstd,block_size=128KiB` (squashfs).
         #[arg(short = 'O', long = "options", value_name = "KEY=VAL", action = clap::ArgAction::Append)]
         options: Vec<String>,
+        /// Compress the qcow2 output. `--compress` = zlib level 6;
+        /// also `--compress=zstd`, `--compress=9`, or `--compress=zstd:9`.
+        #[arg(long, value_name = "SPEC", num_args = 0..=1, default_missing_value = "zlib")]
+        compress: Option<String>,
     },
 
     /// List a directory inside an image. One entry per line:
@@ -188,6 +192,10 @@ enum Command {
         /// Output image file.
         #[arg(short = 'o', long = "output", value_name = "IMAGE")]
         output: PathBuf,
+        /// Compress the qcow2 output. `--compress` = zlib level 6;
+        /// also `--compress=zstd`, `--compress=9`, or `--compress=zstd:9`.
+        #[arg(long, value_name = "SPEC", num_args = 0..=1, default_missing_value = "zlib")]
+        compress: Option<String>,
     },
 
     /// Copy a host file or directory into an existing image. The
@@ -251,6 +259,10 @@ enum Command {
         /// qcow2 cluster size for the destination, when DST is a qcow2.
         #[arg(long, value_name = "SIZE", default_value = "64KiB")]
         cluster_size: String,
+        /// Compress the qcow2 output. `--compress` = zlib level 6;
+        /// also `--compress=zstd`, `--compress=9`, or `--compress=zstd:9`.
+        #[arg(long, value_name = "SPEC", num_args = 0..=1, default_missing_value = "zlib")]
+        compress: Option<String>,
     },
 
     /// Repack an image into a fresh filesystem at a (possibly different)
@@ -288,6 +300,10 @@ enum Command {
         /// qcow2 cluster size for the destination, when DST is a qcow2.
         #[arg(long, value_name = "SIZE", default_value = "64KiB")]
         cluster_size: String,
+        /// Compress the qcow2 output. `--compress` = zlib level 6;
+        /// also `--compress=zstd`, `--compress=9`, or `--compress=zstd:9`.
+        #[arg(long, value_name = "SPEC", num_args = 0..=1, default_missing_value = "zlib")]
+        compress: Option<String>,
     },
     /// Mount an ext{2,3,4} image at a host mountpoint via FUSE.
     /// Only available when fstool is built with `--features fuse`.
@@ -327,16 +343,24 @@ fn run(cli: Cli) -> fstool::Result<()> {
             force,
             cluster_size,
             options,
-        } => create_cmd(CreateArgs {
-            fs_type: &fs_type,
-            src_dir: src_dir.as_deref(),
-            output: &output,
-            size: size.as_deref(),
-            label: label.as_deref(),
-            force,
-            cluster_size: &cluster_size,
-            options: &options,
-        }),
+            compress,
+        } => {
+            let comp = parse_compress(compress.as_deref())?;
+            create_cmd(CreateArgs {
+                fs_type: &fs_type,
+                src_dir: src_dir.as_deref(),
+                output: &output,
+                size: size.as_deref(),
+                label: label.as_deref(),
+                force,
+                cluster_size: &cluster_size,
+                options: &options,
+            })?;
+            if let Some((ctype, level)) = comp {
+                finalize_compress_qcow2(&output, ctype, level)?;
+            }
+            Ok(())
+        }
         Command::Ls {
             image,
             path,
@@ -355,7 +379,18 @@ fn run(cli: Cli) -> fstool::Result<()> {
             block_size,
             json,
         } => analyze_cmd(&source, fs_type.as_deref(), block_size, json),
-        Command::Build { spec, output } => build(&spec, &output),
+        Command::Build {
+            spec,
+            output,
+            compress,
+        } => {
+            let comp = parse_compress(compress.as_deref())?;
+            build(&spec, &output)?;
+            if let Some((ctype, level)) = comp {
+                finalize_compress_qcow2(&output, ctype, level)?;
+            }
+            Ok(())
+        }
         Command::Add {
             image,
             host_src,
@@ -368,7 +403,15 @@ fn run(cli: Cli) -> fstool::Result<()> {
             dst,
             size,
             cluster_size,
-        } => convert_cmd(&src, &dst, size.as_deref(), &cluster_size),
+            compress,
+        } => {
+            let comp = parse_compress(compress.as_deref())?;
+            convert_cmd(&src, &dst, size.as_deref(), &cluster_size)?;
+            if let Some((ctype, level)) = comp {
+                finalize_compress_qcow2(&dst, ctype, level)?;
+            }
+            Ok(())
+        }
         Command::Repack {
             mut paths,
             size,
@@ -376,7 +419,9 @@ fn run(cli: Cli) -> fstool::Result<()> {
             fs_type,
             block_size,
             cluster_size,
+            compress,
         } => {
+            let comp = parse_compress(compress.as_deref())?;
             let dst_str = paths.pop().expect("clap enforces num_args >= 2");
             let dst = PathBuf::from(dst_str);
             let srcs = paths;
@@ -394,7 +439,11 @@ fn run(cli: Cli) -> fstool::Result<()> {
                 &cluster_size,
             );
             fstool::repack::leave();
-            res
+            res?;
+            if let Some((ctype, level)) = comp {
+                finalize_compress_qcow2(&dst, ctype, level)?;
+            }
+            Ok(())
         }
         #[cfg(feature = "fuse")]
         Command::Mount { image, mountpoint } => mount_cmd(&image, &mountpoint),
@@ -533,6 +582,77 @@ fn mount_cmd(image: &str, mountpoint: &std::path::Path) -> fstool::Result<()> {
         mountpoint.display()
     );
     adapter.mount(mountpoint).map_err(fstool::Error::Io)?;
+    Ok(())
+}
+
+/// Parse a `--compress` spec into `(compression_type, level)`. Accepts
+/// `""`/absent-value → zlib/6, a codec name (`zlib`/`zstd`), a bare level
+/// (`9` → zlib/9), or `codec:level` (`zstd:19`-style, clamped to deflate's
+/// 1..=9 for zlib). Returns `Ok(None)` when the flag wasn't given.
+fn parse_compress(spec: Option<&str>) -> fstool::Result<Option<(u8, u8)>> {
+    let Some(s) = spec else {
+        return Ok(None);
+    };
+    let s = s.trim();
+    let (codec, level_str) = match s.split_once(':') {
+        Some((c, l)) => (c, Some(l)),
+        None if s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty() => ("zlib", Some(s)),
+        None => (s, None),
+    };
+    let ctype = match codec.to_ascii_lowercase().as_str() {
+        "" | "zlib" | "deflate" => 0u8,
+        "zstd" => 1u8,
+        other => {
+            return Err(fstool::Error::InvalidArgument(format!(
+                "--compress: unknown codec {other:?} (use zlib or zstd)"
+            )));
+        }
+    };
+    let level = match level_str {
+        Some(l) => l
+            .parse::<u8>()
+            .map_err(|_| fstool::Error::InvalidArgument(format!("--compress: bad level {l:?}")))?
+            .clamp(1, 9),
+        None => 6,
+    };
+    Ok(Some((ctype, level)))
+}
+
+/// Recompress an already-produced qcow2 image in place: read its virtual
+/// content, serialise a fresh compressed qcow2 next to it, and rename over the
+/// original. The cluster size is taken from the produced image's header.
+fn finalize_compress_qcow2(path: &std::path::Path, ctype: u8, level: u8) -> fstool::Result<()> {
+    use fstool::block::BlockDevice;
+    if !fstool::block::is_qcow2_path(path) {
+        return Err(fstool::Error::InvalidArgument(
+            "--compress requires a qcow2 output (e.g. -o out.qcow2)".into(),
+        ));
+    }
+    let mut src = fstool::block::Qcow2Backend::open_read_only(path)?;
+    let cluster_size = src.header().cluster_size() as u32;
+    let before = std::fs::metadata(path)?.len();
+    let tmp = path.with_extension("qcow2.tmp");
+    let written = fstool::block::qcow2::compress::write_compressed_image(
+        &mut src as &mut dyn BlockDevice,
+        &tmp,
+        cluster_size,
+        ctype,
+        level,
+    )?;
+    drop(src);
+    std::fs::rename(&tmp, path)?;
+    let codec = if ctype == 1 { "zstd" } else { "zlib" };
+    eprintln!(
+        "compressed {} with {codec} ({} → {} bytes, {:.1}%)",
+        path.display(),
+        before,
+        written,
+        if before > 0 {
+            100.0 * written as f64 / before as f64
+        } else {
+            100.0
+        }
+    );
     Ok(())
 }
 
