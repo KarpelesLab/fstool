@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.11](https://github.com/KarpelesLab/fstool/compare/v0.4.10...v0.4.11) - 2026-06-03
+
+### Added
+
+- *(qcow2)* produce compressed images — --compress on create/build/repack/convert
+- *(qcow2)* copy-on-write when writing into a compressed cluster
+- *(qcow2)* read compressed clusters (zlib + zstd)
+- *(affs)* in-place mutation for Amiga OFS/FFS (phase 3)
+- *(affs)* Amiga OFS/FFS writer — generate from scratch (phase 2)
+- *(affs)* Amiga OFS/FFS read support (phase 1)
+- *(hfs)* in-place mutation — open_writable + add/remove (Phase 3)
+- *(hfs)* classic-HFS writer — create / build / repack (Phase 2)
+
+### Fixed
+
+- *(hfs)* zero filStBlk in file records (the last fsck error)
+- *(hfs)* 46-byte (Str31) thread records + zero FInfo
+- *(hfs)* variable even-padded thread records + root directory valence
+- *(hfs)* empty B-tree is header-only (extents-overflow file)
+- *(hfs)* even-align catalog records + write MDB volume counts
+- *(hfs)* index-node B-tree records must use fixed-length keys
+
+### Other
+
+- *(affs)* don't intra-doc-link the private `writer` module
+- *(examples)* add Raspberry Pi, EFI, and legacy-BIOS disk specs
+
 ### Added
 
 - *(qcow2)* read **compressed clusters** — both zlib/deflate (qemu's default)
