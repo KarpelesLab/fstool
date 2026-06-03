@@ -118,7 +118,6 @@ impl AffsWriter {
     }
 
     /// Recreate a writer over an already-parsed volume (in-place phase).
-    #[allow(dead_code)] // used by open_writable in the in-place phase
     pub(super) fn adopt(total_blocks: u32, variant: Variant, volume_name: String) -> Self {
         let mut entries = BTreeMap::new();
         entries.insert(

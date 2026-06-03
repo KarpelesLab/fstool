@@ -385,6 +385,9 @@ impl AnyFs {
             FsKind::Hfs => Ok(Self::Hfs(Box::new(crate::fs::hfs::Hfs::open_writable(
                 dev,
             )?))),
+            // AFFS, like classic HFS, opens read-only by default; the in-place
+            // writer loads the whole tree into a mutable model.
+            FsKind::Affs => Ok(Self::Affs(Box::new(Affs::open_writable(dev)?))),
             // Every other backend's open() already returns a mutable
             // handle (ext journals, FAT/exFAT/NTFS rewrite, …), so
             // just defer to the existing dispatch.

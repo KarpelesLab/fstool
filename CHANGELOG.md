@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(affs)* in-place mutation for **Amiga OFS/FFS**: `Affs::open_writable` loads
+  an existing `.adf` (every directory plus the bytes of every file) into the
+  in-memory tree, so `fstool add` / `rm` and shell `put` / `mkdir` / `rm` edit a
+  volume in place — the whole image is re-laid-out (and re-checksummed) on flush,
+  preserving untouched files byte-exact. `AnyFs::open_writable` routes AFFS here;
+  `list`/`open_file_reader` serve pending edits from the model before flush.
+
 - *(affs)* new **Amiga OFS/FFS** (`.adf`) read + generate support. Reads the
   boot-block variant (`DOS\0`..`DOS\7`: FFS/OFS, International, directory-cache),
   the root block, hash-table directories (and same-hash chains), and files via

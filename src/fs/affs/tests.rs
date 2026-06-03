@@ -406,6 +406,89 @@ fn written_ofs_volume_is_kernel_conformant() {
 }
 
 #[test]
+fn in_place_add_and_remove_round_trip() {
+    use crate::fs::{FileMeta, FileSource, Filesystem};
+    use std::path::Path;
+    let mut dev = MemoryBackend::new(880 * 1024);
+    let original: Vec<u8> = (0..3333u32).map(|i| (i % 200) as u8).collect();
+    // Build an initial volume with a couple of entries.
+    {
+        let mut fs = Affs::format(&mut dev, &super::AffsFormatOpts::default()).unwrap();
+        fs.create_dir(&mut dev, Path::new("/keep"), FileMeta::default())
+            .unwrap();
+        fs.create_file(
+            &mut dev,
+            Path::new("/keep/orig.bin"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(original.clone())),
+                len: original.len() as u64,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.create_file(
+            &mut dev,
+            Path::new("/old.txt"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(b"delete me\n".to_vec())),
+                len: 10,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+    }
+
+    // Re-open the existing image, mutate in place, flush.
+    {
+        let mut fs = Affs::open_writable(&mut dev).unwrap();
+        fs.remove(&mut dev, Path::new("/old.txt")).unwrap();
+        fs.create_dir(&mut dev, Path::new("/added"), FileMeta::default())
+            .unwrap();
+        fs.create_file(
+            &mut dev,
+            Path::new("/added/new.txt"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(b"freshly added\n".to_vec())),
+                len: 14,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+    }
+
+    // Re-open read-only and confirm the original survived and the edits stuck.
+    let affs = Affs::open(&mut dev).unwrap();
+    let root: Vec<_> = affs
+        .list_path("/")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert!(root.contains(&"keep".to_string()));
+    assert!(root.contains(&"added".to_string()));
+    assert!(
+        !root.contains(&"old.txt".to_string()),
+        "removed file should be gone"
+    );
+
+    // Original file content preserved byte-exact across the in-place rewrite.
+    let mut r = affs.open_file_reader(&mut dev, "/keep/orig.bin").unwrap();
+    let mut got = Vec::new();
+    r.read_to_end(&mut got).unwrap();
+    assert_eq!(got, original);
+
+    let mut r = affs.open_file_reader(&mut dev, "/added/new.txt").unwrap();
+    let mut got = Vec::new();
+    r.read_to_end(&mut got).unwrap();
+    assert_eq!(got, b"freshly added\n");
+
+    // And the rewritten volume is still kernel-conformant.
+    assert_conformant(&mut dev);
+}
+
+#[test]
 fn writer_remove_and_reject_duplicate() {
     use crate::fs::{FileMeta, FileSource, Filesystem};
     use std::path::Path;

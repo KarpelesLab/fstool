@@ -1,4 +1,4 @@
-//! Amiga Fast/Old File System (AFFS) — read support.
+//! Amiga Fast/Old File System (AFFS) — read + write support.
 //!
 //! Reads Amiga DOS volumes (`.adf` floppy images and larger hard-file
 //! volumes) in both their OFS ("Old File System") and FFS ("Fast File
@@ -20,9 +20,11 @@
 //! Layout offsets follow adflib's `adf_blk.h` structs; the reader is
 //! cross-checked against the Linux kernel `affs` driver.
 //!
-//! Write support (generate-from-scratch and in-place mutation) lands in
-//! later phases; for now every mutating operation returns `Unsupported` and
-//! [`Affs::mutation_capability`] reports [`MutationCapability::Immutable`].
+//! Writing goes through [`writer`]: [`Affs::format`] generates a fresh volume
+//! and [`Affs::open_writable`] loads an existing one into an in-memory tree
+//! that `add`/`mkdir`/`rm` mutate and `flush` re-serialises block-by-block.
+//! A read-only handle ([`Affs::open`]) reports
+//! [`MutationCapability::Immutable`]; a writable one reports `Mutable`.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -249,6 +251,74 @@ impl Affs {
         }
     }
 
+    /// Open an existing volume for in-place mutation. The whole tree (every
+    /// directory and the bytes of every file) is loaded into the writer
+    /// model; subsequent `add`/`mkdir`/`rm` mutate it and `flush` re-lays-out
+    /// the entire image from scratch — the same path that backs `format`.
+    pub fn open_writable(dev: &mut dyn BlockDevice) -> Result<Self> {
+        let ro = Self::open(dev)?;
+        let total_blocks = (dev.total_size() / BSIZE as u64) as u32;
+        let mut w = writer::AffsWriter::adopt(total_blocks, ro.variant, ro.volume_name.clone());
+
+        // Walk the on-disk tree parent-first, collecting paths so writer
+        // inserts (which resolve parents) always see the parent already
+        // present.
+        let mut ordered: Vec<(String, Node)> = Vec::new();
+        let mut stack = vec![(ro.root_block, String::new())];
+        while let Some((blk, prefix)) = stack.pop() {
+            if let Some(kids) = ro.children.get(&blk) {
+                for node in kids {
+                    let path = format!("{prefix}/{}", node.name);
+                    if node.kind == EntryKind::Dir {
+                        stack.push((node.block, path.clone()));
+                    }
+                    ordered.push((path, node.clone()));
+                }
+            }
+        }
+        // Insert dirs before their children: a DFS pre-order already does
+        // this for parents, but the stack reverses sibling order — sort by
+        // path depth then push, which keeps every parent ahead of its kids.
+        ordered.sort_by_key(|(p, _)| p.matches('/').count());
+        for (path, node) in ordered {
+            match node.kind {
+                EntryKind::Dir => w.insert_dir(&path, node.mtime)?,
+                EntryKind::Regular => {
+                    let content = ro.read_file_content(dev, node.block, node.size)?;
+                    w.insert_file(&path, content, node.mtime)?;
+                }
+                // Symlinks/other types are not yet round-tripped by the writer.
+                _ => {}
+            }
+        }
+        Ok(Self::from_writer(w))
+    }
+
+    /// Read a file's full contents from its on-disk data blocks.
+    fn read_file_content(
+        &self,
+        dev: &mut dyn BlockDevice,
+        header: u32,
+        size: u64,
+    ) -> Result<Vec<u8>> {
+        let blocks = self.data_blocks(dev, header)?;
+        let payload = if self.variant.ffs { BSIZE } else { BSIZE - 24 } as u64;
+        let data_off = if self.variant.ffs { 0 } else { 24 };
+        let mut out = Vec::with_capacity(size as usize);
+        let mut remaining = size;
+        for b in blocks {
+            if remaining == 0 {
+                break;
+            }
+            let take = remaining.min(payload) as usize;
+            let mut buf = vec![0u8; take];
+            dev.read_at(b as u64 * BSIZE as u64 + data_off, &mut buf)?;
+            out.extend_from_slice(&buf);
+            remaining -= take as u64;
+        }
+        Ok(out)
+    }
+
     /// Walk the directory tree from the root, populating `children`.
     fn build_index(&mut self, dev: &mut dyn BlockDevice, total_blocks: u32) -> Result<()> {
         let mut children: HashMap<u32, Vec<Node>> = HashMap::new();
@@ -365,8 +435,12 @@ impl Affs {
         None
     }
 
-    /// List a directory path.
+    /// List a directory path. When a writer is attached (a mutable handle),
+    /// the in-memory model is authoritative so pending edits are visible.
     pub fn list_path(&self, path: &str) -> Result<Vec<DirEntry>> {
+        if let Some(w) = &self.writer {
+            return w.list(path);
+        }
         let block = match self.resolve(path) {
             Some(Resolved::Dir(b)) => b,
             Some(_) => {
@@ -421,12 +495,27 @@ impl Affs {
     }
 
     /// Open a regular file for streaming reads. The returned reader owns its
-    /// resolved block list, so it borrows only `dev` (not `self`).
+    /// resolved block list (or, for a mutable handle, the in-memory bytes), so
+    /// it borrows only `dev` (not `self`). When a writer is attached its model
+    /// is authoritative, so pending writes are readable before flush.
     pub fn open_file_reader<'a>(
         &self,
         dev: &'a mut dyn BlockDevice,
         path: &str,
     ) -> Result<AffsFileReader<'a>> {
+        if let Some(w) = &self.writer {
+            let data = w.read(path)?;
+            let size = data.len() as u64;
+            return Ok(AffsFileReader {
+                dev,
+                blocks: Vec::new(),
+                block_size: self.block_size,
+                ofs: false,
+                size,
+                pos: 0,
+                mem: Some(data),
+            });
+        }
         let (header, size) = match self.resolve(path) {
             Some(Resolved::Node(n)) if n.kind == EntryKind::Regular => (n.block, n.size),
             Some(_) => return Err(Error::InvalidArgument("affs: not a regular file".into())),
@@ -444,6 +533,7 @@ impl Affs {
             ofs: !self.variant.ffs,
             size,
             pos: 0,
+            mem: None,
         })
     }
 
@@ -476,6 +566,9 @@ pub struct AffsFileReader<'a> {
     ofs: bool,
     size: u64,
     pos: u64,
+    /// When `Some`, the file's bytes are served from memory (a writable
+    /// handle whose contents aren't yet at a known on-disk location).
+    mem: Option<Vec<u8>>,
 }
 
 impl AffsFileReader<'_> {
@@ -493,6 +586,13 @@ impl Read for AffsFileReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.pos >= self.size {
             return Ok(0);
+        }
+        if let Some(m) = &self.mem {
+            let start = self.pos as usize;
+            let want = (buf.len()).min(m.len() - start);
+            buf[..want].copy_from_slice(&m[start..start + want]);
+            self.pos += want as u64;
+            return Ok(want);
         }
         let payload = self.payload();
         let blk_idx = (self.pos / payload) as usize;
@@ -636,9 +736,6 @@ impl Filesystem for Affs {
         let s = path
             .to_str()
             .ok_or_else(|| Error::InvalidArgument("affs: non-UTF-8 path".into()))?;
-        if let Some(w) = &self.writer {
-            return w.list(s);
-        }
         self.list_path(s)
     }
 
@@ -690,9 +787,6 @@ impl Filesystem for Affs {
         let s = path
             .to_str()
             .ok_or_else(|| Error::InvalidArgument("affs: non-UTF-8 path".into()))?;
-        if let Some(w) = &self.writer {
-            return Ok(Box::new(io::Cursor::new(w.read(s)?)));
-        }
         Ok(Box::new(self.open_file_reader(dev, s)?))
     }
 
@@ -704,9 +798,6 @@ impl Filesystem for Affs {
         let s = path
             .to_str()
             .ok_or_else(|| Error::InvalidArgument("affs: non-UTF-8 path".into()))?;
-        if let Some(w) = &self.writer {
-            return Ok(Box::new(MemHandle::new(w.read(s)?)));
-        }
         Ok(Box::new(self.open_file_reader(dev, s)?))
     }
 
@@ -733,41 +824,6 @@ impl Filesystem for Affs {
         } else {
             MutationCapability::Immutable
         }
-    }
-}
-
-/// A `Read + Seek` over an in-memory buffer with a known length, used to
-/// serve writer-buffered file contents through [`crate::fs::FileReadHandle`].
-struct MemHandle {
-    cur: io::Cursor<Vec<u8>>,
-    len: u64,
-}
-
-impl MemHandle {
-    fn new(data: Vec<u8>) -> Self {
-        let len = data.len() as u64;
-        Self {
-            cur: io::Cursor::new(data),
-            len,
-        }
-    }
-}
-
-impl Read for MemHandle {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.cur.read(buf)
-    }
-}
-
-impl Seek for MemHandle {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.cur.seek(pos)
-    }
-}
-
-impl crate::fs::FileReadHandle for MemHandle {
-    fn len(&self) -> u64 {
-        self.len
     }
 }
 
