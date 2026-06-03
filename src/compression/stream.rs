@@ -113,9 +113,10 @@ impl<R: Read> LzoFrameReader<R> {
         }
         let mut compressed = vec![0u8; clen];
         self.inner.read_exact(&mut compressed)?;
-        let _ = ulen; // uncompressed length is implied by the block itself
+        // `ulen` (the block's declared uncompressed size) caps the decode so a
+        // malformed block can't grow the output unbounded.
         let mut out = Vec::new();
-        compcol::lzo::block::decode_block(&compressed, &mut out).map_err(|e| {
+        compcol::lzo::block::decode_block(&compressed, &mut out, ulen).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("lzo decode failed: {e}"),

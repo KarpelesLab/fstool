@@ -117,6 +117,97 @@ fn read_back_pattern_via_qemu_img_convert() {
     assert_eq!(&all[..19], b"hello qcow2 reader\n");
 }
 
+/// Build a compressible 4 MiB raw source with a few recognizable regions.
+#[cfg(test)]
+fn compressible_source() -> (NamedTempFile, Vec<u8>) {
+    let mut data = vec![0u8; 4 * 1024 * 1024];
+    // Highly compressible text spanning the first cluster.
+    let text = b"The quick brown fox jumps over the lazy dog.\n";
+    for (i, b) in data.iter_mut().take(90_000).enumerate() {
+        *b = text[i % text.len()];
+    }
+    // A less-compressible region straddling a later cluster boundary.
+    for (i, b) in data[2_000_000..2_050_000].iter_mut().enumerate() {
+        *b = (i * 7 % 256) as u8;
+    }
+    let raw = NamedTempFile::new().unwrap();
+    std::fs::write(raw.path(), &data).unwrap();
+    (raw, data)
+}
+
+/// Read back a **zlib**-compressed qcow2 (`qemu-img convert -c`), byte-exact.
+#[test]
+fn read_back_zlib_compressed() {
+    if !which("qemu-img") {
+        eprintln!("skipping: qemu-img not installed");
+        return;
+    }
+    let (raw, expect) = compressible_source();
+    let qcow = NamedTempFile::new().unwrap();
+    let out = Command::new("qemu-img")
+        .args(["convert", "-f", "raw", "-O", "qcow2", "-c"])
+        .arg(raw.path())
+        .arg(qcow.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "qemu-img convert -c failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let mut back = Qcow2Backend::open(qcow.path()).unwrap();
+    assert_eq!(back.total_size(), expect.len() as u64);
+    use std::io::Seek as _;
+    use std::io::SeekFrom;
+    back.seek(SeekFrom::Start(0)).unwrap();
+    let mut all = Vec::new();
+    back.read_to_end(&mut all).unwrap();
+    assert_eq!(all, expect, "zlib-compressed read mismatch");
+}
+
+/// Read back a **zstd**-compressed qcow2 (sets the COMPRESSION_TYPE incompat
+/// bit), byte-exact.
+#[test]
+fn read_back_zstd_compressed() {
+    if !which("qemu-img") {
+        eprintln!("skipping: qemu-img not installed");
+        return;
+    }
+    let (raw, expect) = compressible_source();
+    let qcow = NamedTempFile::new().unwrap();
+    let out = Command::new("qemu-img")
+        .args([
+            "convert",
+            "-f",
+            "raw",
+            "-O",
+            "qcow2",
+            "-c",
+            "-o",
+            "compression_type=zstd",
+        ])
+        .arg(raw.path())
+        .arg(qcow.path())
+        .output()
+        .unwrap();
+    if !out.status.success() {
+        // Old qemu without zstd support — skip rather than fail.
+        eprintln!(
+            "skipping: qemu-img has no zstd compression: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+
+    let mut back = Qcow2Backend::open(qcow.path()).unwrap();
+    assert_eq!(back.header().compression_type, 1, "should be zstd");
+    let mut all = Vec::new();
+    use std::io::Read as _;
+    back.read_to_end(&mut all).unwrap();
+    assert_eq!(all, expect, "zstd-compressed read mismatch");
+}
+
 /// Qcow2Backend::create makes a fresh image that qemu-img validates.
 #[test]
 fn create_then_qemu_img_check() {

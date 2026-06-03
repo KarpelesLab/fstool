@@ -29,6 +29,18 @@ use crate::Result;
 
 use super::header::Header;
 
+/// Where the cluster backing a virtual address physically lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mapping {
+    /// No physical cluster — reads return zeros.
+    Unallocated,
+    /// Plain cluster at this physical byte offset (cluster-aligned).
+    Normal(u64),
+    /// Compressed cluster: `byte_len` compressed bytes start at
+    /// `host_offset` (byte-granular, may straddle clusters).
+    Compressed { host_offset: u64, byte_len: u64 },
+}
+
 /// Set when refcount == 1 — we own the cluster outright.
 pub const COPIED: u64 = 1u64 << 63;
 /// L2-only: compressed cluster. We reject these.
@@ -115,29 +127,54 @@ impl L1L2 {
     /// Look up the physical byte offset of the cluster containing `vaddr`.
     /// Returns `Ok(None)` when the cluster is unallocated (read should
     /// return zeros) and `Err(Unsupported)` when the L2 entry has the
-    /// COMPRESSED bit set.
+    /// COMPRESSED bit set. Write/zero paths that don't yet handle
+    /// compression use this; readers use [`Self::map`].
     pub fn lookup<F: Read + Seek>(&mut self, file: &mut F, vaddr: u64) -> Result<Option<u64>> {
+        match self.map(file, vaddr)? {
+            Mapping::Unallocated => Ok(None),
+            Mapping::Normal(phys) => Ok(Some(phys)),
+            Mapping::Compressed { .. } => Err(crate::Error::Unsupported(
+                "qcow2: compressed clusters are not supported".into(),
+            )),
+        }
+    }
+
+    /// Map the cluster containing `vaddr` to its physical placement,
+    /// distinguishing unallocated, plain, and compressed clusters. A
+    /// compressed cluster reports the (byte-granular, *not* cluster-aligned)
+    /// host offset and the compressed byte length spanning whole 512-byte
+    /// sectors — feed those to `compress::decompress_cluster`.
+    pub fn map<F: Read + Seek>(&mut self, file: &mut F, vaddr: u64) -> Result<Mapping> {
         let (l1_idx, l2_idx, _) = self.split_addr(vaddr);
         if l1_idx >= self.l1.len() {
-            return Ok(None);
+            return Ok(Mapping::Unallocated);
         }
         let l1_entry = self.l1[l1_idx];
         let l2_cluster_off = l1_entry & OFFSET_MASK;
         if l2_cluster_off == 0 {
-            return Ok(None);
+            return Ok(Mapping::Unallocated);
         }
+        let cluster_bits = self.cluster_bits;
         let l2 = self.load_l2(file, l2_cluster_off)?;
         let l2_entry = l2.entries[l2_idx];
         if l2_entry & COMPRESSED != 0 {
-            return Err(crate::Error::Unsupported(
-                "qcow2: compressed clusters are not supported".into(),
-            ));
+            // Bit layout: x = 62 - (cluster_bits - 8); host byte offset in the
+            // low x bits; the next (cluster_bits-8) bits hold (nb_sectors - 1).
+            let x = 62 - (cluster_bits - 8);
+            let host_offset = l2_entry & ((1u64 << x) - 1);
+            let sec_mask = (1u64 << (cluster_bits - 8)) - 1;
+            let nb_sectors = ((l2_entry >> x) & sec_mask) + 1;
+            let byte_len = nb_sectors * 512 - (host_offset & 511);
+            return Ok(Mapping::Compressed {
+                host_offset,
+                byte_len,
+            });
         }
         let phys = l2_entry & OFFSET_MASK;
         if phys == 0 {
-            return Ok(None);
+            return Ok(Mapping::Unallocated);
         }
-        Ok(Some(phys))
+        Ok(Mapping::Normal(phys))
     }
 
     fn load_l2<F: Read + Seek>(&mut self, file: &mut F, l2_off: u64) -> Result<&L2Entry> {

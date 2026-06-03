@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(qcow2)* read **compressed clusters** — both zlib/deflate (qemu's default)
+  and zstd. So every operation (`info`, `ls`, `cat`, `shell`, `add`, `repack`,
+  `convert`, FUSE) now works transparently on compressed qcow2 images such as
+  `qemu-img convert -c` output and distro/cloud images. Deflate clusters decode
+  with a 4 KiB sliding window (matching qemu's `inflateInit2(-12)` and bounding
+  per-cluster RAM); the L2 `COMPRESSED` entry and v3 `compression_type` header
+  field are parsed, and a one-cluster decompression cache keeps sequential
+  sub-cluster reads cheap. New `src/block/qcow2/compress.rs`; bumps `compcol`
+  to 0.6 for its `deflate` window knobs. Cross-checked byte-exact against
+  `qemu-img`-produced zlib and zstd images.
+
 - *(affs)* in-place mutation for **Amiga OFS/FFS**: `Affs::open_writable` loads
   an existing `.adf` (every directory plus the bytes of every file) into the
   in-memory tree, so `fstool add` / `rm` and shell `put` / `mkdir` / `rm` edit a

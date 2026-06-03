@@ -124,7 +124,7 @@ tempfile = "3"
 # compcol: uniform no_std codec collection serving gzip/zlib/deflate/xz/zstd
 # /lz4/lzo plus the CAB codecs. `std` is always on (for the `io` Read/Write
 # adapters); per-algorithm features are added by fstool's feature flags.
-compcol = { version = "0.4", optional = true, default-features = false, features = ["std"] }
+compcol = { version = "0.6", optional = true, default-features = false, features = ["std"] }
 
 # Line editing + persistent history for the interactive shell. Optional, behind
 # the `readline` feature; the bin enables it by default. Pure-Rust line editor.

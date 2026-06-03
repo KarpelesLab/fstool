@@ -29,6 +29,7 @@
 //! file open `O_RDWR` without an exclusive lock — the caller is expected
 //! to not have another writer pointed at the same file.
 
+pub mod compress;
 pub mod header;
 pub mod l1l2;
 pub mod refcount;
@@ -38,7 +39,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use header::Header;
-use l1l2::{COPIED, L1L2};
+use l1l2::{COPIED, L1L2, Mapping};
 use refcount::Refcount;
 
 use super::BlockDevice;
@@ -56,6 +57,10 @@ pub struct Qcow2Backend {
     file_len: u64,
     /// Virtual cursor for the `Read`/`Write`/`Seek` impls.
     cursor: u64,
+    /// Single-entry cache of the most recently decompressed cluster, keyed by
+    /// its virtual cluster-start offset, so sequential sub-cluster reads of a
+    /// compressed cluster don't re-inflate it.
+    decomp_cache: Option<(u64, Vec<u8>)>,
     /// True when the backing `File` was opened `O_RDONLY` by
     /// [`Self::open_read_only`]. Writes return `PermissionDenied`
     /// early so callers get a clean refusal rather than a deep
@@ -96,7 +101,10 @@ impl Qcow2Backend {
             opts.write(true);
         }
         let mut file = opts.open(path)?;
-        let mut buf = [0u8; header::V3_HEADER_LEN];
+        // Read the first sector so the header decoder can reach the
+        // `compression_type` byte at offset 104 (a valid qcow2 is always at
+        // least one cluster, so 512 bytes are guaranteed present).
+        let mut buf = [0u8; 512];
         file.read_exact(&mut buf)?;
         let header = Header::decode(&buf)?;
         let cluster_size = header.cluster_size();
@@ -111,6 +119,7 @@ impl Qcow2Backend {
             refcount,
             file_len,
             cursor: 0,
+            decomp_cache: None,
             read_only,
         })
     }
@@ -181,6 +190,7 @@ impl Qcow2Backend {
             autoclear_features: 0,
             refcount_order: 4,
             header_length: header::V3_HEADER_LEN as u32,
+            compression_type: 0,
         };
 
         // Create the backing file at exactly `file_len` bytes,
@@ -230,6 +240,7 @@ impl Qcow2Backend {
             refcount,
             file_len,
             cursor: 0,
+            decomp_cache: None,
             read_only: false,
         })
     }
@@ -357,6 +368,29 @@ impl Qcow2Backend {
         Ok(new_data_off)
     }
 
+    /// Ensure `decomp_cache` holds the decompressed bytes of the compressed
+    /// cluster at virtual `cluster_start`. Reads `byte_len` compressed bytes
+    /// from `host_offset`, decodes them with the image's codec, and pads the
+    /// result out to a full cluster.
+    fn fill_decomp_cache(
+        &mut self,
+        cluster_start: u64,
+        host_offset: u64,
+        byte_len: u64,
+    ) -> Result<()> {
+        if self.decomp_cache.as_ref().map(|(k, _)| *k) == Some(cluster_start) {
+            return Ok(());
+        }
+        let mut comp = vec![0u8; byte_len as usize];
+        self.file.seek(SeekFrom::Start(host_offset))?;
+        self.file.read_exact(&mut comp)?;
+        let cs = self.cluster_size as usize;
+        let mut plain = compress::decompress_cluster(self.header.compression_type, &comp, cs)?;
+        plain.resize(cs, 0); // qcow2 compresses full clusters; pad short output
+        self.decomp_cache = Some((cluster_start, plain));
+        Ok(())
+    }
+
     /// Read `buf.len()` bytes starting at virtual offset `offset`. Walks
     /// the L1/L2 mapping cluster-by-cluster; unallocated clusters return
     /// zeroes.
@@ -384,13 +418,22 @@ impl Qcow2Backend {
             let take = ((cs - in_cluster) as usize).min(buf.len());
             let (chunk, rest) = buf.split_at_mut(take);
             let cluster_start = offset - in_cluster;
-            match self.l1l2.lookup(&mut self.file, cluster_start)? {
-                Some(phys) => {
+            match self.l1l2.map(&mut self.file, cluster_start)? {
+                Mapping::Normal(phys) => {
                     self.file.seek(SeekFrom::Start(phys + in_cluster))?;
                     self.file.read_exact(chunk)?;
                 }
-                None => {
+                Mapping::Unallocated => {
                     chunk.fill(0);
+                }
+                Mapping::Compressed {
+                    host_offset,
+                    byte_len,
+                } => {
+                    self.fill_decomp_cache(cluster_start, host_offset, byte_len)?;
+                    let cluster = &self.decomp_cache.as_ref().unwrap().1;
+                    let from = in_cluster as usize;
+                    chunk.copy_from_slice(&cluster[from..from + take]);
                 }
             }
             offset += take as u64;
@@ -562,6 +605,7 @@ mod tests {
             autoclear_features: 0,
             refcount_order: 4,
             header_length: header::V3_HEADER_LEN as u32,
+            compression_type: 0,
         };
         let mut f = std::fs::File::create(tmp.path()).unwrap();
         // Cluster 0: header padded to a cluster.

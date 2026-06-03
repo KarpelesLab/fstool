@@ -69,6 +69,10 @@ pub struct Header {
     pub autoclear_features: u64,
     pub refcount_order: u32,
     pub header_length: u32,
+    /// Cluster compression codec: `0` = zlib/deflate (default), `1` = zstd.
+    /// Only meaningful when some cluster is compressed; the
+    /// `COMPRESSION_TYPE` incompatible bit is set iff this is non-zero.
+    pub compression_type: u8,
 }
 
 impl Header {
@@ -127,6 +131,7 @@ impl Header {
             autoclear_features: 0,
             refcount_order: 4, // v2 implicit
             header_length: V2_HEADER_LEN as u32,
+            compression_type: 0,
         };
         if version == VERSION_V3 {
             if buf.len() < V3_HEADER_LEN {
@@ -145,6 +150,11 @@ impl Header {
                     "qcow2: v3 header_length {} < {V3_HEADER_LEN}",
                     h.header_length
                 )));
+            }
+            // `compression_type` is the first additional-field byte at offset
+            // 104, present when the header extends past the fixed v3 layout.
+            if h.header_length > V3_HEADER_LEN as u32 && buf.len() > V3_HEADER_LEN {
+                h.compression_type = buf[V3_HEADER_LEN];
             }
         }
         h.validate()?;
@@ -169,20 +179,40 @@ impl Header {
                 self.refcount_order
             )));
         }
+        // Compression is supported (zlib + zstd). The `COMPRESSION_TYPE`
+        // incompatible bit must be set iff `compression_type` is non-zero,
+        // and we only understand types 0 (zlib) and 1 (zstd).
+        if self.compression_type > 1 {
+            return Err(crate::Error::Unsupported(format!(
+                "qcow2: unsupported compression_type {}",
+                self.compression_type
+            )));
+        }
+        let ctype_bit = self.incompatible_features & incompat::COMPRESSION_TYPE != 0;
+        if ctype_bit != (self.compression_type != 0) {
+            return Err(crate::Error::InvalidImage(
+                "qcow2: COMPRESSION_TYPE incompatible bit disagrees with compression_type".into(),
+            ));
+        }
         let bad = self.incompatible_features
             & (incompat::DIRTY
                 | incompat::CORRUPT
                 | incompat::EXTERNAL_DATA_FILE
-                | incompat::COMPRESSION_TYPE
                 | incompat::EXTENDED_L2);
         if bad != 0 {
             return Err(crate::Error::Unsupported(format!(
-                "qcow2: incompatible features {bad:#x} not supported (dirty/corrupt/external-data/compression/extended-L2)"
+                "qcow2: incompatible features {bad:#x} not supported (dirty/corrupt/external-data/extended-L2)"
             )));
         }
         // Any other incompat bits we don't recognise → also refuse (spec
-        // says we must refuse anything we don't understand).
-        let unknown = self.incompatible_features & !bad;
+        // says we must refuse anything we don't understand). COMPRESSION_TYPE
+        // is recognised and handled above.
+        let known = incompat::DIRTY
+            | incompat::CORRUPT
+            | incompat::EXTERNAL_DATA_FILE
+            | incompat::EXTENDED_L2
+            | incompat::COMPRESSION_TYPE;
+        let unknown = self.incompatible_features & !known;
         if unknown != 0 {
             return Err(crate::Error::Unsupported(format!(
                 "qcow2: unknown incompatible_features {unknown:#x}"
@@ -258,6 +288,7 @@ mod tests {
             autoclear_features: 0,
             refcount_order: 4,
             header_length: V3_HEADER_LEN as u32,
+            compression_type: 0,
         }
     }
 
@@ -285,13 +316,32 @@ mod tests {
     }
 
     #[test]
-    fn rejects_compression_feature() {
+    fn accepts_zstd_compression_type() {
+        // COMPRESSION_TYPE incompat bit + compression_type=1 (zstd) is now
+        // a supported, well-formed header.
         let mut h = sample_v3_header();
         h.incompatible_features = incompat::COMPRESSION_TYPE;
-        let bytes = h.encode_v3();
+        let mut bytes = [0u8; 512];
+        bytes[..V3_HEADER_LEN].copy_from_slice(&h.encode_v3());
+        bytes[100..104].copy_from_slice(&112u32.to_be_bytes()); // header_length
+        bytes[104] = 1; // compression_type = zstd
+        let decoded = Header::decode(&bytes).unwrap();
+        assert_eq!(decoded.compression_type, 1);
+        assert!(decoded.incompatible_features & incompat::COMPRESSION_TYPE != 0);
+    }
+
+    #[test]
+    fn rejects_inconsistent_compression_bit() {
+        // COMPRESSION_TYPE bit set but compression_type still 0 → inconsistent.
+        let mut h = sample_v3_header();
+        h.incompatible_features = incompat::COMPRESSION_TYPE;
+        let mut bytes = [0u8; 512];
+        bytes[..V3_HEADER_LEN].copy_from_slice(&h.encode_v3());
+        bytes[100..104].copy_from_slice(&112u32.to_be_bytes());
+        // byte 104 stays 0.
         assert!(matches!(
             Header::decode(&bytes),
-            Err(crate::Error::Unsupported(_))
+            Err(crate::Error::InvalidImage(_))
         ));
     }
 

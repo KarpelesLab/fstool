@@ -72,8 +72,10 @@ filesystems but *disk-image containers*. They live one layer down, as
 block devices, qcow2"), presenting a flat byte-addressable device that
 any of the filesystems above is then laid down *inside* — fstool reads
 and writes through them transparently. qcow2 is read/write (v2 + v3,
-allocate-on-write); dmg is read-only (UDIF v4 mish chunks: zero / raw /
-zlib / ADC / bzip2 / LZFSE / LZMA, plus encrypted v2 `encrcdsa`).
+allocate-on-write), including **compressed** clusters — reads zlib and zstd
+transparently (writing to a compressed cluster copies it out to a plain one);
+dmg is read-only (UDIF v4 mish chunks: zero / raw / zlib / ADC / bzip2 /
+LZFSE / LZMA, plus encrypted v2 `encrcdsa`).
 
 The reader for each FS streams: file contents are never fully resident in
 memory regardless of size. The writers do the same, two-pass: scan to size
@@ -161,8 +163,11 @@ through the TOML spec — see "[filesystem.options]" below.
   open uses `O_EXCL` so the kernel refuses if any partition is mounted.
   Build commands require `--force` when the output is a block device.
 - **qcow2** — `Qcow2Backend` reads QEMU v2 / v3 images and writes fresh v3
-  ones with allocate-on-write. Path-based factories (`block::open_image`,
-  `block::create_image`) auto-dispatch by qcow2 magic or file extension, so
+  ones with allocate-on-write. **Compressed clusters** are read transparently
+  (zlib/deflate and zstd, decoded with a 4 KiB window to match qemu and bound
+  RAM); a write to a compressed cluster copies it out to a plain cluster.
+  Path-based factories (`block::open_image`, `block::create_image`)
+  auto-dispatch by qcow2 magic or file extension, so
   `fstool create -t ext4 src -o out.qcow2` Just Works.
 
 ## TOML spec

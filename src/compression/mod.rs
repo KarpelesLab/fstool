@@ -495,7 +495,7 @@ fn make_writer_lzma<'a, W: std::io::Write + 'a>(_w: W) -> Result<Box<dyn std::io
 #[cfg(feature = "lz4")]
 fn decompress_lz4(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    compcol::lz4::block::decode_block(src, &mut out)
+    compcol::lz4::block::decode_block(src, &mut out, max_out)
         .map_err(|e| crate::Error::InvalidImage(format!("lz4 decode failed: {e}")))?;
     cap_check(&out, max_out)?;
     Ok(out)
@@ -589,7 +589,7 @@ fn make_writer_zstd<'a, W: std::io::Write + 'a>(_w: W) -> Result<Box<dyn std::io
 #[cfg(feature = "lzo")]
 fn decompress_lzo(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    compcol::lzo::block::decode_block(src, &mut out)
+    compcol::lzo::block::decode_block(src, &mut out, max_out)
         .map_err(|e| crate::Error::InvalidImage(format!("lzo decode failed: {e}")))?;
     cap_check(&out, max_out)?;
     Ok(out)
