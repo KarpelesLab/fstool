@@ -32,6 +32,9 @@ use crate::block::BlockDevice;
 use crate::fs::{DirEntry, EntryKind, Filesystem, MutationCapability};
 use crate::{Error, Result};
 
+mod writer;
+pub use writer::AffsFormatOpts;
+
 /// Logical block size of a bare Amiga DOS volume.
 const BSIZE: usize = 512;
 /// Name hash-table entry count for a 512-byte block (`BSIZE/4 - 56`).
@@ -45,7 +48,6 @@ const MAX_NAME_LEN: usize = 30;
 const T_HEADER: i32 = 2;
 const T_LIST: i32 = 16;
 /// OFS data-block type (used when building/validating OFS data blocks).
-#[allow(dead_code)]
 const T_DATA: i32 = 8;
 
 // Secondary types (word @ BSIZE-4 = 0x1fc).
@@ -164,8 +166,10 @@ pub struct Affs {
     /// Volume name (root block BCPL name, Latin-1).
     pub volume_name: String,
     /// Parent header-block → its children. Root's children are keyed by
-    /// `root_block`.
+    /// `root_block`. Used for read-only (writer-absent) access.
     children: HashMap<u32, Vec<Node>>,
+    /// Present (and authoritative) when the volume is writable.
+    writer: Option<writer::AffsWriter>,
 }
 
 impl Affs {
@@ -221,9 +225,28 @@ impl Affs {
             variant,
             volume_name,
             children: HashMap::new(),
+            writer: None,
         };
         affs.build_index(dev, total_blocks)?;
         Ok(affs)
+    }
+
+    /// Format a fresh volume on `dev` and return a writable handle.
+    pub fn format(dev: &mut dyn BlockDevice, opts: &AffsFormatOpts) -> Result<Self> {
+        let w = writer::AffsWriter::format(dev, opts)?;
+        Ok(Self::from_writer(w))
+    }
+
+    /// Build a writable `Affs` around an in-memory writer model.
+    fn from_writer(w: writer::AffsWriter) -> Self {
+        Self {
+            block_size: BSIZE as u32,
+            root_block: 0,
+            variant: w.variant(),
+            volume_name: w.volume_name().to_string(),
+            children: HashMap::new(),
+            writer: Some(w),
+        }
     }
 
     /// Walk the directory tree from the root, populating `children`.
@@ -513,30 +536,60 @@ impl crate::fs::FileReadHandle for AffsFileReader<'_> {
     }
 }
 
+impl crate::fs::FilesystemFactory for Affs {
+    type FormatOpts = AffsFormatOpts;
+
+    fn format(dev: &mut dyn BlockDevice, opts: &Self::FormatOpts) -> Result<Self> {
+        Affs::format(dev, opts)
+    }
+
+    fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
+        Affs::open(dev)
+    }
+}
+
 impl Filesystem for Affs {
+    fn streams_immediately(&self) -> bool {
+        // create_file reads its source into memory synchronously.
+        true
+    }
+
     fn create_file(
         &mut self,
         _dev: &mut dyn BlockDevice,
-        _path: &Path,
-        _src: crate::fs::FileSource,
-        _meta: crate::fs::FileMeta,
+        path: &Path,
+        src: crate::fs::FileSource,
+        meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        Err(Error::Immutable {
+        let s = path
+            .to_str()
+            .ok_or_else(|| Error::InvalidArgument("affs: non-UTF-8 path".into()))?;
+        let w = self.writer.as_mut().ok_or(Error::Immutable {
             kind: "affs",
             op: "add",
-        })
+        })?;
+        let (mut reader, len) = src.open()?;
+        let mut data = Vec::with_capacity(len as usize);
+        std::io::Read::take(&mut reader, len).read_to_end(&mut data)?;
+        w.insert_file(s, data, meta.mtime)?;
+        Ok(())
     }
 
     fn create_dir(
         &mut self,
         _dev: &mut dyn BlockDevice,
-        _path: &Path,
-        _meta: crate::fs::FileMeta,
+        path: &Path,
+        meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        Err(Error::Immutable {
+        let s = path
+            .to_str()
+            .ok_or_else(|| Error::InvalidArgument("affs: non-UTF-8 path".into()))?;
+        let w = self.writer.as_mut().ok_or(Error::Immutable {
             kind: "affs",
             op: "mkdir",
-        })
+        })?;
+        w.insert_dir(s, meta.mtime)?;
+        Ok(())
     }
 
     fn create_symlink(
@@ -546,10 +599,11 @@ impl Filesystem for Affs {
         _target: &Path,
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        Err(Error::Immutable {
-            kind: "affs",
-            op: "symlink",
-        })
+        // Amiga soft links exist (ST_SOFTLINK) but are deferred; the repack
+        // sink treats this as a skippable entry.
+        Err(Error::Unsupported(
+            "affs: symlink creation not yet implemented".into(),
+        ))
     }
 
     fn create_device(
@@ -567,17 +621,24 @@ impl Filesystem for Affs {
         })
     }
 
-    fn remove(&mut self, _dev: &mut dyn BlockDevice, _path: &Path) -> Result<()> {
-        Err(Error::Immutable {
+    fn remove(&mut self, _dev: &mut dyn BlockDevice, path: &Path) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| Error::InvalidArgument("affs: non-UTF-8 path".into()))?;
+        let w = self.writer.as_mut().ok_or(Error::Immutable {
             kind: "affs",
             op: "rm",
-        })
+        })?;
+        w.remove(s)
     }
 
     fn list(&mut self, _dev: &mut dyn BlockDevice, path: &Path) -> Result<Vec<DirEntry>> {
         let s = path
             .to_str()
             .ok_or_else(|| Error::InvalidArgument("affs: non-UTF-8 path".into()))?;
+        if let Some(w) = &self.writer {
+            return w.list(s);
+        }
         self.list_path(s)
     }
 
@@ -585,6 +646,9 @@ impl Filesystem for Affs {
         let s = path
             .to_str()
             .ok_or_else(|| Error::InvalidArgument("affs: non-UTF-8 path".into()))?;
+        if let Some(w) = &self.writer {
+            return w.getattr(s);
+        }
         let (kind, size, mtime, inode) = match self.resolve(s) {
             Some(Resolved::Dir(b)) => (EntryKind::Dir, 0u64, 0u32, b),
             Some(Resolved::Node(n)) => (n.kind, n.size, n.mtime, n.block),
@@ -611,8 +675,10 @@ impl Filesystem for Affs {
         })
     }
 
-    fn flush(&mut self, _dev: &mut dyn BlockDevice) -> Result<()> {
-        // Read-only in this phase: nothing to persist.
+    fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        if let Some(w) = self.writer.as_mut() {
+            w.flush(dev)?;
+        }
         Ok(())
     }
 
@@ -624,6 +690,9 @@ impl Filesystem for Affs {
         let s = path
             .to_str()
             .ok_or_else(|| Error::InvalidArgument("affs: non-UTF-8 path".into()))?;
+        if let Some(w) = &self.writer {
+            return Ok(Box::new(io::Cursor::new(w.read(s)?)));
+        }
         Ok(Box::new(self.open_file_reader(dev, s)?))
     }
 
@@ -635,6 +704,9 @@ impl Filesystem for Affs {
         let s = path
             .to_str()
             .ok_or_else(|| Error::InvalidArgument("affs: non-UTF-8 path".into()))?;
+        if let Some(w) = &self.writer {
+            return Ok(Box::new(MemHandle::new(w.read(s)?)));
+        }
         Ok(Box::new(self.open_file_reader(dev, s)?))
     }
 
@@ -656,7 +728,46 @@ impl Filesystem for Affs {
     }
 
     fn mutation_capability(&self) -> MutationCapability {
-        MutationCapability::Immutable
+        if self.writer.is_some() {
+            MutationCapability::Mutable
+        } else {
+            MutationCapability::Immutable
+        }
+    }
+}
+
+/// A `Read + Seek` over an in-memory buffer with a known length, used to
+/// serve writer-buffered file contents through [`crate::fs::FileReadHandle`].
+struct MemHandle {
+    cur: io::Cursor<Vec<u8>>,
+    len: u64,
+}
+
+impl MemHandle {
+    fn new(data: Vec<u8>) -> Self {
+        let len = data.len() as u64;
+        Self {
+            cur: io::Cursor::new(data),
+            len,
+        }
+    }
+}
+
+impl Read for MemHandle {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.cur.read(buf)
+    }
+}
+
+impl Seek for MemHandle {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.cur.seek(pos)
+    }
+}
+
+impl crate::fs::FileReadHandle for MemHandle {
+    fn len(&self) -> u64 {
+        self.len
     }
 }
 

@@ -203,6 +203,9 @@ fn build_bare_fs(fs: &FilesystemSpec, output: &Path) -> Result<()> {
             hfs_plus_format_opts(fs)?,
         ),
         "hfs" => build_bare_via_trait::<crate::fs::hfs::Hfs>(fs, output, hfs_format_opts(fs)?),
+        "affs" | "ffs" | "ofs" => {
+            build_bare_via_trait::<crate::fs::affs::Affs>(fs, output, affs_format_opts(fs)?)
+        }
         "ntfs" => build_bare_via_trait::<crate::fs::ntfs::Ntfs>(fs, output, ntfs_format_opts(fs)?),
         "f2fs" => build_bare_via_trait::<crate::fs::f2fs::F2fs>(fs, output, f2fs_format_opts(fs)?),
         "squashfs" => build_bare_via_trait::<crate::fs::squashfs::Squashfs>(
@@ -381,6 +384,37 @@ fn hfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::hfs::HfsFormatOpts>
             .unwrap_or_else(|| "Untitled".to_string()),
         block_size: fs.block_size,
     })
+}
+
+fn affs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::affs::AffsFormatOpts> {
+    let mut bag = options_bag_for(fs)?;
+    let mut opts = crate::fs::affs::AffsFormatOpts::default();
+    if let Some(label) = bag.take_str("volume_label") {
+        opts.volume_name = label;
+    }
+    // The type string itself can select the variant (`type = "ofs"`).
+    match fs.fs_type.to_ascii_lowercase().as_str() {
+        "ofs" => opts.ffs = false,
+        "ffs" => opts.ffs = true,
+        _ => {}
+    }
+    // `[filesystem.options]` overrides: `fstype = "ffs"|"ofs"`, `intl = bool`.
+    if let Some(t) = bag.take_str("fstype") {
+        match t.to_ascii_lowercase().as_str() {
+            "ffs" => opts.ffs = true,
+            "ofs" => opts.ffs = false,
+            other => {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "affs: unknown fstype {other:?} (use ffs|ofs)"
+                )));
+            }
+        }
+    }
+    if let Some(b) = bag.take_bool("intl")? {
+        opts.intl = b;
+    }
+    bag.check_empty("affs")?;
+    Ok(opts)
 }
 
 fn hfs_plus_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::hfs_plus::FormatOpts> {
@@ -753,6 +787,13 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
                     &mut slice,
                     fs,
                     hfs_format_opts(fs)?,
+                )?;
+            }
+            "affs" | "ffs" | "ofs" => {
+                format_in_partition_via_trait::<crate::fs::affs::Affs>(
+                    &mut slice,
+                    fs,
+                    affs_format_opts(fs)?,
                 )?;
             }
             "ntfs" => {

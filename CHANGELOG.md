@@ -9,14 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- *(affs)* new **Amiga OFS/FFS** (`.adf`) read support. Detects the boot-block
-  variant (`DOS\0`..`DOS\7`: FFS/OFS, International, directory-cache), parses the
-  root block, walks hash-table directories (and same-hash chains), reads files
-  through the file header + extension blocks, and serves both OFS (24-byte
-  per-block data headers, 488 payload bytes) and FFS (raw 512-byte) data. Names
-  decode as Latin-1; dates use the Amiga 1978 epoch. New `src/fs/affs/`; wired
-  into detection, `info`, `ls`, `cat`. Layout follows adflib's `adf_blk.h` and is
-  validated against real OFS volumes. Write (generate + in-place) lands next.
+- *(affs)* new **Amiga OFS/FFS** (`.adf`) read + generate support. Reads the
+  boot-block variant (`DOS\0`..`DOS\7`: FFS/OFS, International, directory-cache),
+  the root block, hash-table directories (and same-hash chains), and files via
+  the file header + extension blocks — serving both OFS (24-byte per-block data
+  headers, 488 payload bytes) and FFS (raw 512-byte) data. Names decode as
+  Latin-1; dates use the Amiga 1978 epoch. **Write**: `fstool create -t affs`
+  (or `-t ofs`), `build`, and `repack` generate fresh OFS or FFS volumes
+  (default DOS\3 FFS+INTL; `-O fstype=ofs,intl=false` to vary) via an in-memory
+  tree serialised block-by-block on flush, with correct block checksums, name
+  hashing (ASCII + International), file-extension chaining, and a volume bitmap.
+  New `src/fs/affs/` (`mod.rs` reader, `writer.rs`); wired into detection,
+  `info`, `ls`, `cat`, `create`, `build`. Layout follows adflib's `adf_blk.h`;
+  the reader is validated against real OFS/FFS Workbench volumes and the writer's
+  output is checked for block-checksum / hash-slot / bitmap conformance (the
+  exact invariants the Linux kernel `affs` driver enforces). In-place mutation
+  (`add`/`rm`) lands next.
 
 - *(hfs)* classic-HFS is now **read + write**. `fstool create -t hfs`, `build`,
   and `repack` generate fresh volumes, and `add` / `rm` / shell `put`/`mkdir`

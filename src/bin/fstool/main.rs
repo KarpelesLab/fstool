@@ -2194,6 +2194,45 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             },
             DEFAULT_MIN_SIZE,
         )?,
+        "affs" | "ffs" | "ofs" => create_via_factory::<fstool::fs::affs::Affs>(
+            "affs",
+            source.as_ref(),
+            args.output,
+            args.size,
+            opts,
+            is_device,
+            qcow2_cluster_size,
+            {
+                let mut o = fstool::fs::affs::AffsFormatOpts::default();
+                match fs_type.to_ascii_lowercase().as_str() {
+                    "ofs" => o.ffs = false,
+                    "ffs" => o.ffs = true,
+                    _ => {}
+                }
+                o
+            },
+            |o: &mut fstool::fs::affs::AffsFormatOpts, m| {
+                if let Some(s) = m.take_str("volume_label") {
+                    o.volume_name = s;
+                }
+                if let Some(t) = m.take_str("fstype") {
+                    match t.to_ascii_lowercase().as_str() {
+                        "ffs" => o.ffs = true,
+                        "ofs" => o.ffs = false,
+                        other => {
+                            return Err(fstool::Error::InvalidArgument(format!(
+                                "affs: unknown fstype {other:?} (use ffs|ofs)"
+                            )));
+                        }
+                    }
+                }
+                if let Some(b) = m.take_bool("intl")? {
+                    o.intl = b;
+                }
+                Ok(())
+            },
+            DEFAULT_MIN_SIZE,
+        )?,
         "ntfs" => create_via_factory::<fstool::fs::ntfs::Ntfs>(
             "ntfs",
             source.as_ref(),

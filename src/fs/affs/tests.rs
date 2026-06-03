@@ -180,6 +180,258 @@ fn amiga_epoch_is_1978() {
     assert_eq!(amiga_date_to_unix(1, 0, 0), 252_460_800 + 86_400);
 }
 
+fn roundtrip_variant(ffs: bool) {
+    use crate::fs::{FileMeta, FileSource, Filesystem};
+    use std::path::Path;
+    let mut dev = MemoryBackend::new(880 * 1024); // standard DD floppy
+    let opts = super::AffsFormatOpts {
+        volume_name: "MyVol".into(),
+        ffs,
+        intl: true,
+    };
+    let big: Vec<u8> = (0..5000u32).map(|i| (i * 7 % 256) as u8).collect();
+    {
+        let mut fs = Affs::format(&mut dev, &opts).unwrap();
+        fs.create_dir(&mut dev, Path::new("/docs"), FileMeta::default())
+            .unwrap();
+        fs.create_file(
+            &mut dev,
+            Path::new("/docs/readme.txt"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(b"hello from amiga\n".to_vec())),
+                len: 17,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        // A multi-block file (spans data blocks + exercises OFS headers).
+        fs.create_file(
+            &mut dev,
+            Path::new("/big.bin"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(big.clone())),
+                len: big.len() as u64,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+    }
+
+    // Reopen read-only via the on-disk reader and verify.
+    let affs = Affs::open(&mut dev).unwrap();
+    assert_eq!(affs.volume_name, "MyVol");
+    assert_eq!(affs.variant().ffs, ffs);
+    let root: Vec<_> = affs
+        .list_path("/")
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.name, e.kind))
+        .collect();
+    assert!(root.contains(&("docs".into(), EntryKind::Dir)));
+    assert!(root.contains(&("big.bin".into(), EntryKind::Regular)));
+    let docs = affs.list_path("/docs").unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0].name, "readme.txt");
+
+    let mut r = affs.open_file_reader(&mut dev, "/docs/readme.txt").unwrap();
+    let mut got = Vec::new();
+    r.read_to_end(&mut got).unwrap();
+    assert_eq!(got, b"hello from amiga\n");
+
+    let mut r = affs.open_file_reader(&mut dev, "/big.bin").unwrap();
+    let mut got = Vec::new();
+    r.read_to_end(&mut got).unwrap();
+    assert_eq!(got, big);
+}
+
+#[test]
+fn writer_round_trip_ffs() {
+    roundtrip_variant(true);
+}
+
+#[test]
+fn writer_round_trip_ofs() {
+    roundtrip_variant(false);
+}
+
+/// Independently re-validate a written volume the way the Linux kernel
+/// `affs` driver does: every block checksum, every directory entry living in
+/// the hash slot its name hashes to, and a bitmap that exactly matches the
+/// set of allocated blocks. This catches the writer bugs the lenient reader
+/// (which scans all slots) cannot — and runs on every CI platform with no
+/// external tools.
+fn assert_conformant(dev: &mut MemoryBackend) {
+    let n = (dev.total_size() / BSIZE as u64) as usize;
+    let read = |dev: &mut MemoryBackend, b: usize| {
+        let mut buf = vec![0u8; BSIZE];
+        dev.read_at(b as u64 * BSIZE as u64, &mut buf).unwrap();
+        buf
+    };
+    let boot = read(dev, 0);
+    let ffs = boot[3] & 1 != 0;
+    let intl = boot[3] & 2 != 0;
+    let csum_ok = |blk: &[u8]| {
+        let mut s = 0u32;
+        let mut i = 0;
+        while i < BSIZE {
+            s = s.wrapping_add(be_u32(blk, i));
+            i += 4;
+        }
+        s == 0
+    };
+    let root = n / 2;
+    let rb = read(dev, root);
+    assert!(csum_ok(&rb), "root checksum");
+    assert_eq!(be_i32(&rb, 0x1fc), super::ST_ROOT, "root sectype");
+    assert_eq!(be_u32(&rb, 0x0c), HT_SIZE as u32, "root htSize");
+    assert_eq!(be_i32(&rb, 0x138), -1, "bmFlag valid");
+
+    let bm0 = be_u32(&rb, 0x13c) as usize;
+    assert!(csum_ok(&read(dev, bm0)), "bitmap checksum");
+
+    let mut used = std::collections::BTreeSet::from([0, 1, root, bm0]);
+    // Recursive walk of all hash buckets.
+    let mut stack = vec![root];
+    while let Some(dirblk) = stack.pop() {
+        let db = read(dev, dirblk);
+        for slot in 0..HT_SIZE {
+            let mut e = be_u32(&db, 0x18 + slot * 4) as usize;
+            while e != 0 {
+                used.insert(e);
+                let eb = read(dev, e);
+                assert!(csum_ok(&eb), "header {e} checksum");
+                let name = read_name(&eb);
+                let h = super::writer::hash_name_for_test(&name, intl);
+                assert_eq!(h, slot, "entry {name:?} in slot {slot} but hashes to {h}");
+                match be_i32(&eb, 0x1fc) {
+                    s if s == super::ST_USERDIR => stack.push(e),
+                    s if s == super::ST_FILE => {
+                        // Collect data + extension blocks.
+                        let mut cur = e;
+                        while cur != 0 {
+                            let cb = read(dev, cur);
+                            let hq = be_i32(&cb, 0x08).clamp(0, MAX_DATABLK as i32) as usize;
+                            for i in 0..hq {
+                                let dptr = be_u32(&cb, 0x18 + (MAX_DATABLK - 1 - i) * 4) as usize;
+                                used.insert(dptr);
+                                if !ffs {
+                                    // OFS data blocks carry their own checksum.
+                                    assert!(csum_ok(&read(dev, dptr)), "OFS data {dptr} checksum");
+                                }
+                            }
+                            let ext = be_u32(&cb, 0x1f8) as usize;
+                            if ext != 0 {
+                                used.insert(ext);
+                            }
+                            cur = ext;
+                        }
+                    }
+                    _ => {}
+                }
+                e = be_u32(&eb, 0x1f0) as usize;
+            }
+        }
+    }
+
+    // Bitmap bit set == free; verify it matches the used set exactly.
+    let bm = read(dev, bm0);
+    for b in 2..n {
+        let word = be_u32(&bm, 4 + ((b - 2) / 32) * 4);
+        let free = (word >> ((b - 2) % 32)) & 1 == 1;
+        assert_eq!(free, !used.contains(&b), "bitmap disagrees on block {b}");
+    }
+}
+
+#[test]
+fn written_ffs_volume_is_kernel_conformant() {
+    use crate::fs::{FileMeta, FileSource, Filesystem};
+    use std::path::Path;
+    let mut dev = MemoryBackend::new(880 * 1024);
+    let mut fs = Affs::format(
+        &mut dev,
+        &super::AffsFormatOpts {
+            volume_name: "Conf".into(),
+            ffs: true,
+            intl: true,
+        },
+    )
+    .unwrap();
+    fs.create_dir(&mut dev, Path::new("/System"), FileMeta::default())
+        .unwrap();
+    for name in ["readme", "AExplorer", "Disk.info", "café"] {
+        fs.create_file(
+            &mut dev,
+            &Path::new("/System").join(name),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(vec![0xABu8; 1500])),
+                len: 1500,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+    }
+    fs.flush(&mut dev).unwrap();
+    assert_conformant(&mut dev);
+}
+
+#[test]
+fn written_ofs_volume_is_kernel_conformant() {
+    use crate::fs::{FileMeta, FileSource, Filesystem};
+    use std::path::Path;
+    let mut dev = MemoryBackend::new(880 * 1024);
+    let mut fs = Affs::format(
+        &mut dev,
+        &super::AffsFormatOpts {
+            volume_name: "ConfOfs".into(),
+            ffs: false,
+            intl: false,
+        },
+    )
+    .unwrap();
+    for name in ["one", "two", "three", "SYSTEM"] {
+        fs.create_file(
+            &mut dev,
+            &Path::new("/").join(name),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(vec![0x5Au8; 2000])),
+                len: 2000,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+    }
+    fs.flush(&mut dev).unwrap();
+    assert_conformant(&mut dev);
+}
+
+#[test]
+fn writer_remove_and_reject_duplicate() {
+    use crate::fs::{FileMeta, FileSource, Filesystem};
+    use std::path::Path;
+    let mut dev = MemoryBackend::new(880 * 1024);
+    let mut fs = Affs::format(&mut dev, &super::AffsFormatOpts::default()).unwrap();
+    fs.create_file(
+        &mut dev,
+        Path::new("/a.txt"),
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"x".to_vec())),
+            len: 1,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    // Duplicate name rejected.
+    assert!(
+        fs.create_dir(&mut dev, Path::new("/a.txt"), FileMeta::default())
+            .is_err()
+    );
+    fs.remove(&mut dev, Path::new("/a.txt")).unwrap();
+    fs.flush(&mut dev).unwrap();
+    let affs = Affs::open(&mut dev).unwrap();
+    assert!(affs.list_path("/").unwrap().is_empty());
+}
+
 #[test]
 fn latin1_names_decode() {
     let mut block = vec![0u8; BSIZE];
