@@ -19,6 +19,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+pub mod affs;
 pub mod apfs;
 pub mod archive;
 pub(crate) mod dir_batch;

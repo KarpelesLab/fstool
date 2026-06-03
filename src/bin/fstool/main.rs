@@ -3058,6 +3058,7 @@ fn print_fs_info(dev: &mut dyn fstool::block::BlockDevice, fs: &mut fstool::insp
         fstool::inspect::AnyFs::Exfat(exfat) => print_exfat_info(exfat),
         fstool::inspect::AnyFs::HfsPlus(hfs) => print_hfs_plus_info(hfs),
         fstool::inspect::AnyFs::Hfs(hfs) => print_hfs_info(hfs),
+        fstool::inspect::AnyFs::Affs(affs) => print_affs_info(affs),
         fstool::inspect::AnyFs::Apfs(apfs) => print_apfs_info(apfs),
         fstool::inspect::AnyFs::Ntfs(ntfs) => print_ntfs_info(ntfs),
         fstool::inspect::AnyFs::F2fs(f2) => print_f2fs_info(f2),
@@ -3141,6 +3142,18 @@ fn print_hfs_plus_info(hfs: &fstool::fs::hfs_plus::HfsPlus) {
 
 fn print_hfs_info(hfs: &fstool::fs::hfs::Hfs) {
     println!("volume name:       {:?}", hfs.volume_name);
+}
+
+fn print_affs_info(affs: &fstool::fs::affs::Affs) {
+    let v = affs.variant();
+    println!("volume name:       {:?}", affs.volume_name);
+    println!(
+        "variant:           {} ({}{}{})",
+        v.dos_label(),
+        if v.ffs { "FFS" } else { "OFS" },
+        if v.intl { "+INTL" } else { "" },
+        if v.dircache { "+DC" } else { "" },
+    );
 }
 
 fn print_apfs_info(apfs: &fstool::fs::apfs::Apfs) {

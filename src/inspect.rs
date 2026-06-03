@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::Result;
 use crate::block::BlockDevice;
 use crate::fs::DirEntry;
+use crate::fs::affs::Affs;
 use crate::fs::apfs::Apfs;
 use crate::fs::archive::ar::ArFs;
 use crate::fs::archive::arc::ArcFs;
@@ -59,6 +60,8 @@ pub enum FsKind {
     HfsPlus,
     /// Classic HFS (Mac OS ≤ 8) — read + write (create / in-place add/remove).
     Hfs,
+    /// Amiga OFS/FFS (AFFS) — read-only (write lands in later phases).
+    Affs,
     /// APFS — read-only, single-leaf-tree case only.
     Apfs,
     /// NTFS — scaffold; detection only, all ops return `Unsupported`.
@@ -134,6 +137,13 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
     // GRF: "Master of Magic\0" at offset 0 (16-byte magic header).
     if &bs[0..16] == b"Master of Magic\0" {
         return Ok(FsKind::Grf);
+    }
+
+    // Amiga OFS/FFS: boot block "DOS" + a flag byte 0..=7 at offset 0.
+    // Specific enough to not shadow MBR/boot sectors (which don't begin
+    // with "DOS"); the flag byte's high bits being zero rules out ASCII.
+    if &bs[0..3] == b"DOS" && bs[3] <= 7 {
+        return Ok(FsKind::Affs);
     }
 
     // --- archive formats (all offset 0 except lha at offset 2) ---
@@ -267,6 +277,8 @@ pub enum AnyFs {
     /// HFS+ — read-only.
     HfsPlus(Box<HfsPlus>),
     Hfs(Box<Hfs>),
+    /// Amiga OFS/FFS (AFFS) — read-only.
+    Affs(Box<Affs>),
     /// APFS — read-only; single-leaf trees only.
     Apfs(Box<Apfs>),
     /// NTFS — scaffold; only `info` returns useful data, list/read error.
@@ -297,6 +309,7 @@ impl AnyFs {
             FsKind::Exfat => Ok(Self::Exfat(Box::new(Exfat::open(dev)?))),
             FsKind::HfsPlus => Ok(Self::HfsPlus(Box::new(HfsPlus::open(dev)?))),
             FsKind::Hfs => Ok(Self::Hfs(Box::new(Hfs::open(dev)?))),
+            FsKind::Affs => Ok(Self::Affs(Box::new(Affs::open(dev)?))),
             FsKind::Apfs => Ok(Self::Apfs(Box::new(Apfs::open(dev)?))),
             FsKind::Ntfs => Ok(Self::Ntfs(Box::new(Ntfs::open(dev)?))),
             FsKind::F2fs => Ok(Self::F2fs(Box::new(F2fs::open(dev)?))),
@@ -389,6 +402,7 @@ impl AnyFs {
             Self::Exfat(_) => FsKind::Exfat,
             Self::HfsPlus(_) => FsKind::HfsPlus,
             Self::Hfs(_) => FsKind::Hfs,
+            Self::Affs(_) => FsKind::Affs,
             Self::Apfs(_) => FsKind::Apfs,
             Self::Ntfs(_) => FsKind::Ntfs,
             Self::F2fs(_) => FsKind::F2fs,
@@ -414,6 +428,7 @@ impl AnyFs {
             Self::Exfat(exfat) => exfat.list_path(dev, path),
             Self::HfsPlus(hfs) => hfs.list_path(dev, path),
             Self::Hfs(hfs) => hfs.list_path(path),
+            Self::Affs(affs) => affs.list_path(path),
             Self::Apfs(apfs) => apfs.list_path(dev, path),
             Self::Ntfs(ntfs) => ntfs.list_path(dev, path),
             Self::F2fs(f2) => f2.list_path(dev, path),
@@ -504,6 +519,10 @@ impl AnyFs {
                 let mut r = hfs.open_file_reader(dev, path)?;
                 pump(&mut r, out, &mut buf)
             }
+            Self::Affs(affs) => {
+                let mut r = affs.open_file_reader(dev, path)?;
+                pump(&mut r, out, &mut buf)
+            }
             Self::HfsPlus(hfs) => {
                 let mut r = hfs.open_file_reader(dev, path)?;
                 pump(&mut r, out, &mut buf)
@@ -571,6 +590,7 @@ impl AnyFs {
             Self::Exfat(exfat) => Ok(Box::new(exfat.open_file_reader(dev, path)?)),
             Self::HfsPlus(hfs) => Ok(Box::new(hfs.open_file_reader(dev, path)?)),
             Self::Hfs(hfs) => Ok(Box::new(hfs.open_file_reader(dev, path)?)),
+            Self::Affs(affs) => Ok(Box::new(affs.open_file_reader(dev, path)?)),
             Self::Apfs(apfs) => Ok(Box::new(apfs.open_file_reader(dev, path)?)),
             Self::Ntfs(ntfs) => Ok(Box::new(ntfs.open_file_reader(dev, path)?)),
             Self::F2fs(f2) => Ok(Box::new(f2.open_file_reader(dev, path)?)),
@@ -703,6 +723,7 @@ impl AnyFs {
             Self::Fat32(fat) => crate::fs::Filesystem::mutation_capability(fat.as_ref()),
             Self::HfsPlus(h) => crate::fs::Filesystem::mutation_capability(h.as_ref()),
             Self::Hfs(h) => crate::fs::Filesystem::mutation_capability(h.as_ref()),
+            Self::Affs(a) => crate::fs::Filesystem::mutation_capability(a.as_ref()),
             Self::Ntfs(n) => crate::fs::Filesystem::mutation_capability(n.as_ref()),
             Self::F2fs(fs2) => crate::fs::Filesystem::mutation_capability(fs2.as_ref()),
             Self::Squashfs(sq) => crate::fs::Filesystem::mutation_capability(sq.as_ref()),
@@ -729,6 +750,7 @@ impl AnyFs {
             Self::Fat32(fat) => crate::fs::Filesystem::clone_capability(fat.as_ref()),
             Self::HfsPlus(h) => crate::fs::Filesystem::clone_capability(h.as_ref()),
             Self::Hfs(h) => crate::fs::Filesystem::clone_capability(h.as_ref()),
+            Self::Affs(a) => crate::fs::Filesystem::clone_capability(a.as_ref()),
             Self::Ntfs(n) => crate::fs::Filesystem::clone_capability(n.as_ref()),
             Self::F2fs(fs2) => crate::fs::Filesystem::clone_capability(fs2.as_ref()),
             Self::Squashfs(sq) => crate::fs::Filesystem::clone_capability(sq.as_ref()),
@@ -809,6 +831,7 @@ impl AnyFs {
             Self::Fat32(fat) => f(fat.as_mut()),
             Self::HfsPlus(h) => f(h.as_mut()),
             Self::Hfs(h) => f(h.as_mut()),
+            Self::Affs(a) => f(a.as_mut()),
             Self::Ntfs(n) => f(n.as_mut()),
             Self::F2fs(fs2) => f(fs2.as_mut()),
             Self::Squashfs(sq) => f(sq.as_mut()),
@@ -852,6 +875,9 @@ impl AnyFs {
             // bitmap + MDB) only on flush; route to the real implementation.
             // (A read-only HFS handle has no writer, so its flush is a no-op.)
             Self::Hfs(hfs) => crate::fs::Filesystem::flush(hfs.as_mut(), dev),
+            // AFFS (like classic HFS) persists a buffered model on flush once a
+            // writer is attached; a read-only handle's flush is a no-op.
+            Self::Affs(affs) => crate::fs::Filesystem::flush(affs.as_mut(), dev),
             // Read-only / immediate-write handles have nothing buffered to
             // flush.
             Self::Tar(_)
@@ -885,6 +911,9 @@ impl AnyFs {
         }
         if let Self::Hfs(_) = self {
             return "hfs";
+        }
+        if let Self::Affs(_) = self {
+            return "affs";
         }
         if let Self::Apfs(_) = self {
             return "apfs";
@@ -920,6 +949,7 @@ impl AnyFs {
             | Self::Exfat(_)
             | Self::HfsPlus(_)
             | Self::Hfs(_)
+            | Self::Affs(_)
             | Self::Apfs(_)
             | Self::Ntfs(_)
             | Self::F2fs(_)
@@ -1032,6 +1062,7 @@ impl AnyFs {
             Self::Exfat(b) => b,
             Self::HfsPlus(b) => b,
             Self::Hfs(b) => b,
+            Self::Affs(b) => b,
             Self::Apfs(b) => b,
             Self::Ntfs(b) => b,
             Self::F2fs(b) => b,
