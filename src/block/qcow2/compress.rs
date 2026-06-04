@@ -326,6 +326,13 @@ pub fn write_compressed_image(
     for c in &comps {
         let host_offset = running;
         let len = c.bytes.len() as u64;
+        if len == 0 {
+            // A codec must never return an empty stream for a non-empty
+            // cluster; bail loudly rather than underflow the sector math.
+            return Err(Error::Io(std::io::Error::other(
+                "qcow2: compressor produced an empty cluster",
+            )));
+        }
         running += len;
         // L2 compressed entry: COMPRESSED | host_offset | ((nb_sectors-1) << x).
         let first_sec = host_offset / 512;
@@ -355,6 +362,13 @@ pub fn write_compressed_image(
     // Build refcount blocks + table.
     let max_cluster = (file_len / cs).saturating_sub(1);
     let needed_blocks = (max_cluster / epb + 1).max(rcb_count);
+    if needed_blocks > l1_per_cluster {
+        // The refcount table would need more than one cluster — not supported
+        // (matches Qcow2Backend::create's single-table-cluster assumption).
+        return Err(Error::Unsupported(
+            "qcow2: compressed image too large for a single-cluster refcount table".into(),
+        ));
+    }
     let mut rcb: Vec<Vec<u16>> = (0..needed_blocks)
         .map(|_| vec![0u16; epb as usize])
         .collect();
