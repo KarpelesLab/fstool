@@ -3,8 +3,8 @@
 //! Unlike the rebuild-on-flush [`super::writer::AffsWriter`] (used to *format*
 //! a fresh volume), this edits an existing OFS/FFS image in place: an
 //! `add` / `mkdir` / `rm` touches only the blocks it must — the volume bitmap,
-//! the parent directory's hash chain, and the new/removed file's header + data
-//! + extension blocks — leaving every other block byte-for-byte unchanged.
+//! the parent directory's hash chain, and the new/removed file's header, data,
+//! and extension blocks — leaving every other block byte-for-byte unchanged.
 //! RAM use is bounded by the bitmap, never by file contents.
 
 use crate::block::BlockDevice;
