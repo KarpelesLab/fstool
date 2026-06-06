@@ -37,7 +37,7 @@ fstool repack base.tar patch.tar flat.tar        # OCI-style layer merge with .w
 | HFS+/HFSX  | ✅    | ✅     | ✅              | inline + extents-overflow, symlinks, hard links; decmpfs read (zlib types 3 + 4); **resource forks** (`cat --rsrc`, `resources`, `com.apple.ResourceFork` xattr); real journal (Path A); passes `fsck.hfsplus` |
 | HFS        | ✅    | ✅     | ✅              | classic HFS (Mac OS ≤ 8): MDB + catalog/extents B-trees, MacRoman names, data + **resource** fork read; transparently unwraps **DiskCopy 4.2** images. **Write**: `create -t hfs` / `build` / `repack` generate fresh volumes, and `add` / `rm` / shell `put`/`mkdir` mutate an existing image in place (catalog rebuilt on flush) |
 | AFFS       | ✅    | ✅     | ✅              | Amiga OFS/FFS (`.adf`): boot-block variant detect (`DOS\0`..`DOS\7`), hash-table dirs, file header + extension blocks, OFS (24-byte data headers) + FFS raw data, BCPL/Latin-1 names, Amiga 1978 epoch dates; read validated against real OFS/FFS Workbench volumes. **Write**: `create -t affs` / `-t ofs` / `build` / `repack` generate fresh OFS or FFS volumes (default DOS\3 FFS+INTL; `-O fstype=ofs,intl=false`), and `add` / `rm` / shell `put`/`mkdir` mutate an existing image **incrementally on disk** — only the affected blocks (volume bitmap, the parent directory's hash chain, and the new/removed file's header + data + extension blocks) are touched; untouched files keep their exact blocks, and RAM use is bounded by the bitmap, not file contents. Spec-conformant (block checksums + name-hash placement + bitmap, the invariants the Linux kernel `affs` driver enforces) |
-| APFS       | ✅    | ✅     | 🚧             | multi-level omap + fs-tree; spaceman with IP ring + SFQ free-queues; `open_file_rw` rebuilds a fresh COW checkpoint (whole-file overwrite only — no partial-extent COW yet); not yet `fsck_apfs` clean |
+| APFS       | ✅    | ✅     | 🚧             | **Read**: multi-level omap + fs-tree, directory listings + file extents, embedded xattrs, snapshots (read-only, single-leaf snap-meta). **Write**: format + `create_dir`/`create_file`/`create_symlink` + `chmod`/`chown`/`set_times`/`rename`/`unlink`/`link` via fresh COW checkpoints (spaceman with IP ring + SFQ free-queues), round-tripped through a real macOS mount. **Gaps**: in-place edits are whole-file overwrite (no partial-extent COW); `UF_COMPRESSED`/decmpfs files read as empty; encryption, sealed-volume integrity, Fusion tiering, and dstream-backed xattrs are refused; not yet `fsck_apfs`-clean |
 | NTFS       | ✅    | ✅     | ✅              | MFT, attributes, $DATA + ADS, indexes; xattr map; multi-class `$Secure` ($SDS/$SDH/$SII); real `$LogFile` LFS records (Path A) |
 | F2FS       | ✅    | ✅     | —              | CP / NAT / dnodes / inline data + dentries; writer passes `fsck.f2fs`; **build-once** — the writer serializes the whole FS from memory at flush, so a re-opened image is read-only (reports `Immutable`) |
 | SquashFS   | ✅    | ✅     | —              | gzip / xz / lz4 / zstd / lzo / lzma via Cargo features; writer round-trips via `unsquashfs`; repack-only           |
@@ -515,8 +515,12 @@ Things explicitly out of scope today, in rough order of likely-to-change:
   `create_file` / `remove` over the rw path piggyback on the same
   checkpoint. Multiple back-to-back commits are bounded by the
   `xp_desc` ring (the reader doesn't rotate it yet).
-- **APFS reader**: snapshots, encryption, and sealed-volume integrity
-  are out of scope.
+- **APFS reader**: snapshots are read-only and single-leaf snap-meta only
+  (multi-level snap trees return `Unsupported`). `UF_COMPRESSED`/decmpfs file
+  contents read as empty (the data isn't decoded yet, though the HFS+ decmpfs
+  decoder could be reused). Encryption, sealed-volume integrity (hash/integrity
+  tree), Fusion tiering, and dstream-backed (`XATTR_DATA_STREAM`) xattrs are out
+  of scope.
 - **APFS / NTFS strict-checker pass**: the spaceman + `$Secure` /
   `$LogFile` structures are now populated, but `fsck_apfs` and
   `ntfs-3g` mount can still flag the images for finer points
