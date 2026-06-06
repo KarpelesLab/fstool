@@ -21,6 +21,13 @@
 //!                       come through here: NTFS DOS attrs, ADS,
 //!                       security descriptors; ext / squashfs xattrs;
 //!                       HFS+ Finder info; …)
+//!   find [PATH] [-name GLOB] [-type f|d]
+//!                       recursively list paths (default: cwd), optionally
+//!                       filtered by a `*`/`?` name glob and/or entry type
+//!   grep [-i] [-n] [-r] PATTERN [PATH...]
+//!                       search files for the literal PATTERN; text files
+//!                       print matching lines, binary files print the
+//!                       matching rows as `hexdump -C` output
 //!   help                list these commands
 //!   quit | exit         leave
 //! ```
@@ -230,6 +237,14 @@ impl Shell {
                 self.cmd_info(dev, rest, output)?;
                 Ok(false)
             }
+            "find" => {
+                self.cmd_find(dev, rest, output)?;
+                Ok(false)
+            }
+            "grep" => {
+                self.cmd_grep(dev, rest, output)?;
+                Ok(false)
+            }
             "" => Ok(false),
             other => Err(fstool::Error::InvalidArgument(format!(
                 "unknown command {other:?} (try `help`)"
@@ -268,6 +283,13 @@ mkdir PATH          create an empty directory
 info [PATH]         no arg → image summary; with PATH → file metadata
                     (kind/mode/owner/size/blocks/nlink/inode/atime/mtime
                     /ctime/rdev) plus any extended attributes
+find [PATH] [-name GLOB] [-type f|d]
+                    recursively list paths under PATH (default: cwd),
+                    optionally filtered by name glob (* ?) and/or type
+grep [-i] [-n] [-r] PATTERN [PATH...]
+                    search files for the literal PATTERN (default PATH: cwd
+                    with -r). -i case-insensitive, -n line numbers, -r recurse.
+                    Binary files print their matches as `hexdump -C` rows
 help | ?            print this help
 quit | exit         leave{ro_note}\n"
         );
@@ -502,6 +524,199 @@ quit | exit         leave{ro_note}\n"
         Ok(())
     }
 
+    /// `find [PATH] [-name GLOB] [-type f|d]` — recursively print every path
+    /// under PATH (default cwd), optionally filtered by a basename glob and/or
+    /// an entry type. Paths print in the active display style.
+    fn cmd_find(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        arg: &str,
+        output: &mut impl Write,
+    ) -> Result<()> {
+        let mut start: Option<String> = None;
+        let mut name: Option<String> = None;
+        let mut type_filter: Option<char> = None;
+        let mut toks = arg.split_whitespace();
+        while let Some(tok) = toks.next() {
+            match tok {
+                "-name" => {
+                    name = Some(
+                        toks.next()
+                            .ok_or_else(|| {
+                                fstool::Error::InvalidArgument("find: -name needs a pattern".into())
+                            })?
+                            .to_string(),
+                    );
+                }
+                "-type" => {
+                    let t = toks.next().ok_or_else(|| {
+                        fstool::Error::InvalidArgument("find: -type needs f or d".into())
+                    })?;
+                    type_filter = match t {
+                        "f" => Some('f'),
+                        "d" => Some('d'),
+                        other => {
+                            return Err(fstool::Error::InvalidArgument(format!(
+                                "find: -type {other:?} (use f or d)"
+                            )));
+                        }
+                    };
+                }
+                _ if tok.starts_with('-') => {
+                    return Err(fstool::Error::InvalidArgument(format!(
+                        "find: unknown option {tok:?}"
+                    )));
+                }
+                _ if start.is_none() => start = Some(self.resolve(tok)),
+                _ => {
+                    return Err(fstool::Error::InvalidArgument(
+                        "find: only one starting PATH is supported".into(),
+                    ));
+                }
+            }
+        }
+        let start = start.unwrap_or_else(|| self.cwd.clone());
+
+        let matches = |entry_name: &str, kind: fstool::fs::EntryKind| -> bool {
+            let type_ok = match type_filter {
+                Some('f') => matches!(kind, fstool::fs::EntryKind::Regular),
+                Some('d') => matches!(kind, fstool::fs::EntryKind::Dir),
+                _ => true,
+            };
+            let name_ok = name
+                .as_deref()
+                .map(|g| glob_match(g.as_bytes(), entry_name.as_bytes()))
+                .unwrap_or(true);
+            type_ok && name_ok
+        };
+        let print = |path: &str, output: &mut dyn Write| -> Result<()> {
+            writeln!(
+                output,
+                "{}",
+                path_style::display_path(path, self.kind, self.style)
+            )?;
+            Ok(())
+        };
+
+        // Evaluate the start path itself, then recurse if it's a directory.
+        let start_kind = self.fs.getattr(dev, Path::new(&start))?.kind;
+        let start_name = start.rsplit('/').next().unwrap_or("");
+        if matches(start_name, start_kind) {
+            print(&start, output)?;
+        }
+        if !matches!(start_kind, fstool::fs::EntryKind::Dir) {
+            return Ok(());
+        }
+
+        let mut stack = vec![start];
+        while let Some(dir) = stack.pop() {
+            let entries = self.fs.list(dev, &dir)?;
+            for e in entries {
+                if e.name == "." || e.name == ".." {
+                    continue; // never recurse into the self/parent links
+                }
+                let child = join(&dir, &e.name);
+                if matches(&e.name, e.kind) {
+                    print(&child, output)?;
+                }
+                if matches!(e.kind, fstool::fs::EntryKind::Dir) {
+                    stack.push(child);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `grep [-i] [-n] [-r] PATTERN [PATH...]` — search files for the literal
+    /// `PATTERN`. Text files print matching lines; binary files (NUL byte or
+    /// non-UTF-8) print the rows containing matches as `hexdump -C` output.
+    fn cmd_grep(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        arg: &str,
+        output: &mut impl Write,
+    ) -> Result<()> {
+        let (mut ci, mut numbers, mut recurse) = (false, false, false);
+        let mut pattern: Option<String> = None;
+        let mut paths: Vec<String> = Vec::new();
+        for tok in arg.split_whitespace() {
+            if pattern.is_none() && tok.starts_with('-') && tok.len() > 1 {
+                for f in tok[1..].chars() {
+                    match f {
+                        'i' => ci = true,
+                        'n' => numbers = true,
+                        'r' | 'R' => recurse = true,
+                        other => {
+                            return Err(fstool::Error::InvalidArgument(format!(
+                                "grep: unknown flag -{other}"
+                            )));
+                        }
+                    }
+                }
+            } else if pattern.is_none() {
+                pattern = Some(tok.to_string());
+            } else {
+                paths.push(self.resolve(tok));
+            }
+        }
+        let pattern = pattern
+            .ok_or_else(|| fstool::Error::InvalidArgument("grep: PATTERN is required".into()))?;
+        let needle = pattern.as_bytes();
+        if paths.is_empty() {
+            paths.push(self.cwd.clone());
+        }
+
+        // Expand the targets into a flat list of regular-file paths.
+        let mut files: Vec<String> = Vec::new();
+        for p in paths {
+            match self.fs.getattr(dev, Path::new(&p))?.kind {
+                fstool::fs::EntryKind::Dir => {
+                    if !recurse {
+                        writeln!(output, "grep: {p}: is a directory (use -r)")?;
+                        continue;
+                    }
+                    let mut stack = vec![p];
+                    while let Some(dir) = stack.pop() {
+                        for e in self.fs.list(dev, &dir)? {
+                            if e.name == "." || e.name == ".." {
+                                continue;
+                            }
+                            let child = join(&dir, &e.name);
+                            match e.kind {
+                                fstool::fs::EntryKind::Dir => stack.push(child),
+                                fstool::fs::EntryKind::Regular => files.push(child),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                fstool::fs::EntryKind::Regular => files.push(p),
+                _ => writeln!(output, "grep: {p}: not a regular file")?,
+            }
+        }
+        let show_name = files.len() > 1 || recurse;
+
+        const CAP: u64 = 256 * 1024 * 1024;
+        for path in files {
+            let size = self.fs.getattr(dev, Path::new(&path))?.size;
+            if size > CAP {
+                writeln!(
+                    output,
+                    "grep: {path}: file too large ({size} bytes), skipped"
+                )?;
+                continue;
+            }
+            let mut data = Vec::with_capacity(size as usize);
+            self.fs.copy_file_to(dev, &path, &mut data)?;
+            if is_binary(&data) {
+                grep_binary(&path, &data, needle, ci, show_name, output)?;
+            } else {
+                grep_text(&path, &data, needle, ci, show_name, numbers, output)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve a user-typed `path` against [`Self::cwd`]. The input is first
     /// translated from the active [`PathStyle`] into canonical (`/`-separated)
     /// form; absolute canonical paths normalise as themselves, relative ones
@@ -562,6 +777,162 @@ pub fn normalize_path(p: &str) -> String {
     } else {
         format!("/{}", out.join("/"))
     }
+}
+
+// ---------- helpers for `find` / `grep` ----------
+
+/// Match a basename `s` against a `*`/`?` glob `pat` (byte-wise, case-sensitive).
+fn glob_match(pat: &[u8], s: &[u8]) -> bool {
+    let (mut p, mut si) = (0usize, 0usize);
+    let (mut star, mut mark): (Option<usize>, usize) = (None, 0);
+    while si < s.len() {
+        if p < pat.len() && (pat[p] == b'?' || pat[p] == s[si]) {
+            p += 1;
+            si += 1;
+        } else if p < pat.len() && pat[p] == b'*' {
+            star = Some(p);
+            mark = si;
+            p += 1;
+        } else if let Some(sp) = star {
+            p = sp + 1;
+            mark += 1;
+            si = mark;
+        } else {
+            return false;
+        }
+    }
+    while p < pat.len() && pat[p] == b'*' {
+        p += 1;
+    }
+    p == pat.len()
+}
+
+/// Treat content as binary (→ hexdump output) if it carries a NUL byte or
+/// isn't valid UTF-8 — the same heuristic GNU grep uses to switch modes.
+fn is_binary(data: &[u8]) -> bool {
+    data.contains(&0) || std::str::from_utf8(data).is_err()
+}
+
+#[inline]
+fn fold(b: u8, ci: bool) -> u8 {
+    if ci { b.to_ascii_lowercase() } else { b }
+}
+
+/// All non-overlapping start offsets of `needle` in `hay` (ASCII-case-folded
+/// when `ci`). Empty needle yields no hits.
+fn find_all(hay: &[u8], needle: &[u8], ci: bool) -> Vec<usize> {
+    let mut hits = Vec::new();
+    let n = needle.len();
+    if n == 0 || n > hay.len() {
+        return hits;
+    }
+    let mut i = 0;
+    while i + n <= hay.len() {
+        if (0..n).all(|j| fold(hay[i + j], ci) == fold(needle[j], ci)) {
+            hits.push(i);
+            i += n; // non-overlapping
+        } else {
+            i += 1;
+        }
+    }
+    hits
+}
+
+/// Print matching lines of a text file (grep style).
+fn grep_text(
+    name: &str,
+    data: &[u8],
+    needle: &[u8],
+    ci: bool,
+    show_name: bool,
+    numbers: bool,
+    out: &mut dyn Write,
+) -> Result<()> {
+    for (i, line) in data.split(|&b| b == b'\n').enumerate() {
+        if find_all(line, needle, ci).is_empty() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(line);
+        let text = text.strip_suffix('\r').unwrap_or(&text);
+        match (show_name, numbers) {
+            (true, true) => writeln!(out, "{name}:{}:{text}", i + 1)?,
+            (true, false) => writeln!(out, "{name}:{text}")?,
+            (false, true) => writeln!(out, "{}:{text}", i + 1)?,
+            (false, false) => writeln!(out, "{text}")?,
+        }
+    }
+    Ok(())
+}
+
+/// Print the rows of a binary file that contain a match, as `hexdump -C`
+/// output. Non-contiguous match clusters are separated by a `*` line.
+fn grep_binary(
+    name: &str,
+    data: &[u8],
+    needle: &[u8],
+    ci: bool,
+    show_name: bool,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let hits = find_all(data, needle, ci);
+    if hits.is_empty() {
+        return Ok(());
+    }
+    if show_name {
+        writeln!(
+            out,
+            "{name}: binary file, {} match(es) shown as hexdump -C:",
+            hits.len()
+        )?;
+    }
+    // The set of 16-byte rows that any match touches.
+    let mut rows: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for &off in &hits {
+        let end = off + needle.len();
+        for r in (off / 16)..=((end - 1) / 16) {
+            rows.insert(r);
+        }
+    }
+    let mut prev: Option<usize> = None;
+    for &row in &rows {
+        if let Some(p) = prev
+            && row != p + 1
+        {
+            writeln!(out, "*")?;
+        }
+        let base = row * 16;
+        let chunk = &data[base..(base + 16).min(data.len())];
+        hexdump_line(base, chunk, out)?;
+        prev = Some(row);
+    }
+    Ok(())
+}
+
+/// One `hexdump -C` row: `OFFSET  xx xx … xx  xx … xx  |ascii|`.
+fn hexdump_line(base: usize, chunk: &[u8], out: &mut dyn Write) -> Result<()> {
+    let mut hex = String::with_capacity(50);
+    for i in 0..16 {
+        if i == 8 {
+            hex.push(' ');
+        }
+        if i < chunk.len() {
+            hex.push_str(&format!("{:02x} ", chunk[i]));
+        } else {
+            hex.push_str("   ");
+        }
+    }
+    let ascii: String = chunk
+        .iter()
+        .map(|&b| {
+            if (0x20..=0x7e).contains(&b) {
+                b as char
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    writeln!(out, "{base:08x}  {hex} |{ascii}|")?;
+    Ok(())
 }
 
 // ---------- formatting helpers for `cmd_info` ----------
@@ -685,6 +1056,80 @@ mod tests {
         assert_eq!(normalize_path("/"), "/");
         assert_eq!(normalize_path(""), "/");
         assert_eq!(normalize_path("///"), "/");
+    }
+
+    #[test]
+    fn find_all_offsets_and_ci() {
+        assert_eq!(find_all(b"abcabc", b"bc", false), vec![1, 4]);
+        assert_eq!(find_all(b"aaaa", b"aa", false), vec![0, 2]); // non-overlapping
+        assert_eq!(find_all(b"AbC", b"abc", true), vec![0]);
+        assert!(find_all(b"abc", b"abc", false).contains(&0));
+        assert!(find_all(b"abc", b"", false).is_empty());
+        assert!(find_all(b"ab", b"abc", false).is_empty());
+    }
+
+    #[test]
+    fn is_binary_heuristic() {
+        assert!(!is_binary(b"plain text\nwith newline\n"));
+        assert!(is_binary(b"has\0nul"));
+        assert!(is_binary(&[0xff, 0xfe, 0x00, 0x01])); // invalid utf-8 + nul
+        assert!(is_binary(&[0xc3, 0x28])); // invalid utf-8 (no nul)
+    }
+
+    #[test]
+    fn grep_text_formats() {
+        let data = b"hello world\nsecond\nHELLO again\n";
+        let mut out = Vec::new();
+        grep_text("f", data, b"hello", false, true, true, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "f:1:hello world\n");
+        // case-insensitive catches both lines
+        let mut out = Vec::new();
+        grep_text("f", data, b"hello", true, false, false, &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "hello world\nHELLO again\n"
+        );
+    }
+
+    #[test]
+    fn grep_binary_emits_hexdump_rows() {
+        // 16 bytes/row; "NEEDLE" lands in row 1 (offset 0x10).
+        let mut data = vec![0u8; 16];
+        data.extend_from_slice(b"xx NEEDLE xx\x00\x00\x00\x00");
+        let mut out = Vec::new();
+        grep_binary("b", &data, b"NEEDLE", false, true, &mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("binary file"));
+        assert!(s.contains("00000010 "), "row offset missing:\n{s}");
+        assert!(s.contains("|xx NEEDLE xx"), "ascii pane missing:\n{s}");
+    }
+
+    #[test]
+    fn hexdump_line_layout() {
+        let mut out = Vec::new();
+        hexdump_line(0, b"hello world\n", &mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        // offset, hex bytes, gap after 8th byte, and ascii pane with '.' for \n.
+        assert!(s.starts_with("00000000  68 65 6c 6c 6f 20 77 6f  72 6c 64 0a"));
+        assert!(s.trim_end().ends_with("|hello world.|"));
+    }
+
+    #[test]
+    fn glob_match_cases() {
+        let g = |p: &str, s: &str| glob_match(p.as_bytes(), s.as_bytes());
+        assert!(g("data.txt", "data.txt"));
+        assert!(g("notes.txt", "notes.txt"));
+        assert!(g("*.txt", "notes.txt"));
+        assert!(g("*.txt", "data.txt"));
+        assert!(g("n*", "notes.txt"));
+        assert!(g("*.*", "notes.txt"));
+        assert!(g("notes*", "notes.txt"));
+        assert!(g("?otes.txt", "notes.txt"));
+        assert!(!g("*.txt", "blob.bin"));
+        assert!(!g("data.txt", "notes.txt"));
+        assert!(g("*", "anything"));
+        assert!(g("", ""));
+        assert!(!g("", "x"));
     }
 
     #[test]

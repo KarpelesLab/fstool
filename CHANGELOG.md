@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(shell)* two new interactive commands. **`find [PATH] [-name GLOB] [-type
+  f|d]`** recursively lists paths under PATH (default cwd), optionally filtered
+  by a `*`/`?` basename glob and/or entry type. **`grep [-i] [-n] [-r] PATTERN
+  [PATH...]`** searches files for the literal PATTERN: text files print matching
+  lines (with `-n` line numbers and a filename prefix when searching multiple
+  files), while binary files (NUL byte or non-UTF-8) print the rows containing
+  matches as `hexdump -C` output, with `*` between non-contiguous clusters.
+  Both skip `.`/`..` during recursion.
+
 ### Changed
 
 - *(affs)* AFFS in-place editing is now **truly incremental** on disk. An
