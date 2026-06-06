@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- *(affs)* AFFS in-place editing is now **truly incremental** on disk. An
+  `add` / `mkdir` / `rm` on an existing `.adf` touches only the affected blocks
+  — the volume bitmap, the parent directory's hash chain (head-insert / splice),
+  and the new/removed file's header + data + extension blocks — instead of
+  loading the whole tree into RAM and re-serialising the entire image on flush.
+  Untouched files keep their exact on-disk blocks, RAM use is bounded by the
+  bitmap (not file contents), and edits are O(change). New
+  `src/fs/affs/editor.rs`; `Affs::open_writable` now attaches this editor while
+  `format` keeps the rebuild serialiser. Verified by a test asserting an
+  unrelated file's blocks are byte-identical before/after an edit, plus the
+  existing conformance + round-trip suites (OFS and FFS).
+
 ## [0.4.11](https://github.com/KarpelesLab/fstool/compare/v0.4.10...v0.4.11) - 2026-06-03
 
 ### Added

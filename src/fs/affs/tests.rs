@@ -180,6 +180,110 @@ fn amiga_epoch_is_1978() {
     assert_eq!(amiga_date_to_unix(1, 0, 0), 252_460_800 + 86_400);
 }
 
+/// Collect a file's on-disk block set (header + extension + data) by walking
+/// its header from `dev`, using only the raw block layout.
+fn file_block_set(dev: &mut MemoryBackend, header: u32) -> Vec<u32> {
+    let mut blocks = vec![header];
+    let mut cur = header;
+    loop {
+        let mut buf = vec![0u8; BSIZE];
+        dev.read_at(cur as u64 * BSIZE as u64, &mut buf).unwrap();
+        let hq = be_i32(&buf, OFF_HIGH_SEQ).clamp(0, MAX_DATABLK as i32) as usize;
+        for i in 0..hq {
+            let p = be_u32(&buf, OFF_HASHTABLE + (MAX_DATABLK - 1 - i) * 4);
+            if p != 0 {
+                blocks.push(p);
+            }
+        }
+        let ext = be_u32(&buf, OFF_EXTENSION);
+        if ext == 0 {
+            break;
+        }
+        blocks.push(ext);
+        cur = ext;
+    }
+    blocks
+}
+
+fn snapshot_blocks(dev: &mut MemoryBackend, blocks: &[u32]) -> Vec<(u32, Vec<u8>)> {
+    blocks
+        .iter()
+        .map(|&b| {
+            let mut buf = vec![0u8; BSIZE];
+            dev.read_at(b as u64 * BSIZE as u64, &mut buf).unwrap();
+            (b, buf)
+        })
+        .collect()
+}
+
+/// The whole point of the in-place editor: adding a file must NOT rewrite or
+/// relocate the blocks of files it didn't touch.
+#[test]
+fn in_place_edit_leaves_existing_blocks_untouched() {
+    use crate::fs::{FileMeta, FileSource, Filesystem};
+    use std::path::Path;
+    let keep: Vec<u8> = (0..9000u32).map(|i| (i % 256) as u8).collect();
+    let mut dev = MemoryBackend::new(880 * 1024);
+    {
+        let mut fs = Affs::format(&mut dev, &super::AffsFormatOpts::default()).unwrap();
+        fs.create_file(
+            &mut dev,
+            Path::new("/keep.bin"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(keep.clone())),
+                len: keep.len() as u64,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+    }
+
+    // Record keep.bin's exact on-disk blocks + their bytes.
+    let header = {
+        let affs = Affs::open(&mut dev).unwrap();
+        affs.list_path("/")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "keep.bin")
+            .unwrap()
+            .inode
+    };
+    let kept_blocks = file_block_set(&mut dev, header);
+    let before = snapshot_blocks(&mut dev, &kept_blocks);
+
+    // In-place add of an unrelated file.
+    {
+        let mut fs = Affs::open_writable(&mut dev).unwrap();
+        fs.create_file(
+            &mut dev,
+            Path::new("/added.bin"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(vec![0xEEu8; 4000])),
+                len: 4000,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+    }
+
+    // keep.bin's blocks must be byte-for-byte identical (not re-laid-out).
+    let after = snapshot_blocks(&mut dev, &kept_blocks);
+    assert_eq!(
+        before, after,
+        "in-place edit relocated/rewrote untouched blocks"
+    );
+
+    // …and both files read back correctly, volume still conformant.
+    let affs = Affs::open(&mut dev).unwrap();
+    let mut r = affs.open_file_reader(&mut dev, "/keep.bin").unwrap();
+    let mut got = Vec::new();
+    r.read_to_end(&mut got).unwrap();
+    assert_eq!(got, keep);
+    assert_conformant(&mut dev);
+}
+
 fn roundtrip_variant(ffs: bool) {
     use crate::fs::{FileMeta, FileSource, Filesystem};
     use std::path::Path;

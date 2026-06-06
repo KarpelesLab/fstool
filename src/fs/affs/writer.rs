@@ -117,31 +117,6 @@ impl AffsWriter {
         Ok(w)
     }
 
-    /// Recreate a writer over an already-parsed volume (in-place phase).
-    pub(super) fn adopt(total_blocks: u32, variant: Variant, volume_name: String) -> Self {
-        let mut entries = BTreeMap::new();
-        entries.insert(
-            0,
-            Entry {
-                name: volume_name,
-                parent: 0,
-                is_dir: true,
-                data: Vec::new(),
-                mtime: 0,
-            },
-        );
-        let mut children = BTreeMap::new();
-        children.insert(0, Vec::new());
-        Self {
-            total_blocks,
-            variant,
-            create_date: 0,
-            entries,
-            children,
-            next_id: 1,
-        }
-    }
-
     /// Variant flags (for the reader/info surface).
     pub(super) fn variant(&self) -> Variant {
         self.variant
@@ -659,7 +634,7 @@ impl AffsWriter {
 // --- free functions ---
 
 #[inline]
-fn put_u32(b: &mut [u8], off: usize, v: u32) {
+pub(super) fn put_u32(b: &mut [u8], off: usize, v: u32) {
     b[off..off + 4].copy_from_slice(&v.to_be_bytes());
 }
 
@@ -670,7 +645,7 @@ fn put_i32(b: &mut [u8], off: usize, v: i32) {
 
 /// Store a file's data-block pointers in the header/extension reverse table:
 /// the first pointer goes in slot `MAX_DATABLK-1`, descending.
-fn put_ptr_table(b: &mut [u8], ptrs: &[u32]) {
+pub(super) fn put_ptr_table(b: &mut [u8], ptrs: &[u32]) {
     for (i, &p) in ptrs.iter().enumerate() {
         let slot = MAX_DATABLK - 1 - i;
         put_u32(b, 0x18 + slot * 4, p);
@@ -678,7 +653,7 @@ fn put_ptr_table(b: &mut [u8], ptrs: &[u32]) {
 }
 
 /// Write a BCPL name: length byte at 0x1b0, chars following (Latin-1 already).
-fn put_name(b: &mut [u8], name: &str) {
+pub(super) fn put_name(b: &mut [u8], name: &str) {
     let bytes: Vec<u8> = name.chars().map(|c| c as u8).collect();
     let len = bytes.len().min(MAX_NAME_LEN);
     b[0x1b0] = len as u8;
@@ -687,7 +662,7 @@ fn put_name(b: &mut [u8], name: &str) {
 
 /// Zero the checksum word at `csum_off`, then store `0 - sum(words)` so the
 /// block's 32-bit words sum to zero.
-fn fix_checksum(b: &mut [u8], csum_off: usize) {
+pub(super) fn fix_checksum(b: &mut [u8], csum_off: usize) {
     put_u32(b, csum_off, 0);
     let mut sum = 0u32;
     let mut i = 0;
@@ -699,7 +674,7 @@ fn fix_checksum(b: &mut [u8], csum_off: usize) {
 }
 
 /// Encode a UTF-8 string as Latin-1, erroring on any char above U+00FF.
-fn encode_latin1(s: &str) -> Result<Vec<u8>> {
+pub(super) fn encode_latin1(s: &str) -> Result<Vec<u8>> {
     s.chars()
         .map(|c| {
             let u = c as u32;
@@ -717,7 +692,7 @@ fn encode_latin1(s: &str) -> Result<Vec<u8>> {
 /// AmigaDOS directory name hash. `h = len; for c: h = (h*13 + upper(c)) & 0x7ff`,
 /// then `h % HT_SIZE`. International mode also upper-cases Latin-1 accented
 /// letters. Validated against real Workbench volumes (ASCII and INTL).
-fn hash_name(name: &str, intl: bool) -> usize {
+pub(super) fn hash_name(name: &str, intl: bool) -> usize {
     let bytes: Vec<u8> = name.chars().map(|c| c as u8).collect();
     let mut h = bytes.len() as u32;
     for &c in &bytes {
@@ -750,7 +725,7 @@ fn intl_toupper(c: u8) -> u8 {
 
 /// Unix seconds → Amiga `(days, minutes, ticks@1/50 s)` since 1978-01-01.
 /// Dates before the Amiga epoch clamp to zero.
-fn unix_to_amiga(secs: u32) -> (i32, i32, i32) {
+pub(super) fn unix_to_amiga(secs: u32) -> (i32, i32, i32) {
     let s = (secs as u64).saturating_sub(AMIGA_EPOCH);
     let days = (s / 86_400) as i32;
     let rem = (s % 86_400) as i32;

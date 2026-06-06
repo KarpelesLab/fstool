@@ -34,8 +34,21 @@ use crate::block::BlockDevice;
 use crate::fs::{DirEntry, EntryKind, Filesystem, MutationCapability};
 use crate::{Error, Result};
 
+mod editor;
 mod writer;
 pub use writer::AffsFormatOpts;
+
+/// How a writable `Affs` handle persists changes.
+enum Write {
+    /// Read-only handle.
+    None,
+    /// Fresh volume built from scratch — the in-memory model is authoritative
+    /// and the whole image is serialised on flush.
+    Format(writer::AffsWriter),
+    /// Existing volume edited incrementally on disk; reads come from the
+    /// (disk-derived) `children` index, refreshed after each mutation.
+    InPlace(editor::AffsEditor),
+}
 
 /// Logical block size of a bare Amiga DOS volume.
 const BSIZE: usize = 512;
@@ -170,8 +183,8 @@ pub struct Affs {
     /// Parent header-block → its children. Root's children are keyed by
     /// `root_block`. Used for read-only (writer-absent) access.
     children: HashMap<u32, Vec<Node>>,
-    /// Present (and authoritative) when the volume is writable.
-    writer: Option<writer::AffsWriter>,
+    /// How writes are persisted (read-only / rebuild-on-flush / in-place).
+    mode: Write,
 }
 
 impl Affs {
@@ -227,96 +240,103 @@ impl Affs {
             variant,
             volume_name,
             children: HashMap::new(),
-            writer: None,
+            mode: Write::None,
         };
         affs.build_index(dev, total_blocks)?;
         Ok(affs)
     }
 
-    /// Format a fresh volume on `dev` and return a writable handle.
+    /// Format a fresh volume on `dev` and return a writable handle. Backed by
+    /// the rebuild-on-flush serialiser (the right tool for a brand-new image).
     pub fn format(dev: &mut dyn BlockDevice, opts: &AffsFormatOpts) -> Result<Self> {
         let w = writer::AffsWriter::format(dev, opts)?;
-        Ok(Self::from_writer(w))
-    }
-
-    /// Build a writable `Affs` around an in-memory writer model.
-    fn from_writer(w: writer::AffsWriter) -> Self {
-        Self {
+        Ok(Self {
             block_size: BSIZE as u32,
             root_block: 0,
             variant: w.variant(),
             volume_name: w.volume_name().to_string(),
             children: HashMap::new(),
-            writer: Some(w),
-        }
+            mode: Write::Format(w),
+        })
     }
 
-    /// Open an existing volume for in-place mutation. The whole tree (every
-    /// directory and the bytes of every file) is loaded into the writer
-    /// model; subsequent `add`/`mkdir`/`rm` mutate it and `flush` re-lays-out
-    /// the entire image from scratch — the same path that backs `format`.
+    /// Open an existing volume for **in-place** mutation. Only the bitmap is
+    /// loaded; file contents are never read into RAM. `add`/`mkdir`/`rm` edit
+    /// the affected blocks directly and `flush` writes back the bitmap — the
+    /// rest of the image stays byte-for-byte unchanged.
     pub fn open_writable(dev: &mut dyn BlockDevice) -> Result<Self> {
-        let ro = Self::open(dev)?;
+        let mut affs = Self::open(dev)?;
         let total_blocks = (dev.total_size() / BSIZE as u64) as u32;
-        let mut w = writer::AffsWriter::adopt(total_blocks, ro.variant, ro.volume_name.clone());
-
-        // Walk the on-disk tree parent-first, collecting paths so writer
-        // inserts (which resolve parents) always see the parent already
-        // present.
-        let mut ordered: Vec<(String, Node)> = Vec::new();
-        let mut stack = vec![(ro.root_block, String::new())];
-        while let Some((blk, prefix)) = stack.pop() {
-            if let Some(kids) = ro.children.get(&blk) {
-                for node in kids {
-                    let path = format!("{prefix}/{}", node.name);
-                    if node.kind == EntryKind::Dir {
-                        stack.push((node.block, path.clone()));
-                    }
-                    ordered.push((path, node.clone()));
-                }
-            }
-        }
-        // Insert dirs before their children: a DFS pre-order already does
-        // this for parents, but the stack reverses sibling order — sort by
-        // path depth then push, which keeps every parent ahead of its kids.
-        ordered.sort_by_key(|(p, _)| p.matches('/').count());
-        for (path, node) in ordered {
-            match node.kind {
-                EntryKind::Dir => w.insert_dir(&path, node.mtime)?,
-                EntryKind::Regular => {
-                    let content = ro.read_file_content(dev, node.block, node.size)?;
-                    w.insert_file(&path, content, node.mtime)?;
-                }
-                // Symlinks/other types are not yet round-tripped by the writer.
-                _ => {}
-            }
-        }
-        Ok(Self::from_writer(w))
+        let ed = editor::AffsEditor::open(dev, total_blocks, affs.variant, affs.root_block)?;
+        affs.mode = Write::InPlace(ed);
+        Ok(affs)
     }
 
-    /// Read a file's full contents from its on-disk data blocks.
-    fn read_file_content(
-        &self,
-        dev: &mut dyn BlockDevice,
-        header: u32,
-        size: u64,
-    ) -> Result<Vec<u8>> {
-        let blocks = self.data_blocks(dev, header)?;
-        let payload = if self.variant.ffs { BSIZE } else { BSIZE - 24 } as u64;
-        let data_off = if self.variant.ffs { 0 } else { 24 };
-        let mut out = Vec::with_capacity(size as usize);
-        let mut remaining = size;
-        for b in blocks {
-            if remaining == 0 {
-                break;
-            }
-            let take = remaining.min(payload) as usize;
-            let mut buf = vec![0u8; take];
-            dev.read_at(b as u64 * BSIZE as u64 + data_off, &mut buf)?;
-            out.extend_from_slice(&buf);
-            remaining -= take as u64;
+    /// Re-read the directory tree from disk into `children` after an in-place
+    /// edit. Only metadata is walked — file contents are never read.
+    fn refresh_index(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        let total_blocks = (dev.total_size() / BSIZE as u64) as u32;
+        self.build_index(dev, total_blocks)
+    }
+
+    /// Split `…/name` into its parent directory's on-disk header block and the
+    /// final component, resolving the parent against `children` and rejecting a
+    /// duplicate name. The returned `&str` borrows `path`, not `self`.
+    fn parent_block_and_name<'p>(&self, path: &'p str) -> Result<(u32, &'p str)> {
+        let trimmed = path.trim_matches('/');
+        let (dir, name) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
+        if name.is_empty() {
+            return Err(Error::InvalidArgument("affs: empty entry name".into()));
         }
-        Ok(out)
+        let parent = match self.resolve(dir) {
+            Some(Resolved::Dir(b)) => b,
+            Some(_) => {
+                return Err(Error::InvalidArgument(
+                    "affs: parent is not a directory".into(),
+                ));
+            }
+            None => {
+                return Err(Error::InvalidArgument(format!(
+                    "affs: no such directory {dir:?}"
+                )));
+            }
+        };
+        if self
+            .children
+            .get(&parent)
+            .is_some_and(|kids| kids.iter().any(|n| n.name.eq_ignore_ascii_case(name)))
+        {
+            return Err(Error::InvalidArgument(format!(
+                "affs: {name:?} already exists"
+            )));
+        }
+        Ok((parent, name))
+    }
+
+    /// Resolve a path to `(parent_block, entry_block, name)` for removal.
+    fn locate_for_remove<'p>(&self, path: &'p str) -> Result<(u32, u32, &'p str)> {
+        let trimmed = path.trim_matches('/');
+        let (dir, name) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
+        if name.is_empty() {
+            return Err(Error::InvalidArgument(
+                "affs: cannot remove the root".into(),
+            ));
+        }
+        let parent = match self.resolve(dir) {
+            Some(Resolved::Dir(b)) => b,
+            _ => {
+                return Err(Error::InvalidArgument(format!(
+                    "affs: no such directory {dir:?}"
+                )));
+            }
+        };
+        let entry = self
+            .children
+            .get(&parent)
+            .and_then(|kids| kids.iter().find(|n| n.name.eq_ignore_ascii_case(name)))
+            .map(|n| n.block)
+            .ok_or_else(|| Error::InvalidArgument(format!("affs: no such path {path:?}")))?;
+        Ok((parent, entry, name))
     }
 
     /// Walk the directory tree from the root, populating `children`.
@@ -435,10 +455,11 @@ impl Affs {
         None
     }
 
-    /// List a directory path. When a writer is attached (a mutable handle),
-    /// the in-memory model is authoritative so pending edits are visible.
+    /// List a directory path. In `Format` mode the in-memory model is
+    /// authoritative; otherwise the on-disk-derived `children` index is (kept
+    /// fresh after each in-place edit).
     pub fn list_path(&self, path: &str) -> Result<Vec<DirEntry>> {
-        if let Some(w) = &self.writer {
+        if let Write::Format(w) = &self.mode {
             return w.list(path);
         }
         let block = match self.resolve(path) {
@@ -503,7 +524,7 @@ impl Affs {
         dev: &'a mut dyn BlockDevice,
         path: &str,
     ) -> Result<AffsFileReader<'a>> {
-        if let Some(w) = &self.writer {
+        if let Write::Format(w) = &self.mode {
             let data = w.read(path)?;
             let size = data.len() as u64;
             return Ok(AffsFileReader {
@@ -656,7 +677,7 @@ impl Filesystem for Affs {
 
     fn create_file(
         &mut self,
-        _dev: &mut dyn BlockDevice,
+        dev: &mut dyn BlockDevice,
         path: &Path,
         src: crate::fs::FileSource,
         meta: crate::fs::FileMeta,
@@ -664,32 +685,51 @@ impl Filesystem for Affs {
         let s = path
             .to_str()
             .ok_or_else(|| Error::InvalidArgument("affs: non-UTF-8 path".into()))?;
-        let w = self.writer.as_mut().ok_or(Error::Immutable {
-            kind: "affs",
-            op: "add",
-        })?;
+        if matches!(self.mode, Write::None) {
+            return Err(Error::Immutable {
+                kind: "affs",
+                op: "add",
+            });
+        }
         let (mut reader, len) = src.open()?;
         let mut data = Vec::with_capacity(len as usize);
         std::io::Read::take(&mut reader, len).read_to_end(&mut data)?;
-        w.insert_file(s, data, meta.mtime)?;
-        Ok(())
+        if let Write::Format(w) = &mut self.mode {
+            w.insert_file(s, data, meta.mtime)?;
+            return Ok(());
+        }
+        // In-place: write the file's blocks directly, link into the parent.
+        let (parent, name) = self.parent_block_and_name(s)?;
+        if let Write::InPlace(ed) = &mut self.mode {
+            ed.create_file(dev, parent, name, &data, meta.mtime)?;
+        }
+        self.refresh_index(dev)
     }
 
     fn create_dir(
         &mut self,
-        _dev: &mut dyn BlockDevice,
+        dev: &mut dyn BlockDevice,
         path: &Path,
         meta: crate::fs::FileMeta,
     ) -> Result<()> {
         let s = path
             .to_str()
             .ok_or_else(|| Error::InvalidArgument("affs: non-UTF-8 path".into()))?;
-        let w = self.writer.as_mut().ok_or(Error::Immutable {
-            kind: "affs",
-            op: "mkdir",
-        })?;
-        w.insert_dir(s, meta.mtime)?;
-        Ok(())
+        if matches!(self.mode, Write::None) {
+            return Err(Error::Immutable {
+                kind: "affs",
+                op: "mkdir",
+            });
+        }
+        if let Write::Format(w) = &mut self.mode {
+            w.insert_dir(s, meta.mtime)?;
+            return Ok(());
+        }
+        let (parent, name) = self.parent_block_and_name(s)?;
+        if let Write::InPlace(ed) = &mut self.mode {
+            ed.create_dir(dev, parent, name, meta.mtime)?;
+        }
+        self.refresh_index(dev)
     }
 
     fn create_symlink(
@@ -721,15 +761,24 @@ impl Filesystem for Affs {
         })
     }
 
-    fn remove(&mut self, _dev: &mut dyn BlockDevice, path: &Path) -> Result<()> {
+    fn remove(&mut self, dev: &mut dyn BlockDevice, path: &Path) -> Result<()> {
         let s = path
             .to_str()
             .ok_or_else(|| Error::InvalidArgument("affs: non-UTF-8 path".into()))?;
-        let w = self.writer.as_mut().ok_or(Error::Immutable {
-            kind: "affs",
-            op: "rm",
-        })?;
-        w.remove(s)
+        if matches!(self.mode, Write::None) {
+            return Err(Error::Immutable {
+                kind: "affs",
+                op: "rm",
+            });
+        }
+        if let Write::Format(w) = &mut self.mode {
+            return w.remove(s);
+        }
+        let (parent, entry, name) = self.locate_for_remove(s)?;
+        if let Write::InPlace(ed) = &mut self.mode {
+            ed.remove(dev, parent, entry, name)?;
+        }
+        self.refresh_index(dev)
     }
 
     fn list(&mut self, _dev: &mut dyn BlockDevice, path: &Path) -> Result<Vec<DirEntry>> {
@@ -743,7 +792,7 @@ impl Filesystem for Affs {
         let s = path
             .to_str()
             .ok_or_else(|| Error::InvalidArgument("affs: non-UTF-8 path".into()))?;
-        if let Some(w) = &self.writer {
+        if let Write::Format(w) = &self.mode {
             return w.getattr(s);
         }
         let (kind, size, mtime, inode) = match self.resolve(s) {
@@ -773,8 +822,10 @@ impl Filesystem for Affs {
     }
 
     fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
-        if let Some(w) = self.writer.as_mut() {
-            w.flush(dev)?;
+        match &mut self.mode {
+            Write::Format(w) => w.flush(dev)?,
+            Write::InPlace(ed) => ed.flush(dev)?,
+            Write::None => {}
         }
         Ok(())
     }
@@ -819,7 +870,7 @@ impl Filesystem for Affs {
     }
 
     fn mutation_capability(&self) -> MutationCapability {
-        if self.writer.is_some() {
+        if matches!(self.mode, Write::Format(_) | Write::InPlace(_)) {
             MutationCapability::Mutable
         } else {
             MutationCapability::Immutable
