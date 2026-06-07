@@ -63,6 +63,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(xfs)* `create --type xfs` of an **empty** volume failed with `xfs:
+  flush_writes called before begin_writes()` (at every size). `format()`
+  re-opens through the read path and leaves the write state uninitialised;
+  populated creates worked only because the first `create_file` lazily
+  reconstructs it, but an empty create goes straight from `format()` to
+  `flush()`. `flush_writes` now reconstructs the write state from the on-disk
+  AG headers when needed (the same `resume_writes` path the populated flow
+  relies on), so empty XFS images format cleanly and pass `xfs_repair -n`.
 - *(hfs+, fat32)* **near-instant `create` on large block devices.** Both
   formatters zeroed the *entire* volume up front (`zero_range(0, whole device)`),
   so `fstool create --type hfsplus --output /dev/sdX` on a multi-hundred-GB

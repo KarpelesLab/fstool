@@ -1976,6 +1976,15 @@ impl Xfs {
     /// called once after all `add_*` / `remove` calls so the image is
     /// `xfs_repair -n` clean.
     pub fn flush_writes(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        // A just-formatted (or just-opened) image hasn't begun writes yet:
+        // `format()` re-opens through the read path, leaving `write_state`
+        // None. Reconstruct it from the on-disk AG headers so an *empty*
+        // `create` — which goes straight from `format()` to `flush()` with no
+        // intervening mutator — flushes cleanly instead of erroring. This is
+        // the same `resume_writes` path the populated-create flow already
+        // relies on (the first `create_file` triggers it); a no-op when writes
+        // have already begun.
+        self.ensure_write_state(dev)?;
         // Serialize any pending directory batches first, so the AG
         // free-space / inode accounting below reflects the final state.
         self.flush_dir_batches(dev)?;

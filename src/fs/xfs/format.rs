@@ -1002,6 +1002,31 @@ mod tests {
     }
 
     #[test]
+    fn empty_create_format_then_flush_without_mutations() {
+        // Regression: an empty `create` goes straight from `format()` to
+        // `flush()` with no intervening mutator, so `flush_writes` must
+        // reconstruct the write state itself instead of erroring with
+        // "flush_writes called before begin_writes()".
+        use crate::fs::Filesystem;
+        let mut dev = MemoryBackend::new(256 * 1024 * 1024);
+        let opts = FormatOpts::default();
+        let mut xfs = format(&mut dev, &opts).unwrap();
+        xfs.flush(&mut dev)
+            .expect("empty flush after format must succeed");
+        drop(xfs);
+        // Re-open and confirm a clean, empty root.
+        let reopened = Xfs::open(&mut dev).unwrap();
+        let names: Vec<String> = reopened
+            .list_path(&mut dev, "/")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&".".to_string()));
+        assert!(names.contains(&"..".to_string()));
+    }
+
+    #[test]
     fn ceil_log2_examples() {
         assert_eq!(ceil_log2_u32(1), 0);
         assert_eq!(ceil_log2_u32(2), 1);
