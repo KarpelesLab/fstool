@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.14](https://github.com/KarpelesLab/fstool/compare/v0.4.13...v0.4.14) - 2026-06-07
+
+### Fixed
+
+- *(xfs)* empty `create` failed with "flush_writes called before begin_writes()"
+
+### Other
+
+- *(changelog)* move xfs fix to [Unreleased], drop release-plz dup blocks
+
 ### Fixed
 
 - *(xfs)* `create --type xfs` of an **empty** volume failed with `xfs:
