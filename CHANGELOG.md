@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- *(xfs)* `create --type xfs` of an **empty** volume failed with `xfs:
+  flush_writes called before begin_writes()` (at every size). `format()`
+  re-opens through the read path and leaves the write state uninitialised;
+  populated creates worked only because the first `create_file` lazily
+  reconstructs it, but an empty create goes straight from `format()` to
+  `flush()`. `flush_writes` now reconstructs the write state from the on-disk
+  AG headers when needed (the same `resume_writes` path the populated flow
+  relies on), so empty XFS images format cleanly and pass `xfs_repair -n`.
+
 ## [0.4.13](https://github.com/KarpelesLab/fstool/compare/v0.4.12...v0.4.13) - 2026-06-07
 
 ### Added
@@ -23,70 +34,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Other
 
 - *(changelog)* move dd entry under [Unreleased] after v0.4.12 release
-
-### Added
-
-- *(shell)* new **`get SRC [DEST]`** command — copy a file or directory out of
-  the image to the host, the inverse of `put`. `SRC` is a path inside the
-  image; `DEST` is a host path (an existing directory receives `SRC`'s
-  basename; omitting `DEST` writes the basename into the host's current
-  directory). A directory `SRC` is copied recursively (regular files and, on
-  unix, symlinks; other special files are skipped with a note). It only reads
-  the image, so it works in `--ro` mode, and a long recursive `get` is
-  cancellable with Ctrl-C.
-- *(shell)* new **`fstool shell --with-cache`** flag — an opt-in in-memory
-  metadata cache. Before the first prompt it walks the whole tree and preloads
-  every directory listing and inode attribute into RAM, so metadata operations
-  (`ls`, and especially `find` / `grep` recursion) are served from memory and
-  run instantly instead of re-parsing on-disk structures on every lookup. File
-  *contents* are never cached (so `cat` / `grep` body reads still stream from
-  disk and RAM stays bounded by the tree's metadata). A `put` / `rm` / `mkdir`
-  invalidates the cache, which then lazily refills; a long preload is
-  cancellable with Ctrl-C (leaving a partial, still-correct cache). Works with
-  `--ro` too. The preload prints a one-line `cache: preloaded N dirs / M
-  entries in T ms` summary.
-- *(cli)* new **`fstool dd <SRC> <DST>`** command — a resilient, container-
-  agnostic raw block copy (a `ddrescue`-lite). Copies bytes directly (a qcow2
-  file is cloned as-is, not expanded). Reads begin at the largest block
-  (`--block-size`, default 1 MiB) and **halve on read error**, retrying at the
-  same offset down to `--min-block-size` (default the source's sector); a
-  smallest-block read that still fails is **skipped** — left untouched on the
-  destination — and recorded, so a failing disk copies as much as it can
-  instead of aborting. A reader thread and a writer thread overlap through a
-  bounded buffer pool (`--queue`, default 8), and a live progress line shows
-  the bar, percentage, ETA, **separate read/write throughput**, **buffer-pool
-  occupancy**, the current (possibly shrunk) block size, and bytes skipped.
-  Fresh regular-file destinations stay sparse (all-zero chunks aren't written);
-  block-device / pre-existing destinations require `--force` and are written
-  faithfully. **Ctrl-C** cancels cleanly and the final summary reports how far
-  the copy got and what was skipped.
-
-### Fixed
-
-- *(xfs)* `create --type xfs` of an **empty** volume failed with `xfs:
-  flush_writes called before begin_writes()` (at every size). `format()`
-  re-opens through the read path and leaves the write state uninitialised;
-  populated creates worked only because the first `create_file` lazily
-  reconstructs it, but an empty create goes straight from `format()` to
-  `flush()`. `flush_writes` now reconstructs the write state from the on-disk
-  AG headers when needed (the same `resume_writes` path the populated flow
-  relies on), so empty XFS images format cleanly and pass `xfs_repair -n`.
-- *(hfs+, fat32)* **near-instant `create` on large block devices.** Both
-  formatters zeroed the *entire* volume up front (`zero_range(0, whole device)`),
-  so `fstool create --type hfsplus --output /dev/sdX` on a multi-hundred-GB
-  device wrote hundreds of GB of zeros — minutes of I/O. They now zero only the
-  metadata regions (HFS+: the special-file blocks at the start + the alternate
-  volume header; FAT32: the reserved sectors + both FATs + the root cluster).
-  Data/free blocks are marked free in the bitmap / FAT and never read back, so
-  their prior contents don't matter. Formatting an empty 200 GiB HFS+ volume
-  dropped from minutes to ~0.03 s (FAT32 likewise from a >20 s timeout to
-  ~0.3 s); both stay `fsck.hfsplus` / `fsck.vfat`-clean.
-- *(info)* drop the stale "read support is scaffold-only" note that `fstool
-  info` printed for NTFS, F2FS, and SquashFS — all three have had full read
-  support for some time (the note dated from when they were detection-only).
-  NTFS now prints no caveat; F2FS notes its build-once write model and SquashFS
-  its repack-only write. Also corrected the matching stale doc comments on the
-  `FsKind` / `AnyFs` variants in `src/inspect.rs`.
 
 ## [0.4.12](https://github.com/KarpelesLab/fstool/compare/v0.4.11...v0.4.12) - 2026-06-07
 
