@@ -238,6 +238,14 @@ enum Command {
         /// `mkdir` refuse with a clear error.
         #[arg(long)]
         ro: bool,
+        /// Preload every directory listing and inode into an in-memory
+        /// cache before the first prompt, so metadata operations (`ls`,
+        /// `find`, `grep` recursion) are served from RAM and run instantly.
+        /// Costs the up-front walk and the memory to hold the tree's
+        /// metadata; file contents are never cached. A `put` / `rm` /
+        /// `mkdir` invalidates the cache (it lazily refills).
+        #[arg(long)]
+        with_cache: bool,
     },
 
     /// Convert an image between container formats (raw ↔ qcow2). Streams
@@ -441,7 +449,11 @@ fn run(cli: Cli) -> fstool::Result<()> {
             fs_dest,
         } => add(&image, &host_src, &fs_dest, cli.path_style),
         Command::Rm { image, fs_path } => rm(&image, &fs_path, cli.path_style),
-        Command::Shell { image, ro } => shell_cmd(&image, ro, cli.path_style),
+        Command::Shell {
+            image,
+            ro,
+            with_cache,
+        } => shell_cmd(&image, ro, with_cache, cli.path_style),
         Command::Convert {
             src,
             dst,
@@ -2144,7 +2156,7 @@ fn sum_source_file_bytes(
     src_fs.total_file_bytes(src_dev)
 }
 
-fn shell_cmd(image: &str, ro: bool, style: PathStyle) -> fstool::Result<()> {
+fn shell_cmd(image: &str, ro: bool, with_cache: bool, style: PathStyle) -> fstool::Result<()> {
     let target = fstool::inspect::Target::parse(image);
     if ro {
         // Read-only shell: open the underlying file O_RDONLY (any
@@ -2159,6 +2171,9 @@ fn shell_cmd(image: &str, ro: bool, style: PathStyle) -> fstool::Result<()> {
         return fstool::inspect::with_target_device_read_only(&target, |dev| {
             let fs = fstool::inspect::AnyFs::open(dev)?;
             let mut sh = shell::Shell::new_read_only(fs, style);
+            if with_cache {
+                sh.enable_cache();
+            }
             run_shell(&mut sh, dev)?;
             // No dev.sync() — read-only.
             Ok(())
@@ -2193,6 +2208,9 @@ fn shell_cmd(image: &str, ro: bool, style: PathStyle) -> fstool::Result<()> {
             )));
         }
         let mut sh = shell::Shell::new(fs, style);
+        if with_cache {
+            sh.enable_cache();
+        }
         run_shell(&mut sh, dev)?;
         dev.sync()?;
         Ok(())
@@ -2207,6 +2225,9 @@ fn run_shell(
     sh: &mut shell::Shell,
     dev: &mut dyn fstool::block::BlockDevice,
 ) -> fstool::Result<()> {
+    // Eagerly fill the metadata cache when `--with-cache` is on (no-op
+    // otherwise) so the first `find` / `ls` is instant.
+    sh.preload(dev)?;
     #[cfg(feature = "readline")]
     {
         use std::io::IsTerminal;

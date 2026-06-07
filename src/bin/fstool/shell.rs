@@ -92,6 +92,19 @@ fn clear_interrupt() {
     INTERRUPT.store(false, Ordering::SeqCst);
 }
 
+/// Opt-in in-memory metadata cache (`fstool shell --with-cache`). Holds the
+/// per-path directory listings and inode attributes so repeated `ls` / `find` /
+/// `grep` recursion is served from RAM instead of re-parsing on-disk
+/// structures. File *contents* are deliberately not cached. Keys are the
+/// shell's canonical (`/`-separated, normalised) path strings.
+#[derive(Default)]
+struct InodeCache {
+    dirs: std::collections::HashMap<String, Vec<fstool::fs::DirEntry>>,
+    attrs: std::collections::HashMap<String, fstool::fs::FileAttrs>,
+    /// Set once [`Shell::preload`] has walked the whole tree.
+    preloaded: bool,
+}
+
 /// An interactive shell over an opened image.
 pub struct Shell {
     fs: AnyFs,
@@ -109,6 +122,8 @@ pub struct Shell {
     /// The opened filesystem's kind, so path translation knows its native
     /// separator.
     kind: FsKind,
+    /// Opt-in metadata cache (`--with-cache`). `None` = caching off (default).
+    cache: Option<InodeCache>,
 }
 
 impl Shell {
@@ -122,6 +137,7 @@ impl Shell {
             read_only: false,
             style,
             kind,
+            cache: None,
         }
     }
 
@@ -138,7 +154,110 @@ impl Shell {
             read_only: true,
             style,
             kind,
+            cache: None,
         }
+    }
+
+    /// Turn on the opt-in in-memory metadata cache (`--with-cache`). Reads
+    /// (`list` / `getattr`) are served from / filled into the cache; call
+    /// [`Shell::preload`] to populate it eagerly before the first prompt.
+    pub fn enable_cache(&mut self) {
+        if self.cache.is_none() {
+            self.cache = Some(InodeCache::default());
+        }
+    }
+
+    /// Directory listing for `path`, served from the cache when enabled and
+    /// populated on a miss. The single choke point for `list` reads so the
+    /// cache stays coherent.
+    fn list(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<Vec<fstool::fs::DirEntry>> {
+        if let Some(c) = &self.cache
+            && let Some(v) = c.dirs.get(path)
+        {
+            return Ok(v.clone());
+        }
+        let v = self.fs.list(dev, path)?;
+        if let Some(c) = &mut self.cache {
+            c.dirs.insert(path.to_string(), v.clone());
+        }
+        Ok(v)
+    }
+
+    /// Attributes for `path`, served from the cache when enabled and populated
+    /// on a miss. The single choke point for `getattr` reads.
+    fn getattr(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<fstool::fs::FileAttrs> {
+        if let Some(c) = &self.cache
+            && let Some(a) = c.attrs.get(path)
+        {
+            return Ok(*a);
+        }
+        let a = self.fs.getattr(dev, Path::new(path))?;
+        if let Some(c) = &mut self.cache {
+            c.attrs.insert(path.to_string(), a);
+        }
+        Ok(a)
+    }
+
+    /// Drop every cached entry (after a mutation). The next read lazily
+    /// refills. A no-op when caching is off.
+    fn invalidate_cache(&mut self) {
+        if let Some(c) = &mut self.cache {
+            c.dirs.clear();
+            c.attrs.clear();
+            c.preloaded = false;
+        }
+    }
+
+    /// Eagerly walk the whole tree to fill the cache, so the first `find` /
+    /// `ls` is instant. No-op unless caching is on and not already preloaded.
+    /// Per-directory errors are skipped (a partial cache is still correct — the
+    /// read helpers lazily fill any gaps), and Ctrl-C aborts a long preload.
+    pub fn preload(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        match &self.cache {
+            Some(c) if !c.preloaded => {}
+            _ => return Ok(()),
+        }
+        install_interrupt_handler();
+        clear_interrupt();
+        let start = std::time::Instant::now();
+        let (mut dirs, mut entries) = (0u64, 0u64);
+        let _ = self.getattr(dev, "/");
+        let mut stack = vec!["/".to_string()];
+        while let Some(dir) = stack.pop() {
+            if interrupted() {
+                break;
+            }
+            let listing = match self.list(dev, &dir) {
+                Ok(l) => l,
+                Err(_) => continue, // unreadable dir: skip, lazy-fill later
+            };
+            dirs += 1;
+            for e in listing {
+                if e.name == "." || e.name == ".." {
+                    continue;
+                }
+                let child = join(&dir, &e.name);
+                let _ = self.getattr(dev, &child);
+                entries += 1;
+                if matches!(e.kind, fstool::fs::EntryKind::Dir) {
+                    stack.push(child);
+                }
+            }
+        }
+        let aborted = interrupted();
+        if let Some(c) = &mut self.cache {
+            c.preloaded = !aborted;
+        }
+        eprintln!(
+            "cache: preloaded {dirs} dirs / {entries} entries in {} ms{}",
+            start.elapsed().as_millis(),
+            if aborted {
+                " (interrupted; partial)"
+            } else {
+                ""
+            }
+        );
+        Ok(())
     }
 
     /// Read commands from `input` line by line and execute each one against
@@ -326,6 +445,11 @@ impl Shell {
         } else {
             ""
         };
+        let cache_note = if self.cache.is_some() {
+            "(metadata cache active: --with-cache — ls / find / grep metadata served from RAM)\n"
+        } else {
+            ""
+        };
         let body = format!(
             "ls [PATH]           list a directory (default: cwd)
 pwd                 print the current directory
@@ -350,7 +474,7 @@ grep [-i] [-n] [-r] [-v] [-l] [-c] PATTERN [PATH...]
                     Binary files print their matches as `hexdump -C` rows
                     (Ctrl-C cancels a running find/grep without leaving the shell)
 help | ?            print this help
-quit | exit         leave{ro_note}\n"
+quit | exit         leave{ro_note}\n{cache_note}"
         );
         output.write_all(body.as_bytes())?;
         Ok(())
@@ -367,7 +491,7 @@ quit | exit         leave{ro_note}\n"
         } else {
             self.resolve(arg)
         };
-        let entries = self.fs.list(dev, &target)?;
+        let entries = self.list(dev, &target)?;
         for e in &entries {
             let suffix = match e.kind {
                 fstool::fs::EntryKind::Dir => "/",
@@ -392,7 +516,7 @@ quit | exit         leave{ro_note}\n"
         };
         // Verify it's actually a directory by listing it. Cheap, and gives
         // a useful error if the path is wrong.
-        self.fs.list(dev, &target)?;
+        self.list(dev, &target)?;
         self.cwd = target;
         Ok(())
     }
@@ -451,6 +575,7 @@ quit | exit         leave{ro_note}\n"
         }
         self.fs.flush(dev)?;
         dev.sync()?;
+        self.invalidate_cache();
         writeln!(output, "put {} → {dest}", host.display())?;
         Ok(())
     }
@@ -475,6 +600,7 @@ quit | exit         leave{ro_note}\n"
         self.fs.remove(dev, &path)?;
         self.fs.flush(dev)?;
         dev.sync()?;
+        self.invalidate_cache();
         writeln!(output, "removed {path}")?;
         Ok(())
     }
@@ -494,6 +620,7 @@ quit | exit         leave{ro_note}\n"
         self.fs.mkdir(dev, &path)?;
         self.fs.flush(dev)?;
         dev.sync()?;
+        self.invalidate_cache();
         writeln!(output, "mkdir {path}")?;
         Ok(())
     }
@@ -515,7 +642,7 @@ quit | exit         leave{ro_note}\n"
         // surfaces fs-specific properties (NTFS DOS attrs, ADS, security
         // descriptors; ext / squashfs xattrs; HFS+ Finder info; …).
         let path = self.resolve(arg);
-        let attrs = self.fs.getattr(dev, Path::new(&path))?;
+        let attrs = self.getattr(dev, &path)?;
 
         writeln!(output, "path:   {path}")?;
         writeln!(output, "kind:   {}", fmt_kind(attrs.kind))?;
@@ -708,7 +835,7 @@ quit | exit         leave{ro_note}\n"
         let mut emitted = 0usize;
 
         // The start path itself.
-        let sa = self.fs.getattr(dev, Path::new(&start))?;
+        let sa = self.getattr(dev, &start)?;
         let start_name = start.rsplit('/').next().unwrap_or("");
         if passes(sa.kind, start_name, sa.mtime) {
             let h = Hit {
@@ -730,7 +857,7 @@ quit | exit         leave{ro_note}\n"
                 if interrupted() {
                     break;
                 }
-                for e in self.fs.list(dev, &dir)? {
+                for e in self.list(dev, &dir)? {
                     if interrupted() {
                         break 'walk;
                     }
@@ -753,7 +880,7 @@ quit | exit         leave{ro_note}\n"
                         continue;
                     }
                     let mtime = if need_mtime {
-                        self.fs.getattr(dev, Path::new(&child))?.mtime
+                        self.getattr(dev, &child)?.mtime
                     } else {
                         0
                     };
@@ -846,7 +973,7 @@ quit | exit         leave{ro_note}\n"
         // Expand the targets into a flat list of regular-file paths.
         let mut files: Vec<String> = Vec::new();
         for p in paths {
-            match self.fs.getattr(dev, Path::new(&p))?.kind {
+            match self.getattr(dev, &p)?.kind {
                 fstool::fs::EntryKind::Dir => {
                     if !recurse {
                         writeln!(output, "grep: {p}: is a directory (use -r)")?;
@@ -857,7 +984,7 @@ quit | exit         leave{ro_note}\n"
                         if interrupted() {
                             break;
                         }
-                        for e in self.fs.list(dev, &dir)? {
+                        for e in self.list(dev, &dir)? {
                             if e.name == "." || e.name == ".." {
                                 continue;
                             }
@@ -888,7 +1015,7 @@ quit | exit         leave{ro_note}\n"
             if interrupted() {
                 break;
             }
-            let size = self.fs.getattr(dev, Path::new(&path))?.size;
+            let size = self.getattr(dev, &path)?.size;
             if size > CAP {
                 writeln!(
                     output,
@@ -1593,6 +1720,94 @@ mod tests {
         assert_eq!(super::kind_type_letter(Char), 'c');
         assert_eq!(super::kind_type_letter(Fifo), 'p');
         assert_eq!(super::kind_type_letter(Socket), 's');
+    }
+
+    /// Format a tiny ext image in memory with a couple of nested dirs and
+    /// return the device plus a mutating `Shell` over it.
+    fn ext_shell() -> (fstool::block::MemoryBackend, Shell) {
+        use fstool::fs::ext::{Ext, FormatOpts};
+        let opts = FormatOpts {
+            inodes_count: 64,
+            ..FormatOpts::default()
+        };
+        let mut dev =
+            fstool::block::MemoryBackend::new(opts.blocks_count as u64 * opts.block_size as u64);
+        {
+            let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+            ext.flush(&mut dev).unwrap();
+        }
+        let fs = AnyFs::open_writable(&mut dev).unwrap();
+        let mut sh = Shell::new(fs, PathStyle::Unix);
+        let mut sink = Vec::new();
+        sh.cmd_mkdir(&mut dev, "/a", &mut sink).unwrap();
+        sh.cmd_mkdir(&mut dev, "/a/b", &mut sink).unwrap();
+        (dev, sh)
+    }
+
+    #[test]
+    fn preload_populates_cache_and_marks_done() {
+        let (mut dev, mut sh) = ext_shell();
+        sh.enable_cache();
+        sh.preload(&mut dev).unwrap();
+        let c = sh.cache.as_ref().expect("cache on");
+        assert!(c.preloaded);
+        // Every directory we walked is cached, including the nested ones.
+        assert!(c.dirs.contains_key("/"));
+        assert!(c.dirs.contains_key("/a"));
+        assert!(c.dirs.contains_key("/a/b"));
+        // And the attrs of the entries under them.
+        assert!(c.attrs.contains_key("/a"));
+        assert!(c.attrs.contains_key("/a/b"));
+    }
+
+    #[test]
+    fn cache_serves_after_device_would_change() {
+        // After preload, a cached `list` returns the snapshot even if we then
+        // (separately) mutate the device behind the cache's back — proving it
+        // served from RAM, not a fresh parse.
+        let (mut dev, mut sh) = ext_shell();
+        sh.enable_cache();
+        sh.preload(&mut dev).unwrap();
+        let before = sh.list(&mut dev, "/").unwrap();
+        // Mutate the underlying fs directly (not through the shell, so the
+        // cache isn't invalidated).
+        sh.fs.mkdir(&mut dev, "/zzz").unwrap();
+        sh.fs.flush(&mut dev).unwrap();
+        let cached = sh.list(&mut dev, "/").unwrap();
+        assert_eq!(
+            before.len(),
+            cached.len(),
+            "cached listing should not see the out-of-band mkdir"
+        );
+        assert!(!cached.iter().any(|e| e.name == "zzz"));
+    }
+
+    #[test]
+    fn invalidate_after_mutation_refills_lazily() {
+        let (mut dev, mut sh) = ext_shell();
+        sh.enable_cache();
+        sh.preload(&mut dev).unwrap();
+        // A shell mutation must invalidate the cache.
+        let mut sink = Vec::new();
+        sh.cmd_mkdir(&mut dev, "/fresh", &mut sink).unwrap();
+        assert!(!sh.cache.as_ref().unwrap().preloaded);
+        assert!(sh.cache.as_ref().unwrap().dirs.is_empty());
+        // The next read lazily refills and now sees the new directory.
+        let root = sh.list(&mut dev, "/").unwrap();
+        assert!(root.iter().any(|e| e.name == "fresh"));
+        assert!(sh.cache.as_ref().unwrap().dirs.contains_key("/"));
+    }
+
+    #[test]
+    fn no_cache_means_no_map() {
+        let (mut dev, mut sh) = ext_shell();
+        // Without enable_cache, reads still work and nothing is cached.
+        assert!(sh.cache.is_none());
+        let _ = sh.list(&mut dev, "/").unwrap();
+        assert!(sh.cache.is_none());
+        // preload is a no-op.
+        sh.preload(&mut dev).unwrap();
+        assert!(sh.cache.is_none());
     }
 
     #[test]

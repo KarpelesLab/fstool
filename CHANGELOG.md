@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(shell)* new **`fstool shell --with-cache`** flag — an opt-in in-memory
+  metadata cache. Before the first prompt it walks the whole tree and preloads
+  every directory listing and inode attribute into RAM, so metadata operations
+  (`ls`, and especially `find` / `grep` recursion) are served from memory and
+  run instantly instead of re-parsing on-disk structures on every lookup. File
+  *contents* are never cached (so `cat` / `grep` body reads still stream from
+  disk and RAM stays bounded by the tree's metadata). A `put` / `rm` / `mkdir`
+  invalidates the cache, which then lazily refills; a long preload is
+  cancellable with Ctrl-C (leaving a partial, still-correct cache). Works with
+  `--ro` too. The preload prints a one-line `cache: preloaded N dirs / M
+  entries in T ms` summary.
 - *(cli)* new **`fstool dd <SRC> <DST>`** command — a resilient, container-
   agnostic raw block copy (a `ddrescue`-lite). Copies bytes directly (a qcow2
   file is cloned as-is, not expanded). Reads begin at the largest block
