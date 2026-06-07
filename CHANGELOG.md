@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.12](https://github.com/KarpelesLab/fstool/compare/v0.4.11...v0.4.12) - 2026-06-07
+
+### Added
+
+- *(shell)* richer find (time/sort/limit/types) and grep (-v/-l/-c)
+- *(shell)* Ctrl-C cancels a running find/grep without killing the shell
+- *(shell)* add `find` and `grep` (binary matches as hexdump -C)
+- *(affs)* true incremental in-place editing of OFS/FFS images
+
+### Fixed
+
+- *(affs)* reword editor doc comment to avoid clippy doc_lazy_continuation
+
+### Other
+
+- *(apfs)* make README status accurate (read snapshots/xattrs, write via macOS-mount, honest gaps)
+- *(qcow2)* clean errors instead of panics in the compressed writer
+
 ### Added
 
 - *(shell)* two new interactive commands. **`find [PATH] [-name GLOB] [-type
