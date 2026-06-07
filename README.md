@@ -97,7 +97,7 @@ through xattrs under `user.ntfs.*` and `system.ntfs_security`.
 | `resources`   | Inventory an HFS / HFS+ file's resource fork (ResEdit-style: `vers`/`ICN#`/`DITL`/… with decoded summaries); `--extract TYPE:ID` dumps one resource. |
 | `add`         | Copy a host file / tree into an existing image (any mutable FS).        |
 | `rm`          | Unlink a file, symlink, device, or empty directory.                     |
-| `shell`       | SFTP-style REPL — `ls cd pwd cat put rm mkdir info`. On a TTY it has line editing + ↑/↓ command history (rustyline). |
+| `shell`       | SFTP-style REPL — `ls cd pwd cat put rm mkdir info`, plus `find` (name/type/mtime filters, `-sort`/`-limit` for e.g. the N newest files) and `grep` (`-i`/`-n`/`-r`/`-v`/`-l`/`-c`; binary matches print as `hexdump -C`). Ctrl-C cancels a running `find`/`grep` without leaving the shell. On a TTY it has line editing + ↑/↓ command history (rustyline). |
 | `convert`     | Byte-level raw ↔ qcow2 conversion with optional grow.                   |
 | `repack`      | Walk one or more source FSes, merge bottom→top with whiteouts, rebuild into a fresh image. |
 

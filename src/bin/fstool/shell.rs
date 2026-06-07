@@ -21,13 +21,20 @@
 //!                       come through here: NTFS DOS attrs, ADS,
 //!                       security descriptors; ext / squashfs xattrs;
 //!                       HFS+ Finder info; …)
-//!   find [PATH] [-name GLOB] [-type f|d]
+//!   find [PATH] [-name GLOB] [-type f|d|l|b|c|p|s]
+//!        [-newer T] [-older T] [-sort mtime|size|name] [-limit N]
+//!        [-reverse] [-l]
 //!                       recursively list paths (default: cwd), optionally
-//!                       filtered by a `*`/`?` name glob and/or entry type
-//!   grep [-i] [-n] [-r] PATTERN [PATH...]
+//!                       filtered by a `*`/`?` name glob, entry type, or
+//!                       mtime; `-sort`+`-limit` give e.g. the 200 newest
+//!                       files; `-l` adds mtime+size columns. T is a unix
+//!                       epoch, a relative age (`7d`, `12h`, `30m`), or an
+//!                       ISO date (`2026-01-31`)
+//!   grep [-i] [-n] [-r] [-v] [-l] [-c] PATTERN [PATH...]
 //!                       search files for the literal PATTERN; text files
 //!                       print matching lines, binary files print the
-//!                       matching rows as `hexdump -C` output
+//!                       matching rows as `hexdump -C` output. -v inverts,
+//!                       -l lists matching filenames, -c counts matches
 //!   help                list these commands
 //!   quit | exit         leave
 //! ```
@@ -330,12 +337,16 @@ mkdir PATH          create an empty directory
 info [PATH]         no arg → image summary; with PATH → file metadata
                     (kind/mode/owner/size/blocks/nlink/inode/atime/mtime
                     /ctime/rdev) plus any extended attributes
-find [PATH] [-name GLOB] [-type f|d]
-                    recursively list paths under PATH (default: cwd),
-                    optionally filtered by name glob (* ?) and/or type
-grep [-i] [-n] [-r] PATTERN [PATH...]
+find [PATH] [-name GLOB] [-type f|d|l|b|c|p|s] [-newer T] [-older T]
+     [-sort mtime|size|name] [-limit N] [-reverse] [-l]
+                    recursively list paths under PATH (default: cwd), filtered
+                    by name glob (* ?), type, and/or mtime. -sort + -limit list
+                    e.g. the 200 newest files; -l adds mtime+size columns.
+                    T = unix epoch, relative age (7d/12h/30m), or ISO date.
+grep [-i] [-n] [-r] [-v] [-l] [-c] PATTERN [PATH...]
                     search files for the literal PATTERN (default PATH: cwd
-                    with -r). -i case-insensitive, -n line numbers, -r recurse.
+                    with -r). -i case-insensitive, -n line numbers, -r recurse,
+                    -v invert, -l list matching filenames, -c count matches.
                     Binary files print their matches as `hexdump -C` rows
                     (Ctrl-C cancels a running find/grep without leaving the shell)
 help | ?            print this help
@@ -572,9 +583,15 @@ quit | exit         leave{ro_note}\n"
         Ok(())
     }
 
-    /// `find [PATH] [-name GLOB] [-type f|d]` — recursively print every path
-    /// under PATH (default cwd), optionally filtered by a basename glob and/or
-    /// an entry type. Paths print in the active display style.
+    /// `find [PATH] [-name GLOB] [-type f|d|l|b|c|p|s] [-newer T] [-older T]
+    /// [-sort mtime|size|name] [-limit N] [-reverse] [-l]` — recursively print
+    /// every path under PATH (default cwd), filtered by a basename glob, an
+    /// entry type, and/or mtime (`T` = unix epoch, relative age like `7d`, or
+    /// ISO date). `-sort` with `-limit` yields, e.g., the N most recently
+    /// modified files; `-l` prefixes each line with its mtime and size. Without
+    /// `-sort`, results stream in walk order; with it, all hits are collected,
+    /// sorted, then truncated. Paths print in the active display style.
+    #[allow(clippy::too_many_lines)]
     fn cmd_find(
         &mut self,
         dev: &mut dyn BlockDevice,
@@ -584,32 +601,58 @@ quit | exit         leave{ro_note}\n"
         let mut start: Option<String> = None;
         let mut name: Option<String> = None;
         let mut type_filter: Option<char> = None;
+        let mut newer: Option<u64> = None;
+        let mut older: Option<u64> = None;
+        let mut sort: Option<SortKey> = None;
+        let mut limit: Option<usize> = None;
+        let mut reverse = false;
+        let mut long = false;
         let mut toks = arg.split_whitespace();
+        let next_val = |toks: &mut std::str::SplitWhitespace, flag: &str| -> Result<String> {
+            toks.next().map(str::to_string).ok_or_else(|| {
+                fstool::Error::InvalidArgument(format!("find: {flag} needs a value"))
+            })
+        };
         while let Some(tok) = toks.next() {
             match tok {
-                "-name" => {
-                    name = Some(
-                        toks.next()
-                            .ok_or_else(|| {
-                                fstool::Error::InvalidArgument("find: -name needs a pattern".into())
-                            })?
-                            .to_string(),
-                    );
-                }
+                "-name" => name = Some(next_val(&mut toks, "-name")?),
                 "-type" => {
-                    let t = toks.next().ok_or_else(|| {
-                        fstool::Error::InvalidArgument("find: -type needs f or d".into())
-                    })?;
-                    type_filter = match t {
-                        "f" => Some('f'),
-                        "d" => Some('d'),
-                        other => {
+                    let t = next_val(&mut toks, "-type")?;
+                    let c = t.chars().next().filter(|_| t.len() == 1);
+                    match c {
+                        Some(c @ ('f' | 'd' | 'l' | 'b' | 'c' | 'p' | 's')) => {
+                            type_filter = Some(c)
+                        }
+                        _ => {
                             return Err(fstool::Error::InvalidArgument(format!(
-                                "find: -type {other:?} (use f or d)"
+                                "find: -type {t:?} (use one of f d l b c p s)"
                             )));
                         }
-                    };
+                    }
                 }
+                "-newer" => newer = Some(parse_timespec(&next_val(&mut toks, "-newer")?)?),
+                "-older" => older = Some(parse_timespec(&next_val(&mut toks, "-older")?)?),
+                "-sort" => {
+                    let k = next_val(&mut toks, "-sort")?;
+                    sort = Some(match k.as_str() {
+                        "mtime" | "time" => SortKey::Mtime,
+                        "size" => SortKey::Size,
+                        "name" => SortKey::Name,
+                        other => {
+                            return Err(fstool::Error::InvalidArgument(format!(
+                                "find: -sort {other:?} (use mtime, size, or name)"
+                            )));
+                        }
+                    });
+                }
+                "-limit" | "-n" => {
+                    let v = next_val(&mut toks, tok)?;
+                    limit = Some(v.parse().map_err(|_| {
+                        fstool::Error::InvalidArgument(format!("find: bad -limit {v:?}"))
+                    })?);
+                }
+                "-reverse" => reverse = true,
+                "-l" => long = true,
                 _ if tok.starts_with('-') => {
                     return Err(fstool::Error::InvalidArgument(format!(
                         "find: unknown option {tok:?}"
@@ -624,58 +667,131 @@ quit | exit         leave{ro_note}\n"
             }
         }
         let start = start.unwrap_or_else(|| self.cwd.clone());
+        // mtime is needed for time filters, mtime sorting, or long output.
+        let need_mtime =
+            newer.is_some() || older.is_some() || matches!(sort, Some(SortKey::Mtime)) || long;
 
-        let matches = |entry_name: &str, kind: fstool::fs::EntryKind| -> bool {
-            let type_ok = match type_filter {
-                Some('f') => matches!(kind, fstool::fs::EntryKind::Regular),
-                Some('d') => matches!(kind, fstool::fs::EntryKind::Dir),
-                _ => true,
-            };
+        let passes = |kind: fstool::fs::EntryKind, ename: &str, mtime: u32| -> bool {
+            let type_ok = type_filter
+                .map(|t| kind_type_letter(kind) == t)
+                .unwrap_or(true);
             let name_ok = name
                 .as_deref()
-                .map(|g| glob_match(g.as_bytes(), entry_name.as_bytes()))
+                .map(|g| glob_match(g.as_bytes(), ename.as_bytes()))
                 .unwrap_or(true);
-            type_ok && name_ok
+            let time_ok = newer.map(|t| u64::from(mtime) > t).unwrap_or(true)
+                && older.map(|t| u64::from(mtime) < t).unwrap_or(true);
+            type_ok && name_ok && time_ok
         };
-        let print = |path: &str, output: &mut dyn Write| -> Result<()> {
-            writeln!(
-                output,
-                "{}",
-                path_style::display_path(path, self.kind, self.style)
-            )?;
+
+        let mut hits: Vec<Hit> = Vec::new();
+        let streaming = sort.is_none();
+        let style = (self.kind, self.style);
+        let emit = |h: Hit, output: &mut dyn Write| -> Result<()> {
+            if long {
+                writeln!(
+                    output,
+                    "{}  {:>12}  {}",
+                    fmt_unix_utc(h.mtime),
+                    h.size,
+                    path_style::display_path(&h.path, style.0, style.1)
+                )?;
+            } else {
+                writeln!(
+                    output,
+                    "{}",
+                    path_style::display_path(&h.path, style.0, style.1)
+                )?;
+            }
             Ok(())
         };
+        let mut emitted = 0usize;
 
-        // Evaluate the start path itself, then recurse if it's a directory.
-        let start_kind = self.fs.getattr(dev, Path::new(&start))?.kind;
+        // The start path itself.
+        let sa = self.fs.getattr(dev, Path::new(&start))?;
         let start_name = start.rsplit('/').next().unwrap_or("");
-        if matches(start_name, start_kind) {
-            print(&start, output)?;
-        }
-        if !matches!(start_kind, fstool::fs::EntryKind::Dir) {
-            return Ok(());
+        if passes(sa.kind, start_name, sa.mtime) {
+            let h = Hit {
+                path: start.clone(),
+                size: sa.size,
+                mtime: sa.mtime,
+            };
+            if streaming {
+                emit(h, output)?;
+                emitted += 1;
+            } else {
+                hits.push(h);
+            }
         }
 
-        let mut stack = vec![start];
-        while let Some(dir) = stack.pop() {
-            if interrupted() {
-                break;
-            }
-            let entries = self.fs.list(dev, &dir)?;
-            for e in entries {
+        if matches!(sa.kind, fstool::fs::EntryKind::Dir) {
+            let mut stack = vec![start];
+            'walk: while let Some(dir) = stack.pop() {
                 if interrupted() {
                     break;
                 }
-                if e.name == "." || e.name == ".." {
-                    continue; // never recurse into the self/parent links
+                for e in self.fs.list(dev, &dir)? {
+                    if interrupted() {
+                        break 'walk;
+                    }
+                    if e.name == "." || e.name == ".." {
+                        continue;
+                    }
+                    let child = join(&dir, &e.name);
+                    if matches!(e.kind, fstool::fs::EntryKind::Dir) {
+                        stack.push(child.clone());
+                    }
+                    // Cheap filters first; only fetch mtime when actually needed.
+                    let cheap_ok = type_filter
+                        .map(|t| kind_type_letter(e.kind) == t)
+                        .unwrap_or(true)
+                        && name
+                            .as_deref()
+                            .map(|g| glob_match(g.as_bytes(), e.name.as_bytes()))
+                            .unwrap_or(true);
+                    if !cheap_ok {
+                        continue;
+                    }
+                    let mtime = if need_mtime {
+                        self.fs.getattr(dev, Path::new(&child))?.mtime
+                    } else {
+                        0
+                    };
+                    if !passes(e.kind, &e.name, mtime) {
+                        continue;
+                    }
+                    let h = Hit {
+                        path: child,
+                        size: e.size,
+                        mtime,
+                    };
+                    if streaming {
+                        emit(h, output)?;
+                        emitted += 1;
+                        if limit.is_some_and(|n| emitted >= n) {
+                            break 'walk;
+                        }
+                    } else {
+                        hits.push(h);
+                    }
                 }
-                let child = join(&dir, &e.name);
-                if matches(&e.name, e.kind) {
-                    print(&child, output)?;
-                }
-                if matches!(e.kind, fstool::fs::EntryKind::Dir) {
-                    stack.push(child);
-                }
+            }
+        }
+
+        if !streaming {
+            match sort.unwrap() {
+                SortKey::Mtime => hits.sort_by_key(|h| std::cmp::Reverse(h.mtime)), // newest first
+                SortKey::Size => hits.sort_by_key(|h| std::cmp::Reverse(h.size)),   // largest first
+                SortKey::Name => hits.sort_by(|a, b| a.path.cmp(&b.path)),          // A→Z
+            }
+            if reverse {
+                hits.reverse();
+            }
+            if let Some(n) = limit {
+                hits.truncate(n);
+            }
+            for h in hits {
+                emit(h, output)?;
             }
         }
         if interrupted() {
@@ -694,6 +810,7 @@ quit | exit         leave{ro_note}\n"
         output: &mut impl Write,
     ) -> Result<()> {
         let (mut ci, mut numbers, mut recurse) = (false, false, false);
+        let (mut invert, mut list, mut count) = (false, false, false);
         let mut pattern: Option<String> = None;
         let mut paths: Vec<String> = Vec::new();
         for tok in arg.split_whitespace() {
@@ -703,6 +820,9 @@ quit | exit         leave{ro_note}\n"
                         'i' => ci = true,
                         'n' => numbers = true,
                         'r' | 'R' => recurse = true,
+                        'v' => invert = true,
+                        'l' => list = true,
+                        'c' => count = true,
                         other => {
                             return Err(fstool::Error::InvalidArgument(format!(
                                 "grep: unknown flag -{other}"
@@ -754,7 +874,14 @@ quit | exit         leave{ro_note}\n"
                 _ => writeln!(output, "grep: {p}: not a regular file")?,
             }
         }
-        let show_name = files.len() > 1 || recurse;
+        let opts = GrepOpts {
+            ci,
+            numbers,
+            invert,
+            list,
+            count,
+            show_name: files.len() > 1 || recurse,
+        };
 
         const CAP: u64 = 256 * 1024 * 1024;
         for path in files {
@@ -772,9 +899,9 @@ quit | exit         leave{ro_note}\n"
             let mut data = Vec::with_capacity(size as usize);
             self.fs.copy_file_to(dev, &path, &mut data)?;
             if is_binary(&data) {
-                grep_binary(&path, &data, needle, ci, show_name, output)?;
+                grep_binary(&path, &data, needle, opts, output)?;
             } else {
-                grep_text(&path, &data, needle, ci, show_name, numbers, output)?;
+                grep_text(&path, &data, needle, opts, output)?;
             }
         }
         if interrupted() {
@@ -847,6 +974,96 @@ pub fn normalize_path(p: &str) -> String {
 
 // ---------- helpers for `find` / `grep` ----------
 
+/// A `find` result row: the resolved path plus the metadata needed for
+/// `-sort` and `-l` (long) output.
+struct Hit {
+    path: String,
+    size: u64,
+    mtime: u32,
+}
+
+/// `find -sort` key.
+#[derive(Clone, Copy)]
+enum SortKey {
+    Mtime,
+    Size,
+    Name,
+}
+
+/// The single-letter `find -type` code for an entry kind (`?` for unknown).
+fn kind_type_letter(kind: fstool::fs::EntryKind) -> char {
+    use fstool::fs::EntryKind::{Block, Char, Dir, Fifo, Regular, Socket, Symlink, Unknown};
+    match kind {
+        Regular => 'f',
+        Dir => 'd',
+        Symlink => 'l',
+        Char => 'c',
+        Block => 'b',
+        Fifo => 'p',
+        Socket => 's',
+        Unknown => '?',
+    }
+}
+
+/// Current wall-clock time as unix epoch seconds (`0` if the clock is before
+/// the epoch, which never happens in practice).
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Parse a `find -newer`/`-older` time spec into unix epoch seconds. Accepts a
+/// bare epoch integer, a relative `N{s,m,h,d,w}` ("that long ago", e.g. `7d`),
+/// or an ISO `YYYY-MM-DD` date at 00:00 UTC.
+fn parse_timespec(s: &str) -> Result<u64> {
+    let s = s.trim();
+    let bad = || fstool::Error::InvalidArgument(format!("find: bad time {s:?}"));
+    if s.is_empty() {
+        return Err(bad());
+    }
+    let b = s.as_bytes();
+    // ISO date: YYYY-MM-DD
+    if s.len() == 10 && b[4] == b'-' && b[7] == b'-' {
+        let y: i64 = s[0..4].parse().map_err(|_| bad())?;
+        let m: i64 = s[5..7].parse().map_err(|_| bad())?;
+        let d: i64 = s[8..10].parse().map_err(|_| bad())?;
+        if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+            return Err(bad());
+        }
+        let days = days_from_civil(y, m, d);
+        return u64::try_from(days * 86400).map_err(|_| bad());
+    }
+    // Relative: N followed by a unit suffix.
+    let last = *b.last().unwrap();
+    if matches!(last, b's' | b'm' | b'h' | b'd' | b'w') {
+        let n: u64 = s[..s.len() - 1].parse().map_err(|_| bad())?;
+        let unit = match last {
+            b's' => 1,
+            b'm' => 60,
+            b'h' => 3600,
+            b'd' => 86400,
+            b'w' => 604_800,
+            _ => unreachable!(),
+        };
+        return Ok(now_epoch().saturating_sub(n * unit));
+    }
+    // Bare epoch seconds.
+    s.parse::<u64>().map_err(|_| bad())
+}
+
+/// Days from the unix epoch (1970-01-01) to a civil date, using Howard
+/// Hinnant's `days_from_civil` algorithm. Valid for the Gregorian calendar.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// Match a basename `s` against a `*`/`?` glob `pat` (byte-wise, case-sensitive).
 fn glob_match(pat: &[u8], s: &[u8]) -> bool {
     let (mut p, mut si) = (0usize, 0usize);
@@ -904,26 +1121,69 @@ fn find_all(hay: &[u8], needle: &[u8], ci: bool) -> Vec<usize> {
     hits
 }
 
-/// Print matching lines of a text file (grep style).
+/// grep behaviour flags, threaded into the per-file printers.
+#[derive(Clone, Copy)]
+struct GrepOpts {
+    ci: bool,
+    numbers: bool,
+    invert: bool,
+    list: bool,
+    count: bool,
+    show_name: bool,
+}
+
+/// Print matching lines of a text file (grep style). Honours `-v` (invert),
+/// `-l` (name only), and `-c` (count); `-l` takes precedence over `-c`.
 fn grep_text(
     name: &str,
     data: &[u8],
     needle: &[u8],
-    ci: bool,
-    show_name: bool,
-    numbers: bool,
+    o: GrepOpts,
     out: &mut dyn Write,
 ) -> Result<()> {
-    for (i, line) in data.split(|&b| b == b'\n').enumerate() {
+    // Split into lines, dropping the empty segment a trailing newline produces
+    // (so a file of N newline-terminated lines counts as N, not N+1). An empty
+    // file has zero lines.
+    let lines: Vec<&[u8]> = if data.is_empty() {
+        Vec::new()
+    } else {
+        data.strip_suffix(b"\n")
+            .unwrap_or(data)
+            .split(|&b| b == b'\n')
+            .collect()
+    };
+    // -l / -c only need a verdict per line, not the text.
+    if o.list || o.count {
+        let mut n = 0usize;
+        for line in &lines {
+            if interrupted() {
+                break;
+            }
+            if find_all(line, needle, o.ci).is_empty() == o.invert {
+                n += 1;
+            }
+        }
+        if o.list {
+            if n > 0 {
+                writeln!(out, "{name}")?;
+            }
+        } else if o.show_name {
+            writeln!(out, "{name}:{n}")?;
+        } else {
+            writeln!(out, "{n}")?;
+        }
+        return Ok(());
+    }
+    for (i, line) in lines.iter().enumerate() {
         if interrupted() {
             break;
         }
-        if find_all(line, needle, ci).is_empty() {
+        if find_all(line, needle, o.ci).is_empty() != o.invert {
             continue;
         }
         let text = String::from_utf8_lossy(line);
         let text = text.strip_suffix('\r').unwrap_or(&text);
-        match (show_name, numbers) {
+        match (o.show_name, o.numbers) {
             (true, true) => writeln!(out, "{name}:{}:{text}", i + 1)?,
             (true, false) => writeln!(out, "{name}:{text}")?,
             (false, true) => writeln!(out, "{}:{text}", i + 1)?,
@@ -934,20 +1194,33 @@ fn grep_text(
 }
 
 /// Print the rows of a binary file that contain a match, as `hexdump -C`
-/// output. Non-contiguous match clusters are separated by a `*` line.
+/// output. Non-contiguous match clusters are separated by a `*` line. `-l`
+/// prints just the name and `-c` the match count; `-v`/`-n` don't apply to
+/// binary output and are ignored.
 fn grep_binary(
     name: &str,
     data: &[u8],
     needle: &[u8],
-    ci: bool,
-    show_name: bool,
+    o: GrepOpts,
     out: &mut dyn Write,
 ) -> Result<()> {
-    let hits = find_all(data, needle, ci);
+    let hits = find_all(data, needle, o.ci);
     if hits.is_empty() {
         return Ok(());
     }
-    if show_name {
+    if o.list {
+        writeln!(out, "{name}")?;
+        return Ok(());
+    }
+    if o.count {
+        if o.show_name {
+            writeln!(out, "{name}:{}", hits.len())?;
+        } else {
+            writeln!(out, "{}", hits.len())?;
+        }
+        return Ok(());
+    }
+    if o.show_name {
         writeln!(
             out,
             "{name}: binary file, {} match(es) shown as hexdump -C:",
@@ -1148,19 +1421,53 @@ mod tests {
         assert!(is_binary(&[0xc3, 0x28])); // invalid utf-8 (no nul)
     }
 
+    fn gopts(ci: bool, numbers: bool, show_name: bool) -> GrepOpts {
+        GrepOpts {
+            ci,
+            numbers,
+            show_name,
+            invert: false,
+            list: false,
+            count: false,
+        }
+    }
+
     #[test]
     fn grep_text_formats() {
         let data = b"hello world\nsecond\nHELLO again\n";
         let mut out = Vec::new();
-        grep_text("f", data, b"hello", false, true, true, &mut out).unwrap();
+        grep_text("f", data, b"hello", gopts(false, true, true), &mut out).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "f:1:hello world\n");
         // case-insensitive catches both lines
         let mut out = Vec::new();
-        grep_text("f", data, b"hello", true, false, false, &mut out).unwrap();
+        grep_text("f", data, b"hello", gopts(true, false, false), &mut out).unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "hello world\nHELLO again\n"
         );
+    }
+
+    #[test]
+    fn grep_text_invert_count_list() {
+        let data = b"hello world\nsecond\nHELLO again\n";
+        // -v: lines NOT containing "hello" (case-sensitive) — "second" + "HELLO again".
+        let mut out = Vec::new();
+        let mut o = gopts(false, false, false);
+        o.invert = true;
+        grep_text("f", data, b"hello", o, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "second\nHELLO again\n");
+        // -c with a name prefix counts matching lines.
+        let mut out = Vec::new();
+        let mut o = gopts(true, false, true);
+        o.count = true;
+        grep_text("f", data, b"hello", o, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "f:2\n");
+        // -l prints the name once when there's a match.
+        let mut out = Vec::new();
+        let mut o = gopts(false, false, true);
+        o.list = true;
+        grep_text("f", data, b"hello", o, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "f\n");
     }
 
     #[test]
@@ -1169,11 +1476,17 @@ mod tests {
         let mut data = vec![0u8; 16];
         data.extend_from_slice(b"xx NEEDLE xx\x00\x00\x00\x00");
         let mut out = Vec::new();
-        grep_binary("b", &data, b"NEEDLE", false, true, &mut out).unwrap();
+        grep_binary("b", &data, b"NEEDLE", gopts(false, false, true), &mut out).unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("binary file"));
         assert!(s.contains("00000010 "), "row offset missing:\n{s}");
         assert!(s.contains("|xx NEEDLE xx"), "ascii pane missing:\n{s}");
+        // -l on a binary match prints just the name.
+        let mut out = Vec::new();
+        let mut o = gopts(false, false, true);
+        o.list = true;
+        grep_binary("b", &data, b"NEEDLE", o, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "b\n");
     }
 
     #[test]
@@ -1240,6 +1553,46 @@ mod tests {
         assert_eq!(super::fmt_unix_utc(1_000_000_000), "2001-09-09T01:46:40Z");
         // 2023-11-14T22:13:20Z — the 1.7e9 mark.
         assert_eq!(super::fmt_unix_utc(1_700_000_000), "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn parse_timespec_forms() {
+        // Bare epoch.
+        assert_eq!(super::parse_timespec("1700000000").unwrap(), 1_700_000_000);
+        // ISO date at 00:00 UTC (verified against fmt_unix_utc).
+        let t = super::parse_timespec("2023-11-14").unwrap();
+        assert_eq!(super::fmt_unix_utc(t as u32), "2023-11-14T00:00:00Z");
+        // Relative ages are "now minus N units" — check the deltas, not the clock.
+        let now = super::now_epoch();
+        let d7 = super::parse_timespec("7d").unwrap();
+        assert!((now - d7).abs_diff(7 * 86400) <= 1);
+        let h12 = super::parse_timespec("12h").unwrap();
+        assert!((now - h12).abs_diff(12 * 3600) <= 1);
+        // Garbage is rejected.
+        assert!(super::parse_timespec("").is_err());
+        assert!(super::parse_timespec("nope").is_err());
+        assert!(super::parse_timespec("2023-13-01").is_err());
+    }
+
+    #[test]
+    fn days_from_civil_anchors() {
+        assert_eq!(super::days_from_civil(1970, 1, 1), 0);
+        assert_eq!(super::days_from_civil(1970, 1, 2), 1);
+        assert_eq!(super::days_from_civil(1969, 12, 31), -1);
+        // 2000-03-01 is 11017 days after the epoch.
+        assert_eq!(super::days_from_civil(2000, 3, 1), 11017);
+    }
+
+    #[test]
+    fn kind_type_letters() {
+        use fstool::fs::EntryKind::{Block, Char, Dir, Fifo, Regular, Socket, Symlink};
+        assert_eq!(super::kind_type_letter(Regular), 'f');
+        assert_eq!(super::kind_type_letter(Dir), 'd');
+        assert_eq!(super::kind_type_letter(Symlink), 'l');
+        assert_eq!(super::kind_type_letter(Block), 'b');
+        assert_eq!(super::kind_type_letter(Char), 'c');
+        assert_eq!(super::kind_type_letter(Fifo), 'p');
+        assert_eq!(super::kind_type_letter(Socket), 's');
     }
 
     #[test]

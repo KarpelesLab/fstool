@@ -10,16 +10,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - *(shell)* two new interactive commands. **`find [PATH] [-name GLOB] [-type
-  f|d]`** recursively lists paths under PATH (default cwd), optionally filtered
-  by a `*`/`?` basename glob and/or entry type. **`grep [-i] [-n] [-r] PATTERN
-  [PATH...]`** searches files for the literal PATTERN: text files print matching
-  lines (with `-n` line numbers and a filename prefix when searching multiple
-  files), while binary files (NUL byte or non-UTF-8) print the rows containing
-  matches as `hexdump -C` output, with `*` between non-contiguous clusters.
-  Both skip `.`/`..` during recursion. **Ctrl-C** cancels a running `find` /
-  `grep` (a SIGINT handler sets a flag the commands poll) without killing the
-  shell — it aborts the command, prints `^C`, and returns to the prompt
-  (unix; no-op elsewhere, where Ctrl-C keeps its default behaviour).
+  f|d|l|b|c|p|s] [-newer T] [-older T] [-sort mtime|size|name] [-limit N]
+  [-reverse] [-l]`** recursively lists paths under PATH (default cwd), filtered
+  by a `*`/`?` basename glob, entry type (now the full set of POSIX kinds),
+  and/or mtime. `T` accepts a unix epoch, a relative age (`7d`, `12h`, `30m`),
+  or an ISO `YYYY-MM-DD` date. `-sort` with `-limit` yields, e.g., the 200 most
+  recently modified files (`find / -type f -sort mtime -limit 200`); `-reverse`
+  flips the order and `-l` adds `mtime`/`size` columns. Without `-sort`, results
+  stream in walk order; with it they are collected, sorted, then truncated.
+  **`grep [-i] [-n] [-r] [-v] [-l] [-c] PATTERN [PATH...]`** searches files for
+  the literal PATTERN: text files print matching lines (with `-n` line numbers
+  and a filename prefix when searching multiple files), while binary files (NUL
+  byte or non-UTF-8) print the rows containing matches as `hexdump -C` output,
+  with `*` between non-contiguous clusters. `-v` inverts the match, `-l` lists
+  only the names of files that match, and `-c` prints a per-file match count.
+  Both commands skip `.`/`..` during recursion. **Ctrl-C** cancels a running
+  `find` / `grep` (a SIGINT handler sets a flag the commands poll) without
+  killing the shell — it aborts the command, prints `^C`, and returns to the
+  prompt (unix; no-op elsewhere, where Ctrl-C keeps its default behaviour).
 
 ### Changed
 
