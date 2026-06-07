@@ -7,24 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.12](https://github.com/KarpelesLab/fstool/compare/v0.4.11...v0.4.12) - 2026-06-07
-
-### Added
-
-- *(shell)* richer find (time/sort/limit/types) and grep (-v/-l/-c)
-- *(shell)* Ctrl-C cancels a running find/grep without killing the shell
-- *(shell)* add `find` and `grep` (binary matches as hexdump -C)
-- *(affs)* true incremental in-place editing of OFS/FFS images
-
-### Fixed
-
-- *(affs)* reword editor doc comment to avoid clippy doc_lazy_continuation
-
-### Other
-
-- *(apfs)* make README status accurate (read snapshots/xattrs, write via macOS-mount, honest gaps)
-- *(qcow2)* clean errors instead of panics in the compressed writer
-
 ### Added
 
 - *(cli)* new **`fstool dd <SRC> <DST>`** command — a resilient, container-
@@ -42,39 +24,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   block-device / pre-existing destinations require `--force` and are written
   faithfully. **Ctrl-C** cancels cleanly and the final summary reports how far
   the copy got and what was skipped.
-- *(shell)* two new interactive commands. **`find [PATH] [-name GLOB] [-type
-  f|d|l|b|c|p|s] [-newer T] [-older T] [-sort mtime|size|name] [-limit N]
-  [-reverse] [-l]`** recursively lists paths under PATH (default cwd), filtered
-  by a `*`/`?` basename glob, entry type (now the full set of POSIX kinds),
-  and/or mtime. `T` accepts a unix epoch, a relative age (`7d`, `12h`, `30m`),
-  or an ISO `YYYY-MM-DD` date. `-sort` with `-limit` yields, e.g., the 200 most
-  recently modified files (`find / -type f -sort mtime -limit 200`); `-reverse`
-  flips the order and `-l` adds `mtime`/`size` columns. Without `-sort`, results
-  stream in walk order; with it they are collected, sorted, then truncated.
-  **`grep [-i] [-n] [-r] [-v] [-l] [-c] PATTERN [PATH...]`** searches files for
-  the literal PATTERN: text files print matching lines (with `-n` line numbers
-  and a filename prefix when searching multiple files), while binary files (NUL
-  byte or non-UTF-8) print the rows containing matches as `hexdump -C` output,
-  with `*` between non-contiguous clusters. `-v` inverts the match, `-l` lists
-  only the names of files that match, and `-c` prints a per-file match count.
-  Both commands skip `.`/`..` during recursion. **Ctrl-C** cancels a running
-  `find` / `grep` (a SIGINT handler sets a flag the commands poll) without
-  killing the shell — it aborts the command, prints `^C`, and returns to the
-  prompt (unix; no-op elsewhere, where Ctrl-C keeps its default behaviour).
 
-### Changed
+## [0.4.12](https://github.com/KarpelesLab/fstool/compare/v0.4.11...v0.4.12) - 2026-06-07
 
-- *(affs)* AFFS in-place editing is now **truly incremental** on disk. An
-  `add` / `mkdir` / `rm` on an existing `.adf` touches only the affected blocks
-  — the volume bitmap, the parent directory's hash chain (head-insert / splice),
-  and the new/removed file's header + data + extension blocks — instead of
-  loading the whole tree into RAM and re-serialising the entire image on flush.
-  Untouched files keep their exact on-disk blocks, RAM use is bounded by the
-  bitmap (not file contents), and edits are O(change). New
-  `src/fs/affs/editor.rs`; `Affs::open_writable` now attaches this editor while
-  `format` keeps the rebuild serialiser. Verified by a test asserting an
-  unrelated file's blocks are byte-identical before/after an edit, plus the
-  existing conformance + round-trip suites (OFS and FFS).
+### Added
+
+- *(shell)* richer find (time/sort/limit/types) and grep (-v/-l/-c)
+- *(shell)* Ctrl-C cancels a running find/grep without killing the shell
+- *(shell)* add `find` and `grep` (binary matches as hexdump -C)
+- *(affs)* true incremental in-place editing of OFS/FFS images
+
+### Fixed
+
+- *(affs)* reword editor doc comment to avoid clippy doc_lazy_continuation
+
+### Other
+
+- *(apfs)* make README status accurate (read snapshots/xattrs, write via macOS-mount, honest gaps)
+- *(qcow2)* clean errors instead of panics in the compressed writer
 
 ## [0.4.11](https://github.com/KarpelesLab/fstool/compare/v0.4.10...v0.4.11) - 2026-06-03
 
