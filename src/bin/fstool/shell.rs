@@ -12,6 +12,9 @@
 //!   cat PATH            print a file's contents to stdout
 //!   put HOST [DEST]     copy a host file/dir into the image
 //!                       (DEST defaults to the basename of HOST in cwd)
+//!   get SRC [DEST]      copy a file/dir out of the image to the host
+//!                       (inverse of put; DEST defaults to SRC's basename in
+//!                       the host cwd; works in --ro mode)
 //!   rm PATH             remove a file or empty directory
 //!   mkdir PATH          create an empty directory
 //!   info [PATH]         no arg → image summary; with PATH → per-file
@@ -396,6 +399,10 @@ impl Shell {
                 self.cmd_put(dev, rest, output)?;
                 Ok(false)
             }
+            "get" => {
+                self.cmd_get(dev, rest, output)?;
+                Ok(false)
+            }
             "rm" => {
                 self.require_writable("rm")?;
                 self.cmd_rm(dev, rest, output)?;
@@ -456,6 +463,9 @@ pwd                 print the current directory
 cd [PATH]           change directory (no arg → /)
 cat PATH            print a file's contents to stdout
 put HOST [DEST]     copy a host file or directory into the image
+get SRC [DEST]      copy a file or directory out of the image to the host
+                    (inverse of put; DEST defaults to SRC's basename in the
+                    host cwd, or names a target/existing dir; works read-only)
 rm PATH             remove a file or empty directory
 mkdir PATH          create an empty directory
 info [PATH]         no arg → image summary; with PATH → file metadata
@@ -578,6 +588,134 @@ quit | exit         leave{ro_note}\n{cache_note}"
         self.invalidate_cache();
         writeln!(output, "put {} → {dest}", host.display())?;
         Ok(())
+    }
+
+    /// `get SRC [DEST]` — copy a file (or directory tree) **out** of the image
+    /// to the host. The inverse of `put`; read-only, so it works in `--ro` mode
+    /// too. `SRC` is a path inside the image; `DEST` is a host path. When `DEST`
+    /// is omitted the file lands under `SRC`'s basename in the host's current
+    /// directory; when `DEST` names an existing host directory the basename is
+    /// appended. A directory `SRC` is copied recursively (regular files and,
+    /// on unix, symlinks; other special files are skipped with a note).
+    fn cmd_get(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        arg: &str,
+        output: &mut impl Write,
+    ) -> Result<()> {
+        let mut parts = arg.splitn(2, char::is_whitespace);
+        let src_arg = parts.next().unwrap_or("").trim();
+        let dest_arg = parts.next().unwrap_or("").trim();
+        if src_arg.is_empty() {
+            return Err(fstool::Error::InvalidArgument(
+                "get: SRC (a path inside the image) is required".into(),
+            ));
+        }
+        let src = self.resolve(src_arg);
+        let attrs = self.getattr(dev, &src)?;
+        let leaf = src
+            .rsplit('/')
+            .find(|s| !s.is_empty())
+            .unwrap_or("image_root");
+
+        // Resolve the host destination: an existing directory receives the
+        // basename; otherwise DEST is the literal target path; empty DEST
+        // means the basename in the host's current directory.
+        let dest: std::path::PathBuf = if dest_arg.is_empty() {
+            std::path::PathBuf::from(leaf)
+        } else {
+            let d = std::path::PathBuf::from(dest_arg);
+            if d.is_dir() { d.join(leaf) } else { d }
+        };
+
+        let src_disp = path_style::display_path(&src, self.kind, self.style);
+        match attrs.kind {
+            fstool::fs::EntryKind::Regular => {
+                self.get_file(dev, &src, &dest)?;
+                writeln!(output, "get {src_disp} → {}", dest.display())?;
+            }
+            fstool::fs::EntryKind::Dir => {
+                let n = self.get_dir(dev, &src, &dest, output)?;
+                writeln!(output, "get {src_disp} → {} ({n} files)", dest.display())?;
+            }
+            fstool::fs::EntryKind::Symlink => {
+                let target = self.fs.read_symlink(dev, &src)?;
+                write_host_symlink(&target, &dest)?;
+                writeln!(output, "get {src_disp} → {} (symlink)", dest.display())?;
+            }
+            other => {
+                return Err(fstool::Error::InvalidArgument(format!(
+                    "get: {src_disp} is a {other:?}; only regular files, directories, \
+                     and symlinks can be extracted"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy one regular file out of the image to host path `dest`, creating
+    /// parent directories as needed.
+    fn get_file(&mut self, dev: &mut dyn BlockDevice, src: &str, dest: &Path) -> Result<()> {
+        if let Some(parent) = dest.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut f = std::fs::File::create(dest)?;
+        self.fs.copy_file_to(dev, src, &mut f)?;
+        Ok(())
+    }
+
+    /// Recursively copy directory `src` (an image path) to host directory
+    /// `dest`. Returns the number of regular files written. Cancellable with
+    /// Ctrl-C (leaves whatever was copied so far in place).
+    fn get_dir(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        src: &str,
+        dest: &Path,
+        output: &mut impl Write,
+    ) -> Result<u64> {
+        std::fs::create_dir_all(dest)?;
+        let mut files = 0u64;
+        let mut stack = vec![(src.to_string(), dest.to_path_buf())];
+        'walk: while let Some((idir, hdir)) = stack.pop() {
+            if interrupted() {
+                break;
+            }
+            for e in self.list(dev, &idir)? {
+                if interrupted() {
+                    break 'walk;
+                }
+                if e.name == "." || e.name == ".." {
+                    continue;
+                }
+                let ichild = join(&idir, &e.name);
+                let hchild = hdir.join(&e.name);
+                match e.kind {
+                    fstool::fs::EntryKind::Dir => {
+                        std::fs::create_dir_all(&hchild)?;
+                        stack.push((ichild, hchild));
+                    }
+                    fstool::fs::EntryKind::Regular => {
+                        let mut f = std::fs::File::create(&hchild)?;
+                        self.fs.copy_file_to(dev, &ichild, &mut f)?;
+                        files += 1;
+                    }
+                    fstool::fs::EntryKind::Symlink => {
+                        let target = self.fs.read_symlink(dev, &ichild)?;
+                        write_host_symlink(&target, &hchild)?;
+                    }
+                    other => {
+                        writeln!(output, "get: skipping {} ({other:?})", hchild.display())?;
+                    }
+                }
+            }
+        }
+        if interrupted() {
+            writeln!(output, "^C")?;
+        }
+        Ok(files)
     }
 
     fn cmd_rm(
@@ -1068,6 +1206,33 @@ fn split_cmd(line: &str) -> (&str, &str) {
     match line.find(char::is_whitespace) {
         Some(i) => (&line[..i], line[i..].trim()),
         None => (line, ""),
+    }
+}
+
+/// Create a host symlink at `dest` pointing at `target`. Removes any existing
+/// file at `dest` first (symlink creation fails if the path exists). On
+/// non-unix platforms symlinks aren't created — returns `Unsupported`.
+fn write_host_symlink(target: &str, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        if dest.symlink_metadata().is_ok() {
+            std::fs::remove_file(dest)?;
+        }
+        std::os::unix::fs::symlink(target, dest)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = target;
+        Err(fstool::Error::Unsupported(format!(
+            "get: cannot create symlink {} on this platform",
+            dest.display()
+        )))
     }
 }
 
@@ -1742,6 +1907,76 @@ mod tests {
         sh.cmd_mkdir(&mut dev, "/a", &mut sink).unwrap();
         sh.cmd_mkdir(&mut dev, "/a/b", &mut sink).unwrap();
         (dev, sh)
+    }
+
+    #[test]
+    fn get_roundtrips_file_dir_and_dest_modes() {
+        let (mut dev, mut sh) = ext_shell();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sink = Vec::new();
+
+        // Stage a file on the host, put it into the image, then get it back.
+        let host_src = tmp.path().join("hello.txt");
+        std::fs::write(&host_src, b"image contents\n").unwrap();
+        sh.cmd_put(
+            &mut dev,
+            &format!("{} /hello.txt", host_src.display()),
+            &mut sink,
+        )
+        .unwrap();
+
+        // get with an explicit target path.
+        let out = tmp.path().join("out.txt");
+        sh.cmd_get(
+            &mut dev,
+            &format!("/hello.txt {}", out.display()),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"image contents\n");
+
+        // get into an existing directory appends the basename.
+        let into = tmp.path().join("into");
+        std::fs::create_dir(&into).unwrap();
+        sh.cmd_get(
+            &mut dev,
+            &format!("/hello.txt {}", into.display()),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(into.join("hello.txt")).unwrap(),
+            b"image contents\n"
+        );
+
+        // Recursive get of a directory: put a file under /a, then pull /a out.
+        sh.cmd_put(
+            &mut dev,
+            &format!("{} /a/f.txt", host_src.display()),
+            &mut sink,
+        )
+        .unwrap();
+        let adst = tmp.path().join("a_copy");
+        sh.cmd_get(&mut dev, &format!("/a {}", adst.display()), &mut sink)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(adst.join("f.txt")).unwrap(),
+            b"image contents\n"
+        );
+        // The nested empty dir /a/b is recreated too.
+        assert!(adst.join("b").is_dir());
+    }
+
+    #[test]
+    fn get_missing_source_errors() {
+        let (mut dev, mut sh) = ext_shell();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sink = Vec::new();
+        let out = tmp.path().join("x");
+        assert!(
+            sh.cmd_get(&mut dev, &format!("/nope.txt {}", out.display()), &mut sink)
+                .is_err()
+        );
     }
 
     #[test]

@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(shell)* new **`get SRC [DEST]`** command — copy a file or directory out of
+  the image to the host, the inverse of `put`. `SRC` is a path inside the
+  image; `DEST` is a host path (an existing directory receives `SRC`'s
+  basename; omitting `DEST` writes the basename into the host's current
+  directory). A directory `SRC` is copied recursively (regular files and, on
+  unix, symlinks; other special files are skipped with a note). It only reads
+  the image, so it works in `--ro` mode, and a long recursive `get` is
+  cancellable with Ctrl-C.
 - *(shell)* new **`fstool shell --with-cache`** flag — an opt-in in-memory
   metadata cache. Before the first prompt it walks the whole tree and preloads
   every directory listing and inode attribute into RAM, so metadata operations
