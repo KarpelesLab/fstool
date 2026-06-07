@@ -16,7 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lines (with `-n` line numbers and a filename prefix when searching multiple
   files), while binary files (NUL byte or non-UTF-8) print the rows containing
   matches as `hexdump -C` output, with `*` between non-contiguous clusters.
-  Both skip `.`/`..` during recursion.
+  Both skip `.`/`..` during recursion. **Ctrl-C** cancels a running `find` /
+  `grep` (a SIGINT handler sets a flag the commands poll) without killing the
+  shell — it aborts the command, prints `^C`, and returns to the prompt
+  (unix; no-op elsewhere, where Ctrl-C keeps its default behaviour).
 
 ### Changed
 

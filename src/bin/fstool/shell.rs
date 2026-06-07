@@ -38,10 +38,52 @@
 use std::io::{BufRead, Write};
 use std::path::Path;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use fstool::Result;
 use fstool::block::BlockDevice;
 use fstool::inspect::{AnyFs, FsKind};
 use fstool::path_style::{self, PathStyle};
+
+/// Raised by the SIGINT handler. Long-running commands (`find` / `grep`) poll
+/// it and stop cleanly, so Ctrl-C cancels the command without killing the
+/// shell. Reset before each command runs.
+static INTERRUPT: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn handle_sigint(_sig: libc::c_int) {
+    INTERRUPT.store(true, Ordering::SeqCst);
+}
+
+/// Install the SIGINT → flag handler exactly once. At the readline prompt
+/// rustyline reads Ctrl-C as a keystroke (raw mode, no signal), so this only
+/// fires while a command is executing. On non-unix it's a no-op — Ctrl-C keeps
+/// its default behaviour there.
+fn install_interrupt_handler() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        #[cfg(unix)]
+        // SAFETY: the handler only performs an atomic store, which is
+        // async-signal-safe.
+        unsafe {
+            libc::signal(
+                libc::SIGINT,
+                handle_sigint as *const () as libc::sighandler_t,
+            );
+        }
+    });
+}
+
+/// True if a Ctrl-C arrived since the last [`clear_interrupt`].
+fn interrupted() -> bool {
+    INTERRUPT.load(Ordering::Relaxed)
+}
+
+/// Clear the interrupt flag (called before each command runs).
+fn clear_interrupt() {
+    INTERRUPT.store(false, Ordering::SeqCst);
+}
 
 /// An interactive shell over an opened image.
 pub struct Shell {
@@ -103,6 +145,7 @@ impl Shell {
         mut input: impl BufRead,
         mut output: impl Write,
     ) -> Result<()> {
+        install_interrupt_handler();
         loop {
             write!(
                 output,
@@ -120,6 +163,7 @@ impl Shell {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
+            clear_interrupt();
             match self.dispatch(dev, line, &mut output) {
                 Ok(true) => break,
                 Ok(false) => {}
@@ -140,6 +184,8 @@ impl Shell {
     #[cfg(feature = "readline")]
     pub fn run_interactive(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         use rustyline::error::ReadlineError;
+
+        install_interrupt_handler();
 
         let mut rl = rustyline::DefaultEditor::new()
             .map_err(|e| fstool::Error::Io(std::io::Error::other(e.to_string())))?;
@@ -162,6 +208,7 @@ impl Shell {
                         continue;
                     }
                     let _ = rl.add_history_entry(trimmed);
+                    clear_interrupt();
                     match self.dispatch(dev, trimmed, &mut output) {
                         Ok(true) => break,
                         Ok(false) => {}
@@ -290,6 +337,7 @@ grep [-i] [-n] [-r] PATTERN [PATH...]
                     search files for the literal PATTERN (default PATH: cwd
                     with -r). -i case-insensitive, -n line numbers, -r recurse.
                     Binary files print their matches as `hexdump -C` rows
+                    (Ctrl-C cancels a running find/grep without leaving the shell)
 help | ?            print this help
 quit | exit         leave{ro_note}\n"
         );
@@ -610,8 +658,14 @@ quit | exit         leave{ro_note}\n"
 
         let mut stack = vec![start];
         while let Some(dir) = stack.pop() {
+            if interrupted() {
+                break;
+            }
             let entries = self.fs.list(dev, &dir)?;
             for e in entries {
+                if interrupted() {
+                    break;
+                }
                 if e.name == "." || e.name == ".." {
                     continue; // never recurse into the self/parent links
                 }
@@ -623,6 +677,9 @@ quit | exit         leave{ro_note}\n"
                     stack.push(child);
                 }
             }
+        }
+        if interrupted() {
+            writeln!(output, "^C")?;
         }
         Ok(())
     }
@@ -677,6 +734,9 @@ quit | exit         leave{ro_note}\n"
                     }
                     let mut stack = vec![p];
                     while let Some(dir) = stack.pop() {
+                        if interrupted() {
+                            break;
+                        }
                         for e in self.fs.list(dev, &dir)? {
                             if e.name == "." || e.name == ".." {
                                 continue;
@@ -698,6 +758,9 @@ quit | exit         leave{ro_note}\n"
 
         const CAP: u64 = 256 * 1024 * 1024;
         for path in files {
+            if interrupted() {
+                break;
+            }
             let size = self.fs.getattr(dev, Path::new(&path))?.size;
             if size > CAP {
                 writeln!(
@@ -713,6 +776,9 @@ quit | exit         leave{ro_note}\n"
             } else {
                 grep_text(&path, &data, needle, ci, show_name, numbers, output)?;
             }
+        }
+        if interrupted() {
+            writeln!(output, "^C")?;
         }
         Ok(())
     }
@@ -849,6 +915,9 @@ fn grep_text(
     out: &mut dyn Write,
 ) -> Result<()> {
     for (i, line) in data.split(|&b| b == b'\n').enumerate() {
+        if interrupted() {
+            break;
+        }
         if find_all(line, needle, ci).is_empty() {
             continue;
         }
@@ -895,6 +964,9 @@ fn grep_binary(
     }
     let mut prev: Option<usize> = None;
     for &row in &rows {
+        if interrupted() {
+            break;
+        }
         if let Some(p) = prev
             && row != p + 1
         {
