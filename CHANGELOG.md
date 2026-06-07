@@ -36,6 +36,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   faithfully. **Ctrl-C** cancels cleanly and the final summary reports how far
   the copy got and what was skipped.
 
+### Fixed
+
+- *(info)* drop the stale "read support is scaffold-only" note that `fstool
+  info` printed for NTFS, F2FS, and SquashFS — all three have had full read
+  support for some time (the note dated from when they were detection-only).
+  NTFS now prints no caveat; F2FS notes its build-once write model and SquashFS
+  its repack-only write. Also corrected the matching stale doc comments on the
+  `FsKind` / `AnyFs` variants in `src/inspect.rs`.
+
 ## [0.4.12](https://github.com/KarpelesLab/fstool/compare/v0.4.11...v0.4.12) - 2026-06-07
 
 ### Added

@@ -3410,7 +3410,6 @@ fn print_ntfs_info(ntfs: &fstool::fs::ntfs::Ntfs) {
     println!("sectors / cluster: {}", ntfs.sectors_per_cluster());
     println!("MFT record size:   {}", ntfs.mft_record_size());
     println!("volume serial:     {:#018x}", ntfs.volume_serial());
-    println!("note:              read support is scaffold-only");
 }
 
 fn print_f2fs_info(f2: &fstool::fs::f2fs::F2fs) {
@@ -3420,7 +3419,7 @@ fn print_f2fs_info(f2: &fstool::fs::f2fs::F2fs) {
     println!("version:           {}.{}", sb.major_ver, sb.minor_ver);
     println!("block count:       {}", sb.block_count);
     println!("volume name:       {:?}", f2.volume_name());
-    println!("note:              read support is scaffold-only");
+    println!("note:              write is build-once (a re-opened image is read-only)");
 }
 
 fn print_squashfs_info(sq: &fstool::fs::squashfs::Squashfs) {
@@ -3430,7 +3429,7 @@ fn print_squashfs_info(sq: &fstool::fs::squashfs::Squashfs) {
     println!("compression:       {:?}", sq.compression());
     println!("version:           {}.{}", sb.major, sb.minor);
     println!("inode count:       {}", sb.inode_count);
-    println!("note:              read support is scaffold-only");
+    println!("note:              write via `repack` only (no in-place mutation)");
 }
 
 fn print_iso9660_info(iso: &fstool::fs::iso9660::Iso9660) {

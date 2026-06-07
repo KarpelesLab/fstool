@@ -64,11 +64,12 @@ pub enum FsKind {
     Affs,
     /// APFS — read-only, single-leaf-tree case only.
     Apfs,
-    /// NTFS — scaffold; detection only, all ops return `Unsupported`.
+    /// NTFS — read + write (MFT, attributes, `$DATA` + ADS, indexes,
+    /// `$Secure`, `$LogFile`).
     Ntfs,
-    /// F2FS — scaffold; detection only.
+    /// F2FS — read + write (build-once: a re-opened image is read-only).
     F2fs,
-    /// SquashFS — scaffold; detection only.
+    /// SquashFS — read + write via `repack` (compressed, repack-only).
     Squashfs,
     /// ISO 9660 (optical media). Read-only on this trait surface;
     /// writing happens through `repack` to a fresh image.
@@ -281,11 +282,11 @@ pub enum AnyFs {
     Affs(Box<Affs>),
     /// APFS — read-only; single-leaf trees only.
     Apfs(Box<Apfs>),
-    /// NTFS — scaffold; only `info` returns useful data, list/read error.
+    /// NTFS — read + write (MFT, attributes, `$DATA` + ADS, indexes).
     Ntfs(Box<Ntfs>),
-    /// F2FS — scaffold; only `info` returns useful data, list/read error.
+    /// F2FS — read + write (build-once: a re-opened image is read-only).
     F2fs(Box<F2fs>),
-    /// SquashFS — scaffold; only `info` returns useful data, list/read error.
+    /// SquashFS — read + write via `repack` (compressed, repack-only).
     Squashfs(Box<Squashfs>),
     /// ISO 9660 — read-only (PVD + Joliet + Rock Ridge + El Torito).
     Iso9660(Box<crate::fs::iso9660::Iso9660>),
