@@ -1196,9 +1196,6 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
     }
     let total_blocks = total_blocks_u64 as u32;
 
-    // Zero the entire formatted region so unused bytes read as zero.
-    dev.zero_range(0, u64::from(total_blocks) * u64::from(bs))?;
-
     // ---- layout: place special files starting at block 1.
     let mut cursor: u32 = 1;
 
@@ -1296,6 +1293,19 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
     if bitmap[by] & mask == 0 {
         bitmap[by] |= mask;
     }
+
+    // Zero only the metadata regions, not the whole device. The special
+    // files (bitmap, B-trees, journal) occupy blocks `[0, cursor)` at the
+    // start and the alternate volume header lives in the volume's last
+    // 1 KiB. Every other block is marked free in the bitmap and is never
+    // read back, so its prior contents are irrelevant to a valid empty
+    // volume — leaving it untouched keeps `format` O(metadata) instead of
+    // O(device), so formatting a large block device is near-instant rather
+    // than writing zeros across its entire capacity. `flush` then writes
+    // the real structures into these cleared regions.
+    dev.zero_range(0, u64::from(cursor) * u64::from(bs))?;
+    let tail_start = (u64::from(last_block) * u64::from(bs)).min(total_size - 1024);
+    dev.zero_range(tail_start, total_size - tail_start)?;
 
     let mut free_blocks = total_blocks - cursor;
     if total_blocks > 0 {

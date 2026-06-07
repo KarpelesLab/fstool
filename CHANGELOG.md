@@ -38,6 +38,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(hfs+, fat32)* **near-instant `create` on large block devices.** Both
+  formatters zeroed the *entire* volume up front (`zero_range(0, whole device)`),
+  so `fstool create --type hfsplus --output /dev/sdX` on a multi-hundred-GB
+  device wrote hundreds of GB of zeros — minutes of I/O. They now zero only the
+  metadata regions (HFS+: the special-file blocks at the start + the alternate
+  volume header; FAT32: the reserved sectors + both FATs + the root cluster).
+  Data/free blocks are marked free in the bitmap / FAT and never read back, so
+  their prior contents don't matter. Formatting an empty 200 GiB HFS+ volume
+  dropped from minutes to ~0.03 s (FAT32 likewise from a >20 s timeout to
+  ~0.3 s); both stay `fsck.hfsplus` / `fsck.vfat`-clean.
 - *(info)* drop the stale "read support is scaffold-only" note that `fstool
   info` printed for NTFS, F2FS, and SquashFS — all three have had full read
   support for some time (the note dated from when they were detection-only).

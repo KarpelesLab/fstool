@@ -182,8 +182,18 @@ impl Fat32 {
             dir_batch: DirBatch::new(DEFAULT_CAPACITY),
             pending_names: std::collections::HashMap::new(),
         };
-        // Zero the whole volume up front so unwritten clusters read clean.
-        dev.zero_range(0, need)?;
+        // Zero only the metadata, not the whole device: the reserved
+        // sectors + both FAT copies (everything before the data region) and
+        // the empty root-directory cluster. Data-region clusters are marked
+        // free in the FAT and never read, so their prior contents are
+        // irrelevant — this keeps `format` O(metadata) instead of O(device),
+        // so formatting a large block device is near-instant rather than
+        // writing zeros across its whole capacity. `flush` writes the boot
+        // sectors, FSInfo, and both full FATs into the cleared region.
+        let meta_bytes = u64::from(fs.boot.data_start_sector()) * u64::from(SECTOR);
+        dev.zero_range(0, meta_bytes)?;
+        let cluster_bytes = u64::from(spc) * u64::from(SECTOR);
+        dev.zero_range(fs.cluster_offset(fs.boot.root_cluster), cluster_bytes)?;
 
         // Mirror the boot-sector volume label as the first root-dir entry;
         // without this fsck.vfat treats the boot label as stale and would
