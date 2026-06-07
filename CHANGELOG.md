@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.13](https://github.com/KarpelesLab/fstool/compare/v0.4.12...v0.4.13) - 2026-06-07
+
+### Added
+
+- *(shell)* add `get SRC [DEST]` — copy a file/dir out of the image to host
+- *(shell)* --with-cache opt-in in-memory inode cache
+- *(cli)* fstool dd — resilient raw block copy with live progress
+
+### Fixed
+
+- *(hfs+,fat32)* zero only metadata on format, not the whole device
+- *(info)* drop stale "read support is scaffold-only" note (NTFS/F2FS/SquashFS)
+
+### Other
+
+- *(changelog)* move dd entry under [Unreleased] after v0.4.12 release
+
 ### Added
 
 - *(shell)* new **`get SRC [DEST]`** command — copy a file or directory out of
