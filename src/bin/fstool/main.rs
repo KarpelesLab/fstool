@@ -14,6 +14,7 @@
 //! - `fstool add` / `fstool rm` / `fstool shell` — in-place mutation
 //!   on supported filesystems.
 
+mod dd;
 mod shell;
 
 use std::io::Write;
@@ -305,6 +306,49 @@ enum Command {
         #[arg(long, value_name = "SPEC", num_args = 0..=1, default_missing_value = "zlib")]
         compress: Option<String>,
     },
+    /// Resilient raw block copy from a file or device to another file or
+    /// device — a `ddrescue`-lite. Copies bytes directly (container-agnostic:
+    /// a qcow2 file is cloned as-is, not expanded). Reads start at the largest
+    /// block (default 1 MiB) and halve on read error down to the source's
+    /// smallest sector; an unreadable smallest block is skipped (left untouched
+    /// on the destination) and reported, so a failing disk still copies as much
+    /// as it can. A reader and writer thread overlap through a bounded buffer
+    /// pool, and a live progress line shows the bar, percentage, ETA, separate
+    /// read/write speed, buffer occupancy, current block size, and bytes
+    /// skipped. Ctrl-C cancels cleanly and prints how far it got.
+    Dd {
+        /// Source file or block device. Opened raw and read-only — never
+        /// modified.
+        #[arg(value_name = "SRC")]
+        src: PathBuf,
+        /// Destination file or block device. Requires `--force` to overwrite
+        /// an existing file or write to a block device.
+        #[arg(value_name = "DST")]
+        dst: PathBuf,
+        /// Largest (initial) read block; halved on read error down to
+        /// `--min-block-size`. Must be a power of two. Default 1 MiB.
+        #[arg(
+            long,
+            visible_alias = "bs",
+            value_name = "SIZE",
+            default_value = "1MiB"
+        )]
+        block_size: String,
+        /// Smallest retry block — the error-skip granularity. Must be a power
+        /// of two. Defaults to the source's advisory sector size (512).
+        #[arg(long, visible_alias = "min-bs", value_name = "SIZE")]
+        min_block_size: Option<String>,
+        /// In-flight buffer count (pipeline depth). Memory use is roughly
+        /// `queue × block-size`. Default 8.
+        #[arg(long, value_name = "N", default_value_t = 8)]
+        queue: usize,
+        /// Allow writing to a block device or overwriting an existing file.
+        #[arg(long)]
+        force: bool,
+        /// Suppress the live progress display (the final summary still prints).
+        #[arg(long)]
+        no_progress: bool,
+    },
     /// Mount an ext{2,3,4} image at a host mountpoint via FUSE.
     /// Only available when fstool is built with `--features fuse`.
     /// The mount stays attached until `umount` on the mountpoint
@@ -445,6 +489,23 @@ fn run(cli: Cli) -> fstool::Result<()> {
             }
             Ok(())
         }
+        Command::Dd {
+            src,
+            dst,
+            block_size,
+            min_block_size,
+            queue,
+            force,
+            no_progress,
+        } => dd::run(dd::DdArgs {
+            src: &src,
+            dst: &dst,
+            block_size: &block_size,
+            min_block_size: min_block_size.as_deref(),
+            queue,
+            force,
+            no_progress,
+        }),
         #[cfg(feature = "fuse")]
         Command::Mount { image, mountpoint } => mount_cmd(&image, &mountpoint),
     }

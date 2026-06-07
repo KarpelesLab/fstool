@@ -27,6 +27,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(cli)* new **`fstool dd <SRC> <DST>`** command — a resilient, container-
+  agnostic raw block copy (a `ddrescue`-lite). Copies bytes directly (a qcow2
+  file is cloned as-is, not expanded). Reads begin at the largest block
+  (`--block-size`, default 1 MiB) and **halve on read error**, retrying at the
+  same offset down to `--min-block-size` (default the source's sector); a
+  smallest-block read that still fails is **skipped** — left untouched on the
+  destination — and recorded, so a failing disk copies as much as it can
+  instead of aborting. A reader thread and a writer thread overlap through a
+  bounded buffer pool (`--queue`, default 8), and a live progress line shows
+  the bar, percentage, ETA, **separate read/write throughput**, **buffer-pool
+  occupancy**, the current (possibly shrunk) block size, and bytes skipped.
+  Fresh regular-file destinations stay sparse (all-zero chunks aren't written);
+  block-device / pre-existing destinations require `--force` and are written
+  faithfully. **Ctrl-C** cancels cleanly and the final summary reports how far
+  the copy got and what was skipped.
 - *(shell)* two new interactive commands. **`find [PATH] [-name GLOB] [-type
   f|d|l|b|c|p|s] [-newer T] [-older T] [-sort mtime|size|name] [-limit N]
   [-reverse] [-l]`** recursively lists paths under PATH (default cwd), filtered

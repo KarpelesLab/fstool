@@ -100,6 +100,7 @@ through xattrs under `user.ntfs.*` and `system.ntfs_security`.
 | `shell`       | SFTP-style REPL — `ls cd pwd cat put rm mkdir info`, plus `find` (name/type/mtime filters, `-sort`/`-limit` for e.g. the N newest files) and `grep` (`-i`/`-n`/`-r`/`-v`/`-l`/`-c`; binary matches print as `hexdump -C`). Ctrl-C cancels a running `find`/`grep` without leaving the shell. On a TTY it has line editing + ↑/↓ command history (rustyline). |
 | `convert`     | Byte-level raw ↔ qcow2 conversion with optional grow.                   |
 | `repack`      | Walk one or more source FSes, merge bottom→top with whiteouts, rebuild into a fresh image. |
+| `dd`          | Resilient raw block copy (file/device → file/device), `ddrescue`-style: reads in 1 MiB blocks that halve on error down to the source sector and skip unreadable spots. Threaded reader/writer pipeline with a live progress bar (%, ETA, separate read/write speed, buffer occupancy, current block, bytes skipped). Ctrl-C cancels cleanly. |
 
 All commands accept partition-aware `disk.img:N` targets (1-indexed) — see
 "Partitions, block devices, qcow2" below.
