@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(create)* **content-fit sizing, exact per filesystem.** `fstool create
+  <fs> <source-dir>` without `--size` now computes the *minimal* image that
+  holds the content, instead of a `2× + 64 MiB` over-provision (or, for FAT32,
+  requiring `--size`). A new `FsSizePlan` trait (mirroring ext's `BuildPlan`)
+  lets each filesystem accumulate the exact on-disk allocation from the single
+  analysis walk and return the smallest image its writer accepts, rounded only
+  to that filesystem's native unit. **FAT32** is the first wired up: it
+  searches the authoritative `Fat32::geometry`, so e.g. 250 MiB of content
+  produces a ~254 MiB image (≈1 % overhead, all but one cluster used) and a
+  source-backed `create -t fat32` no longer needs `--size`. The remaining
+  self-sizing filesystems (hfs+, hfs, affs, xfs, ntfs, f2fs) land in follow-up
+  commits and fall back to the old heuristic until then.
+
 ## [0.4.14](https://github.com/KarpelesLab/fstool/compare/v0.4.13...v0.4.14) - 2026-06-07
 
 ### Fixed
@@ -16,17 +31,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Other
 
 - *(changelog)* move xfs fix to [Unreleased], drop release-plz dup blocks
-
-### Fixed
-
-- *(xfs)* `create --type xfs` of an **empty** volume failed with `xfs:
-  flush_writes called before begin_writes()` (at every size). `format()`
-  re-opens through the read path and leaves the write state uninitialised;
-  populated creates worked only because the first `create_file` lazily
-  reconstructs it, but an empty create goes straight from `format()` to
-  `flush()`. `flush_writes` now reconstructs the write state from the on-disk
-  AG headers when needed (the same `resume_writes` path the populated flow
-  relies on), so empty XFS images format cleanly and pass `xfs_repair -n`.
 
 ## [0.4.13](https://github.com/KarpelesLab/fstool/compare/v0.4.12...v0.4.13) - 2026-06-07
 

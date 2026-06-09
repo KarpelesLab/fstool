@@ -2686,15 +2686,17 @@ fn create_fat32(
     let bytes = if is_device {
         let dev = FileBackend::open(output)?;
         dev.total_size()
-    } else {
-        let s = size_arg.ok_or_else(|| {
-            fstool::Error::InvalidArgument(
-                "create: --size is required for fat32 when OUTPUT is a regular file \
-                 (FAT32 needs ≥ ~33 MiB)"
-                    .into(),
-            )
-        })?;
+    } else if let Some(s) = size_arg {
         fstool::spec::parse_size(s)?
+    } else if let Some(src) = source {
+        // No --size but a source: size the image to exactly fit the content.
+        fstool::analyze::size_for_source(src, "fat32")?.expect("fat32 has a content-fit size plan")
+    } else {
+        return Err(fstool::Error::InvalidArgument(
+            "create: --size is required for an empty fat32 image on a regular file \
+             (FAT32 needs ≥ ~33 MiB); pass --size or a source directory"
+                .into(),
+        ));
     };
     let total_sectors: u32 = (bytes / 512).try_into().map_err(|_| {
         fstool::Error::InvalidArgument(
@@ -2801,14 +2803,21 @@ where
         && size_arg.is_none()
         && let Some(src) = source
     {
-        let analysis = fstool::analyze::analyze_source(src, 1024)?;
-        Some(
-            analysis
-                .total_file_bytes
-                .saturating_mul(2)
-                .saturating_add(64 * 1024 * 1024)
-                .max(default_min_size),
-        )
+        // Prefer an exact content-fit size when this FS has a size plan;
+        // otherwise fall back to the generous `2× + 64 MiB` heuristic.
+        match fstool::analyze::size_for_source(src, label)? {
+            Some(exact) => Some(exact),
+            None => {
+                let analysis = fstool::analyze::analyze_source(src, 1024)?;
+                Some(
+                    analysis
+                        .total_file_bytes
+                        .saturating_mul(2)
+                        .saturating_add(64 * 1024 * 1024)
+                        .max(default_min_size),
+                )
+            }
+        }
     } else {
         None
     };

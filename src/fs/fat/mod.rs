@@ -14,7 +14,10 @@ pub mod dir;
 pub mod fsinfo;
 pub mod handle;
 pub mod mutate;
+pub mod size_plan;
 pub mod table;
+
+pub use size_plan::FatSizePlan;
 
 use std::io::Read;
 use std::path::Path;
@@ -101,8 +104,9 @@ pub struct Fat32 {
 
 impl Fat32 {
     /// Pick `sectors_per_cluster` for a volume of `total_sectors`, mirroring
-    /// the conventional mkfs.vfat size thresholds.
-    fn pick_spc(total_sectors: u32) -> u8 {
+    /// the conventional mkfs.vfat size thresholds. `pub(crate)` so the
+    /// content-fit sizer ([`size_plan`]) inverts the exact same geometry.
+    pub(crate) fn pick_spc(total_sectors: u32) -> u8 {
         match total_sectors {
             0..=532_480 => 1,          // ≤ 260 MiB
             532_481..=16_777_216 => 8, // ≤ 8 GiB
@@ -114,8 +118,9 @@ impl Fat32 {
 
     /// Compute `(sectors_per_cluster, fat_size_sectors, cluster_count)` for a
     /// volume of `total_sectors`. Errors if the volume is too small to be a
-    /// valid FAT32.
-    fn geometry(total_sectors: u32) -> Result<(u8, u32, u32)> {
+    /// valid FAT32. `pub(crate)` so the content-fit sizer ([`size_plan`])
+    /// searches against the authoritative geometry rather than re-deriving it.
+    pub(crate) fn geometry(total_sectors: u32) -> Result<(u8, u32, u32)> {
         let spc = Self::pick_spc(total_sectors);
         let reserved = 32u32;
         let num_fats = 2u32;

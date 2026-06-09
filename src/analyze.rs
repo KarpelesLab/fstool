@@ -19,7 +19,7 @@ use std::io::Read;
 use crate::Result;
 use crate::block::BlockDevice;
 use crate::fs::ext::{BuildPlan, FsKind};
-use crate::fs::{DeviceKind, XattrPair};
+use crate::fs::{DeviceKind, FsSizePlan, XattrPair};
 use crate::inspect::AnyFs;
 use crate::repack::{RepackMeta, RepackSink, Source, walk_anyfs, walk_source_into_sink};
 
@@ -250,6 +250,88 @@ pub fn analyze_fs(fs: &mut AnyFs, dev: &mut dyn BlockDevice, block_size: u32) ->
     let mut sink = AnalysisSink::new(block_size);
     walk_anyfs(fs, dev, &mut sink)?;
     Ok(sink.a)
+}
+
+/// A [`RepackSink`] that forwards each entry to an [`FsSizePlan`] instead of
+/// writing anything, so a single metadata-only walk feeds a content-fit
+/// sizer. Bodies are never read.
+struct SizingSink<'p> {
+    plan: &'p mut dyn FsSizePlan,
+}
+
+impl RepackSink for SizingSink<'_> {
+    fn put_dir(&mut self, path: &str, _m: RepackMeta, _x: &[XattrPair]) -> Result<()> {
+        self.plan.add_dir(path);
+        Ok(())
+    }
+    fn put_file(
+        &mut self,
+        path: &str,
+        _body: &mut dyn Read,
+        len: u64,
+        _m: RepackMeta,
+        _x: &[XattrPair],
+    ) -> Result<()> {
+        self.plan.add_file(path, len);
+        Ok(())
+    }
+    fn put_symlink(
+        &mut self,
+        path: &str,
+        target: &str,
+        _m: RepackMeta,
+        _x: &[XattrPair],
+    ) -> Result<()> {
+        self.plan.add_symlink(path, target);
+        Ok(())
+    }
+    fn put_device(
+        &mut self,
+        path: &str,
+        _k: DeviceKind,
+        _major: u32,
+        _minor: u32,
+        _m: RepackMeta,
+        _x: &[XattrPair],
+    ) -> Result<()> {
+        self.plan.add_device(path);
+        Ok(())
+    }
+    fn put_hardlink(
+        &mut self,
+        path: &str,
+        _target: &str,
+        _m: RepackMeta,
+        _x: &[XattrPair],
+    ) -> Result<bool> {
+        // Charge a directory entry for the extra link; its data is shared with
+        // the already-counted target (FSes that can't share copy a small
+        // amount we absorb in rounding).
+        self.plan.add_file(path, 0);
+        Ok(true)
+    }
+    fn finish(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Walk `source` once and return the **exact** content-fit image size in bytes
+/// for `fs_type`, or `None` when that filesystem has no size plan yet (the
+/// caller then falls back to its own heuristic). Used by `fstool create
+/// <fs> <dir>` to size a fresh image to its content without an explicit
+/// `--size`.
+pub fn size_for_source(source: &Source, fs_type: &str) -> Result<Option<u64>> {
+    let mut plan: Box<dyn FsSizePlan> = match fs_type.to_ascii_lowercase().as_str() {
+        "fat32" | "vfat" => Box::new(crate::fs::fat::FatSizePlan::new()),
+        _ => return Ok(None),
+    };
+    {
+        let mut sink = SizingSink {
+            plan: plan.as_mut(),
+        };
+        walk_source_into_sink(source, &mut sink)?;
+    }
+    Ok(Some(plan.total_size()))
 }
 
 #[cfg(test)]

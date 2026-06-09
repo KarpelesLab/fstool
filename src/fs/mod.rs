@@ -228,6 +228,48 @@ pub trait FileReadHandle: Read + Seek {
     }
 }
 
+/// Accumulates the **exact** on-disk allocation a filesystem's writer will use
+/// for a given source tree, so `create` can produce a content-fit image
+/// without guessing a size.
+///
+/// A plan is fed one entry at a time, in walk order (parents before children),
+/// by the same sink machinery that drives a real build — see the
+/// `SizingSink`/`size_for_source` helpers in [`crate::analyze`]. Paths are the
+/// canonical absolute (`/`-rooted) paths the walkers emit, so a plan can
+/// attribute each entry to its parent directory and size that directory for its
+/// exact child count and name encoding.
+///
+/// [`total_size`](Self::total_size) returns the minimal image size in bytes
+/// that the writer needs, rounded only to the filesystem's native allocation
+/// unit (cluster / allocation block / AG) and clamped to its minimum — not a
+/// percentage-padded guess. This mirrors what `BuildPlan` does for ext.
+pub trait FsSizePlan {
+    /// Record a directory at `path`: its parent gains a child entry and the
+    /// directory itself gains its own storage.
+    fn add_dir(&mut self, path: &str);
+    /// Record a regular file of `len` bytes at `path`.
+    fn add_file(&mut self, path: &str, len: u64);
+    /// Record a symbolic link at `path` pointing at `target`.
+    fn add_symlink(&mut self, path: &str, target: &str);
+    /// Record a device / special node at `path`.
+    fn add_device(&mut self, path: &str);
+    /// Minimal image size in bytes that holds everything added so far.
+    fn total_size(&self) -> u64;
+}
+
+/// Split an absolute (`/`-rooted) path into `(parent, name)`. The parent of a
+/// top-level entry is `"/"`. Shared by [`FsSizePlan`] implementations for
+/// per-directory attribution.
+#[must_use]
+pub fn split_parent_name(path: &str) -> (&str, &str) {
+    let p = path.strip_suffix('/').unwrap_or(path);
+    match p.rfind('/') {
+        Some(0) => ("/", &p[1..]),
+        Some(i) => (&p[..i], &p[i + 1..]),
+        None => ("/", p),
+    }
+}
+
 /// Special-file class for [`Filesystem::create_device`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceKind {
