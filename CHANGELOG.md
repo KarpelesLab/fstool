@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- *(hfs+)* `create -t hfsplus` now produces `fsck.hfsplus`-clean volumes at
+  **any** size, not only block-aligned ones. Two pre-existing writer bugs:
+  (1) the image could be a non-multiple of the 4 KiB allocation block (the
+  `2× + 64 MiB` auto-size, or an arbitrary `--size`), leaving a trailing
+  partial block past the alternate volume header where `fsck` reads a
+  misplaced header — `HfsPlus` now reports `image_len`, so the create/repack
+  paths truncate the output to a whole number of allocation blocks; (2) when
+  the bitmap's last byte was partial, its padding bits were written as `1`,
+  but TN1150 requires bits beyond `total_blocks` to read as `0` — they're now
+  cleared on disk (the in-memory allocator still keeps them set). Verified
+  `fsck.hfsplus`-clean across previously-failing block counts and 500/5000-file
+  trees.
+
 ### Added
 
 - *(create)* **content-fit sizing, exact per filesystem.** `fstool create

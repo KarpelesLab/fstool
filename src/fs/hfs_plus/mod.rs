@@ -1626,6 +1626,18 @@ impl crate::fs::Filesystem for HfsPlus {
         Self::flush(self, dev)
     }
 
+    /// The volume spans a whole number of allocation blocks
+    /// (`total_blocks × block_size`), and the alternate volume header sits in
+    /// its last 1 KiB. Reporting that length lets the `create` / `repack`
+    /// paths truncate the output file to it — so a request whose size isn't a
+    /// block multiple (the old `2× + 64 MiB` auto-size, or an arbitrary
+    /// `--size`) doesn't leave a trailing partial block past the alternate VH,
+    /// which `fsck.hfsplus` reads as a misplaced header. No-op when the size is
+    /// already block-aligned (e.g. content-fit sizing).
+    fn image_len(&self) -> Option<u64> {
+        Some(self.total_bytes())
+    }
+
     fn read_symlink(
         &mut self,
         dev: &mut dyn BlockDevice,

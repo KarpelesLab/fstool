@@ -2499,6 +2499,19 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
     let bm_off =
         u64::from(writer.allocation_file.extents[0].start_block) * u64::from(writer.block_size);
     sink.write_at(bm_off, &writer.bitmap)?;
+    // TN1150: when the bitmap has more bits than allocation blocks (the last
+    // byte is partial), the bits beyond `total_blocks` must read as **zero** on
+    // disk. The in-memory bitmap keeps those padding bits set to 1 so the
+    // allocator never hands them out; clear them in the last on-disk byte so
+    // `fsck.hfsplus` doesn't flag "Volume Bit Map needs minor repair".
+    if !writer.total_blocks.is_multiple_of(8) {
+        let last = (writer.total_blocks / 8) as usize;
+        if last < writer.bitmap.len() {
+            let valid = writer.total_blocks % 8;
+            let corrected = writer.bitmap[last] & ((!0u8) << (8 - valid));
+            sink.write_at(bm_off + last as u64, &[corrected])?;
+        }
+    }
     // Pad the rest of the allocation-file blocks with zero already done
     // by zero_range at format time.
 
@@ -3437,6 +3450,32 @@ mod tests {
         hfs.create_symlink(&mut dev, "/sym", "/file", 0o777, 0, 0)
             .unwrap();
         assert!(hfs.create_hardlink(&mut dev, "/sym", "/sym-link").is_err());
+    }
+
+    #[test]
+    fn bitmap_padding_bits_are_zero_on_disk() {
+        use crate::block::BlockDevice;
+        // 513 allocation blocks → 513 % 8 == 1, so the last bitmap byte holds
+        // one real block bit (block 512, the alternate-VH block) plus 7 padding
+        // bits that TN1150 requires to read as zero on disk.
+        let bs = u64::from(DEFAULT_BLOCK_SIZE);
+        let blocks = 513u64;
+        let mut dev = MemoryBackend::new(blocks * bs);
+        let opts = FormatOpts::default();
+        let mut hfs = crate::fs::hfs_plus::HfsPlus::format(&mut dev, &opts).unwrap();
+        hfs.flush(&mut dev).unwrap();
+
+        // The allocation bitmap is the first special file, at block 1.
+        let last_byte = 513u64 / 8; // 64
+        let mut b = [0u8; 1];
+        dev.read_at(bs + last_byte, &mut b).unwrap();
+        // Only the MSB (block 512) may be set; the 7 padding bits must be zero.
+        assert_eq!(
+            b[0] & 0x7F,
+            0,
+            "padding bits beyond total_blocks must be zero on disk (got {:#04x})",
+            b[0]
+        );
     }
 
     #[test]
