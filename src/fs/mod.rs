@@ -1074,6 +1074,17 @@ pub trait FilesystemFactory: Filesystem + Sized {
 
     /// Open an existing filesystem from `dev`.
     fn open(dev: &mut dyn crate::block::BlockDevice) -> crate::Result<Self>;
+
+    /// Phase 1 of content-fit sizing: a fresh [`FsSizePlan`] that, when fed the
+    /// static file list, computes the exact image size this filesystem's batch
+    /// writer needs for that content (see [`FsSizePlan`]). Returns `None` for
+    /// filesystems that don't yet have an analytic plan (the caller then falls
+    /// back to its own estimate). `opts` lets the plan honour size-affecting
+    /// format choices (e.g. AFFS OFS vs FFS data-block payload).
+    fn size_plan(opts: &Self::FormatOpts) -> Option<Box<dyn FsSizePlan>> {
+        let _ = opts;
+        None
+    }
 }
 
 /// A `Read + Seek` that produces `remaining` zero bytes and then EOF.

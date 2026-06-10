@@ -35,7 +35,9 @@ use crate::fs::{DirEntry, EntryKind, Filesystem, MutationCapability};
 use crate::{Error, Result};
 
 mod editor;
+mod size_plan;
 mod writer;
+pub use size_plan::AffsSizePlan;
 pub use writer::AffsFormatOpts;
 
 /// How a writable `Affs` handle persists changes.
@@ -666,6 +668,10 @@ impl crate::fs::FilesystemFactory for Affs {
 
     fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
         Affs::open(dev)
+    }
+
+    fn size_plan(opts: &Self::FormatOpts) -> Option<Box<dyn crate::fs::FsSizePlan>> {
+        Some(Box::new(AffsSizePlan::new(opts.ffs)))
     }
 }
 

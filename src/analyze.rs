@@ -521,13 +521,19 @@ pub fn size_for_source(source: &Source, fs_type: &str) -> Result<Option<u64>> {
         "fat32" | "vfat" => Box::new(crate::fs::fat::FatSizePlan::new()),
         _ => return Ok(None),
     };
-    {
-        let mut sink = SizingSink {
-            plan: plan.as_mut(),
-        };
-        walk_source_into_sink(source, &mut sink)?;
-    }
+    plan_size(source, plan.as_mut())?;
     Ok(Some(plan.total_size()))
+}
+
+/// Phase 2 of content-fit sizing: walk the static file list of `source` into an
+/// already-constructed phase-1 [`FsSizePlan`] (built by a filesystem's
+/// [`FilesystemFactory::size_plan`](crate::fs::FilesystemFactory::size_plan))
+/// and return the exact image size it computes. One metadata-only pass; file
+/// bodies are never read.
+pub fn plan_size(source: &Source, plan: &mut dyn FsSizePlan) -> Result<u64> {
+    let mut sink = SizingSink { plan };
+    walk_source_into_sink(source, &mut sink)?;
+    Ok(plan.total_size())
 }
 
 #[cfg(test)]

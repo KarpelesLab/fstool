@@ -2810,11 +2810,16 @@ where
         && let Some(src) = source
     {
         if writer_sized {
-            // Let the writer determine its own minimal size: a dry-run format +
-            // populate against a sizing device finds the smallest image its own
-            // allocator accepts (file data written as zeros, so it's metadata-
-            // only). The per-FS minimum guards tiny inputs.
-            let exact = fstool::analyze::writer_required_size::<F>(src, &format_opts)?;
+            // Phase 1 + 2 of the two-phase builder: when this filesystem has an
+            // analytic size plan, walk the static file list through it (assign
+            // inodes, lay out directories) and take its exact computed size.
+            // Filesystems not yet modelled fall back to the dry-run sizer until
+            // their plan lands.
+            let exact = if let Some(mut plan) = F::size_plan(&format_opts) {
+                fstool::analyze::plan_size(src, plan.as_mut())?
+            } else {
+                fstool::analyze::writer_required_size::<F>(src, &format_opts)?
+            };
             Some(exact.max(default_min_size))
         } else {
             // Archive / streaming backends: a comfortable provision that the
