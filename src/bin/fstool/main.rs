@@ -228,9 +228,19 @@ enum Command {
     /// and reads commands from stdin; type `help` once inside for the
     /// command list, or `quit` (or EOF) to leave.
     Shell {
-        /// Image path, optionally with `:N` to select partition N.
+        /// Image path, optionally with `:N` to select partition N. Omit it
+        /// together with `--new-ramfs` to start an empty in-memory filesystem.
         #[arg(value_name = "IMAGE[:N]")]
-        image: String,
+        image: Option<String>,
+        /// Start an empty in-memory ramfs instead of opening an image. Build a
+        /// tree interactively (`put` / `mkdir` / `rm`) then `save OUT` to a tar
+        /// when done. Nothing is persisted unless you `save`.
+        #[arg(long)]
+        new_ramfs: bool,
+        /// With `--new-ramfs`, pre-populate the ramfs from this source (a host
+        /// directory, an image, or a tar archive) before the first prompt.
+        #[arg(long, value_name = "SOURCE")]
+        from: Option<String>,
         /// Open the image strictly read-only. The underlying file is
         /// opened `O_RDONLY` (any write fails at the syscall), the
         /// shell skips its in-place-mutable check (lets you browse
@@ -453,7 +463,16 @@ fn run(cli: Cli) -> fstool::Result<()> {
             image,
             ro,
             with_cache,
-        } => shell_cmd(&image, ro, with_cache, cli.path_style),
+            new_ramfs,
+            from,
+        } => shell_cmd(
+            image.as_deref(),
+            ro,
+            with_cache,
+            new_ramfs,
+            from.as_deref(),
+            cli.path_style,
+        ),
         Command::Convert {
             src,
             dst,
@@ -2156,7 +2175,37 @@ fn sum_source_file_bytes(
     src_fs.total_file_bytes(src_dev)
 }
 
-fn shell_cmd(image: &str, ro: bool, with_cache: bool, style: PathStyle) -> fstool::Result<()> {
+fn shell_cmd(
+    image: Option<&str>,
+    ro: bool,
+    with_cache: bool,
+    new_ramfs: bool,
+    from: Option<&str>,
+    style: PathStyle,
+) -> fstool::Result<()> {
+    if new_ramfs {
+        // An in-memory ramfs: no backing file. Build it (optionally from a
+        // source), then drive the shell over a throwaway device — `save OUT`
+        // is the only way bytes leave the session.
+        let mut dev = fstool::block::MemoryBackend::new(0);
+        let fs = match from {
+            Some(src) => {
+                let source = fstool::repack::Source::detect(src)?;
+                fstool::inspect::AnyFs::new_ramfs_from(&mut dev, &source)?
+            }
+            None => fstool::inspect::AnyFs::new_ramfs(),
+        };
+        let mut sh = shell::Shell::new(fs, style);
+        if with_cache {
+            sh.enable_cache();
+        }
+        return run_shell(&mut sh, &mut dev);
+    }
+    let image = image.ok_or_else(|| {
+        fstool::Error::InvalidArgument(
+            "shell: an IMAGE is required (or pass --new-ramfs for an empty in-memory tree)".into(),
+        )
+    })?;
     let target = fstool::inspect::Target::parse(image);
     if ro {
         // Read-only shell: open the underlying file O_RDONLY (any
@@ -3329,6 +3378,8 @@ fn print_fs_info(dev: &mut dyn fstool::block::BlockDevice, fs: &mut fstool::insp
         // Archive backends carry no extra summary beyond the kind line
         // above; the `/ listing` below covers their contents.
         fstool::inspect::AnyFs::Archive(..) => {}
+        // ramfs is in-memory with no superblock; the listing covers it.
+        fstool::inspect::AnyFs::Ramfs(_) => {}
     }
     println!();
     println!("/ listing:");

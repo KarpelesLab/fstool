@@ -403,6 +403,10 @@ impl Shell {
                 self.cmd_get(dev, rest, output)?;
                 Ok(false)
             }
+            "save" => {
+                self.cmd_save(dev, rest, output)?;
+                Ok(false)
+            }
             "rm" => {
                 self.require_writable("rm")?;
                 self.cmd_rm(dev, rest, output)?;
@@ -483,6 +487,11 @@ grep [-i] [-n] [-r] [-v] [-l] [-c] PATTERN [PATH...]
                     -v invert, -l list matching filenames, -c count matches.
                     Binary files print their matches as `hexdump -C` rows
                     (Ctrl-C cancels a running find/grep without leaving the shell)
+save OUT[.tar[.gz|.zst|.xz]]
+                    snapshot the whole tree to a (optionally compressed) tar
+                    on the host — symlinks, devices and xattrs preserved. Handy
+                    for a `--new-ramfs` session; `fstool repack OUT image -t …`
+                    then builds an exactly-sized real filesystem from it.
 help | ?            print this help
 quit | exit         leave{ro_note}\n{cache_note}"
         );
@@ -650,6 +659,45 @@ quit | exit         leave{ro_note}\n{cache_note}"
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// `save OUT` — snapshot the whole filesystem to a tar on the host
+    /// (compression inferred from the extension). Walks the live tree through
+    /// the same sink the `repack` command uses, so symlinks, devices and
+    /// xattrs are preserved. Works in `--ro` mode too (it only reads the
+    /// image and writes to the host). Compose with `fstool repack OUT image
+    /// -t <fs>` to materialise an exactly-sized real filesystem.
+    fn cmd_save(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        arg: &str,
+        output: &mut impl Write,
+    ) -> Result<()> {
+        use fstool::repack::RepackSink;
+        let out = arg.trim();
+        if out.is_empty() {
+            return Err(fstool::Error::InvalidArgument(
+                "save: OUT (a host path, e.g. snap.tar / snap.tar.zst) is required".into(),
+            ));
+        }
+        let path = std::path::Path::new(out);
+        let codec = crate::tar_output_codec(path);
+        let file = std::fs::File::create(path)?;
+        let buffered: Box<dyn Write> = Box::new(std::io::BufWriter::with_capacity(64 * 1024, file));
+        let inner = match codec {
+            Some(algo) => fstool::compression::make_writer(algo, buffered)?,
+            None => buffered,
+        };
+        let mut sink = fstool::repack::TarStreamSink::new(inner);
+        fstool::repack::walk_anyfs(&mut self.fs, dev, &mut sink)?;
+        sink.finish()?;
+        let written = sink.bytes_written();
+        let label = match codec {
+            Some(algo) => format!("tar.{}", algo.name()),
+            None => "tar".to_string(),
+        };
+        writeln!(output, "saved → {out} ({label}, {written} bytes plain)")?;
         Ok(())
     }
 

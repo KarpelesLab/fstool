@@ -31,6 +31,7 @@ use crate::fs::fat::Fat32;
 use crate::fs::hfs::Hfs;
 use crate::fs::hfs_plus::HfsPlus;
 use crate::fs::ntfs::Ntfs;
+use crate::fs::ramfs::Ramfs;
 use crate::fs::squashfs::Squashfs;
 use crate::fs::tar::Tar;
 use crate::fs::xfs::Xfs;
@@ -96,6 +97,9 @@ pub enum FsKind {
     Cab,
     /// StuffIt — detection-only scaffold.
     Sit,
+    /// In-memory ramfs. Has no on-disk form, so it is never returned by
+    /// [`detect_fs`] — only constructed explicitly (`AnyFs::new_ramfs`).
+    Ramfs,
 }
 
 /// Probe `dev` to decide which filesystem it carries. Reads only sector 0
@@ -297,12 +301,36 @@ pub enum AnyFs {
     /// The 10 archive formats share one variant since they dispatch
     /// uniformly through the trait.
     Archive(Box<dyn crate::fs::Filesystem>, FsKind, &'static str),
+    /// In-memory ramfs — never produced by [`detect_fs`]; built explicitly
+    /// via [`AnyFs::new_ramfs`] / [`AnyFs::new_ramfs_from`].
+    Ramfs(Box<Ramfs>),
 }
 
 impl AnyFs {
+    /// A fresh, empty in-memory ramfs wrapped as an `AnyFs`.
+    #[must_use]
+    pub fn new_ramfs() -> Self {
+        Self::Ramfs(Box::default())
+    }
+
+    /// A ramfs pre-populated from `source` (a host dir / image / tar), built
+    /// through the generic repack sink so symlinks, devices and xattrs carry
+    /// over. The `dev` is the ramfs's ignored device.
+    pub fn new_ramfs_from(
+        dev: &mut dyn BlockDevice,
+        source: &crate::repack::Source,
+    ) -> Result<Self> {
+        let mut fs = Ramfs::new();
+        crate::repack::populate_fs_from_source_dyn(dev, &mut fs, source)?;
+        Ok(Self::Ramfs(Box::new(fs)))
+    }
+
     /// Open `dev`, picking the backend automatically.
     pub fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
         match detect_fs(dev)? {
+            FsKind::Ramfs => Err(crate::Error::Unsupported(
+                "ramfs has no on-disk form; construct it with AnyFs::new_ramfs()".into(),
+            )),
             FsKind::Ext => Ok(Self::Ext(Box::new(Ext::open(dev)?))),
             FsKind::Fat32 => Ok(Self::Fat32(Box::new(Fat32::open(dev)?))),
             FsKind::Tar => Ok(Self::Tar(Box::new(Tar::open(dev)?))),
@@ -414,6 +442,7 @@ impl AnyFs {
             Self::Iso9660(_) => FsKind::Iso9660,
             Self::Grf(_) => FsKind::Grf,
             Self::Archive(_, kind, _) => *kind,
+            Self::Ramfs(_) => FsKind::Ramfs,
         }
     }
 
@@ -443,6 +472,10 @@ impl AnyFs {
                 grf.list(dev, std::path::Path::new(path))
             }
             Self::Archive(fs, _, _) => fs.list(dev, std::path::Path::new(path)),
+            Self::Ramfs(r) => {
+                use crate::fs::Filesystem;
+                r.list(dev, std::path::Path::new(path))
+            }
         }
     }
 
@@ -566,6 +599,11 @@ impl AnyFs {
                 let mut r = fs.read_file(dev, std::path::Path::new(path))?;
                 pump(&mut r, out, &mut buf)
             }
+            Self::Ramfs(rfs) => {
+                use crate::fs::Filesystem;
+                let mut r = rfs.read_file(dev, std::path::Path::new(path))?;
+                pump(&mut r, out, &mut buf)
+            }
         }
     }
 
@@ -609,6 +647,10 @@ impl AnyFs {
                 Ok(Box::new(std::io::Cursor::new(bytes)))
             }
             Self::Archive(fs, _, _) => fs.read_file(dev, std::path::Path::new(path)),
+            Self::Ramfs(r) => {
+                use crate::fs::Filesystem;
+                r.read_file(dev, std::path::Path::new(path))
+            }
         }
     }
 
@@ -738,6 +780,7 @@ impl AnyFs {
             Self::Exfat(e) => crate::fs::Filesystem::mutation_capability(e.as_ref()),
             Self::Grf(g) => crate::fs::Filesystem::mutation_capability(g.as_ref()),
             Self::Archive(fs, _, _) => crate::fs::Filesystem::mutation_capability(fs.as_ref()),
+            Self::Ramfs(r) => crate::fs::Filesystem::mutation_capability(r.as_ref()),
         }
     }
 
@@ -765,6 +808,7 @@ impl AnyFs {
             Self::Exfat(e) => crate::fs::Filesystem::clone_capability(e.as_ref()),
             Self::Grf(g) => crate::fs::Filesystem::clone_capability(g.as_ref()),
             Self::Archive(fs, _, _) => crate::fs::Filesystem::clone_capability(fs.as_ref()),
+            Self::Ramfs(r) => crate::fs::Filesystem::clone_capability(r.as_ref()),
         }
     }
 
@@ -846,6 +890,7 @@ impl AnyFs {
             Self::Iso9660(iso) => f(iso.as_mut()),
             Self::Grf(g) => f(g.as_mut()),
             Self::Archive(fs, _, _) => f(fs.as_mut()),
+            Self::Ramfs(r) => f(r.as_mut()),
         }
     }
 
@@ -892,7 +937,9 @@ impl AnyFs {
             | Self::Ntfs(_)
             | Self::F2fs(_)
             | Self::Squashfs(_)
-            | Self::Iso9660(_) => Ok(()),
+            | Self::Iso9660(_)
+            // ramfs is in-memory: nothing to persist.
+            | Self::Ramfs(_) => Ok(()),
             // Archive handles opened via `AnyFs` are read-mode (a fresh
             // writer is driven on the concrete type during `build`), so
             // routing to the trait flush is a no-op here.
@@ -940,6 +987,9 @@ impl AnyFs {
         if let Self::Archive(_, _, name) = self {
             return name;
         }
+        if let Self::Ramfs(_) = self {
+            return "ramfs";
+        }
         match self {
             Self::Ext(ext) => match ext.kind {
                 crate::fs::ext::FsKind::Ext2 => "ext2",
@@ -960,7 +1010,8 @@ impl AnyFs {
             | Self::Squashfs(_)
             | Self::Iso9660(_)
             | Self::Grf(_)
-            | Self::Archive(..) => unreachable!(),
+            | Self::Archive(..)
+            | Self::Ramfs(_) => unreachable!(),
         }
     }
 }
@@ -1074,6 +1125,7 @@ impl AnyFs {
             Self::Iso9660(b) => b,
             Self::Grf(b) => b,
             Self::Archive(fs, _, _) => fs,
+            Self::Ramfs(b) => b,
         }
     }
 }
