@@ -21,6 +21,9 @@ use crate::macroman;
 mod writer;
 pub use writer::HfsFormatOpts;
 
+mod size_plan;
+pub use size_plan::HfsClassicSizePlan;
+
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -736,6 +739,9 @@ impl crate::fs::FilesystemFactory for Hfs {
     }
     fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
         Self::open(dev)
+    }
+    fn size_plan(opts: &Self::FormatOpts) -> Option<Box<dyn crate::fs::FsSizePlan>> {
+        Some(Box::new(HfsClassicSizePlan::new(opts)))
     }
 }
 
