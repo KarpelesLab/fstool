@@ -2457,7 +2457,9 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             qcow2_cluster_size,
             fstool::fs::f2fs::FormatOpts::default(),
             |o, m| o.apply_options(m),
-            64 * 1024 * 1024,
+            // The analytic size plan enforces F2FS's real 6-main-segment floor
+            // (~27 MiB); keep a modest empty-image minimum below it.
+            16 * 1024 * 1024,
         )?,
         "squashfs" => create_via_factory::<fstool::fs::squashfs::Squashfs>(
             "squashfs",

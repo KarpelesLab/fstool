@@ -48,6 +48,7 @@ pub mod format;
 pub mod inode;
 pub mod nat;
 pub mod rw;
+pub mod size_plan;
 pub mod superblock;
 pub mod write;
 
@@ -396,6 +397,10 @@ impl crate::fs::FilesystemFactory for F2fs {
 
     fn format(dev: &mut dyn BlockDevice, opts: &Self::FormatOpts) -> Result<Self> {
         Self::format(dev, opts)
+    }
+
+    fn size_plan(_opts: &Self::FormatOpts) -> Option<Box<dyn crate::fs::FsSizePlan>> {
+        Some(Box::new(size_plan::F2fsSizePlan::new()))
     }
 
     fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
