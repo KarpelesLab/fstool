@@ -2806,22 +2806,16 @@ where
     // (squashfs / iso / grf / zip / cpio / ar) and APFS instead over-provision
     // and truncate via `image_len` after flush — and squashfs *compresses*, so
     // a zero-data dry run would size them wildly wrong.
-    let writer_sized = matches!(label, "hfs+" | "hfs" | "affs" | "xfs" | "ntfs" | "f2fs");
     let auto_size = if !is_device
         && size_arg.is_none()
         && let Some(src) = source
     {
-        if writer_sized {
-            // Phase 1 + 2 of the two-phase builder: when this filesystem has an
-            // analytic size plan, walk the static file list through it (assign
-            // inodes, lay out directories) and take its exact computed size.
-            // Filesystems not yet modelled fall back to the dry-run sizer until
-            // their plan lands.
-            let exact = if let Some(mut plan) = F::size_plan(&format_opts) {
-                fstool::analyze::plan_size(src, plan.as_mut())?
-            } else {
-                fstool::analyze::writer_required_size::<F>(src, &format_opts)?
-            };
+        if let Some(mut plan) = F::size_plan(&format_opts) {
+            // Phase 1 + 2 of the two-phase builder: walk the static file list
+            // through this filesystem's analytic size plan (assign inodes, lay
+            // out directories, account free space / superblock / backups) and
+            // take its exact computed size.
+            let exact = fstool::analyze::plan_size(src, plan.as_mut())?;
             Some(exact.max(default_min_size))
         } else {
             // Archive / streaming backends: a comfortable provision that the

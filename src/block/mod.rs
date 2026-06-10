@@ -33,7 +33,6 @@ pub mod dmg;
 pub mod file;
 pub mod memory;
 pub mod qcow2;
-pub mod sizing;
 pub mod sliced;
 
 pub use crash_inject::{CrashInject, FailAfter};
