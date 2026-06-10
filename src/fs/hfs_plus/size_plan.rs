@@ -6,14 +6,12 @@
 //! `node_size`-byte leaves (usable = `node_size − 14 − 2`, each record costing
 //! `key + body + 2`); index nodes sit above. Files contribute data
 //! (allocation) blocks; symlinks a data block for the target. Phase 2
-//! ([`total_size`]) folds in the extents B-tree, the size-dependent allocation
+//! (`total_size`) folds in the extents B-tree, the size-dependent allocation
 //! bitmap (resolved by a short fixed point), the journal when enabled, and the
 //! boot/volume-header blocks.
 //!
 //! A safe upper bound: the leaf count uses a conservative fill so greedy
 //! packing never overflows the computed size (validated `fsck.hfsplus`-clean).
-//!
-//! [`total_size`]: HfsPlusSizePlan::total_size
 
 use super::writer::{DEFAULT_JOURNAL_BUFFER_BLOCKS, FormatOpts};
 
