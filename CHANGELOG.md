@@ -33,9 +33,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to that filesystem's native unit. **FAT32** is the first wired up: it
   searches the authoritative `Fat32::geometry`, so e.g. 250 MiB of content
   produces a ~254 MiB image (≈1 % overhead, all but one cluster used) and a
-  source-backed `create -t fat32` no longer needs `--size`. The remaining
-  self-sizing filesystems (hfs+, hfs, affs, xfs, ntfs, f2fs) land in follow-up
-  commits and fall back to the old heuristic until then.
+  source-backed `create -t fat32` no longer needs `--size`.
+- *(create)* **the writer now determines its own size for every block
+  filesystem** (hfs+, hfs, affs, xfs, ntfs, f2fs). Rather than a parallel size
+  model that could drift, `create <fs> <dir>` (no `--size`) does a dry-run:
+  it formats and populates the *real* writer against a sparse, write-discarding
+  `SizingDevice` — assigning inodes/CNIDs, encoding names, building B-trees and
+  directory blocks exactly as for a real build, with file data written as
+  zeros so the probe is metadata-only — and binary-searches the smallest size
+  the writer's own allocator accepts. Result: tight, `fsck`-clean images
+  (hfs +0 %, affs +1 %, hfs+ +3 %, xfs +13 %; ntfs and f2fs report their
+  writers' genuine minimums) versus the former `2× + 64 MiB`. Compressing /
+  archive backends (squashfs, iso, grf, …) keep their grow-then-truncate path.
+  The probe tolerates writers that *panic* on degenerate small sizes (caught
+  and treated as "doesn't fit"), e.g. a pre-existing f2fs format panic.
 
 ## [0.4.14](https://github.com/KarpelesLab/fstool/compare/v0.4.13...v0.4.14) - 2026-06-07
 

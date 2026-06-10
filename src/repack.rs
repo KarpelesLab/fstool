@@ -524,7 +524,7 @@ impl RepackMeta {
         }
     }
 
-    fn to_file_meta(self) -> FileMeta {
+    pub(crate) fn to_file_meta(self) -> FileMeta {
         FileMeta {
             mode: self.mode,
             uid: self.uid,

@@ -2799,24 +2799,34 @@ where
     // 2 + 64 MiB`) and let the deferred-archive backends (squashfs / iso
     // / grf) truncate via `image_len` after flush; fixed-size FSes just
     // get a comfortable image.
+    // Fixed-size block filesystems that allocate against a sized device can be
+    // sized exactly by the writer itself. The deferred-archive backends
+    // (squashfs / iso / grf / zip / cpio / ar) and APFS instead over-provision
+    // and truncate via `image_len` after flush — and squashfs *compresses*, so
+    // a zero-data dry run would size them wildly wrong.
+    let writer_sized = matches!(label, "hfs+" | "hfs" | "affs" | "xfs" | "ntfs" | "f2fs");
     let auto_size = if !is_device
         && size_arg.is_none()
         && let Some(src) = source
     {
-        // Prefer an exact content-fit size when this FS has a size plan;
-        // otherwise fall back to the generous `2× + 64 MiB` heuristic.
-        match fstool::analyze::size_for_source(src, label)? {
-            Some(exact) => Some(exact),
-            None => {
-                let analysis = fstool::analyze::analyze_source(src, 1024)?;
-                Some(
-                    analysis
-                        .total_file_bytes
-                        .saturating_mul(2)
-                        .saturating_add(64 * 1024 * 1024)
-                        .max(default_min_size),
-                )
-            }
+        if writer_sized {
+            // Let the writer determine its own minimal size: a dry-run format +
+            // populate against a sizing device finds the smallest image its own
+            // allocator accepts (file data written as zeros, so it's metadata-
+            // only). The per-FS minimum guards tiny inputs.
+            let exact = fstool::analyze::writer_required_size::<F>(src, &format_opts)?;
+            Some(exact.max(default_min_size))
+        } else {
+            // Archive / streaming backends: a comfortable provision that the
+            // writer truncates to its real `image_len` after flush.
+            let analysis = fstool::analyze::analyze_source(src, 1024)?;
+            Some(
+                analysis
+                    .total_file_bytes
+                    .saturating_mul(2)
+                    .saturating_add(64 * 1024 * 1024)
+                    .max(default_min_size),
+            )
         }
     } else {
         None
