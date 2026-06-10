@@ -2445,7 +2445,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             qcow2_cluster_size,
             fstool::fs::ntfs::format::FormatOpts::default(),
             |o, m| o.apply_options(m),
-            16 * 1024 * 1024,
+            4 * 1024 * 1024,
         )?,
         "f2fs" => create_via_factory::<fstool::fs::f2fs::F2fs>(
             "f2fs",

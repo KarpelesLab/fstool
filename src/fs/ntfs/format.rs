@@ -2135,21 +2135,15 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
     bitmap.set_range(mft_lcn, mft_clusters);
     bitmap.next_hint = mft_lcn + mft_clusters;
 
-    // Allocate $MFTMirr in the volume midpoint (or at fixed near-end if small).
+    // Allocate $MFTMirr contiguously with the other system files near the
+    // start of the volume (modern NTFS does this too — the legacy "volume
+    // midpoint" placement is read from $Boot either way, and splitting the
+    // free space at the midpoint would prevent a single file larger than half
+    // the volume from being allocated as one contiguous run, forcing
+    // content-fit images to ~2× the data. Keeping all free space contiguous
+    // lets `create`/`repack` size the image to the content exactly).
     let mirror_clusters_n = mirror_clusters(rec_size, cluster_size);
-    let mid_cluster = total_clusters / 2;
-    // Try midpoint, fallback to allocator.
-    let mftmirr_lcn = {
-        let candidate = mid_cluster;
-        if candidate + mirror_clusters_n <= total_clusters
-            && (candidate..candidate + mirror_clusters_n).all(|c| !bitmap.is_set(c))
-        {
-            bitmap.set_range(candidate, mirror_clusters_n);
-            candidate
-        } else {
-            bitmap.allocate(mirror_clusters_n)?
-        }
-    };
+    let mftmirr_lcn = bitmap.allocate(mirror_clusters_n)?;
 
     // Allocate $LogFile.
     let logfile_clusters = ceil_div(LOGFILE_BYTES, cluster_size as u64);

@@ -69,6 +69,7 @@ pub mod mft;
 pub mod run_list;
 pub mod rw;
 pub mod secure;
+pub mod size_plan;
 pub mod upcase_gen;
 pub mod writer;
 
@@ -1711,6 +1712,10 @@ impl crate::fs::FilesystemFactory for Ntfs {
 
     fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
         Self::open(dev)
+    }
+
+    fn size_plan(opts: &Self::FormatOpts) -> Option<Box<dyn crate::fs::FsSizePlan>> {
+        Some(Box::new(size_plan::NtfsSizePlan::new(opts)))
     }
 }
 
