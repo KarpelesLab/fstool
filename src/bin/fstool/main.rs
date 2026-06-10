@@ -373,13 +373,24 @@ enum Command {
     /// (or the process exits — `AutoUnmount` is on by default).
     #[cfg(feature = "fuse")]
     Mount {
-        /// Image to mount. Plain file or `path:N` partition selector.
-        #[arg(value_name = "IMAGE")]
-        image: String,
-        /// Host directory to mount the image under. Must already exist
-        /// and be empty (or close to it — your kernel decides).
+        /// Image to mount. Plain file or `path:N` partition selector. Omit it
+        /// together with `--new-ramfs` to mount an empty in-memory filesystem.
+        #[arg(value_name = "IMAGE", required_unless_present = "new_ramfs")]
+        image: Option<String>,
+        /// Host directory to mount under. Must already exist and be empty (or
+        /// close to it — your kernel decides). With `--new-ramfs` this is the
+        /// only positional, so `fstool mount --new-ramfs <MOUNTPOINT>` works.
         #[arg(value_name = "MOUNTPOINT")]
-        mountpoint: PathBuf,
+        mountpoint: Option<PathBuf>,
+        /// Mount a fresh in-memory ramfs instead of an image. Writes through
+        /// the mountpoint land in RAM and are discarded on unmount unless you
+        /// snapshot them first (`fstool shell --new-ramfs … save`).
+        #[arg(long)]
+        new_ramfs: bool,
+        /// With `--new-ramfs`, pre-populate the ramfs from this source (a host
+        /// directory, an image, or a tar archive) before mounting.
+        #[arg(long, value_name = "SOURCE")]
+        from: Option<String>,
     },
 }
 
@@ -538,14 +549,67 @@ fn run(cli: Cli) -> fstool::Result<()> {
             no_progress,
         }),
         #[cfg(feature = "fuse")]
-        Command::Mount { image, mountpoint } => mount_cmd(&image, &mountpoint),
+        Command::Mount {
+            image,
+            mountpoint,
+            new_ramfs,
+            from,
+        } => mount_cmd(
+            image.as_deref(),
+            mountpoint.as_deref(),
+            new_ramfs,
+            from.as_deref(),
+        ),
     }
 }
 
 #[cfg(feature = "fuse")]
-fn mount_cmd(image: &str, mountpoint: &std::path::Path) -> fstool::Result<()> {
+fn mount_cmd(
+    image: Option<&str>,
+    mountpoint: Option<&std::path::Path>,
+    new_ramfs: bool,
+    from: Option<&str>,
+) -> fstool::Result<()> {
     use fstool::fs::Filesystem;
     use fstool::inspect::FsKind;
+
+    if new_ramfs {
+        // With `--new-ramfs` the lone positional is the mountpoint; clap binds
+        // it to `image` (the first positional) when `mountpoint` is absent.
+        let mountpoint = mountpoint
+            .or_else(|| image.map(std::path::Path::new))
+            .ok_or_else(|| {
+                fstool::Error::InvalidArgument("mount --new-ramfs: a MOUNTPOINT is required".into())
+            })?;
+        // An in-memory ramfs: a throwaway device the FS ignores, optionally
+        // seeded from a source. Writes through the mount stay in RAM.
+        let mut dev: Box<dyn fstool::block::BlockDevice + Send> =
+            Box::new(fstool::block::MemoryBackend::new(0));
+        let fs: Box<dyn Filesystem + Send> = match from {
+            Some(src) => {
+                let source = fstool::repack::Source::detect(src)?;
+                let mut r = fstool::fs::ramfs::Ramfs::new();
+                fstool::repack::populate_fs_from_source_dyn(dev.as_mut(), &mut r, &source)?;
+                Box::new(r)
+            }
+            None => Box::new(fstool::fs::ramfs::Ramfs::new()),
+        };
+        let adapter = fstool::fuse_adapter::FstoolFs::new(fs, dev, "ramfs").allow_other(true);
+        eprintln!(
+            "fstool: mounted in-memory ramfs at {} (changes are NOT persisted; umount to detach)",
+            mountpoint.display()
+        );
+        adapter.mount(mountpoint).map_err(fstool::Error::Io)?;
+        return Ok(());
+    }
+
+    let image = image.ok_or_else(|| {
+        fstool::Error::InvalidArgument(
+            "mount: an IMAGE is required (or pass --new-ramfs for an empty in-memory tree)".into(),
+        )
+    })?;
+    let mountpoint = mountpoint
+        .ok_or_else(|| fstool::Error::InvalidArgument("mount: a MOUNTPOINT is required".into()))?;
 
     // FUSE adapter wants ownership of both the filesystem handle and
     // the backing block device. Partition selectors (`image:N`) and

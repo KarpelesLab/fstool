@@ -23,9 +23,10 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use fstool::block::FileBackend;
+use fstool::block::{FileBackend, MemoryBackend};
 use fstool::fs::ext::{Ext, FormatOpts};
-use fstool::fs::{FileMeta, FileSource};
+use fstool::fs::ramfs::Ramfs;
+use fstool::fs::{FileMeta, FileSource, Filesystem};
 use fstool::fuse_adapter::FstoolFs;
 use tempfile::{NamedTempFile, TempDir};
 
@@ -205,5 +206,72 @@ fn fuse_kernel_roundtrip_ext2() {
     // Give the kernel a beat to actually tear down before TempDir
     // tries to rmdir; 200 ms is well over what the autounmount
     // path needs.
+    std::thread::sleep(Duration::from_millis(200));
+}
+
+/// Mount an in-memory [`Ramfs`] over FUSE and exercise both reads
+/// **and writes** through the kernel — ramfs reports `Mutable`, so
+/// `create` / `write` / `mkdir` / `unlink` go all the way to the
+/// in-memory store and read back. Proves the new `mount --new-ramfs`
+/// path actually serves a live, writable filesystem.
+#[test]
+fn fuse_kernel_roundtrip_ramfs_readwrite() {
+    if !fuse_usable() {
+        eprintln!("skipping: /dev/fuse not usable or fusermount missing");
+        return;
+    }
+
+    // Build a small seeded ramfs in memory (ignores its device).
+    let mut dev: Box<dyn fstool::block::BlockDevice + Send> = Box::new(MemoryBackend::new(0));
+    let mut r = Ramfs::new();
+    r.create_dir(dev.as_mut(), Path::new("/etc"), FileMeta::default())
+        .unwrap();
+    let seed = b"seeded ramfs\n";
+    r.create_file(
+        dev.as_mut(),
+        Path::new("/etc/motd"),
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(seed.to_vec())),
+            len: seed.len() as u64,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    let fs: Box<dyn Filesystem + Send> = Box::new(r);
+
+    let mountdir = TempDir::new().expect("mount tempdir");
+    let mountpoint = mountdir.path().to_path_buf();
+    let session = FstoolFs::new(fs, dev, "ramfs")
+        .spawn_mount(&mountpoint)
+        .expect("spawn_mount");
+    wait_until_mounted(&mountpoint);
+
+    // Read the seeded file through the kernel.
+    let got = std::fs::read(mountpoint.join("etc/motd")).expect("read seeded");
+    assert_eq!(&got[..], seed);
+
+    // Write a brand-new file through the mount, then read it back.
+    let body = b"written through fuse\n";
+    std::fs::write(mountpoint.join("fresh.txt"), body).expect("write via fuse");
+    let back = std::fs::read(mountpoint.join("fresh.txt")).expect("read back");
+    assert_eq!(&back[..], body);
+
+    // mkdir + nested write + unlink + rmdir all round-trip.
+    std::fs::create_dir(mountpoint.join("sub")).expect("mkdir via fuse");
+    std::fs::write(mountpoint.join("sub/inner"), b"x").expect("nested write");
+    assert_eq!(std::fs::read(mountpoint.join("sub/inner")).unwrap(), b"x");
+    std::fs::remove_file(mountpoint.join("sub/inner")).expect("unlink");
+    std::fs::remove_dir(mountpoint.join("sub")).expect("rmdir");
+    assert!(std::fs::metadata(mountpoint.join("sub")).is_err());
+
+    // The new file is visible in a readdir of the root.
+    let names: std::collections::HashSet<String> = std::fs::read_dir(&mountpoint)
+        .expect("readdir root")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(names.contains("fresh.txt"), "fresh.txt missing: {names:?}");
+    assert!(names.contains("etc"), "etc missing: {names:?}");
+
+    drop(session);
     std::thread::sleep(Duration::from_millis(200));
 }
