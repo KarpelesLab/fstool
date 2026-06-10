@@ -42,6 +42,7 @@ pub mod format;
 pub mod inode;
 pub mod journal;
 pub mod rw;
+pub mod size_plan;
 pub mod superblock;
 pub mod symlink;
 pub mod write;
@@ -683,6 +684,10 @@ impl crate::fs::FilesystemFactory for Xfs {
 
     fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
         Self::open(dev)
+    }
+
+    fn size_plan(_opts: &Self::FormatOpts) -> Option<Box<dyn crate::fs::FsSizePlan>> {
+        Some(Box::new(size_plan::XfsSizePlan::new()))
     }
 }
 
