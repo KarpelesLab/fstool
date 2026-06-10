@@ -52,6 +52,7 @@ pub mod decmpfs;
 pub mod extents;
 pub mod handle;
 pub(crate) mod journal;
+pub mod size_plan;
 pub mod volume_header;
 pub mod writer;
 
@@ -1390,6 +1391,10 @@ impl crate::fs::FilesystemFactory for HfsPlus {
 
     fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
         Self::open(dev)
+    }
+
+    fn size_plan(opts: &Self::FormatOpts) -> Option<Box<dyn crate::fs::FsSizePlan>> {
+        Some(Box::new(size_plan::HfsPlusSizePlan::new(opts)))
     }
 }
 
