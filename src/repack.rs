@@ -1046,6 +1046,107 @@ pub fn walk_anyfs(
     Ok(())
 }
 
+/// DFS over any `&mut dyn Filesystem` source, emitting each entry into
+/// `sink` — the trait-driven twin of [`walk_anyfs`]. Used to repack an
+/// in-memory [`crate::fs::ramfs::Ramfs`] (or any other `Filesystem`) into a
+/// fresh image without routing through [`crate::inspect::AnyFs`]. Same
+/// cycle/depth guards and `(inode, nlink)` hard-link de-duplication. Does
+/// **not** call `sink.finish()` — the caller does.
+pub fn walk_filesystem(
+    src_fs: &mut dyn Filesystem,
+    src_dev: &mut dyn BlockDevice,
+    sink: &mut dyn RepackSink,
+) -> Result<()> {
+    use crate::fs::EntryKind;
+    let mut link_map: std::collections::HashMap<(u32, u32), String> =
+        std::collections::HashMap::new();
+    let mut visited_dirs: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut entries_seen: u64 = 0;
+    let mut stack: Vec<(String, usize)> = vec![("/".to_string(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        for e in src_fs.list(src_dev, Path::new(&dir))? {
+            if e.name == "." || e.name == ".." || e.name == "lost+found" {
+                continue;
+            }
+            entries_seen += 1;
+            if entries_seen > MAX_WALK_ENTRIES {
+                return Err(crate::Error::InvalidImage(format!(
+                    "source directory tree exceeds {MAX_WALK_ENTRIES} entries — refusing \
+                     to walk a possibly cyclic image"
+                )));
+            }
+            let child = join_fs_path(&dir, &e.name);
+            note(&child);
+            let child_path = Path::new(&child);
+            let attrs = src_fs.getattr(src_dev, child_path)?;
+            let xattrs = src_fs.list_xattrs(src_dev, child_path)?;
+            let meta = RepackMeta {
+                mode: attrs.mode,
+                uid: attrs.uid,
+                gid: attrs.gid,
+                mtime: attrs.mtime,
+                atime: attrs.atime,
+                ctime: attrs.ctime,
+            };
+            match attrs.kind {
+                EntryKind::Dir => {
+                    if attrs.inode != 0 && !visited_dirs.insert(attrs.inode) {
+                        return Err(crate::Error::InvalidImage(format!(
+                            "source directory cycle: {child:?} re-enters inode {} — \
+                             refusing to walk a cyclic image",
+                            attrs.inode
+                        )));
+                    }
+                    if depth >= MAX_WALK_DEPTH {
+                        return Err(crate::Error::InvalidImage(format!(
+                            "source directory nesting exceeds depth {MAX_WALK_DEPTH} at \
+                             {child:?} — refusing to walk a possibly cyclic image"
+                        )));
+                    }
+                    sink.put_dir(&child, meta, &xattrs)?;
+                    stack.push((child, depth + 1));
+                }
+                EntryKind::Regular => {
+                    if attrs.inode != 0 && attrs.nlink > 1 {
+                        let key = (attrs.inode, attrs.nlink);
+                        if let Some(first) = link_map.get(&key) {
+                            if sink.put_hardlink(&child, first, meta, &xattrs)? {
+                                continue;
+                            }
+                            // else: sink can't link — fall through and copy.
+                        } else {
+                            link_map.insert(key, child.clone());
+                        }
+                    }
+                    let mut body = src_fs.read_file(src_dev, child_path)?;
+                    sink.put_file(&child, &mut *body, attrs.size, meta, &xattrs)?;
+                    note_bytes(attrs.size);
+                }
+                EntryKind::Symlink => {
+                    let target = src_fs.read_symlink(src_dev, child_path)?;
+                    let target = target.to_string_lossy();
+                    sink.put_symlink(&child, &target, meta, &xattrs)?;
+                }
+                EntryKind::Char | EntryKind::Block | EntryKind::Fifo | EntryKind::Socket => {
+                    let (major, minor) = split_rdev(attrs.rdev);
+                    let kind = match attrs.kind {
+                        EntryKind::Char => DeviceKind::Char,
+                        EntryKind::Block => DeviceKind::Block,
+                        EntryKind::Fifo => DeviceKind::Fifo,
+                        EntryKind::Socket => DeviceKind::Socket,
+                        _ => unreachable!(),
+                    };
+                    sink.put_device(&child, kind, major, minor, meta, &xattrs)?;
+                }
+                EntryKind::Unknown => {
+                    eprintln!("repack: skipping unknown entry {child:?}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Open a (possibly compressed) tar at `path` as a forward-only byte
 /// stream — `make_reader` decompresses on the fly, so no tempfile is
 /// ever written. Each call re-opens from byte 0; callers that need a

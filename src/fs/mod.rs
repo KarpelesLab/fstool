@@ -32,6 +32,7 @@ pub mod hfs;
 pub mod hfs_plus;
 pub mod iso9660;
 pub mod ntfs;
+pub mod ramfs;
 pub mod rootdevs;
 pub mod squashfs;
 pub mod tar;
