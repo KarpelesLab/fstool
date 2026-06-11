@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.15](https://github.com/KarpelesLab/fstool/compare/v0.4.14...v0.4.15) - 2026-06-11
+
+### Added
+
+- *(cli)* surface statfs in `fstool info` and add a shell `df` command
+- *(ramfs)* `fstool mount --new-ramfs` — mount an in-memory tree over FUSE
+- *(ramfs)* AnyFs::Ramfs variant + `fstool shell --new-ramfs` with save
+- *(ramfs)* in-memory Filesystem with repack_to + generic walk_filesystem
+- *(ntfs)* analytic FsSizePlan + contiguous $MFTMirr for content-fit create
+- *(hfs)* analytic FsSizePlan for content-fit classic-HFS create
+- *(create)* HFS+ analytic FsSizePlan (catalog B-tree)
+- *(create)* F2FS analytic FsSizePlan
+- *(create)* XFS analytic FsSizePlan
+- *(create)* two-phase analytic builder — FsSizePlan via FilesystemFactory, AFFS reference
+- *(create)* writer-determined exact sizing for all block filesystems
+- *(create)* exact content-fit sizing infra + FAT32 (FsSizePlan)
+
+### Fixed
+
+- *(hfs+)* fsck-clean create at any size (alt-VH alignment + bitmap padding)
+
+### Other
+
+- *(analyze)* drop the binary-search writer_required_size fallback
+- *(hfs+)* drop unresolved intra-doc link to trait method total_size
+
 ### Fixed
 
 - *(hfs+)* `create -t hfsplus` now produces `fsck.hfsplus`-clean volumes at
