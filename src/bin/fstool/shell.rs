@@ -421,6 +421,10 @@ impl Shell {
                 self.cmd_info(dev, rest, output)?;
                 Ok(false)
             }
+            "df" => {
+                self.cmd_df(dev, output)?;
+                Ok(false)
+            }
             "find" => {
                 self.cmd_find(dev, rest, output)?;
                 Ok(false)
@@ -475,6 +479,8 @@ mkdir PATH          create an empty directory
 info [PATH]         no arg → image summary; with PATH → file metadata
                     (kind/mode/owner/size/blocks/nlink/inode/atime/mtime
                     /ctime/rdev) plus any extended attributes
+df                  filesystem capacity (statfs): block size, total / used /
+                    free space and inode counts
 find [PATH] [-name GLOB] [-type f|d|l|b|c|p|s] [-newer T] [-older T]
      [-sort mtime|size|name] [-limit N] [-reverse] [-l]
                     recursively list paths under PATH (default: cwd), filtered
@@ -892,6 +898,45 @@ quit | exit         leave{ro_note}\n{cache_note}"
             for xa in &xattrs {
                 writeln!(output, "  {:<28} = {}", xa.name, fmt_xattr_value(&xa.value))?;
             }
+        }
+        Ok(())
+    }
+
+    /// `df` — print the filesystem's capacity stats (the same `statfs` view
+    /// the FUSE adapter answers `df` with). Backends without a real superblock
+    /// report zero counts, shown verbatim.
+    fn cmd_df(&mut self, dev: &mut dyn BlockDevice, output: &mut impl Write) -> Result<()> {
+        let s = self.fs.statfs(dev)?;
+        let bs = u64::from(s.block_size);
+        let used = s.blocks.saturating_sub(s.blocks_free);
+        writeln!(output, "filesystem:  {}", self.fs.kind_string())?;
+        writeln!(output, "block size:  {} bytes", s.block_size)?;
+        writeln!(
+            output,
+            "size:        {} ({} blocks)",
+            crate::human_size(s.blocks * bs),
+            s.blocks
+        )?;
+        writeln!(
+            output,
+            "used:        {} ({} blocks)",
+            crate::human_size(used * bs),
+            used
+        )?;
+        writeln!(
+            output,
+            "free:        {} ({} blocks, {} avail)",
+            crate::human_size(s.blocks_free * bs),
+            s.blocks_free,
+            s.blocks_avail
+        )?;
+        writeln!(
+            output,
+            "inodes:      {} total, {} free",
+            s.inodes, s.inodes_free
+        )?;
+        if s.blocks == 0 && s.inodes == 0 {
+            writeln!(output, "(this backend does not report statfs counts)")?;
         }
         Ok(())
     }

@@ -487,6 +487,14 @@ impl AnyFs {
         self.as_filesystem_dyn(|fs| fs.total_file_bytes(dev))
     }
 
+    /// Filesystem-level capacity stats — delegates to the inner backend's
+    /// [`crate::fs::Filesystem::statfs`]. Backends without a real superblock
+    /// answer return [`crate::fs::StatFs::default`] (zero counts), which is
+    /// what `fstool info` / the shell `df` surface verbatim.
+    pub fn statfs(&mut self, dev: &mut dyn BlockDevice) -> Result<crate::fs::StatFs> {
+        self.as_filesystem_dyn(|fs| fs.statfs(dev))
+    }
+
     /// Full attributes for `path` — delegates to the inner backend's
     /// [`crate::fs::Filesystem::getattr`]. Used by the repack walker to
     /// read source metadata uniformly.

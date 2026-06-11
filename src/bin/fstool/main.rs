@@ -3446,6 +3446,8 @@ fn print_fs_info(dev: &mut dyn fstool::block::BlockDevice, fs: &mut fstool::insp
         fstool::inspect::AnyFs::Ramfs(_) => {}
     }
     println!();
+    print_statfs(dev, fs);
+    println!();
     println!("/ listing:");
     match fs.list(dev, "/") {
         Ok(entries) => {
@@ -3454,6 +3456,40 @@ fn print_fs_info(dev: &mut dyn fstool::block::BlockDevice, fs: &mut fstool::insp
             }
         }
         Err(e) => println!("  (couldn't list /: {e})"),
+    }
+}
+
+/// Print the unified `statfs` view (the same numbers the FUSE adapter answers
+/// `df` with). Backends without a real superblock report zero counts — shown
+/// verbatim so the output reflects exactly what `statfs` returns.
+fn print_statfs(dev: &mut dyn fstool::block::BlockDevice, fs: &mut fstool::inspect::AnyFs) {
+    let s = match fs.statfs(dev) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("statfs:            (unavailable: {e})");
+            return;
+        }
+    };
+    let bs = u64::from(s.block_size);
+    let used = s.blocks.saturating_sub(s.blocks_free);
+    println!("statfs:");
+    println!("  block size:      {} bytes", s.block_size);
+    println!(
+        "  blocks:          {} total, {} free, {} avail  ({} total, {} free)",
+        s.blocks,
+        s.blocks_free,
+        s.blocks_avail,
+        human_size(s.blocks * bs),
+        human_size(s.blocks_free * bs),
+    );
+    println!("  used:            {} ({})", used, human_size(used * bs));
+    println!(
+        "  inodes:          {} total, {} free",
+        s.inodes, s.inodes_free
+    );
+    println!("  name max:        {} bytes", s.name_max);
+    if s.blocks == 0 && s.inodes == 0 {
+        println!("  (this backend does not report statfs counts)");
     }
 }
 
