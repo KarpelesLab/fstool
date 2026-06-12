@@ -923,90 +923,29 @@ impl AnyFs {
     }
 
     /// Persist any in-memory metadata changes to the device.
+    ///
+    /// Delegates straight to each backend's [`crate::fs::Filesystem::flush`]
+    /// via [`as_filesystem_dyn`](Self::as_filesystem_dyn) — there is exactly
+    /// one flush implementation per backend, and this wrapper must never
+    /// reimplement the dispatch. A hand-written per-variant `match` here used
+    /// to no-op the backends that buffer directory writes in a `DirBatch`
+    /// (NTFS / XFS / exFAT) or a catalog (HFS+), so a CLI `put`/`rm` followed
+    /// by exit silently dropped the change. Every backend's `flush` is already
+    /// a guarded no-op when nothing is pending (a read-only handle has no
+    /// writer / `write_state` / dirty flag), so unconditional delegation is
+    /// safe for read-only handles and correct for writable ones.
     pub fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
-        match self {
-            Self::Ext(ext) => ext.flush(dev),
-            Self::Fat32(fat) => fat.flush(dev),
-            Self::Grf(g) => crate::fs::Filesystem::flush(g.as_mut(), dev),
-            // Classic HFS buffers its catalog in memory and persists it (and the
-            // bitmap + MDB) only on flush; route to the real implementation.
-            // (A read-only HFS handle has no writer, so its flush is a no-op.)
-            Self::Hfs(hfs) => crate::fs::Filesystem::flush(hfs.as_mut(), dev),
-            // AFFS (like classic HFS) persists a buffered model on flush once a
-            // writer is attached; a read-only handle's flush is a no-op.
-            Self::Affs(affs) => crate::fs::Filesystem::flush(affs.as_mut(), dev),
-            // NTFS / XFS / exFAT batch directory writes in an in-memory
-            // `DirBatch` (and stage bitmap/FAT/MFT updates) that is only
-            // drained by the backend's own flush. They must route to it: a
-            // bare `put`/`rm` followed by exit otherwise loses the staged
-            // directory entry entirely. Each backend's flush is a no-op when
-            // no writer is attached, so a read-only handle stays read-only.
-            // F2FS is build-once (a re-opened image is read-only) so its flush
-            // no-ops here, but route it for consistency. This used to be a
-            // blanket `Ok(())` no-op — correct before the DirBatch cache
-            // landed, a silent data-loss bug after it.
-            Self::Ntfs(ntfs) => crate::fs::Filesystem::flush(ntfs.as_mut(), dev),
-            Self::Xfs(xfs) => crate::fs::Filesystem::flush(xfs.as_mut(), dev),
-            Self::Exfat(exfat) => crate::fs::Filesystem::flush(exfat.as_mut(), dev),
-            Self::F2fs(f2fs) => crate::fs::Filesystem::flush(f2fs.as_mut(), dev),
-            // Genuinely read-only or in-memory handles: nothing buffered.
-            Self::Tar(_)
-            | Self::HfsPlus(_)
-            | Self::Apfs(_)
-            | Self::Squashfs(_)
-            | Self::Iso9660(_)
-            // ramfs is in-memory: nothing to persist.
-            | Self::Ramfs(_) => Ok(()),
-            // Archive handles opened via `AnyFs` are read-mode (a fresh
-            // writer is driven on the concrete type during `build`), so
-            // routing to the trait flush is a no-op here.
-            Self::Archive(fs, _, _) => crate::fs::Filesystem::flush(fs.as_mut(), dev),
-        }
+        self.as_filesystem_dyn(|fs| fs.flush(dev))
     }
 
     /// One-line FS summary, used by `fstool info`'s heading.
+    ///
+    /// A single exhaustive `match` so the compiler forces every variant to
+    /// yield a real label. (This used to be a list of early-`return`s
+    /// followed by a `match` whose remaining arms were `unreachable!()` —
+    /// add a variant, forget the early-`return`, and it panics at runtime
+    /// instead of failing to compile.)
     pub fn kind_string(&self) -> &'static str {
-        // Stitch in the read-only variants up front so the existing
-        // arms below for ext/fat32/tar don't need restructuring.
-        if let Self::Xfs(_) = self {
-            return "xfs";
-        }
-        if let Self::Exfat(_) = self {
-            return "exfat";
-        }
-        if let Self::HfsPlus(_) = self {
-            return "hfs+";
-        }
-        if let Self::Hfs(_) = self {
-            return "hfs";
-        }
-        if let Self::Affs(_) = self {
-            return "affs";
-        }
-        if let Self::Apfs(_) = self {
-            return "apfs";
-        }
-        if let Self::Ntfs(_) = self {
-            return "ntfs";
-        }
-        if let Self::F2fs(_) = self {
-            return "f2fs";
-        }
-        if let Self::Squashfs(_) = self {
-            return "squashfs";
-        }
-        if let Self::Iso9660(_) = self {
-            return "iso9660";
-        }
-        if let Self::Grf(_) = self {
-            return "grf";
-        }
-        if let Self::Archive(_, _, name) = self {
-            return name;
-        }
-        if let Self::Ramfs(_) = self {
-            return "ramfs";
-        }
         match self {
             Self::Ext(ext) => match ext.kind {
                 crate::fs::ext::FsKind::Ext2 => "ext2",
@@ -1015,20 +954,19 @@ impl AnyFs {
             },
             Self::Fat32(_) => "fat32",
             Self::Tar(_) => "tar",
-            // Read-only variants are dispatched above.
-            Self::Xfs(_)
-            | Self::Exfat(_)
-            | Self::HfsPlus(_)
-            | Self::Hfs(_)
-            | Self::Affs(_)
-            | Self::Apfs(_)
-            | Self::Ntfs(_)
-            | Self::F2fs(_)
-            | Self::Squashfs(_)
-            | Self::Iso9660(_)
-            | Self::Grf(_)
-            | Self::Archive(..)
-            | Self::Ramfs(_) => unreachable!(),
+            Self::Xfs(_) => "xfs",
+            Self::Exfat(_) => "exfat",
+            Self::HfsPlus(_) => "hfs+",
+            Self::Hfs(_) => "hfs",
+            Self::Affs(_) => "affs",
+            Self::Apfs(_) => "apfs",
+            Self::Ntfs(_) => "ntfs",
+            Self::F2fs(_) => "f2fs",
+            Self::Squashfs(_) => "squashfs",
+            Self::Iso9660(_) => "iso9660",
+            Self::Grf(_) => "grf",
+            Self::Archive(_, _, name) => name,
+            Self::Ramfs(_) => "ramfs",
         }
     }
 }

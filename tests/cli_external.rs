@@ -1932,3 +1932,113 @@ fn cli_hfs_in_place_add_and_remove() {
         validate_hfs_with_fsck(img.path());
     }
 }
+
+/// Run `fstool shell IMG`, feeding `script` on stdin. Returns the captured
+/// stdout and whether the process exited successfully.
+fn shell_script(img: &std::path::Path, script: &str) -> (String, bool) {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(FSTOOL)
+        .arg("shell")
+        .arg(img)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.success(),
+    )
+}
+
+/// Regression guard, at the *CLI* layer, for the `AnyFs::flush` data-loss
+/// bug: `fstool shell` → `put FILE /dest` → `quit`, with **no** intervening
+/// read, must leave the file readable on reopen.
+///
+/// Every other test reopens through the library (`inspect::open`), which
+/// reaches the `Filesystem` trait flush — the path the bug was *not* in.
+/// Only spawning the real binary exercises `AnyFs::flush`, the wrapper the
+/// shell actually calls. This drove silent data loss on NTFS / XFS / exFAT
+/// (DirBatch) and HFS+ (catalog) until the wrapper was made to delegate.
+///
+/// The body is 6 KiB so it is non-resident on NTFS and spans past exFAT's
+/// first cluster — i.e. it needs a real on-disk directory entry plus data
+/// runs, exactly what the dropped flush used to lose. Needs no external
+/// tool: a fresh `fstool` process reads it back, so this runs everywhere.
+#[test]
+fn cli_shell_put_quit_persists_across_backends() {
+    let body: Vec<u8> = (0..6144).map(|i| (i % 251) as u8).collect();
+    let host = NamedTempFile::new().unwrap();
+    std::fs::write(host.path(), &body).unwrap();
+
+    // Every filesystem `fstool create` can format and then mutate on reopen.
+    let cases = [
+        ("ext4", "32M"),
+        ("fat32", "64M"),
+        ("exfat", "64M"),
+        ("ntfs", "32M"),
+        ("xfs", "300M"),
+        ("hfs+", "16M"),
+        ("apfs", "32M"),
+    ];
+
+    for (ty, size) in cases {
+        let img = NamedTempFile::new().unwrap();
+        let create = Command::new(FSTOOL)
+            .args(["create", "--type", ty, "--size", size, "-o"])
+            .arg(img.path())
+            .output()
+            .unwrap();
+        assert!(
+            create.status.success(),
+            "{ty}: create failed: {}",
+            String::from_utf8_lossy(&create.stderr)
+        );
+
+        // The exact failing sequence: put then quit, nothing in between.
+        let (_out, ok) = shell_script(
+            img.path(),
+            &format!("put {} /f.bin\nquit\n", host.path().display()),
+        );
+        assert!(ok, "{ty}: `shell` exited non-zero on put;quit");
+
+        // Reopen with a brand-new process and read it back.
+        let cat = Command::new(FSTOOL)
+            .arg("cat")
+            .arg(img.path())
+            .arg("/f.bin")
+            .output()
+            .unwrap();
+        assert!(
+            cat.status.success(),
+            "{ty}: `cat` after put;quit failed (entry lost?): {}",
+            String::from_utf8_lossy(&cat.stderr)
+        );
+        assert_eq!(
+            cat.stdout, body,
+            "{ty}: put;quit lost or corrupted the file body"
+        );
+
+        // Where the native NTFS driver is installed, prove the bytes are
+        // readable by a real driver (what WinXP would see), not just fstool.
+        if ty == "ntfs" && which("ntfscat") {
+            let nc = Command::new("ntfscat")
+                .arg(img.path())
+                .arg("/f.bin")
+                .output()
+                .unwrap();
+            assert!(
+                nc.status.success() && nc.stdout == body,
+                "ntfs: ntfs-3g could not read back the file written via shell put;quit"
+            );
+        }
+    }
+}

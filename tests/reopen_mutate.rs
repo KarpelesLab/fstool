@@ -428,6 +428,7 @@ fn hfs_plus_reopen_mutate() {
         dev.sync().unwrap();
     }
     reopen_add_then_verify(tmp.path());
+    anyfs_put_flush_survives(tmp.path());
 
     if which("fsck.hfsplus") {
         let out = Command::new("fsck.hfsplus")
