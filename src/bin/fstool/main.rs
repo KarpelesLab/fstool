@@ -15,6 +15,7 @@
 //!   on supported filesystems.
 
 mod dd;
+mod safety;
 mod shell;
 
 use std::io::Write;
@@ -2023,7 +2024,13 @@ fn ls_tar_stream(
             tar_require_dir(&index, &want)?;
         }
         for e in &children {
-            let _ = writeln!(out, "{}\t{:?}\t{}", e.inode, e.kind, e.name);
+            let _ = writeln!(
+                out,
+                "{}\t{:?}\t{}",
+                e.inode,
+                e.kind,
+                safety::sanitize_name(&e.name)
+            );
         }
     }
     Ok(())
@@ -2093,9 +2100,15 @@ fn ls_tar_recursive(
         tar_require_dir(index, want)?;
     }
     let children = tar_children(index, want);
-    writeln!(out, "{want}:")?;
+    writeln!(out, "{}:", safety::sanitize_name(want))?;
     for e in &children {
-        writeln!(out, "{}\t{:?}\t{}", e.inode, e.kind, e.name)?;
+        writeln!(
+            out,
+            "{}\t{:?}\t{}",
+            e.inode,
+            e.kind,
+            safety::sanitize_name(&e.name)
+        )?;
     }
     writeln!(out)?;
     for e in &children {
@@ -2190,7 +2203,7 @@ fn info_tar_stream(image: &str, algo: Option<fstool::compression::Algo>) -> fsto
     println!();
     println!("/ listing:");
     for (name, kind, ino) in &top_entries {
-        println!("  {:>10}  {:?}  {}", ino, kind, name);
+        println!("  {:>10}  {:?}  {}", ino, kind, safety::sanitize_name(name));
     }
     Ok(())
 }
@@ -3093,7 +3106,7 @@ fn ls(image: &str, path: &str, recursive: bool, style: PathStyle) -> fstool::Res
                     "{}\t{:?}\t{}",
                     e.inode,
                     e.kind,
-                    path_style::display_name(&e.name, kind, style)
+                    safety::sanitize_name(&path_style::display_name(&e.name, kind, style))
                 );
             }
         }
@@ -3117,14 +3130,18 @@ fn ls_recursive(
     // `dir` and `e.name` are canonical; translate ONLY for display. The
     // recursion below must keep using the canonical values, or a name with a
     // separator-collision (e.g. HFS "A/ROSE Includes") would be mis-resolved.
-    writeln!(out, "{}:", path_style::display_path(dir, kind, style))?;
+    writeln!(
+        out,
+        "{}:",
+        safety::sanitize_name(&path_style::display_path(dir, kind, style))
+    )?;
     for e in &entries {
         writeln!(
             out,
             "{}\t{:?}\t{}",
             e.inode,
             e.kind,
-            path_style::display_name(&e.name, kind, style)
+            safety::sanitize_name(&path_style::display_name(&e.name, kind, style))
         )?;
     }
     writeln!(out)?;
@@ -3255,8 +3272,8 @@ fn print_resources(path: &str, total_bytes: usize, rf: &fstool::resfork::Resourc
             let data = rf.bytes_of(r);
             let decoded = fstool::resfork::decode_summary(&t.ostype, data);
             let label = match (&r.name, &decoded) {
-                (Some(n), Some(d)) => format!("\"{n}\"  {d}"),
-                (Some(n), None) => format!("\"{n}\""),
+                (Some(n), Some(d)) => format!("\"{}\"  {d}", safety::sanitize_name(n)),
+                (Some(n), None) => format!("\"{}\"", safety::sanitize_name(n)),
                 (None, Some(d)) => d.clone(),
                 (None, None) => String::new(),
             };
@@ -3361,9 +3378,12 @@ fn print_partition_table(
     println!();
     println!("  N  start (LBA)     end (LBA)         size       kind                    name");
     for (i, p) in parts.iter().enumerate() {
-        let end = p.start_lba + p.size_lba - 1;
-        let bytes = p.size_lba * 512;
-        let name = p.name.as_deref().unwrap_or("");
+        // Attacker-controlled LBA fields: use saturating arithmetic so a
+        // crafted table can't panic (debug) or wrap (release). (CLI-4)
+        let end = p.start_lba.saturating_add(p.size_lba).saturating_sub(1);
+        let bytes = p.size_lba.saturating_mul(512);
+        // Partition name is image-supplied: escape control bytes. (CLI-2)
+        let name = safety::sanitize_name(p.name.as_deref().unwrap_or(""));
         println!(
             "  {:>2}  {:>11}  {:>13}  {:>10}  {:<22}  {}",
             i + 1,
@@ -3452,7 +3472,12 @@ fn print_fs_info(dev: &mut dyn fstool::block::BlockDevice, fs: &mut fstool::insp
     match fs.list(dev, "/") {
         Ok(entries) => {
             for e in &entries {
-                println!("  {:>10}  {:?}  {}", e.inode, e.kind, e.name);
+                println!(
+                    "  {:>10}  {:?}  {}",
+                    e.inode,
+                    e.kind,
+                    safety::sanitize_name(&e.name)
+                );
             }
         }
         Err(e) => println!("  (couldn't list /: {e})"),

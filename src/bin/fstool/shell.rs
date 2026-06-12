@@ -526,7 +526,9 @@ quit | exit         leave{ro_note}\n{cache_note}"
             writeln!(
                 output,
                 "{}{}",
-                path_style::display_name(&e.name, self.kind, self.style),
+                crate::safety::sanitize_name(&path_style::display_name(
+                    &e.name, self.kind, self.style
+                )),
                 suffix
             )?;
         }
@@ -849,7 +851,7 @@ quit | exit         leave{ro_note}\n{cache_note}"
         let path = self.resolve(arg);
         let attrs = self.getattr(dev, &path)?;
 
-        writeln!(output, "path:   {path}")?;
+        writeln!(output, "path:   {}", crate::safety::sanitize_name(&path))?;
         writeln!(output, "kind:   {}", fmt_kind(attrs.kind))?;
         writeln!(
             output,
@@ -898,7 +900,7 @@ quit | exit         leave{ro_note}\n{cache_note}"
         if matches!(attrs.kind, fstool::fs::EntryKind::Symlink)
             && let Ok(tgt) = self.fs.read_symlink(dev, &path)
         {
-            writeln!(output, "target: {tgt}")?;
+            writeln!(output, "target: {}", crate::safety::sanitize_name(&tgt))?;
         }
 
         // Extended attributes — fs-specific metadata in a generic shape.
@@ -909,7 +911,12 @@ quit | exit         leave{ro_note}\n{cache_note}"
             writeln!(output)?;
             writeln!(output, "xattrs ({}):", xattrs.len())?;
             for xa in &xattrs {
-                writeln!(output, "  {:<28} = {}", xa.name, fmt_xattr_value(&xa.value))?;
+                writeln!(
+                    output,
+                    "  {:<28} = {}",
+                    crate::safety::sanitize_name(&xa.name),
+                    fmt_xattr_value(&xa.value)
+                )?;
             }
         }
         Ok(())
@@ -1065,13 +1072,17 @@ quit | exit         leave{ro_note}\n{cache_note}"
                     "{}  {:>12}  {}",
                     fmt_unix_utc(h.mtime),
                     h.size,
-                    path_style::display_path(&h.path, style.0, style.1)
+                    crate::safety::sanitize_name(&path_style::display_path(
+                        &h.path, style.0, style.1
+                    ))
                 )?;
             } else {
                 writeln!(
                     output,
                     "{}",
-                    path_style::display_path(&h.path, style.0, style.1)
+                    crate::safety::sanitize_name(&path_style::display_path(
+                        &h.path, style.0, style.1
+                    ))
                 )?;
             }
             Ok(())
@@ -1220,7 +1231,11 @@ quit | exit         leave{ro_note}\n{cache_note}"
             match self.getattr(dev, &p)?.kind {
                 fstool::fs::EntryKind::Dir => {
                     if !recurse {
-                        writeln!(output, "grep: {p}: is a directory (use -r)")?;
+                        writeln!(
+                            output,
+                            "grep: {}: is a directory (use -r)",
+                            crate::safety::sanitize_name(&p)
+                        )?;
                         continue;
                     }
                     let mut stack = vec![p];
@@ -1242,7 +1257,11 @@ quit | exit         leave{ro_note}\n{cache_note}"
                     }
                 }
                 fstool::fs::EntryKind::Regular => files.push(p),
-                _ => writeln!(output, "grep: {p}: not a regular file")?,
+                _ => writeln!(
+                    output,
+                    "grep: {}: not a regular file",
+                    crate::safety::sanitize_name(&p)
+                )?,
             }
         }
         let opts = GrepOpts {
@@ -1263,7 +1282,8 @@ quit | exit         leave{ro_note}\n{cache_note}"
             if size > CAP {
                 writeln!(
                     output,
-                    "grep: {path}: file too large ({size} bytes), skipped"
+                    "grep: {}: file too large ({size} bytes), skipped",
+                    crate::safety::sanitize_name(&path)
                 )?;
                 continue;
             }
@@ -1561,6 +1581,7 @@ fn grep_text(
                 n += 1;
             }
         }
+        let name = crate::safety::sanitize_name(name);
         if o.list {
             if n > 0 {
                 writeln!(out, "{name}")?;
@@ -1572,6 +1593,9 @@ fn grep_text(
         }
         return Ok(());
     }
+    // Filenames are image-supplied; escape control bytes so a crafted name
+    // can't inject terminal escapes. Matched line content is left verbatim.
+    let name = crate::safety::sanitize_name(name);
     for (i, line) in lines.iter().enumerate() {
         if interrupted() {
             break;
@@ -1606,6 +1630,8 @@ fn grep_binary(
     if hits.is_empty() {
         return Ok(());
     }
+    // Image-supplied filename: escape control bytes before printing.
+    let name = crate::safety::sanitize_name(name);
     if o.list {
         writeln!(out, "{name}")?;
         return Ok(());
