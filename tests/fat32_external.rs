@@ -277,7 +277,7 @@ fn modify_in_place_add_and_remove() {
         let mut dev = FileBackend::open(img.path()).unwrap();
         let mut fs = Fat32::open(&mut dev).unwrap();
         fs.add_file(&mut dev, "/added.txt", &added_file).unwrap();
-        fs.add_dir(&mut dev, "/new").unwrap();
+        fs.add_dir(&mut dev, "/new", 0).unwrap();
         fs.add_file(&mut dev, "/new/A Long Name.md", &nested_file)
             .unwrap();
         fs.remove(&mut dev, "/original.txt").unwrap();

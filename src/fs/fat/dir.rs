@@ -41,6 +41,93 @@ pub const LFN_CHARS_PER_ENTRY: usize = 13;
 /// DOS date for 1980-01-01 (the FAT epoch): year 0, month 1, day 1.
 pub const DOS_DATE_EPOCH: u16 = (1 << 5) | 1;
 
+/// 1980-01-01 00:00:00 UTC as Unix epoch seconds — the FAT/DOS epoch.
+const FAT_EPOCH: u64 = 315_532_800;
+
+fn is_leap_year(y: u32) -> bool {
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
+}
+
+/// Convert Unix epoch seconds into the FAT `(date, time)` word pair. Values
+/// before 1980 (or past 2107) collapse to the reproducible epoch
+/// `(DOS_DATE_EPOCH, 0)`. FAT time has 2-second resolution, so odd seconds
+/// round down.
+pub fn unix_to_dos_datetime(unix_secs: u32) -> (u16, u16) {
+    if u64::from(unix_secs) < FAT_EPOCH {
+        return (DOS_DATE_EPOCH, 0);
+    }
+    let secs = u64::from(unix_secs) - FAT_EPOCH;
+    let day_secs = secs % 86_400;
+    let (h, m, s) = (day_secs / 3600, (day_secs / 60) % 60, day_secs % 60);
+    let mut days = secs / 86_400;
+    let mut year: u32 = 1980;
+    loop {
+        let diy = if is_leap_year(year) { 366 } else { 365 };
+        if days < diy {
+            break;
+        }
+        days -= diy;
+        year += 1;
+        if year > 2107 {
+            return (DOS_DATE_EPOCH, 0);
+        }
+    }
+    const MONTH_DAYS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month: u32 = 1;
+    for (i, md) in MONTH_DAYS.iter().enumerate() {
+        let dim = if i == 1 && is_leap_year(year) {
+            29
+        } else {
+            *md
+        };
+        if days < dim {
+            break;
+        }
+        days -= dim;
+        month += 1;
+    }
+    let day = days as u32 + 1;
+    let date = (((year - 1980) << 9) | (month << 5) | day) as u16;
+    let time = ((h << 11) | (m << 5) | (s / 2)) as u16;
+    (date, time)
+}
+
+/// Inverse of [`unix_to_dos_datetime`]: decode a FAT `(date, time)` pair into
+/// Unix epoch seconds. A zero `date` (an unset field) decodes to `0`.
+pub fn dos_datetime_to_unix(date: u16, time: u16) -> u32 {
+    // A zero field, or the reproducible epoch sentinel an mtime-less entry is
+    // written with, both mean "no timestamp". (A real 1980-01-01 00:00:00
+    // file is indistinguishable from the sentinel anyway — `unix_to_dos_*`
+    // maps it to exactly this pair — so collapsing it to 0 is lossless.)
+    if date == 0 || (date == DOS_DATE_EPOCH && time == 0) {
+        return 0;
+    }
+    let s = u32::from(time & 0x1F) * 2;
+    let m = u32::from((time >> 5) & 0x3F);
+    let h = u32::from((time >> 11) & 0x1F);
+    let day = u32::from(date & 0x1F);
+    let month = u32::from((date >> 5) & 0x0F);
+    let year = u32::from((date >> 9) & 0x7F) + 1980;
+    if !(1..=12).contains(&month) || day < 1 {
+        return 0;
+    }
+    let mut days: u64 = 0;
+    for y in 1980..year {
+        days += if is_leap_year(y) { 366 } else { 365 };
+    }
+    const MONTH_DAYS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    for mo in 1..month {
+        days += if mo == 2 && is_leap_year(year) {
+            29
+        } else {
+            MONTH_DAYS[(mo - 1) as usize]
+        };
+    }
+    days += u64::from(day - 1);
+    let secs = FAT_EPOCH + days * 86_400 + u64::from(h) * 3600 + u64::from(m) * 60 + u64::from(s);
+    secs.min(u64::from(u32::MAX)) as u32
+}
+
 /// A decoded 8.3 directory entry.
 #[derive(Debug, Clone)]
 pub struct DirEntry {
@@ -49,21 +136,34 @@ pub struct DirEntry {
     pub attr: u8,
     pub first_cluster: u32,
     pub file_size: u32,
+    /// Modification time, Unix epoch seconds. `0` means "no timestamp" and
+    /// encodes as the reproducible FAT epoch (1980-01-01). FAT has 2-second
+    /// resolution, so odd seconds round down on encode.
+    pub mtime: u32,
 }
 
 impl DirEntry {
-    /// Encode this 8.3 entry into 32 bytes. Timestamps are fixed at the
-    /// FAT epoch for reproducible output.
+    /// Encode this 8.3 entry into 32 bytes. When `mtime` is `0` the
+    /// timestamps are fixed at the FAT epoch for reproducible output;
+    /// otherwise the creation / access / write fields all carry `mtime`.
     pub fn encode(&self) -> [u8; ENTRY_SIZE] {
         let mut b = [0u8; ENTRY_SIZE];
         b[0..11].copy_from_slice(&self.name_83);
         b[11] = self.attr;
-        // 14..16 creation time = 0; 16..18 creation date = epoch.
-        b[16..18].copy_from_slice(&DOS_DATE_EPOCH.to_le_bytes());
-        b[18..20].copy_from_slice(&DOS_DATE_EPOCH.to_le_bytes());
+        let (date, time) = if self.mtime == 0 {
+            (DOS_DATE_EPOCH, 0)
+        } else {
+            unix_to_dos_datetime(self.mtime)
+        };
+        // 13 creation time tenths = 0; 14..16 creation time; 16..18 creation date.
+        b[14..16].copy_from_slice(&time.to_le_bytes());
+        b[16..18].copy_from_slice(&date.to_le_bytes());
+        // 18..20 last-access date (no time field in FAT).
+        b[18..20].copy_from_slice(&date.to_le_bytes());
         b[20..22].copy_from_slice(&((self.first_cluster >> 16) as u16).to_le_bytes());
-        // 22..24 write time = 0; 24..26 write date = epoch.
-        b[24..26].copy_from_slice(&DOS_DATE_EPOCH.to_le_bytes());
+        // 22..24 write time; 24..26 write date.
+        b[22..24].copy_from_slice(&time.to_le_bytes());
+        b[24..26].copy_from_slice(&date.to_le_bytes());
         b[26..28].copy_from_slice(&(self.first_cluster as u16).to_le_bytes());
         b[28..32].copy_from_slice(&self.file_size.to_le_bytes());
         b
@@ -83,11 +183,14 @@ impl DirEntry {
         name_83.copy_from_slice(&b[0..11]);
         let hi = u16::from_le_bytes(b[20..22].try_into().unwrap()) as u32;
         let lo = u16::from_le_bytes(b[26..28].try_into().unwrap()) as u32;
+        let write_time = u16::from_le_bytes(b[22..24].try_into().unwrap());
+        let write_date = u16::from_le_bytes(b[24..26].try_into().unwrap());
         Some(Self {
             name_83,
             attr,
             first_cluster: (hi << 16) | lo,
             file_size: u32::from_le_bytes(b[28..32].try_into().unwrap()),
+            mtime: dos_datetime_to_unix(write_date, write_time),
         })
     }
 
@@ -358,12 +461,34 @@ mod tests {
             attr: ATTR_ARCHIVE,
             first_cluster: 0x0012_3456,
             file_size: 4096,
+            mtime: 0,
         };
         let dec = DirEntry::decode(&e.encode()).unwrap();
         assert_eq!(dec.name_83, *b"HELLO   TXT");
         assert_eq!(dec.first_cluster, 0x0012_3456);
         assert_eq!(dec.file_size, 4096);
         assert_eq!(dec.short_name_string(), "hello.txt");
+        assert_eq!(dec.mtime, 0); // epoch sentinel → "no timestamp"
+    }
+
+    #[test]
+    fn dos_datetime_round_trips() {
+        // Even-second Unix times survive encode→decode (FAT has 2-second
+        // resolution).
+        for &t in &[
+            1_577_836_800u32, // 2020-01-01 00:00:00
+            1_615_779_296,    // 2021-03-15 12:34:56
+            1_234_567_890,    // 2009-02-13 23:31:30
+        ] {
+            let (date, time) = unix_to_dos_datetime(t);
+            assert_eq!(dos_datetime_to_unix(date, time), t, "round-trip {t}");
+        }
+        // Pre-1980 and the epoch both collapse to "no timestamp".
+        assert_eq!(unix_to_dos_datetime(0), (DOS_DATE_EPOCH, 0));
+        assert_eq!(dos_datetime_to_unix(DOS_DATE_EPOCH, 0), 0);
+        // Odd seconds round down through the 2-second field.
+        let (d, t) = unix_to_dos_datetime(1_615_779_297);
+        assert_eq!(dos_datetime_to_unix(d, t), 1_615_779_296);
     }
 
     #[test]

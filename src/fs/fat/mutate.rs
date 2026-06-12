@@ -265,21 +265,25 @@ impl Fat32 {
         dest_path: &str,
         host_src: &Path,
     ) -> Result<()> {
-        let size = std::fs::metadata(host_src)?.len();
+        let md = std::fs::metadata(host_src)?;
+        let size = md.len();
+        let mtime = host_mtime_secs(&md);
         let mut file = std::fs::File::open(host_src)?;
-        self.add_file_from_reader(dev, dest_path, &mut file, size)
+        self.add_file_from_reader(dev, dest_path, &mut file, size, mtime)
     }
 
     /// Like [`Self::add_file`] but pulls bytes from any [`std::io::Read`]
     /// instead of a host filesystem path. The reader must produce exactly
     /// `size` bytes; used by the repack path to stream content directly
-    /// from another opened filesystem.
+    /// from another opened filesystem. `mtime` is Unix epoch seconds (`0`
+    /// for none) and is stored in the directory entry's date/time fields.
     pub fn add_file_from_reader(
         &mut self,
         dev: &mut dyn BlockDevice,
         dest_path: &str,
         reader: &mut dyn std::io::Read,
         size: u64,
+        mtime: u32,
     ) -> Result<()> {
         let (parent_cluster, leaf) = self.resolve_parent(dev, dest_path)?;
         if self.child_exists(dev, parent_cluster, &leaf)? {
@@ -297,7 +301,14 @@ impl Fat32 {
         self.stream_reader_chain(dev, reader, &chain, size)?;
         let first = chain.first().copied().unwrap_or(0);
         let mut entries: Vec<u8> = Vec::new();
-        self.push_dir_entry(&mut entries, &leaf, dir::ATTR_ARCHIVE, first, size as u32);
+        self.push_dir_entry(
+            &mut entries,
+            &leaf,
+            dir::ATTR_ARCHIVE,
+            first,
+            size as u32,
+            mtime,
+        );
         self.stage_dir_entry(
             dev,
             parent_cluster,
@@ -337,7 +348,13 @@ impl Fat32 {
     }
 
     /// Create a directory at `dest_path`. The parent must already exist.
-    pub fn add_dir(&mut self, dev: &mut dyn BlockDevice, dest_path: &str) -> Result<()> {
+    /// `mtime` is Unix epoch seconds (`0` for none).
+    pub fn add_dir(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dest_path: &str,
+        mtime: u32,
+    ) -> Result<()> {
         let (parent_cluster, leaf) = self.resolve_parent(dev, dest_path)?;
         if self.child_exists(dev, parent_cluster, &leaf)? {
             return Err(crate::Error::InvalidArgument(format!(
@@ -360,7 +377,14 @@ impl Fat32 {
         dev.write_at(self.cluster_offset(child_cluster), &dir_body)?;
 
         let mut entries: Vec<u8> = Vec::new();
-        self.push_dir_entry(&mut entries, &leaf, dir::ATTR_DIRECTORY, child_cluster, 0);
+        self.push_dir_entry(
+            &mut entries,
+            &leaf,
+            dir::ATTR_DIRECTORY,
+            child_cluster,
+            0,
+            mtime,
+        );
         self.stage_dir_entry(
             dev,
             parent_cluster,
@@ -558,6 +582,7 @@ impl Fat32 {
     /// entry) for `name` into `entries`. Wraps the existing private helper
     /// without the short-name uniqueness counter — modify-in-place callers
     /// pick a fresh seq via the cluster number, which is itself unique.
+    #[allow(clippy::too_many_arguments)]
     fn push_dir_entry(
         &self,
         entries: &mut Vec<u8>,
@@ -565,6 +590,7 @@ impl Fat32 {
         attr: u8,
         first_cluster: u32,
         file_size: u32,
+        mtime: u32,
     ) {
         let upper = name.to_ascii_uppercase();
         let (name_83, need_lfn) = if dir::is_valid_83(&upper) {
@@ -583,6 +609,7 @@ impl Fat32 {
             attr,
             first_cluster,
             file_size,
+            mtime,
         };
         entries.extend_from_slice(&entry.encode());
     }
@@ -594,8 +621,19 @@ fn dot_entry(name_83: &[u8; 11], cluster: u32) -> [u8; dir::ENTRY_SIZE] {
         attr: dir::ATTR_DIRECTORY,
         first_cluster: cluster,
         file_size: 0,
+        mtime: 0,
     }
     .encode()
+}
+
+/// Host file modification time as Unix epoch seconds, or `0` if unavailable
+/// (or before the epoch). Portable across platforms via `Metadata::modified`.
+pub(super) fn host_mtime_secs(md: &std::fs::Metadata) -> u32 {
+    md.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs().min(u64::from(u32::MAX)) as u32)
+        .unwrap_or(0)
 }
 
 // `cluster_offset` and `cluster_bytes` are on the parent impl; export them

@@ -221,6 +221,7 @@ impl Fat32 {
             attr: dir::ATTR_VOLUME_ID,
             first_cluster: 0,
             file_size: 0,
+            mtime: 0,
         }
         .encode()
     }
@@ -418,6 +419,7 @@ impl Fat32 {
             if ft.is_symlink() {
                 continue; // FAT has no symlinks
             }
+            let mtime = mutate::host_mtime_secs(&meta);
             if ft.is_file() {
                 let size = meta.len();
                 let cb = self.cluster_bytes();
@@ -431,6 +433,7 @@ impl Fat32 {
                     dir::ATTR_ARCHIVE,
                     first,
                     size as u32,
+                    mtime,
                     &mut short_seq,
                 );
                 // A zero-length file keeps no clusters.
@@ -448,6 +451,7 @@ impl Fat32 {
                     dir::ATTR_DIRECTORY,
                     child_cluster,
                     0,
+                    mtime,
                     &mut short_seq,
                 );
             }
@@ -459,7 +463,9 @@ impl Fat32 {
     }
 
     /// Append a directory entry for `name` to `entries`, emitting LFN
-    /// fragments first when the name isn't a plain 8.3 name.
+    /// fragments first when the name isn't a plain 8.3 name. `mtime` is
+    /// Unix epoch seconds (`0` for none).
+    #[allow(clippy::too_many_arguments)]
     fn push_entry(
         &self,
         entries: &mut Vec<u8>,
@@ -467,6 +473,7 @@ impl Fat32 {
         attr: u8,
         first_cluster: u32,
         file_size: u32,
+        mtime: u32,
         short_seq: &mut u32,
     ) {
         let upper = name.to_ascii_uppercase();
@@ -491,6 +498,7 @@ impl Fat32 {
             attr,
             first_cluster,
             file_size,
+            mtime,
         };
         entries.extend_from_slice(&entry.encode());
     }
@@ -930,6 +938,7 @@ fn dot_entry(name_83: &[u8; 11], cluster: u32) -> [u8; dir::ENTRY_SIZE] {
         attr: dir::ATTR_DIRECTORY,
         first_cluster: cluster,
         file_size: 0,
+        mtime: 0,
     }
     .encode()
 }
@@ -957,13 +966,13 @@ impl crate::fs::Filesystem for Fat32 {
         dev: &mut dyn BlockDevice,
         path: &Path,
         src: crate::fs::FileSource,
-        _meta: crate::fs::FileMeta,
+        meta: crate::fs::FileMeta,
     ) -> Result<()> {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("fat32: non-UTF-8 path".into()))?;
         let (mut reader, len) = src.open()?;
-        self.add_file_from_reader(dev, s, &mut reader, len)
+        self.add_file_from_reader(dev, s, &mut reader, len, meta.mtime)
     }
 
     fn create_file_streaming(
@@ -972,24 +981,24 @@ impl crate::fs::Filesystem for Fat32 {
         path: &Path,
         body: &mut dyn std::io::Read,
         len: u64,
-        _meta: crate::fs::FileMeta,
+        meta: crate::fs::FileMeta,
     ) -> Result<()> {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("fat32: non-UTF-8 path".into()))?;
-        self.add_file_from_reader(dev, s, body, len)
+        self.add_file_from_reader(dev, s, body, len, meta.mtime)
     }
 
     fn create_dir(
         &mut self,
         dev: &mut dyn BlockDevice,
         path: &Path,
-        _meta: crate::fs::FileMeta,
+        meta: crate::fs::FileMeta,
     ) -> Result<()> {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("fat32: non-UTF-8 path".into()))?;
-        self.add_dir(dev, s)
+        self.add_dir(dev, s, meta.mtime)
     }
 
     fn create_symlink(
@@ -1033,6 +1042,34 @@ impl crate::fs::Filesystem for Fat32 {
         // ancestor lookups along the way) reflect them.
         self.flush_dir_batches(dev)?;
         self.list_path(dev, s)
+    }
+
+    /// Surface the entry's modification time. The trait default fills the
+    /// timestamps with zeros (a `DirEntry` carries none); FAT stores a DOS
+    /// date/time in the 8.3 entry, so decode it here. FAT has no per-file
+    /// atime time-of-day or distinct ctime, so all three report the write
+    /// time (atime/ctime are stored from the same value on create).
+    fn getattr(&mut self, dev: &mut dyn BlockDevice, path: &Path) -> Result<crate::fs::FileAttrs> {
+        use crate::fs::{EntryKind, FileAttrs};
+        if path == Path::new("/") || path.as_os_str().is_empty() {
+            return Ok(FileAttrs::defaults_for(EntryKind::Dir, 0, 0));
+        }
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("fat32: non-UTF-8 path".into()))?;
+        // A freshly `put` file may still be staged; materialize first.
+        self.flush_dir_batches(dev)?;
+        let (entry, _dir_cluster) = self.resolve_entry(dev, s)?;
+        let kind = if entry.attr & dir::ATTR_DIRECTORY != 0 {
+            EntryKind::Dir
+        } else {
+            EntryKind::Regular
+        };
+        let mut attrs = FileAttrs::defaults_for(kind, u64::from(entry.file_size), 0);
+        attrs.mtime = entry.mtime;
+        attrs.atime = entry.mtime;
+        attrs.ctime = entry.mtime;
+        Ok(attrs)
     }
 
     fn read_file<'a>(
@@ -1120,7 +1157,8 @@ impl crate::fs::Filesystem for Fat32 {
                 // Create an empty file via the existing modify-in-place
                 // path; serialize it so its on-disk entry exists, then
                 // re-find it (the handle updates that entry in place).
-                self.add_file_from_reader(dev, s, &mut std::io::empty(), 0)?;
+                let mtime = meta.as_ref().map(|m| m.mtime).unwrap_or(0);
+                self.add_file_from_reader(dev, s, &mut std::io::empty(), 0, mtime)?;
                 self.flush_dir_batches(dev)?;
                 self.find_entry(dev, parent_cluster, &leaf)?
                     .ok_or_else(|| {

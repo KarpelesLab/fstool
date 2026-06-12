@@ -2091,7 +2091,9 @@ fn cli_shell_quoted_paths() {
 }
 
 /// `put` preserves the host file's mtime (it used to drop every timestamp to
-/// zero). Checked on ext4, whose getattr round-trips mtime.
+/// zero). Checked on every backend whose getattr round-trips mtime: ext4,
+/// fat32, exfat, ntfs. (fat32/exfat have 2-second resolution, so the host
+/// mtime is an even second.)
 #[test]
 fn cli_shell_put_preserves_mtime() {
     use std::time::{Duration, SystemTime};
@@ -2099,8 +2101,8 @@ fn cli_shell_put_preserves_mtime() {
     let srcdir = tempfile::tempdir().unwrap();
     let hostfile = srcdir.path().join("dated.txt");
     std::fs::write(&hostfile, b"has a date\n").unwrap();
-    // A fixed, non-zero mtime well in the past.
-    let when = SystemTime::UNIX_EPOCH + Duration::from_secs(1_615_779_296); // 2021-03-15
+    // A fixed, non-zero, even-second mtime well in the past (2021-03-15).
+    let when = SystemTime::UNIX_EPOCH + Duration::from_secs(1_615_779_296);
     let f = std::fs::File::options()
         .write(true)
         .open(&hostfile)
@@ -2108,32 +2110,40 @@ fn cli_shell_put_preserves_mtime() {
     f.set_modified(when).unwrap();
     drop(f);
 
-    let img = NamedTempFile::new().unwrap();
-    assert!(
-        Command::new(FSTOOL)
-            .args(["create", "--type", "ext4", "--size", "16M", "-o"])
-            .arg(img.path())
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    for (ty, size) in [
+        ("ext4", "16M"),
+        ("fat32", "64M"),
+        ("exfat", "64M"),
+        ("ntfs", "32M"),
+    ] {
+        let img = NamedTempFile::new().unwrap();
+        assert!(
+            Command::new(FSTOOL)
+                .args(["create", "--type", ty, "--size", size, "-o"])
+                .arg(img.path())
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "{ty}: create failed"
+        );
 
-    let (out, ok) = shell_script(
-        img.path(),
-        &format!("put \"{}\" /dated.txt\nquit\n", hostfile.display()),
-    );
-    assert!(ok, "put failed: {out}");
+        let (out, ok) = shell_script(
+            img.path(),
+            &format!("put \"{}\" /dated.txt\nquit\n", hostfile.display()),
+        );
+        assert!(ok, "{ty}: put failed: {out}");
 
-    // `info` reports `mtime:  <epoch>  (...)`. It must be the host value, not 0.
-    let (info, ok) = shell_script(img.path(), "info /dated.txt\nquit\n");
-    assert!(ok, "info failed: {info}");
-    let mtime_line = info
-        .lines()
-        .find(|l| l.trim_start().starts_with("mtime:"))
-        .unwrap_or("");
-    assert!(
-        mtime_line.contains("1615779296"),
-        "put did not preserve host mtime (line: {mtime_line:?})"
-    );
+        // `info` reports `mtime:  <epoch>  (...)`. It must be the host value.
+        let (info, ok) = shell_script(img.path(), "info /dated.txt\nquit\n");
+        assert!(ok, "{ty}: info failed: {info}");
+        let mtime_line = info
+            .lines()
+            .find(|l| l.trim_start().starts_with("mtime:"))
+            .unwrap_or("");
+        assert!(
+            mtime_line.contains("1615779296"),
+            "{ty}: put did not preserve host mtime (line: {mtime_line:?})"
+        );
+    }
 }

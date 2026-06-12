@@ -39,6 +39,9 @@ pub struct FatFileHandle<'a> {
     entry_attr: u8,
     /// Raw 8.3 name field — preserved across rewrites.
     entry_name_83: [u8; 11],
+    /// Modification time (Unix epoch seconds) — preserved across rewrites so
+    /// re-encoding the entry after a write doesn't reset it to the FAT epoch.
+    entry_mtime: u32,
     /// True once writes (or set_len) have made the in-memory FAT / entry
     /// diverge from disk. Cleared on `sync()` and `Drop`.
     dirty: bool,
@@ -70,6 +73,7 @@ impl<'a> FatFileHandle<'a> {
             entry_pos,
             entry_attr: entry.attr,
             entry_name_83: entry.name_83,
+            entry_mtime: entry.mtime,
             dirty: false,
         })
     }
@@ -192,6 +196,7 @@ impl<'a> FatFileHandle<'a> {
             attr: self.entry_attr,
             first_cluster,
             file_size: self.file_size as u32,
+            mtime: self.entry_mtime,
         };
         let enc = entry.encode();
         let cb = self.cb() as usize;
