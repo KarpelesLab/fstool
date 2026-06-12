@@ -1448,6 +1448,34 @@ impl crate::fs::Filesystem for Exfat {
     fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         Exfat::flush(self, dev)
     }
+
+    /// Surface the on-disk timestamps. The trait default fills mtime/atime/
+    /// ctime with zeros (a `DirEntry` carries none); exFAT stores them in the
+    /// file entry set, so decode them here.
+    fn getattr(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<crate::fs::FileAttrs> {
+        use crate::fs::{EntryKind, FileAttrs};
+        if path == std::path::Path::new("/") || path.as_os_str().is_empty() {
+            return Ok(FileAttrs::defaults_for(EntryKind::Dir, 0, 0));
+        }
+        let p = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        let (set, _cluster) = self.resolve_entry(dev, p)?;
+        let kind = if set.is_directory {
+            EntryKind::Dir
+        } else {
+            EntryKind::Regular
+        };
+        let mut attrs = FileAttrs::defaults_for(kind, set.data_length, set.first_cluster);
+        attrs.mtime = exfat_timestamp_to_unix(set.last_modified_timestamp);
+        attrs.atime = exfat_timestamp_to_unix(set.last_accessed_timestamp);
+        attrs.ctime = exfat_timestamp_to_unix(set.create_timestamp);
+        Ok(attrs)
+    }
 }
 
 /// Convert a Unix epoch seconds value into the exFAT timestamp word
@@ -1506,6 +1534,43 @@ fn unix_to_exfat_timestamp(unix_secs: u32) -> u32 {
     let time = (h << 11) | (m << 5) | (s / 2);
     let date = (year_off << 9) | (month << 5) | day;
     (date << 16) | time
+}
+
+/// Inverse of [`unix_to_exfat_timestamp`]: decode a packed exFAT
+/// date/time word into Unix epoch seconds. Returns `0` for a zero word
+/// (no timestamp) or a structurally invalid date (month/day out of range).
+fn exfat_timestamp_to_unix(ts: u32) -> u32 {
+    if ts == 0 {
+        return 0;
+    }
+    const EXFAT_EPOCH: u64 = 315_532_800; // 1980-01-01 in Unix seconds
+    let time = ts & 0xFFFF;
+    let date = ts >> 16;
+    let sec = (time & 0x1F) * 2;
+    let min = (time >> 5) & 0x3F;
+    let hour = (time >> 11) & 0x1F;
+    let day = date & 0x1F;
+    let month = (date >> 5) & 0x0F;
+    let year = ((date >> 9) & 0x7F) + 1980;
+    if !(1..=12).contains(&month) || day < 1 {
+        return 0;
+    }
+    let mut days: u64 = 0;
+    for y in 1980..year {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
+    const MONTH_DAYS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    for m in 1..month {
+        days += if m == 2 && is_leap(year) {
+            29
+        } else {
+            MONTH_DAYS[(m - 1) as usize]
+        };
+    }
+    days += u64::from(day - 1);
+    let secs =
+        EXFAT_EPOCH + days * 86_400 + u64::from(hour) * 3600 + u64::from(min) * 60 + u64::from(sec);
+    secs.min(u64::from(u32::MAX)) as u32
 }
 
 /// True if `year` is a Gregorian leap year. exFAT only spans 1980..=2107
@@ -2229,6 +2294,28 @@ mod tests {
         let month = (date >> 5) & 0x0F;
         let day = date & 0x1F;
         assert_eq!((year, month, day), (40, 1, 1));
+    }
+
+    #[test]
+    fn exfat_timestamp_round_trips_to_unix() {
+        // Even-second Unix times survive a full encode→decode (exFAT has
+        // 2-second resolution, so we use even seconds).
+        for &t in &[
+            315_532_800u32, // 1980-01-01 00:00:00
+            1_577_836_800,  // 2020-01-01 00:00:00
+            1_615_779_296,  // 2021-03-15 12:34:56
+            1_234_567_890,  // 2009-02-13 23:31:30
+        ] {
+            let packed = unix_to_exfat_timestamp(t);
+            assert_eq!(exfat_timestamp_to_unix(packed), t, "round-trip for {t}");
+        }
+        // A zero word decodes to "no timestamp".
+        assert_eq!(exfat_timestamp_to_unix(0), 0);
+        // Odd seconds round down to the even boundary on the way through.
+        assert_eq!(
+            exfat_timestamp_to_unix(unix_to_exfat_timestamp(1_615_779_297)),
+            1_615_779_296
+        );
     }
 
     #[test]
