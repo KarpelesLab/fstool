@@ -195,6 +195,18 @@ impl Grf {
     /// Handles per-file MIXCRYPT/DES decryption and zlib inflation.
     pub fn read_entry(&self, dev: &mut dyn BlockDevice, entry: &Entry) -> Result<Vec<u8>> {
         let abs = HEADER_SIZE as u64 + entry.pos as u64;
+        // `len_aligned` is an attacker-controlled u32 (up to ~4 GiB).
+        // Allocating it without bounding against the device is an OOM
+        // vector; a real entry's body lies within the image, so reject a
+        // read that would run past the end of the device before allocating.
+        let dev_size = dev.total_size();
+        let end = abs.saturating_add(u64::from(entry.len_aligned));
+        if end > dev_size {
+            return Err(crate::Error::InvalidImage(format!(
+                "grf: entry body (pos {} len_aligned {}) past end of device size {}",
+                entry.pos, entry.len_aligned, dev_size
+            )));
+        }
         let mut comp = vec![0u8; entry.len_aligned as usize];
         if entry.len_aligned > 0 {
             dev.read_at(abs, &mut comp)?;
