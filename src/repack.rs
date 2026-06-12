@@ -52,6 +52,22 @@ const MAX_WALK_DEPTH: usize = 4096;
 /// but bounds a self-referential one to finite work.
 const MAX_WALK_ENTRIES: u64 = 64 * 1024 * 1024;
 
+/// Increment `seen` and fail once it crosses [`MAX_WALK_ENTRIES`]. Shared by
+/// the tar/merge walkers (which have no inode identity or depth to bound them)
+/// so a decompression-bomb archive of millions of zero-byte headers can't
+/// exhaust RAM building its in-memory model. The image walkers above inline
+/// the same check alongside their depth/visited guards.
+pub(crate) fn check_entry_budget(seen: &mut u64) -> Result<()> {
+    *seen += 1;
+    if *seen > MAX_WALK_ENTRIES {
+        return Err(crate::Error::InvalidImage(format!(
+            "tar stream exceeds {MAX_WALK_ENTRIES} entries — refusing to walk a \
+             possibly malicious archive"
+        )));
+    }
+    Ok(())
+}
+
 /// Progress reporter for a running repack. The CLI installs one with
 /// [`enter`] before driving the copy path and tears it down with
 /// [`leave`] afterward; the inner copy code calls [`note`] for each
@@ -1224,8 +1240,10 @@ pub fn walk_tar_stream(reader: &mut dyn Read, sink: &mut dyn RepackSink) -> Resu
     let mut tsr = TarStreamReader::new(reader);
     let mut created: std::collections::HashSet<String> =
         std::collections::HashSet::from(["/".to_string()]);
+    let mut entries_seen: u64 = 0;
 
     while let Some(mut se) = tsr.next_entry()? {
+        check_entry_budget(&mut entries_seen)?;
         // Snapshot metadata off the entry before borrowing `se` as the
         // body reader for `put_file`.
         let path = collapse(&se.entry.path);
@@ -1425,7 +1443,7 @@ pub fn ext_build_plan_for_source(
         } => {
             let spec = path.to_string_lossy().into_owned();
             let index = build_tar_stream_index(&spec, *algo)?;
-            walk_tar_index_for_plan(&index, &mut plan);
+            walk_tar_index_for_plan(&index, &mut plan)?;
         }
         Source::TarArchive { path, codec: None } => {
             let target = crate::inspect::Target::parse(&path.to_string_lossy());
@@ -1671,9 +1689,11 @@ pub(crate) fn scan_into_build_plan(
 fn walk_tar_index_for_plan(
     index: &crate::fs::tar::TarStreamIndex,
     plan: &mut crate::fs::ext::BuildPlan,
-) {
+) -> Result<()> {
     use crate::fs::tar::EntryKind as TarKind;
+    let mut entries_seen: u64 = 0;
     for ix in index.entries() {
+        check_entry_budget(&mut entries_seen)?;
         match ix.entry.kind {
             TarKind::Regular | TarKind::HardLink => plan.add_file(ix.entry.size),
             TarKind::Dir => plan.add_dir(),
@@ -1687,6 +1707,7 @@ fn walk_tar_index_for_plan(
             TarKind::CharDev | TarKind::BlockDev | TarKind::Fifo => plan.add_device(),
         }
     }
+    Ok(())
 }
 
 // ----------------------------------------------------------------------
@@ -1751,7 +1772,9 @@ pub(crate) fn size_from_tar_index(
     let mut symlinks = 0u64;
     let mut devices = 0u64;
     let mut bytes = 0u64;
+    let mut entries_seen: u64 = 0;
     for ix in index.entries() {
+        check_entry_budget(&mut entries_seen)?;
         match ix.entry.kind {
             TarKind::Regular => {
                 files += 1;

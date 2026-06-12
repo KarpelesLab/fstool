@@ -592,7 +592,9 @@ fn apply_tar_layer(
         None => crate::repack::open_tar_stream_index(&spec, None)?,
     };
 
+    let mut entries_seen: u64 = 0;
     for ix in index.entries() {
+        crate::repack::check_entry_budget(&mut entries_seen)?;
         let e = &ix.entry;
         let canon = normalise_tar_path(&e.path);
         if canon.is_empty() {
@@ -778,7 +780,7 @@ fn resolve_hardlink_target(
 
 fn normalise_tar_path(p: &str) -> String {
     let mut out = String::new();
-    for seg in p.split('/').filter(|s| !s.is_empty() && *s != ".") {
+    for seg in p.split('/').filter(|s| !s.is_empty() && *s != "." && *s != "..") {
         out.push('/');
         out.push_str(seg);
     }
