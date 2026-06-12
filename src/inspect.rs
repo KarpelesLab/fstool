@@ -925,9 +925,9 @@ impl AnyFs {
     /// Persist any in-memory metadata changes to the device.
     ///
     /// Delegates straight to each backend's [`crate::fs::Filesystem::flush`]
-    /// via [`as_filesystem_dyn`](Self::as_filesystem_dyn) — there is exactly
-    /// one flush implementation per backend, and this wrapper must never
-    /// reimplement the dispatch. A hand-written per-variant `match` here used
+    /// via the `as_filesystem_dyn` helper — there is exactly one flush
+    /// implementation per backend, and this wrapper must never reimplement
+    /// the dispatch. A hand-written per-variant `match` here used
     /// to no-op the backends that buffer directory writes in a `DirBatch`
     /// (NTFS / XFS / exFAT) or a catalog (HFS+), so a CLI `put`/`rm` followed
     /// by exit silently dropped the change. Every backend's `flush` is already
