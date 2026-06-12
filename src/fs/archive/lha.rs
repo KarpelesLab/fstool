@@ -333,6 +333,11 @@ mod imp {
 
             match level {
                 0 | 1 => {
+                    // Level 0/1 indexes head[21] (name length); need at least
+                    // 22 bytes or we'd read past a short tail read near EOF.
+                    if head.len() < 22 {
+                        break;
+                    }
                     let header_size = head[0] as u64;
                     let base_end = pos + 2 + header_size;
                     if base_end > dev_len {
@@ -363,6 +368,11 @@ mod imp {
                     }
                 }
                 2 => {
+                    // Level 2 reads le16(&head, 24); need the full 26-byte
+                    // header or a short tail read near EOF would index OOB.
+                    if head.len() < 26 {
+                        break;
+                    }
                     let total_header_size = le16(&head, 0) as u64;
                     if total_header_size < 26 || pos + total_header_size > dev_len {
                         break;
