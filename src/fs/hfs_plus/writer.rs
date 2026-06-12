@@ -2773,6 +2773,19 @@ pub fn open_writable(
     let block_size = vh.block_size;
     let total_blocks = vh.total_blocks;
 
+    // HFS-4: reject a `total_blocks` that cannot fit on the underlying
+    // device before allocating a bitmap sized from it. A malformed header
+    // can claim a huge block count on a tiny image, forcing a ~512 MB
+    // bitmap allocation for `total_blocks` == u32::MAX.
+    let claimed_bytes = u64::from(total_blocks).saturating_mul(u64::from(block_size));
+    if claimed_bytes > dev.total_size() {
+        return Err(crate::Error::InvalidImage(format!(
+            "hfs+ open_writable: total_blocks {total_blocks} * block_size {block_size} \
+             exceeds device size {}",
+            dev.total_size()
+        )));
+    }
+
     // ---- 1. Load the allocation bitmap.
     let bitmap_bytes = (total_blocks as u64).div_ceil(8) as usize;
     let mut bitmap = vec![0u8; bitmap_bytes];
@@ -2791,10 +2804,26 @@ pub fn open_writable(
         ForkReader::from_inline(&vh.catalog_file, block_size, "catalog (writable open)")?;
     let cat_header = read_btree_header(dev, &cat_fork)?;
     let node_size = u32::from(cat_header.node_size);
+    let cat_total_nodes = cat_header.total_nodes;
 
     let mut catalog: BTreeMap<OwnedKey, Vec<u8>> = BTreeMap::new();
     let mut node_idx = cat_header.first_leaf_node;
+    // HFS-1: bound the leaf-chain walk by the node count and reject any
+    // out-of-range `f_link`, mirroring the read-side guard in
+    // `HfsPlus::list_cnid` — a malicious `f_link` cycle would loop forever.
+    let mut cat_steps_left = cat_total_nodes as usize;
     while node_idx != 0 {
+        if cat_steps_left == 0 {
+            return Err(crate::Error::InvalidImage(
+                "hfs+ open_writable: catalog leaf chain exceeded node count (cycle?)".into(),
+            ));
+        }
+        cat_steps_left -= 1;
+        if node_idx >= cat_total_nodes {
+            return Err(crate::Error::InvalidImage(format!(
+                "hfs+ open_writable: catalog leaf node {node_idx} >= total_nodes {cat_total_nodes}"
+            )));
+        }
         let node = read_node(dev, &cat_fork, node_idx, node_size)?;
         let desc = NodeDescriptor::decode(&node)?;
         if desc.kind != KIND_LEAF {
@@ -2835,8 +2864,22 @@ pub fn open_writable(
         )?;
         let ext_header = read_btree_header(dev, &ext_fork)?;
         let ext_node_size = u32::from(ext_header.node_size);
+        let ext_total_nodes = ext_header.total_nodes;
         let mut idx = ext_header.first_leaf_node;
+        // HFS-1: same leaf-chain cycle/range guard as the catalog walk.
+        let mut ext_steps_left = ext_total_nodes as usize;
         while idx != 0 {
+            if ext_steps_left == 0 {
+                return Err(crate::Error::InvalidImage(
+                    "hfs+ open_writable: extents leaf chain exceeded node count (cycle?)".into(),
+                ));
+            }
+            ext_steps_left -= 1;
+            if idx >= ext_total_nodes {
+                return Err(crate::Error::InvalidImage(format!(
+                    "hfs+ open_writable: extents leaf node {idx} >= total_nodes {ext_total_nodes}"
+                )));
+            }
             let node = read_node(dev, &ext_fork, idx, ext_node_size)?;
             let desc = NodeDescriptor::decode(&node)?;
             if desc.kind != KIND_LEAF {
