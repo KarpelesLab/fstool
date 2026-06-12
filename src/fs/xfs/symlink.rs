@@ -104,7 +104,13 @@ pub fn decode_remote(
             let fsb = ext.startblock + blkidx;
             let ag = fsb >> agblklog;
             let agblk = fsb & ((1u64 << agblklog) - 1);
-            let byte_off = ag * agblocks * bs + agblk * bs;
+            // `fsb` is attacker-derived; saturate so an overflow can't panic
+            // (debug) or wrap (release). A saturated address fails the device
+            // bounds check on read below.
+            let byte_off = ag
+                .saturating_mul(agblocks)
+                .saturating_mul(bs)
+                .saturating_add(agblk.saturating_mul(bs));
             let mut block = vec![0u8; bs as usize];
             dev.read_at(byte_off, &mut block)?;
             let payload: &[u8] = if layout.is_v5 {

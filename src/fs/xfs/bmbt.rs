@@ -147,7 +147,11 @@ pub fn decode_extents(buf: &[u8], n: u32) -> Result<Vec<Extent>> {
 fn fsb_to_byte(agblklog: u8, blocksize: u32, agblocks: u32, fsb: u64) -> u64 {
     let ag = fsb >> agblklog as u32;
     let agblk = fsb & ((1u64 << agblklog as u32) - 1);
-    ag * (agblocks as u64) * (blocksize as u64) + agblk * (blocksize as u64)
+    // `fsb` is attacker-derived; saturate so an overflow can't panic (debug)
+    // or wrap (release). A saturated address fails the device bounds check.
+    ag.saturating_mul(agblocks as u64)
+        .saturating_mul(blocksize as u64)
+        .saturating_add(agblk.saturating_mul(blocksize as u64))
 }
 
 /// Layout describing how to walk the BMBT for a single inode.

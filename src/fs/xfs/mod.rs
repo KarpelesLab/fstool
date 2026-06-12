@@ -144,10 +144,21 @@ impl Xfs {
                 self.sb.agcount
             )));
         }
-        let ag_bytes = ag * (self.sb.agblocks as u64) * (self.sb.blocksize as u64);
-        let blk_bytes = blk * (self.sb.blocksize as u64);
-        let slot_bytes = slot * (self.sb.inodesize as u64);
-        Ok(ag_bytes + blk_bytes + slot_bytes)
+        let overflow = || {
+            crate::Error::InvalidImage(format!("xfs: inode {ino} byte offset overflows u64"))
+        };
+        let ag_bytes = ag
+            .checked_mul(self.sb.agblocks as u64)
+            .and_then(|v| v.checked_mul(self.sb.blocksize as u64))
+            .ok_or_else(overflow)?;
+        let blk_bytes = blk.checked_mul(self.sb.blocksize as u64).ok_or_else(overflow)?;
+        let slot_bytes = slot
+            .checked_mul(self.sb.inodesize as u64)
+            .ok_or_else(overflow)?;
+        ag_bytes
+            .checked_add(blk_bytes)
+            .and_then(|v| v.checked_add(slot_bytes))
+            .ok_or_else(overflow)
     }
 
     /// Read an inode by number, returning the raw bytes plus the decoded core.
@@ -215,11 +226,17 @@ impl Xfs {
     }
 
     /// Convert an FSB (filesystem block number) to a device byte offset.
+    ///
+    /// `fsb` is attacker-derived (from an extent record). Use saturating
+    /// arithmetic so an out-of-range value can't panic (debug) or wrap
+    /// (release); a saturated `u64::MAX` address is rejected downstream by
+    /// the bounds check in `BlockDevice::read_at`.
     fn fsb_to_byte(&self, fsb: u64) -> u64 {
         let ag = fsb >> self.sb.agblklog as u32;
         let agblk = fsb & ((1u64 << self.sb.agblklog as u32) - 1);
-        ag * (self.sb.agblocks as u64) * (self.sb.blocksize as u64)
-            + agblk * (self.sb.blocksize as u64)
+        ag.saturating_mul(self.sb.agblocks as u64)
+            .saturating_mul(self.sb.blocksize as u64)
+            .saturating_add(agblk.saturating_mul(self.sb.blocksize as u64))
     }
 
     /// Read the extent list for a file/dir inode. Returns the decoded
@@ -308,36 +325,52 @@ impl Xfs {
         // logical address that some extent covers (capped at the leaf-
         // offset boundary, which separates the data-block address range
         // from the leaf-index / free-index ranges).
+        //
+        // Iterate the extents directly rather than scanning every logical
+        // block from 0 up to the (attacker-influenced) maximum: that upper
+        // bound can reach 32 GiB / blocksize ≈ 67M, and an O(num_extents)
+        // membership test per block makes it quadratic CPU-DoS. Here we only
+        // touch blocks an extent actually covers. To preserve the previous
+        // ascending logical-block iteration order (and thus identical output
+        // ordering for valid directories), collect the directory-block-
+        // aligned logical addresses, sort/dedup them, then decode in order.
         let mut out = Vec::new();
-        // Cap is the LESSER of (last covered logical block + 1) and the
-        // leaf-block boundary.
-        let max_covered = extents
-            .iter()
-            .map(|e| e.offset + e.blockcount as u64)
-            .max()
-            .unwrap_or(0);
-        let upper = max_covered.min(leaf_dir_block_addr_fsblk);
-        let mut lblk = 0u64;
-        while lblk < upper {
-            // Is `lblk` covered by any extent?
-            let covered = extents
-                .iter()
-                .any(|e| lblk >= e.offset && lblk < e.offset + e.blockcount as u64);
-            if covered {
-                let block =
-                    self.read_dir_block_at_logical(dev, extents, lblk, dir_block_size as usize)?;
-                if block.len() >= 4 {
-                    let magic = u32::from_be_bytes(block[0..4].try_into().unwrap());
-                    if magic == dir::XFS_DIR3_DATA_MAGIC || magic == dir::XFS_DIR2_DATA_MAGIC {
-                        let mut entries = dir::decode_data_block(&block, is_v5)?;
-                        out.append(&mut entries);
-                    }
-                    // Other magics (block / leaf / node / free) are either
-                    // skipped (leaf/node/free are pure index) or impossible
-                    // here (block-format was handled above).
-                }
+        let mut dir_blocks: Vec<u64> = Vec::new();
+        for e in extents {
+            // Clamp this extent's covered range to the data-block address
+            // region [0, leaf_dir_block_addr_fsblk); leaf/node/free index
+            // blocks live at or above that boundary and are skipped.
+            let start = e.offset;
+            let end = (e.offset + e.blockcount as u64).min(leaf_dir_block_addr_fsblk);
+            if start >= end {
+                continue;
             }
-            lblk += fs_blocks_per_dir_block;
+            // Step over directory-block-aligned addresses. Align the first
+            // address down to a directory-block boundary so multi-FS-block
+            // dir blocks are visited once at their base logical address.
+            let mut lblk = start - (start % fs_blocks_per_dir_block);
+            while lblk < end {
+                if lblk >= start {
+                    dir_blocks.push(lblk);
+                }
+                lblk += fs_blocks_per_dir_block;
+            }
+        }
+        dir_blocks.sort_unstable();
+        dir_blocks.dedup();
+        for lblk in dir_blocks {
+            let block =
+                self.read_dir_block_at_logical(dev, extents, lblk, dir_block_size as usize)?;
+            if block.len() >= 4 {
+                let magic = u32::from_be_bytes(block[0..4].try_into().unwrap());
+                if magic == dir::XFS_DIR3_DATA_MAGIC || magic == dir::XFS_DIR2_DATA_MAGIC {
+                    let mut entries = dir::decode_data_block(&block, is_v5)?;
+                    out.append(&mut entries);
+                }
+                // Other magics (block / leaf / node / free) are either
+                // skipped (leaf/node/free are pure index) or impossible
+                // here (block-format was handled above).
+            }
         }
         Ok(out)
     }
@@ -556,10 +589,15 @@ pub struct XfsFileReader<'a> {
 
 impl<'a> XfsFileReader<'a> {
     /// FSB → device byte address. Identical math to [`Xfs::fsb_to_byte`].
+    /// Saturating arithmetic guards against attacker-derived `fsb` values
+    /// overflowing u64 (panic in debug / wrap in release); a saturated
+    /// address is rejected by the device bounds check on read.
     fn fsb_to_byte(&self, fsb: u64) -> u64 {
         let ag = fsb >> self.agblklog as u32;
         let agblk = fsb & ((1u64 << self.agblklog as u32) - 1);
-        ag * self.agblocks * self.blocksize + agblk * self.blocksize
+        ag.saturating_mul(self.agblocks)
+            .saturating_mul(self.blocksize)
+            .saturating_add(agblk.saturating_mul(self.blocksize))
     }
 }
 
@@ -610,7 +648,7 @@ impl<'a> std::io::Read for XfsFileReader<'a> {
                     .map(|e| e.offset)
                     .min();
                 let next_byte = next_extent_block
-                    .map(|b| b * self.blocksize)
+                    .map(|b| b.saturating_mul(self.blocksize))
                     .unwrap_or(self.size);
                 let hole_bytes = next_byte.saturating_sub(self.pos);
                 let to_zero = (n as u64).min(hole_bytes) as usize;
