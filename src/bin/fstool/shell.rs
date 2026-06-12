@@ -744,6 +744,19 @@ quit | exit         leave{ro_note}\n{cache_note}"
                 if e.name == "." || e.name == ".." {
                     continue;
                 }
+                // The entry name is attacker-controlled: a name containing
+                // `..`, a separator, or an absolute path would escape `hdir`
+                // (Path::join with an absolute path replaces the base) and let
+                // a malicious image write anywhere on the host. Skip anything
+                // that isn't a single ordinary path component. (CLI-1 / CLI-3)
+                if !crate::safety::safe_component(&e.name) {
+                    eprintln!(
+                        "get: skipping entry with unsafe name {:?} under {}",
+                        crate::safety::sanitize_name(&e.name),
+                        idir
+                    );
+                    continue;
+                }
                 let ichild = join(&idir, &e.name);
                 let hchild = hdir.join(&e.name);
                 match e.kind {
