@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.17](https://github.com/KarpelesLab/fstool/compare/v0.4.16...v0.4.17) - 2026-06-12
+
+### Fixed
+
+- *(inspect)* drain NTFS/XFS/exFAT dir batches in AnyFs::flush
+
+### Other
+
+- *(inspect)* drop intra-doc link to private as_filesystem_dyn
+- *(inspect)* collapse AnyFs::flush + kind_string to exhaustive dispatch
+
 ## [0.4.16](https://github.com/KarpelesLab/fstool/compare/v0.4.15...v0.4.16) - 2026-06-12
 
 ### Fixed
