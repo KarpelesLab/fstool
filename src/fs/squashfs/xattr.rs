@@ -92,7 +92,9 @@ impl XattrReader {
         // could physically hold. Reject an oversized count before it drives
         // any allocation (mirrors the device-bounded cap in
         // `inode.rs::read_block_sizes`).
-        let total_bytes = (count as u64).checked_mul(16).filter(|&b| b <= dev.total_size());
+        let total_bytes = (count as u64)
+            .checked_mul(16)
+            .filter(|&b| b <= dev.total_size());
         let total_bytes = match total_bytes {
             Some(b) => b as usize,
             None => {

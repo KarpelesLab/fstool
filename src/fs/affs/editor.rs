@@ -61,8 +61,7 @@ impl AffsEditor {
         // blocks; cap the collected page list at that so a malformed
         // extension chain can't make `pages` (and the bitmap built from it)
         // grow without bound.
-        let max_pages =
-            (total_blocks as usize).div_ceil(WORDS_PER_PAGE * 32).max(1) + 1;
+        let max_pages = (total_blocks as usize).div_ceil(WORDS_PER_PAGE * 32).max(1) + 1;
         let mut pages: Vec<u32> = Vec::new();
         let push_page = |pages: &mut Vec<u32>, p: u32| -> Result<()> {
             if p != 0 {
@@ -72,9 +71,7 @@ impl AffsEditor {
                     ));
                 }
                 if pages.len() >= max_pages {
-                    return Err(Error::InvalidImage(
-                        "affs: too many bitmap pages".into(),
-                    ));
+                    return Err(Error::InvalidImage("affs: too many bitmap pages".into()));
                 }
                 pages.push(p);
             }

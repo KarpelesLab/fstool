@@ -356,7 +356,9 @@ mod imp {
             // A bitvector of n bits is backed by ceil(n/8) header bytes;
             // reject an inflated count before allocating n bools.
             if n.div_ceil(8) > self.remaining() {
-                return Err(Error::InvalidImage("7z: bitvector exceeds header size".into()));
+                return Err(Error::InvalidImage(
+                    "7z: bitvector exceeds header size".into(),
+                ));
             }
             let mut out = Vec::with_capacity(n);
             let mut cur = 0u8;
@@ -519,7 +521,9 @@ mod imp {
         // A folder with no output streams is malformed; the bind-pair count
         // is `total_out - 1`, which would underflow (panic in debug) here.
         if total_out == 0 {
-            return Err(Error::InvalidImage("7z: folder has no output streams".into()));
+            return Err(Error::InvalidImage(
+                "7z: folder has no output streams".into(),
+            ));
         }
         let num_bind_pairs = total_out - 1;
         // Each bind pair is two `num()`s (≥1 byte each); reject an inflated

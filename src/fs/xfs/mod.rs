@@ -144,14 +144,15 @@ impl Xfs {
                 self.sb.agcount
             )));
         }
-        let overflow = || {
-            crate::Error::InvalidImage(format!("xfs: inode {ino} byte offset overflows u64"))
-        };
+        let overflow =
+            || crate::Error::InvalidImage(format!("xfs: inode {ino} byte offset overflows u64"));
         let ag_bytes = ag
             .checked_mul(self.sb.agblocks as u64)
             .and_then(|v| v.checked_mul(self.sb.blocksize as u64))
             .ok_or_else(overflow)?;
-        let blk_bytes = blk.checked_mul(self.sb.blocksize as u64).ok_or_else(overflow)?;
+        let blk_bytes = blk
+            .checked_mul(self.sb.blocksize as u64)
+            .ok_or_else(overflow)?;
         let slot_bytes = slot
             .checked_mul(self.sb.inodesize as u64)
             .ok_or_else(overflow)?;

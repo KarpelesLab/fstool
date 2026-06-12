@@ -553,9 +553,7 @@ impl<'a> NtfsFileHandle<'a> {
                 .and_then(|s| name_len.checked_mul(2).and_then(|n| s.checked_add(n)));
             let attr_name = match name_end {
                 _ if name_len == 0 => String::new(),
-                Some(end) if end <= cursor + len => {
-                    decode_utf16le(&rec[cursor + name_off..end])
-                }
+                Some(end) if end <= cursor + len => decode_utf16le(&rec[cursor + name_off..end]),
                 // Name field overruns the attribute — skip safely.
                 _ => {
                     cursor += len;
@@ -841,11 +839,7 @@ fn patch_entries_for_record(buf: &mut [u8], start_off: usize, rec_no: u64, new_l
         // write (key_off+40..key_off+56) must fit inside `buf`. Cross-check
         // both before treating this as a $FILE_NAME key.
         let key_off = cursor + 16;
-        if !is_last
-            && key_len >= 66
-            && entry_len >= 16 + key_len
-            && key_off + 56 <= buf.len()
-        {
+        if !is_last && key_len >= 66 && entry_len >= 16 + key_len && key_off + 56 <= buf.len() {
             let file_ref = u64::from_le_bytes(buf[cursor..cursor + 8].try_into().unwrap());
             if (file_ref & 0x0000_FFFF_FFFF_FFFF) == rec_no {
                 // Patch allocated_size / real_size (rounded to next 4 KiB

@@ -147,7 +147,10 @@ mod tests {
         assert_eq!(read_signed_le(&0i64.to_le_bytes()), 0);
         assert_eq!(read_signed_le(&i64::MIN.to_le_bytes()), i64::MIN);
         assert_eq!(read_signed_le(&i64::MAX.to_le_bytes()), i64::MAX);
-        assert_eq!(read_signed_le(&0x1234_5678_9abc_def0i64.to_le_bytes()), 0x1234_5678_9abc_def0);
+        assert_eq!(
+            read_signed_le(&0x1234_5678_9abc_def0i64.to_le_bytes()),
+            0x1234_5678_9abc_def0
+        );
     }
 
     #[test]
@@ -168,7 +171,9 @@ mod tests {
         // An 8-byte delta of -1 from base 0 yields a negative absolute LCN.
         // The decoder must reject it cleanly rather than panic on the
         // sign-extension shift (NTFS-1).
-        let runs = decode(&[0x81, 0x04, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+        let runs = decode(&[
+            0x81, 0x04, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
+        ]);
         assert!(matches!(runs, Err(crate::Error::InvalidImage(_))));
     }
 }

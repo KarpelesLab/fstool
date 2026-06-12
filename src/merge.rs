@@ -780,7 +780,10 @@ fn resolve_hardlink_target(
 
 fn normalise_tar_path(p: &str) -> String {
     let mut out = String::new();
-    for seg in p.split('/').filter(|s| !s.is_empty() && *s != "." && *s != "..") {
+    for seg in p
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+    {
         out.push('/');
         out.push_str(seg);
     }

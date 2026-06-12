@@ -260,12 +260,7 @@ impl<'a> Ext2FileHandle<'a> {
             crate::Error::InvalidImage("ext4: depth ≥ 1 root with depth 0 header".into())
         })?;
         for idx in &indices {
-            self.collect_extent_tree(
-                idx.leaf as u32,
-                child_depth,
-                &mut runs,
-                &mut meta_blocks,
-            )?;
+            self.collect_extent_tree(idx.leaf as u32, child_depth, &mut runs, &mut meta_blocks)?;
         }
         Ok(ExtentTreeState { runs, meta_blocks })
     }

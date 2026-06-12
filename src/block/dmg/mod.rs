@@ -319,9 +319,7 @@ impl DmgBackend {
                 .compressed_offset_in_fork
                 .checked_add(c.compressed_length)
                 .ok_or_else(|| {
-                    crate::Error::InvalidImage(
-                        "dmg: chunk compressed extent overflows u64".into(),
-                    )
+                    crate::Error::InvalidImage("dmg: chunk compressed extent overflows u64".into())
                 })?;
             if comp_end > trailer.data_fork_length {
                 return Err(crate::Error::InvalidImage(format!(
