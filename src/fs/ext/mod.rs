@@ -48,6 +48,12 @@ use crate::block::BlockDevice;
 use crate::fs::rootdevs::{RootDevs, device_table};
 use crate::fs::{DeviceKind, FileMeta, FileSource};
 
+/// Hard cap on ext4 extent-tree depth. Real ext4 trees never exceed depth 5
+/// (the inline root plus on-disk index levels); a larger declared `eh_depth`
+/// is a forged image and would drive recursive descent/append to overflow
+/// the stack. Used to bound recursion on malformed images.
+const EXT4_MAX_EXTENT_DEPTH: u16 = 5;
+
 /// Which member of the ext family to produce. Controls which feature flags
 /// are set and whether a journal is allocated. ext4-specific format work
 /// (extent tree, 64-bit, flex_bg, ...) lands incrementally — v1 accepts
@@ -1438,6 +1444,15 @@ impl Ext {
         let iblock = extent::iblock_to_bytes(&inode_copy.block);
         let header = extent::decode_header(&iblock[..12])?;
         let depth = header.depth;
+        // ext4 extent trees never exceed depth 5 in practice (the inline root
+        // plus on-disk index levels). A forged `eh_depth` of up to 65535 would
+        // drive `append_into_node` to recurse that many frames and overflow
+        // the stack. Reject implausible depths up front.
+        if depth > EXT4_MAX_EXTENT_DEPTH {
+            return Err(crate::Error::InvalidImage(format!(
+                "ext4: extent tree depth {depth} exceeds max {EXT4_MAX_EXTENT_DEPTH}"
+            )));
+        }
         let (_, mut top) = extent::decode_idx_iblock(&iblock)?;
         let rightmost = top.last().expect("depth ≥ 2 root has ≥ 1 idx").leaf as u32;
 
@@ -1498,12 +1513,35 @@ impl Ext {
         let csum_tail = self.has_metadata_csum();
         let per = extent::entries_per_leaf_block_capped(bs, csum_tail);
 
+        // Defensive depth floor: callers always pass `node_depth ≥ 1`, but a
+        // forged tree reaching here at depth 0 would underflow `node_depth - 1`
+        // below. Reject rather than wrap.
+        if node_depth == 0 {
+            return Err(crate::Error::InvalidImage(
+                "ext4: append into index node at depth 0".into(),
+            ));
+        }
         let node_bytes = self.staged_block_bytes(dev, node_phys)?;
         let node_hdr = extent::decode_header(&node_bytes[..12])?;
+        // Each idx entry reads `node_bytes[12 + i*12 .. 24 + i*12]`; bound the
+        // entry count to the per-block index capacity before iterating so a
+        // forged `eh_entries` can't slice out of bounds and panic.
+        let max_entries = (bs.saturating_sub(12) / 12) as u16;
+        if node_hdr.entries > max_entries {
+            return Err(crate::Error::InvalidImage(format!(
+                "ext4: extent index claims {} entries, block holds at most {max_entries}",
+                node_hdr.entries
+            )));
+        }
         let mut indices: Vec<extent::ExtentIdx> = (0..node_hdr.entries as usize)
             .map(|i| extent::decode_idx(&node_bytes[12 + i * 12..24 + i * 12]))
             .collect();
-        let rightmost = indices.last().expect("index node has ≥ 1 entry").leaf as u32;
+        let rightmost = indices
+            .last()
+            .ok_or_else(|| {
+                crate::Error::InvalidImage("ext4: extent index node has no entries".into())
+            })?
+            .leaf as u32;
 
         // The new child to splice into this node (a fresh leaf when this is
         // a depth-1 node, or a fresh sibling bubbled up from below) along
@@ -2723,7 +2761,7 @@ impl Ext {
 
         // Walk dx_root's dx_entry table to pick the child (leaf or
         // dx_node, depending on indirect_levels).
-        let next_logical = dx_lookup_logical(&root_buf, htree::DX_ROOT_HEADER_LEN, hash);
+        let next_logical = dx_lookup_logical(&root_buf, htree::DX_ROOT_HEADER_LEN, hash)?;
 
         if indirect_levels == 0 {
             return Ok(next_logical);
@@ -2743,7 +2781,7 @@ impl Ext {
             .find(|(b, _)| *b == dx_node_phys)
             .map(|(_, bytes)| bytes.clone())
             .unwrap();
-        let leaf_logical = dx_lookup_logical(&node_buf, htree::DX_NODE_HEADER_LEN, hash);
+        let leaf_logical = dx_lookup_logical(&node_buf, htree::DX_NODE_HEADER_LEN, hash)?;
         Ok(leaf_logical)
     }
 
@@ -3901,7 +3939,12 @@ impl Ext {
             )));
         }
         let bs = self.layout.block_size;
-        let n_blocks = inode.size.div_ceil(bs);
+        // A forged directory inode can claim a multi-gigabyte `i_size`, making
+        // the scan loop iterate billions of times (CPU DoS). A directory can
+        // never be larger than the device, so clamp the block count to the
+        // volume size before scanning.
+        let device_blocks = self.sb.blocks_count as u64;
+        let n_blocks = (inode.size.div_ceil(bs) as u64).min(device_blocks) as u32;
         let mut out = Vec::new();
         let with_filetype = self.sb.feature_incompat & constants::feature::INCOMPAT_FILETYPE != 0;
         let mut block_buf = vec![0u8; bs as usize];
@@ -4076,6 +4119,16 @@ impl Ext {
             )));
         }
         let size = inode.size as usize;
+        // `inode.size` is attacker-controlled (up to 4 GiB) and feeds
+        // `Vec::with_capacity(size)` below → OOM. A POSIX symlink target is
+        // bounded by PATH_MAX and never exceeds a single block; reject larger
+        // as a forged image before allocating.
+        let max_symlink = (self.layout.block_size as usize).max(4096);
+        if size > max_symlink {
+            return Err(crate::Error::InvalidImage(format!(
+                "ext: symlink target size {size} exceeds max {max_symlink}"
+            )));
+        }
         // Fast (inline) symlink: target is in the 60 bytes of block[].
         if size <= 60 && inode.blocks_512 == 0 {
             let mut bytes = [0u8; 60];
@@ -4752,12 +4805,24 @@ fn popcount_bits(bm: &[u8], start: u32, end: u32) -> u32 {
 /// rows sorted by ascending hash, and the rightmost slot whose hash
 /// ≤ target wins. The countlimit slot's `block` field is the
 /// catch-all for hashes preceding any real boundary.
-fn dx_lookup_logical(buf: &[u8], header_len: usize, target: u32) -> u32 {
+fn dx_lookup_logical(buf: &[u8], header_len: usize, target: u32) -> Result<u32> {
     let cl_hash = u32::from_le_bytes(buf[header_len..header_len + 4].try_into().unwrap());
     let count = (cl_hash >> 16) as usize;
+    // `count` is attacker-controlled (high half of the countlimit slot's hash
+    // field). The loop reads `buf[off..off+4]` for `off = header_len +
+    // slot*DX_ENTRY_LEN`; an oversized count slices past the block end and
+    // panics. The dx_entry table can hold at most
+    // `(block_size - header_len) / DX_ENTRY_LEN` slots — reject anything that
+    // claims more.
+    let max_slots = buf.len().saturating_sub(header_len) / htree::DX_ENTRY_LEN;
+    if count > max_slots {
+        return Err(crate::Error::InvalidImage(format!(
+            "ext4: HTree dx_entry count {count} exceeds block capacity {max_slots}"
+        )));
+    }
     let mut chosen_slot = 0usize;
     for slot in 1..count {
-        let off = header_len + slot * 8;
+        let off = header_len + slot * htree::DX_ENTRY_LEN;
         let slot_hash = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
         if slot_hash <= target {
             chosen_slot = slot;
@@ -4765,8 +4830,10 @@ fn dx_lookup_logical(buf: &[u8], header_len: usize, target: u32) -> u32 {
             break;
         }
     }
-    let block_off = header_len + chosen_slot * 8 + 4;
-    u32::from_le_bytes(buf[block_off..block_off + 4].try_into().unwrap())
+    let block_off = header_len + chosen_slot * htree::DX_ENTRY_LEN + 4;
+    Ok(u32::from_le_bytes(
+        buf[block_off..block_off + 4].try_into().unwrap(),
+    ))
 }
 
 #[cfg(test)]
