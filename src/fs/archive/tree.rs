@@ -3,12 +3,14 @@
 //! directory tree from these.
 
 /// Normalise a path to start with `/` and not end with `/` (root is
-/// `/`). Collapses repeated slashes and strips `.` components, matching
-/// how tar normalises entry names.
+/// `/`). Collapses repeated slashes and strips `.` and `..` components,
+/// matching how tar normalises entry names. Dropping `..` is a security
+/// requirement: a stored `../../etc/passwd` entry must not survive
+/// normalisation and escape the extraction root on the host.
 pub fn normalise_path(p: &str) -> String {
     let mut out = String::new();
     for comp in p.split('/') {
-        if comp.is_empty() || comp == "." {
+        if comp.is_empty() || comp == "." || comp == ".." {
             continue;
         }
         out.push('/');
@@ -43,6 +45,17 @@ mod tests {
         assert_eq!(normalise_path("a/b/"), "/a/b");
         assert_eq!(normalise_path("./a//b/./c"), "/a/b/c");
         assert_eq!(normalise_path("///"), "/");
+    }
+
+    #[test]
+    fn normalise_strips_dotdot() {
+        // `..` components are dropped so a traversal entry can't escape
+        // the extraction root on the host.
+        assert_eq!(normalise_path("../../etc/passwd"), "/etc/passwd");
+        assert_eq!(normalise_path("/../../etc/passwd"), "/etc/passwd");
+        assert_eq!(normalise_path("a/../b"), "/a/b");
+        assert_eq!(normalise_path(".."), "/");
+        assert_eq!(normalise_path("a/b/../../.."), "/a/b");
     }
 
     #[test]
