@@ -595,7 +595,14 @@ where
     }
     // Internal root: each child is a virtual oid (kvloc, 8-byte child
     // vid value). Resolve through the omap.
-    let mut out = Vec::with_capacity(root_node.nkeys as usize);
+    //
+    // `nkeys` is an unbounded on-disk u32; a malformed node could claim
+    // ~4e9 keys and make this reservation balloon to tens of GB. Cap the
+    // capacity hint to what a single block could plausibly hold (each entry
+    // is at least an 8-byte value); the loop below error-checks every entry
+    // regardless, so under-reserving only costs a few reallocations.
+    let cap_hint = (root_node.nkeys as usize).min(ctx.block_size / 8);
+    let mut out = Vec::with_capacity(cap_hint);
     for i in 0..root_node.nkeys {
         let (_, vb) = root_node.entry_at(i, 0, 8)?;
         if vb.len() < 8 {
@@ -651,6 +658,12 @@ fn patch_inode_dstream_size(val: &mut [u8], new_size: u64, block_size: u64) {
             u16::from_le_bytes(xfields[hdr_off + 2..hdr_off + 4].try_into().unwrap()) as usize;
         if kind == INO_EXT_TYPE_DSTREAM && size >= 16 {
             // j_dstream_t: u64 size, u64 alloced_size, ...
+            // `value_cursor` is driven by attacker-controlled xfield sizes;
+            // guard the 16-byte write before touching the slice (mirrors the
+            // read-side guard) so a crafted inode can't trigger an OOB panic.
+            if value_cursor + 16 > xfields.len() {
+                return;
+            }
             let alloc = new_size.div_ceil(block_size) * block_size;
             xfields[value_cursor..value_cursor + 8].copy_from_slice(&new_size.to_le_bytes());
             xfields[value_cursor + 8..value_cursor + 16].copy_from_slice(&alloc.to_le_bytes());

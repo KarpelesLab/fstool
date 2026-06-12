@@ -877,6 +877,14 @@ impl Apfs {
         let target_oid = self.resolve_path_to_oid(dev, path)?;
         let (size, dstream_oid) = self.lookup_inode_size(dev, target_oid)?;
         let extents = self.collect_extents(dev, dstream_oid.unwrap_or(target_oid))?;
+        // A malformed inode can advertise an enormous logical size (a u64
+        // taken verbatim from the DSTREAM xfield) with no backing extents.
+        // Reading such a file zero-fills holes up to `size`, so an exabyte-
+        // sized declaration on a tiny image would make `read_to_end`
+        // materialize gigabytes/exabytes of zeros. Clamp the effective file
+        // size to the container byte count — no valid file can be larger
+        // than the device that holds it.
+        let size = size.min(dev.total_size());
         Ok(ApfsFileReader {
             dev,
             block_size: self.block_size,
@@ -2377,7 +2385,15 @@ impl<'a> std::io::Read for ApfsFileReader<'a> {
         // files have a small number of extents.
         let mut covering: Option<(u64, FileExtentVal)> = None;
         for &(la, ev) in &self.extents {
-            if la <= self.cursor && self.cursor < la + ev.length {
+            // `la + ev.length` is attacker-controlled (both from the on-disk
+            // extent record) and can overflow u64; use a checked add so a
+            // malformed extent end is simply treated as not covering rather
+            // than panicking in debug / wrapping in release.
+            let la_end = match la.checked_add(ev.length) {
+                Some(e) => e,
+                None => continue,
+            };
+            if la <= self.cursor && self.cursor < la_end {
                 covering = Some((la, ev));
                 break;
             }
@@ -2408,7 +2424,19 @@ impl<'a> std::io::Read for ApfsFileReader<'a> {
             // Sparse extent — zero bytes.
             buf[..want].fill(0);
         } else {
-            let abs_off = ev.phys_block_num * self.block_size as u64 + off_in_extent;
+            // `phys_block_num` and `off_in_extent` derive from on-disk data;
+            // compute the absolute byte offset with checked arithmetic so a
+            // crafted extent can't overflow u64 (panic in debug / wrap in
+            // release) — surface a clean InvalidImage instead.
+            let abs_off = ev
+                .phys_block_num
+                .checked_mul(self.block_size as u64)
+                .and_then(|b| b.checked_add(off_in_extent))
+                .ok_or_else(|| {
+                    std::io::Error::other(crate::Error::InvalidImage(
+                        "apfs: extent physical offset overflows u64".into(),
+                    ))
+                })?;
             self.dev
                 .read_at(abs_off, &mut buf[..want])
                 .map_err(std::io::Error::other)?;
@@ -2682,7 +2710,12 @@ fn find_live_nxsb(
     label: &NxSuperblock,
     block_size: u32,
 ) -> Result<Option<(NxSuperblock, u64)>> {
-    let n = label.xp_desc_blocks as u64;
+    // `xp_desc_blocks` is an attacker-controlled u32; on a tiny image it can
+    // claim ~4e9 descriptor blocks, spinning the loop through billions of
+    // no-op iterations. Clamp to how many blocks the device can actually hold
+    // — anything past the end of the device is skipped anyway.
+    let dev_blocks = dev.total_size() / block_size as u64;
+    let n = (label.xp_desc_blocks as u64).min(dev_blocks);
     let base = label.xp_desc_base;
     let mut best: Option<(NxSuperblock, u64)> = None;
     let mut buf = vec![0u8; block_size as usize];
