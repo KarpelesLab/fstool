@@ -87,7 +87,20 @@ impl XattrReader {
             self.kv_start = kv_start;
             return Ok(());
         }
-        let total_bytes = count as usize * 16;
+        // `count` is a raw u32 from disk; each lookup entry is 16 bytes, so a
+        // legitimate table can never describe more entries than the device
+        // could physically hold. Reject an oversized count before it drives
+        // any allocation (mirrors the device-bounded cap in
+        // `inode.rs::read_block_sizes`).
+        let total_bytes = (count as u64).checked_mul(16).filter(|&b| b <= dev.total_size());
+        let total_bytes = match total_bytes {
+            Some(b) => b as usize,
+            None => {
+                return Err(crate::Error::InvalidImage(format!(
+                    "squashfs: xattr lookup count {count} exceeds device-bounded cap"
+                )));
+            }
+        };
         let metablock_count = total_bytes.div_ceil(8192);
         // Locations array immediately follows the 16-byte header.
         let mut locs = vec![0u8; metablock_count * 8];
@@ -137,11 +150,15 @@ impl XattrReader {
         let meta_block_rel = entry.xattr_ref >> 16;
         let in_block_offset = (entry.xattr_ref & 0xFFFF) as usize;
         // Walk K/V records. Crossing metablock boundaries is allowed.
-        let mut out = Vec::with_capacity(entry.count as usize);
+        // `entry.count` is a raw u32 from disk; don't trust it for the
+        // initial capacity (the loop reads each record from disk anyway, so
+        // a wrong count just stops the loop early or errors on a short read).
+        let mut out = Vec::new();
         let mut mb_rel = meta_block_rel;
         let mut offset = in_block_offset;
         for _ in 0..entry.count {
-            let (kv, nb, no) = read_kv_record(dev, self.kv_start, mb_rel, offset, compression)?;
+            let (kv, nb, no) =
+                read_kv_record(dev, self.kv_start, mb_rel, offset, entry._size, compression)?;
             mb_rel = nb;
             offset = no;
             out.push(kv);
@@ -158,9 +175,14 @@ fn read_kv_record(
     kv_start: u64,
     mut mb_rel: u64,
     mut offset: usize,
+    entry_size: u32,
     compression: Compression,
 ) -> Result<(Xattr, u64, usize)> {
     use crate::fs::squashfs::metablock::MetadataReader;
+    // A single record's name/value can never be larger than the whole xattr
+    // set's declared uncompressed size. Use it as an upper bound so a bogus
+    // u16/u32 length field can't drive an oversized read/allocation.
+    let max_field = entry_size as usize;
     let mut mr = MetadataReader::new(kv_start, compression);
     // Key header: u16 type, u16 name_size.
     let (head, nb, no) = mr.read(dev, mb_rel, offset, 4)?;
@@ -168,6 +190,11 @@ fn read_kv_record(
     offset = no;
     let raw_type = u16::from_le_bytes(head[0..2].try_into().unwrap());
     let name_size = u16::from_le_bytes(head[2..4].try_into().unwrap()) as usize;
+    if name_size > max_field {
+        return Err(crate::Error::InvalidImage(format!(
+            "squashfs: xattr name_size {name_size} exceeds entry size {max_field}"
+        )));
+    }
     let (name_bytes, nb, no) = mr.read(dev, mb_rel, offset, name_size)?;
     mb_rel = nb;
     offset = no;
@@ -180,6 +207,13 @@ fn read_kv_record(
     mb_rel = nb;
     offset = no;
     let v_size = u32::from_le_bytes(vh[0..4].try_into().unwrap()) as usize;
+    // Out-of-line values store an 8-byte reference rather than the value
+    // itself, so only bound inline values against the entry size.
+    if raw_type & XATTR_FLAG_OOL == 0 && v_size > max_field {
+        return Err(crate::Error::InvalidImage(format!(
+            "squashfs: xattr value size {v_size} exceeds entry size {max_field}"
+        )));
+    }
     let (mut v_bytes, nb, no) = mr.read(dev, mb_rel, offset, v_size)?;
     mb_rel = nb;
     offset = no;
@@ -191,6 +225,11 @@ fn read_kv_record(
         let mut mr2 = MetadataReader::new(kv_start, compression);
         let (vh2, nb2, no2) = mr2.read(dev, ref_block, ref_offset, 4)?;
         let real_size = u32::from_le_bytes(vh2[0..4].try_into().unwrap()) as usize;
+        if real_size > max_field {
+            return Err(crate::Error::InvalidImage(format!(
+                "squashfs: out-of-line xattr value size {real_size} exceeds entry size {max_field}"
+            )));
+        }
         let (real_bytes, _, _) = mr2.read(dev, nb2, no2, real_size)?;
         v_bytes = real_bytes;
     }

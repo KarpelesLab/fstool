@@ -398,6 +398,12 @@ impl<'a> Read for SquashfsFileReadHandle<'a> {
                 .map_err(|e| io::Error::other(format!("{e}")))?;
             let block_logical_start = u64::from(self.full_block_size) * block_idx as u64;
             let off_in_block = (self.pos - block_logical_start) as usize;
+            // A malformed image can decode a block shorter than its logical
+            // length; treat any offset at/after the decoded end as EOF rather
+            // than underflowing the subtraction below.
+            if off_in_block >= self.cached_buf.len() {
+                return Ok(0);
+            }
             let avail = self.cached_buf.len() - off_in_block;
             let n = avail.min(out.len());
             out[..n].copy_from_slice(&self.cached_buf[off_in_block..off_in_block + n]);

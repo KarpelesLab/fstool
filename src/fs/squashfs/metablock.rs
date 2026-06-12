@@ -143,7 +143,14 @@ impl MetadataReader {
         mut offset: usize,
         n: usize,
     ) -> Result<(Vec<u8>, u64, usize)> {
-        let mut out = Vec::with_capacity(n);
+        // `n` can come from an untrusted on-disk length (e.g. an xattr
+        // value size). The bytes are pulled out of metablocks that live on
+        // the device, so a legitimate read can never exceed the device's
+        // total size. Bound the up-front reservation against that so a bogus
+        // `n` (up to 4 GiB) can't force a huge allocation; the loop still
+        // grows `out` as real bytes arrive and errors on a short read.
+        let reserve = (n as u64).min(dev.total_size()) as usize;
+        let mut out = Vec::with_capacity(reserve);
         while out.len() < n {
             self.ensure(dev, block_disk_rel)?;
             let cached = self.cached.as_ref().expect("cached after ensure");
