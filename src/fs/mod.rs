@@ -1039,9 +1039,19 @@ pub trait Filesystem {
     /// Skips the special names `"."`, `".."`, and `"lost+found"` so
     /// the walk doesn't loop / double-count ext's reserved tree.
     fn total_file_bytes(&mut self, dev: &mut dyn crate::block::BlockDevice) -> crate::Result<u64> {
+        // Mirror the cycle/over-depth guards used by the repack walkers: a
+        // crafted source (e.g. an ISO directory whose child extent points
+        // back at an ancestor) would otherwise loop forever here, with the
+        // path stack growing unbounded. Track visited directory identities
+        // (`DirEntry::inode`) and bound the depth; a backend that reports
+        // inode 0 for every entry still terminates via the depth ceiling.
+        // The walk is best-effort, so we stop cleanly at the bound rather
+        // than erroring.
+        const MAX_DEPTH: usize = 4096;
         let mut total = 0u64;
-        let mut stack: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from("/")];
-        while let Some(dir) = stack.pop() {
+        let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(std::path::PathBuf::from("/"), 0)];
+        while let Some((dir, depth)) = stack.pop() {
             let entries = self.list(dev, &dir)?;
             for e in entries {
                 if e.name == "." || e.name == ".." || e.name == "lost+found" {
@@ -1050,7 +1060,19 @@ pub trait Filesystem {
                 let child = dir.join(&e.name);
                 match e.kind {
                     EntryKind::Regular => total = total.saturating_add(e.size),
-                    EntryKind::Dir => stack.push(child),
+                    EntryKind::Dir => {
+                        // Skip a directory we've already descended into (a
+                        // cycle) and don't push past the depth ceiling. An
+                        // inode of 0 is treated as "unknown identity" and not
+                        // deduplicated — the depth bound is the backstop there.
+                        if depth + 1 > MAX_DEPTH {
+                            continue;
+                        }
+                        if e.inode != 0 && !visited.insert(e.inode) {
+                            continue;
+                        }
+                        stack.push((child, depth + 1));
+                    }
                     _ => {}
                 }
             }
