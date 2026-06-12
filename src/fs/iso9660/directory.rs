@@ -131,6 +131,17 @@ pub fn read_directory(
     joliet_svd: Option<&SupplementaryVolumeDescriptor>,
 ) -> Result<Vec<DirEntryRaw>> {
     let mut out = Vec::new();
+    // Defend against a crafted directory record whose `length` (up to
+    // ~4 GiB) far exceeds the backing device: allocating it blindly is an
+    // OOM vector. A legitimate directory extent fits within the image, so
+    // reject anything larger than the device before allocating.
+    let dev_size = dev.total_size();
+    if dir.length > dev_size {
+        return Err(crate::Error::InvalidImage(format!(
+            "iso9660: directory length {} exceeds device size {}",
+            dir.length, dev_size
+        )));
+    }
     let mut buf = vec![0u8; dir.length as usize];
     dev.read_at(u64::from(dir.extent_lba) * u64::from(SECTOR_SIZE), &mut buf)?;
     let mut cursor = 0usize;
