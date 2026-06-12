@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.16](https://github.com/KarpelesLab/fstool/compare/v0.4.15...v0.4.16) - 2026-06-12
+
+### Fixed
+
+- *(fstool)* escape image-supplied names on TTY; saturating LBA math (CLI-2, CLI-4)
+- *(fstool)* validate image entry names before host path join (CLI-1, CLI-3)
+- *(repack,merge)* bound tar walkers and drop `..` in merge (CORE-1, CORE-2)
+- *(fs)* guard total_file_bytes against directory cycles (MISC-4)
+- *(ramfs)* cap capacity hints and resize ceilings (MISC-3, MISC-5)
+- *(grf)* bound read_entry allocation by device size (MISC-2)
+- *(iso9660)* bound read_directory allocation by device size (MISC-1)
+- *(gpt)* checked_mul for entries_start_lba * 512 (BLK-4)
+- *(dmg)* bound attacker-controlled allocations on malformed images
+- *(archive)* strip `..` in shared normalise_path to block traversal
+- *(lha)* guard short tail reads in the header scan loop
+- *(sevenz)* bound untrusted 7z counts and cap encoded-header decode
+- *(xfs)* extent-driven dir walk and checked byte-offset math
+- *(f2fs)* bound superblock block_count by device capacity (SQF2-5)
+- *(squashfs)* bound untrusted allocations and guard short-block underflow
+- *(affs)* bound chain walks with range checks + visited-sets (FATX-3, FATX-4, FATX-5)
+- *(fat)* bound chain walks by cluster_count, validate sectors_per_cluster (FATX-2, FATX-6)
+- *(exfat)* bound cluster-chain walks by ClusterCount (FATX-1)
+- *(hfs+)* bound journal replay and validate ring geometry (HFS-2, HFS-3, HFS-5)
+- *(hfs+)* guard writer leaf-chain walks and bitmap sizing (HFS-1, HFS-4)
+- *(apfs)* harden reader/writer against malformed images
+- *(ntfs)* harden malformed-image handling (NTFS-1..5)
+- *(ext)* bound extent-append, dx lookup, symlink, and dir scan on malformed input (EXT-4, EXT-5, EXT-6, EXT-8)
+- *(ext)* harden indirect/extent tree walks against OOB, cycles, depth (EXT-3, EXT-7)
+- *(ext)* cap journal replay at ring size to stop cyclic descriptors (EXT-2)
+- *(ext)* bound attacker-controlled group count before allocating (EXT-1)
+
+### Other
+
+- *(fstool)* make safe_component drive-prefix test platform-aware (CLI-1)
+- apply rustfmt to security-hardening changes
+
 ## [0.4.15](https://github.com/KarpelesLab/fstool/compare/v0.4.14...v0.4.15) - 2026-06-11
 
 ### Added
