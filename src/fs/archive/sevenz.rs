@@ -193,6 +193,11 @@ mod imp {
     use crate::fs::archive::{ArchiveEntry, ArchiveIndex, EntryKind};
     use crate::{Error, Result};
 
+    /// Upper bound on the decoded size of an LZMA-packed `kEncodedHeader`.
+    /// A real archive's header is tiny; this only exists to stop a malformed
+    /// archive from decompression-bombing us at open time.
+    const MAX_DECODED_HEADER: u64 = 64 << 20;
+
     // Property IDs.
     const K_HEADER: u8 = 0x01;
     const K_MAIN_STREAMS_INFO: u8 = 0x04;
@@ -330,8 +335,29 @@ mod imp {
             let n = self.num()?;
             usize::try_from(n).map_err(|_| Error::InvalidImage("7z: number too large".into()))
         }
+        /// Bytes left in the header buffer after the cursor.
+        fn remaining(&self) -> usize {
+            self.b.len().saturating_sub(self.p)
+        }
+        /// Read a count and reject it if it could not possibly be backed by
+        /// the header bytes that remain. Each counted element consumes at
+        /// least one further header byte (a `num()` is ≥1 byte, a coder is
+        /// ≥1 byte, …), so a count exceeding the remaining length is an
+        /// attacker-inflated value and would only drive a huge allocation.
+        fn bounded_count(&mut self) -> Result<usize> {
+            let n = self.usize_num()?;
+            if n > self.remaining() {
+                return Err(Error::InvalidImage("7z: count exceeds header size".into()));
+            }
+            Ok(n)
+        }
         /// Read a bit vector of `n` bits (MSB first within each byte).
         fn bits(&mut self, n: usize) -> Result<Vec<bool>> {
+            // A bitvector of n bits is backed by ceil(n/8) header bytes;
+            // reject an inflated count before allocating n bools.
+            if n.div_ceil(8) > self.remaining() {
+                return Err(Error::InvalidImage("7z: bitvector exceeds header size".into()));
+            }
             let mut out = Vec::with_capacity(n);
             let mut cur = 0u8;
             let mut mask = 0u8;
@@ -377,7 +403,7 @@ mod imp {
         let mut id = c.byte()?;
         if id == K_PACK_INFO {
             pack_pos = c.num()?;
-            let n = c.usize_num()?;
+            let n = c.bounded_count()?;
             loop {
                 let pid = c.byte()?;
                 if pid == K_SIZE {
@@ -398,7 +424,7 @@ mod imp {
             if fid != K_FOLDER {
                 return Err(Error::InvalidImage("7z: expected kFolder".into()));
             }
-            let num_folders = c.usize_num()?;
+            let num_folders = c.bounded_count()?;
             let external = c.byte()?;
             if external != 0 {
                 return Err(Error::Unsupported(
@@ -415,6 +441,12 @@ mod imp {
             }
             for f in folders.iter_mut() {
                 let n_out = f.total_out() as usize;
+                // Each output size is a `num()` consuming ≥1 header byte.
+                if n_out > c.remaining() {
+                    return Err(Error::InvalidImage(
+                        "7z: coder unpack-size count exceeds header size".into(),
+                    ));
+                }
                 f.unpack_sizes = (0..n_out).map(|_| c.num()).collect::<Result<_>>()?;
             }
             // Optional kCRC then kEnd.
@@ -458,7 +490,7 @@ mod imp {
     }
 
     fn parse_folder(c: &mut Cur) -> Result<Folder> {
-        let num_coders = c.usize_num()?;
+        let num_coders = c.bounded_count()?;
         let mut coders = Vec::with_capacity(num_coders);
         for _ in 0..num_coders {
             let flag = c.byte()?;
@@ -484,12 +516,26 @@ mod imp {
         }
         let total_out: u64 = coders.iter().map(|c| c.n_out).sum();
         let total_in: u64 = coders.iter().map(|c| c.n_in).sum();
+        // A folder with no output streams is malformed; the bind-pair count
+        // is `total_out - 1`, which would underflow (panic in debug) here.
+        if total_out == 0 {
+            return Err(Error::InvalidImage("7z: folder has no output streams".into()));
+        }
         let num_bind_pairs = total_out - 1;
+        // Each bind pair is two `num()`s (≥1 byte each); reject an inflated
+        // count before looping over attacker-controlled iterations.
+        if num_bind_pairs > c.remaining() as u64 {
+            return Err(Error::InvalidImage(
+                "7z: bind-pair count exceeds header size".into(),
+            ));
+        }
         for _ in 0..num_bind_pairs {
             c.num()?; // in index
             c.num()?; // out index
         }
-        let num_packed = total_in - num_bind_pairs;
+        let num_packed = total_in.checked_sub(num_bind_pairs).ok_or_else(|| {
+            Error::InvalidImage("7z: bind pairs exceed coder input streams".into())
+        })?;
         if num_packed > 1 {
             for _ in 0..num_packed {
                 c.num()?; // packed stream index
@@ -508,7 +554,16 @@ mod imp {
         let mut id = c.byte()?;
         if id == K_NUM_UNPACK_STREAM {
             for f in folders.iter_mut() {
-                f.num_substreams = c.num()?;
+                let n = c.num()?;
+                // Each substream beyond the first costs a `num()` size entry
+                // (≥1 header byte); reject a wildly inflated count up front so
+                // the later `with_capacity(n)` can't be driven to OOM.
+                if n > c.remaining() as u64 + 1 {
+                    return Err(Error::InvalidImage(
+                        "7z: substream count exceeds header size".into(),
+                    ));
+                }
+                f.num_substreams = n;
             }
             id = c.byte()?;
         }
@@ -678,8 +733,19 @@ mod imp {
                 return Err(Error::Unsupported(reason.clone()));
             }
             let mut r = folder_output_reader(dev, &runs[0])?;
+            // The folder declares its own unpack size; decoding to that size
+            // unbounded is a decompression bomb at open time. Cap the decoded
+            // header and reject anything that would exceed the cap.
             let mut decoded = Vec::new();
-            r.read_to_end(&mut decoded).map_err(Error::from)?;
+            (&mut r)
+                .take(MAX_DECODED_HEADER + 1)
+                .read_to_end(&mut decoded)
+                .map_err(Error::from)?;
+            if decoded.len() as u64 > MAX_DECODED_HEADER {
+                return Err(Error::InvalidImage(
+                    "7z: encoded header decodes too large".into(),
+                ));
+            }
             header = decoded;
         }
 
@@ -796,7 +862,7 @@ mod imp {
         index: &mut ArchiveIndex,
         files: &mut HashMap<String, Entry>,
     ) -> Result<()> {
-        let num_files = c.usize_num()?;
+        let num_files = c.bounded_count()?;
         let mut empty_stream = vec![false; num_files];
         let mut empty_file: Vec<bool> = Vec::new();
         let mut names: Vec<String> = Vec::new();
