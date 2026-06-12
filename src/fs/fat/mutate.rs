@@ -87,7 +87,7 @@ impl Fat32 {
         if start < 2 {
             return Ok(()); // zero-length file
         }
-        let chain = self.fat.chain(start)?;
+        let chain = self.fat.chain(start, self.boot.cluster_count())?;
         for c in chain {
             self.fat.set(c, table::FREE);
         }
@@ -103,7 +103,7 @@ impl Fat32 {
         dev: &mut dyn BlockDevice,
         dir_cluster: u32,
     ) -> Result<(Vec<u32>, Vec<u8>)> {
-        let chain = self.fat.chain(dir_cluster)?;
+        let chain = self.fat.chain(dir_cluster, self.boot.cluster_count())?;
         let cb = self.cluster_bytes() as usize;
         let mut buf = vec![0u8; chain.len() * cb];
         for (i, &c) in chain.iter().enumerate() {

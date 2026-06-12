@@ -580,6 +580,17 @@ impl Fat32 {
                 boot.bytes_per_sector
             )));
         }
+        // `sectors_per_cluster` is an untrusted u8 that divides into
+        // `cluster_count()` and scales `cluster_bytes()`. Per the FAT spec
+        // it must be a power of two in `1..=128`; zero would panic the
+        // `data_sectors / spc` division and a non-power-of-two breaks the
+        // cluster geometry. Reject both up front.
+        let spc = boot.sectors_per_cluster;
+        if spc == 0 || !spc.is_power_of_two() || spc > 128 {
+            return Err(crate::Error::InvalidImage(format!(
+                "fat32: sectors_per_cluster must be a power of two in 1..=128 (got {spc})"
+            )));
+        }
         // Validate the on-disk geometry before sizing any allocation from
         // the untrusted `fat_size_32` field. The FAT(s) plus reserved
         // sectors must fit inside the declared volume, and the volume must
@@ -655,7 +666,7 @@ impl Fat32 {
     /// Walk the cluster chain starting at `start`, collecting every cluster
     /// in order.
     pub fn chain_of(&self, start: u32) -> Result<Vec<u32>> {
-        self.fat.chain(start)
+        self.fat.chain(start, self.boot.cluster_count())
     }
 
     /// List the entries of a directory by absolute path. `/` resolves to

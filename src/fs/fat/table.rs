@@ -79,16 +79,26 @@ impl Fat {
     /// Follow the cluster chain starting at `start`, returning every
     /// cluster in order. Stops at an end-of-chain marker; returns an error
     /// on a free/zero entry mid-chain or an obvious loop.
-    pub fn chain(&self, start: u32) -> crate::Result<Vec<u32>> {
+    ///
+    /// `cluster_count` is the volume's true data-cluster count: valid
+    /// clusters live in `[2, cluster_count + 2)`. The in-memory FAT is
+    /// allocated in whole sectors and may hold far more entries than that,
+    /// so the walk bounds itself by `cluster_count` rather than by
+    /// `entries.len()` — otherwise a malformed FAT can produce a chain
+    /// spanning the whole table capacity, and the buffer subsequently
+    /// sized from `chain.len()` blows past the real volume size.
+    pub fn chain(&self, start: u32, cluster_count: u32) -> crate::Result<Vec<u32>> {
+        let max_cluster = (cluster_count as usize) + 2;
+        let bound = max_cluster.min(self.entries.len());
         let mut out = Vec::new();
         let mut cur = start;
         while !Self::is_eoc(cur) {
-            if cur < 2 || cur as usize >= self.entries.len() {
+            if cur < 2 || cur as usize >= bound {
                 return Err(crate::Error::InvalidImage(format!(
                     "fat32: cluster {cur} out of range while walking a chain"
                 )));
             }
-            if out.len() > self.entries.len() {
+            if out.len() > cluster_count as usize {
                 return Err(crate::Error::InvalidImage(
                     "fat32: cluster chain loops".into(),
                 ));
@@ -125,7 +135,7 @@ mod tests {
         fat.set(3, 4);
         fat.set(4, EOC);
         let decoded = Fat::decode(&fat.encode());
-        assert_eq!(decoded.chain(2).unwrap(), vec![2, 3, 4]);
+        assert_eq!(decoded.chain(2, 62).unwrap(), vec![2, 3, 4]);
     }
 
     #[test]
@@ -140,6 +150,6 @@ mod tests {
     fn chain_detects_free_break() {
         let mut fat = Fat::new(64, 0xF8);
         fat.set(2, 3); // 3 is still FREE
-        assert!(fat.chain(2).is_err());
+        assert!(fat.chain(2, 62).is_err());
     }
 }
