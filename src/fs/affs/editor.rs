@@ -57,31 +57,57 @@ impl AffsEditor {
         let mut root = vec![0u8; BSIZE];
         dev.read_at(root_block as u64 * BSIZE as u64, &mut root)?;
 
+        // A volume can have at most one bitmap page per `WORDS_PER_PAGE * 32`
+        // blocks; cap the collected page list at that so a malformed
+        // extension chain can't make `pages` (and the bitmap built from it)
+        // grow without bound.
+        let max_pages =
+            (total_blocks as usize).div_ceil(WORDS_PER_PAGE * 32).max(1) + 1;
         let mut pages: Vec<u32> = Vec::new();
-        for i in 0..25 {
-            let p = be_u32(&root, OFF_BM_PAGES + i * 4);
+        let push_page = |pages: &mut Vec<u32>, p: u32| -> Result<()> {
             if p != 0 {
+                if (p as u64) >= total_blocks as u64 {
+                    return Err(Error::InvalidImage(
+                        "affs: bitmap page pointer out of range".into(),
+                    ));
+                }
+                if pages.len() >= max_pages {
+                    return Err(Error::InvalidImage(
+                        "affs: too many bitmap pages".into(),
+                    ));
+                }
                 pages.push(p);
             }
+            Ok(())
+        };
+        for i in 0..25 {
+            let p = be_u32(&root, OFF_BM_PAGES + i * 4);
+            push_page(&mut pages, p)?;
         }
         // Follow the bitmap-extension chain (each block is WORDS_PER_PAGE page
-        // pointers then a next-ext pointer in the final word).
+        // pointers then a next-ext pointer in the final word). The chain is
+        // attacker-controlled: validate every extension pointer against the
+        // volume's block count and break on a revisited block so a cyclic
+        // `bm_ext` can't loop forever (each pass otherwise pushes up to
+        // WORDS_PER_PAGE page pointers → OOM).
         let mut bm_ext = be_u32(&root, OFF_BM_EXT);
-        let mut guard = 0u32;
+        let mut visited = std::collections::HashSet::new();
         let mut ext = vec![0u8; BSIZE];
         while bm_ext != 0 {
+            if (bm_ext as u64) >= total_blocks as u64 {
+                return Err(Error::InvalidImage(
+                    "affs: bitmap extension block out of range".into(),
+                ));
+            }
+            if !visited.insert(bm_ext) {
+                return Err(Error::InvalidImage("affs: bitmap extension loop".into()));
+            }
             dev.read_at(bm_ext as u64 * BSIZE as u64, &mut ext)?;
             for w in 0..WORDS_PER_PAGE {
                 let p = be_u32(&ext, w * 4);
-                if p != 0 {
-                    pages.push(p);
-                }
+                push_page(&mut pages, p)?;
             }
             bm_ext = be_u32(&ext, WORDS_PER_PAGE * 4);
-            guard += 1;
-            if guard > total_blocks {
-                return Err(Error::InvalidImage("affs: bitmap extension loop".into()));
-            }
         }
 
         let mut bitmap = Vec::with_capacity(pages.len() * WORDS_PER_PAGE);

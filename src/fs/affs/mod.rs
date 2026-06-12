@@ -377,10 +377,19 @@ impl Affs {
         let mut out = Vec::new();
         for i in 0..HT_SIZE {
             let mut entry = be_u32(dir, OFF_HASHTABLE + i * 4);
-            let mut guard = 0;
+            // Per-bucket set of header blocks already walked on this
+            // same-hash chain. The directory-level `visited` set tracks
+            // directories being indexed, not sibling file headers, so a
+            // cyclic `nextSameHash` pointer would otherwise re-push the same
+            // nodes forever and exhaust memory. Break the moment a header
+            // repeats within this chain.
+            let mut seen = std::collections::HashSet::new();
             while entry != 0 && (entry as u64) < total_blocks as u64 {
                 if visited.contains(&entry) {
                     break; // already-seen header → avoid cycles
+                }
+                if !seen.insert(entry) {
+                    break; // cyclic same-hash chain
                 }
                 let mut hb = vec![0u8; BSIZE];
                 dev.read_at(entry as u64 * BSIZE as u64, &mut hb)?;
@@ -418,10 +427,6 @@ impl Affs {
                     });
                 }
                 entry = be_u32(&hb, OFF_NEXT_SAME_HASH);
-                guard += 1;
-                if guard > total_blocks {
-                    break;
-                }
             }
         }
         Ok(out)
@@ -492,11 +497,25 @@ impl Affs {
     /// Build the ordered list of data-block numbers backing a file, walking
     /// the file header plus any extension blocks.
     fn data_blocks(&self, dev: &mut dyn BlockDevice, header: u32) -> Result<Vec<u32>> {
+        // The extension-block chain is attacker-controlled: a self-referential
+        // or out-of-range `OFF_EXTENSION` pointer would otherwise spin until
+        // the `u32::MAX/2` guard, accumulating data-block pointers each pass
+        // and exhausting memory. Bound the walk by the volume's block count
+        // and break the moment we revisit an extension block.
+        let total_blocks = (dev.total_size() / BSIZE as u64) as u32;
         let mut blocks = Vec::new();
         let mut cur = header;
-        let mut guard = 0u64;
+        let mut visited = std::collections::HashSet::new();
         let mut buf = vec![0u8; BSIZE];
         while cur != 0 {
+            if (cur as u64) >= total_blocks as u64 {
+                return Err(Error::InvalidImage(
+                    "affs: file extension block out of range".into(),
+                ));
+            }
+            if !visited.insert(cur) {
+                return Err(Error::InvalidImage("affs: file extension loop".into()));
+            }
             dev.read_at(cur as u64 * BSIZE as u64, &mut buf)?;
             let high_seq = be_i32(&buf, OFF_HIGH_SEQ).clamp(0, MAX_DATABLK as i32) as usize;
             // Data-block pointers are stored in reverse: the first data block
@@ -509,10 +528,6 @@ impl Affs {
                 }
             }
             cur = be_u32(&buf, OFF_EXTENSION);
-            guard += 1;
-            if guard > u32::MAX as u64 / 2 {
-                return Err(Error::InvalidImage("affs: file extension loop".into()));
-            }
         }
         Ok(blocks)
     }
