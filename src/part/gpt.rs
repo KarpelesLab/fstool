@@ -150,7 +150,16 @@ impl Gpt {
                 ))
             })? as usize;
         let mut entries_buf = vec![0u8; entries_bytes];
-        dev.read_at(hdr.entries_start_lba * 512, &mut entries_buf)?;
+        // `entries_start_lba` is attacker-controlled; the multiply can wrap
+        // (release) or panic (debug). Use checked arithmetic, consistent with
+        // the `num_entries * entry_size` computation above.
+        let entries_offset = hdr.entries_start_lba.checked_mul(512).ok_or_else(|| {
+            crate::Error::InvalidImage(format!(
+                "GPT entries_start_lba {} * 512 overflows",
+                hdr.entries_start_lba
+            ))
+        })?;
+        dev.read_at(entries_offset, &mut entries_buf)?;
         let computed = crc32fast::hash(&entries_buf);
         if computed != hdr.entries_crc {
             return Err(crate::Error::InvalidImage(format!(
