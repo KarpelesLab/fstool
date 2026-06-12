@@ -73,6 +73,20 @@ use volume_header::{ForkData, VolumeHeader, read_volume_header};
 /// are tiny path strings and a sane filesystem stays well under this.
 const SYMLINK_MAX_BYTES: u64 = 4096;
 
+/// Seconds between the HFS+ epoch (1904-01-01) and the Unix epoch
+/// (1970-01-01). HFS+ stores catalog dates as seconds since 1904.
+const HFS_EPOCH_OFFSET: u32 = 2_082_844_800;
+
+/// Convert Unix epoch seconds to an HFS+ catalog date. `0` (no timestamp)
+/// maps to `0`; values past the u32 range saturate.
+fn unix_to_hfs_time(unix: u32) -> u32 {
+    if unix == 0 {
+        0
+    } else {
+        unix.saturating_add(HFS_EPOCH_OFFSET)
+    }
+}
+
 /// An opened HFS+ volume.
 pub struct HfsPlus {
     volume_header: VolumeHeader,
@@ -200,6 +214,7 @@ impl HfsPlus {
     }
 
     /// Create a directory at the given absolute path.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_dir(
         &mut self,
         _dev: &mut dyn BlockDevice,
@@ -207,6 +222,7 @@ impl HfsPlus {
         mode: u16,
         uid: u32,
         gid: u32,
+        mtime: u32,
     ) -> Result<u32> {
         let (parent_id, name) = self.resolve_create_target(path)?;
         let w = self
@@ -218,7 +234,16 @@ impl HfsPlus {
             .next_cnid
             .checked_add(1)
             .ok_or_else(|| crate::Error::Unsupported("hfs+: CNID space exhausted".into()))?;
-        writer::insert_folder(w, parent_id, &name, cnid, mode, uid, gid)?;
+        writer::insert_folder(
+            w,
+            parent_id,
+            &name,
+            cnid,
+            mode,
+            uid,
+            gid,
+            unix_to_hfs_time(mtime),
+        )?;
         Ok(cnid)
     }
 
@@ -234,6 +259,7 @@ impl HfsPlus {
         mode: u16,
         uid: u32,
         gid: u32,
+        mtime: u32,
     ) -> Result<u32> {
         let (parent_id, name) = self.resolve_create_target(path)?;
         let w = self
@@ -254,6 +280,7 @@ impl HfsPlus {
             mode | catalog::mode::S_IFREG,
             uid,
             gid,
+            unix_to_hfs_time(mtime),
             *b"\0\0\0\0",
             *b"\0\0\0\0",
             &fork,
@@ -292,6 +319,7 @@ impl HfsPlus {
             mode | catalog::mode::S_IFLNK,
             uid,
             gid,
+            0, // mod_date: symlinks fall back to the volume create date
             *b"slnk",
             *b"rhap",
             &fork,
@@ -353,6 +381,7 @@ impl HfsPlus {
             mode | kind_bits,
             uid,
             gid,
+            0, // mod_date: device nodes fall back to the volume create date
             *b"\0\0\0\0",
             *b"\0\0\0\0",
             &ForkData::default(),
@@ -1419,8 +1448,17 @@ impl crate::fs::Filesystem for HfsPlus {
         let len = src.len()?;
         let (mut reader, _) = src.open()?;
         let mode = meta.mode;
-        self.create_file(dev, s, &mut reader, len, mode, meta.uid, meta.gid)
-            .map(|_| ())
+        self.create_file(
+            dev,
+            s,
+            &mut reader,
+            len,
+            mode,
+            meta.uid,
+            meta.gid,
+            meta.mtime,
+        )
+        .map(|_| ())
     }
 
     fn create_dir(
@@ -1433,7 +1471,7 @@ impl crate::fs::Filesystem for HfsPlus {
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("hfs+: non-UTF-8 path".into()))?;
         let mode = meta.mode;
-        self.create_dir(dev, s, mode, meta.uid, meta.gid)
+        self.create_dir(dev, s, mode, meta.uid, meta.gid, meta.mtime)
             .map(|_| ())
     }
 
@@ -1588,7 +1626,7 @@ impl crate::fs::Filesystem for HfsPlus {
             _ => (bsd.special.max(1), 0),
         };
         // HFS+ dates are seconds since 1904-01-01; Unix is 1904 + 66 yrs.
-        let mtime = mtime_hfs.saturating_sub(2_082_844_800);
+        let mtime = mtime_hfs.saturating_sub(HFS_EPOCH_OFFSET);
         Ok(crate::fs::FileAttrs {
             kind,
             mode,
@@ -1718,8 +1756,17 @@ mod tests {
 
         let data = b"link-inode invariant payload\n".repeat(8);
         let mut src = std::io::Cursor::new(&data);
-        hfs.create_file(&mut dev, "/src", &mut src, data.len() as u64, 0o644, 0, 0)
-            .unwrap();
+        hfs.create_file(
+            &mut dev,
+            "/src",
+            &mut src,
+            data.len() as u64,
+            0o644,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
         let link_inode = hfs.create_hardlink(&mut dev, "/src", "/dst").unwrap();
         hfs.flush(&mut dev).unwrap();
 
@@ -1792,6 +1839,7 @@ mod tests {
             0o644,
             0,
             0,
+            0,
         )
         .unwrap();
         hfs.flush(&mut dev).unwrap();
@@ -1831,8 +1879,17 @@ mod tests {
         let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
         let data = b"no resources here\n".to_vec();
         let mut src = std::io::Cursor::new(&data);
-        hfs.create_file(&mut dev, "/plain", &mut src, data.len() as u64, 0o644, 0, 0)
-            .unwrap();
+        hfs.create_file(
+            &mut dev,
+            "/plain",
+            &mut src,
+            data.len() as u64,
+            0o644,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
         hfs.flush(&mut dev).unwrap();
         let mut hfs = HfsPlus::open(&mut dev).unwrap();
 
@@ -1867,6 +1924,7 @@ mod tests {
                 &mut src,
                 first.len() as u64,
                 0o644,
+                0,
                 0,
                 0,
             )
@@ -1904,6 +1962,7 @@ mod tests {
                 &mut src,
                 second.len() as u64,
                 0o644,
+                0,
                 0,
                 0,
             )
@@ -1958,6 +2017,7 @@ mod tests {
                 0o644,
                 0,
                 0,
+                0,
             )
             .unwrap();
             hfs.create_file(
@@ -1966,6 +2026,7 @@ mod tests {
                 &mut std::io::Cursor::new(b"keep me\n"),
                 8,
                 0o644,
+                0,
                 0,
                 0,
             )
@@ -2027,6 +2088,7 @@ mod tests {
                 &mut src,
                 payload.len() as u64,
                 0o644,
+                0,
                 0,
                 0,
             )
@@ -2091,6 +2153,7 @@ mod tests {
                 &mut src,
                 payload.len() as u64,
                 0o644,
+                0,
                 0,
                 0,
             )
@@ -2183,6 +2246,7 @@ mod tests {
                 &mut src,
                 payload.len() as u64,
                 0o644,
+                0,
                 0,
                 0,
             )
@@ -2312,6 +2376,7 @@ mod tests {
                 &mut src,
                 payload.len() as u64,
                 0o644,
+                0,
                 0,
                 0,
             )
@@ -2453,6 +2518,7 @@ mod tests {
                 0o644,
                 0,
                 0,
+                0,
             )
             .unwrap();
             hfs.flush(&mut dev).unwrap();
@@ -2533,6 +2599,7 @@ mod tests {
                 0o644,
                 0,
                 0,
+                0,
             )
             .unwrap();
             hfs.flush(&mut dev).unwrap();
@@ -2568,7 +2635,8 @@ mod tests {
             // Multiple mutations: dir + file + remove. This dirties the
             // catalog (always), the bitmap (file allocation + free), and
             // bumps next_cnid (volume header).
-            hfs.create_dir(&mut dev, "/added-dir", 0o755, 0, 0).unwrap();
+            hfs.create_dir(&mut dev, "/added-dir", 0o755, 0, 0, 0)
+                .unwrap();
             let mut src = std::io::Cursor::new(&new_payload);
             hfs.create_file(
                 &mut dev,
@@ -2576,6 +2644,7 @@ mod tests {
                 &mut src,
                 new_payload.len() as u64,
                 0o644,
+                0,
                 0,
                 0,
             )
@@ -2711,6 +2780,7 @@ mod tests {
                 &mut src,
                 data.len() as u64,
                 0o644,
+                0,
                 0,
                 0,
             )
@@ -2893,7 +2963,7 @@ mod tests {
         // from the decmpfs xattr we install below.
         let mut empty = std::io::Cursor::new(Vec::<u8>::new());
         let cnid = hfs
-            .create_file(&mut dev, "/cmp.bin", &mut empty, 0, 0o644, 0, 0)
+            .create_file(&mut dev, "/cmp.bin", &mut empty, 0, 0o644, 0, 0, 0)
             .unwrap();
 
         let plain = b"hello hfsplus decmpfs inline zlib world!\n".repeat(20);
@@ -2965,7 +3035,7 @@ mod tests {
 
         let mut empty = std::io::Cursor::new(Vec::<u8>::new());
         let cnid = hfs
-            .create_file(&mut dev, "/big.bin", &mut empty, 0, 0o644, 0, 0)
+            .create_file(&mut dev, "/big.bin", &mut empty, 0, 0o644, 0, 0, 0)
             .unwrap();
 
         // Build two blocks: first 64 KiB, then a tail.
@@ -3083,7 +3153,7 @@ mod tests {
         let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
         let mut empty = std::io::Cursor::new(Vec::<u8>::new());
         let cnid = hfs
-            .create_file(&mut dev, "/lzvn.bin", &mut empty, 0, 0o644, 0, 0)
+            .create_file(&mut dev, "/lzvn.bin", &mut empty, 0, 0o644, 0, 0, 0)
             .unwrap();
 
         // decmpfs header advertises type 7 (LZVN inline), but we ship

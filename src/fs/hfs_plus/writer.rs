@@ -599,6 +599,20 @@ fn encode_fork(fork: &ForkData, out: &mut Vec<u8>) {
 }
 
 /// Encode a `HFSPlusCatalogFolder` record body (88 bytes).
+/// Append the five 4-byte HFS+ catalog dates (createDate, contentModDate,
+/// attributeModDate, accessDate, backupDate). `mod_date` (HFS+ epoch
+/// seconds) drives the three mod/access dates when non-zero; `0` falls back
+/// to `create_date`, preserving the reproducible all-`create_date` output
+/// for records with no per-entry timestamp.
+fn push_catalog_dates(out: &mut Vec<u8>, create_date: u32, mod_date: u32) {
+    let modd = if mod_date != 0 { mod_date } else { create_date };
+    out.extend_from_slice(&create_date.to_be_bytes()); // createDate
+    out.extend_from_slice(&modd.to_be_bytes()); // contentModDate
+    out.extend_from_slice(&modd.to_be_bytes()); // attributeModDate
+    out.extend_from_slice(&modd.to_be_bytes()); // accessDate
+    out.extend_from_slice(&create_date.to_be_bytes()); // backupDate
+}
+
 pub(crate) fn encode_folder_body(
     folder_id: u32,
     valence: u32,
@@ -606,16 +620,14 @@ pub(crate) fn encode_folder_body(
     uid: u32,
     gid: u32,
     create_date: u32,
+    mod_date: u32,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(88);
     out.extend_from_slice(&REC_FOLDER.to_be_bytes());
     out.extend_from_slice(&0u16.to_be_bytes()); // flags
     out.extend_from_slice(&valence.to_be_bytes()); // valence
     out.extend_from_slice(&folder_id.to_be_bytes()); // folderID
-    // five 4-byte dates
-    for _ in 0..5 {
-        out.extend_from_slice(&create_date.to_be_bytes());
-    }
+    push_catalog_dates(&mut out, create_date, mod_date);
     // BSDInfo (16 bytes)
     encode_bsd(&mut out, file_mode, uid, gid, 0);
     // FolderInfo (16 bytes) — leave as zero
@@ -640,6 +652,7 @@ pub(crate) fn encode_file_body(
     uid: u32,
     gid: u32,
     create_date: u32,
+    mod_date: u32,
     file_type: [u8; 4],
     creator: [u8; 4],
     data_fork: &ForkData,
@@ -650,10 +663,7 @@ pub(crate) fn encode_file_body(
     out.extend_from_slice(&0u16.to_be_bytes()); // flags
     out.extend_from_slice(&0u32.to_be_bytes()); // reserved1
     out.extend_from_slice(&file_id.to_be_bytes());
-    // five 4-byte dates
-    for _ in 0..5 {
-        out.extend_from_slice(&create_date.to_be_bytes());
-    }
+    push_catalog_dates(&mut out, create_date, mod_date);
     encode_bsd(&mut out, file_mode, uid, gid, special);
     // FileInfo (16 bytes): fileType, creator, then 8 reserved bytes.
     out.extend_from_slice(&file_type);
@@ -1355,6 +1365,7 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
         0,
         0,
         opts.create_date,
+        0,
     );
     writer.catalog.insert(
         OwnedKey {
@@ -1636,6 +1647,7 @@ pub(crate) fn write_inline_data(
 
 /// Insert a new directory child with the given encoded folder body.
 /// The caller must have allocated `folder_id` from `writer.next_cnid`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn insert_folder(
     writer: &mut Writer,
     parent_id: u32,
@@ -1644,6 +1656,7 @@ pub(crate) fn insert_folder(
     mode: u16,
     uid: u32,
     gid: u32,
+    mod_date: u32,
 ) -> Result<()> {
     if name.code_units.is_empty() {
         return Err(crate::Error::InvalidArgument(
@@ -1672,6 +1685,7 @@ pub(crate) fn insert_folder(
         uid,
         gid,
         writer.create_date,
+        mod_date,
     );
     writer.catalog.insert(folder_key, body);
 
@@ -1695,6 +1709,7 @@ pub(crate) fn insert_file(
     file_mode: u16,
     uid: u32,
     gid: u32,
+    mod_date: u32,
     file_type: [u8; 4],
     creator: [u8; 4],
     data_fork: &ForkData,
@@ -1726,6 +1741,7 @@ pub(crate) fn insert_file(
         uid,
         gid,
         writer.create_date,
+        mod_date,
         file_type,
         creator,
         data_fork,
@@ -1878,7 +1894,7 @@ pub(crate) fn ensure_private_dir(writer: &mut Writer) -> Result<u32> {
         .ok_or_else(|| crate::Error::Unsupported("hfs+: CNID space exhausted".into()))?;
     let name = private_data_dir_name();
     // mode 0700 / uid root / gid root, S_IFDIR is or'ed in by insert_folder.
-    insert_folder(writer, ROOT_FOLDER_ID, &name, cnid, 0o700, 0, 0)?;
+    insert_folder(writer, ROOT_FOLDER_ID, &name, cnid, 0o700, 0, 0, 0)?;
     writer.private_dir_cnid = Some(cnid);
     // Apple marks the Private Data directory as invisible in Finder:
     // FolderInfo.frFlags |= kIsInvisible (0x4000). The FolderInfo block
@@ -2159,6 +2175,7 @@ pub(crate) fn promote_to_hardlink(
         uid,
         gid,
         writer.create_date,
+        0,
         [0u8; 4], // fileType (zero — Apple convention)
         [0u8; 4], // creator
         &src_fork,
@@ -3078,7 +3095,7 @@ mod tests {
         let mut dev = MemoryBackend::new(8 * 1024 * 1024);
         let opts = FormatOpts::default();
         let mut hfs = crate::fs::hfs_plus::HfsPlus::format(&mut dev, &opts).unwrap();
-        hfs.create_dir(&mut dev, "/foo", 0o755, 0, 0).unwrap();
+        hfs.create_dir(&mut dev, "/foo", 0o755, 0, 0, 0).unwrap();
         hfs.flush(&mut dev).unwrap();
         let entries = hfs.list_path(&mut dev, "/").unwrap();
         assert_eq!(entries.len(), 1);
@@ -3106,6 +3123,7 @@ mod tests {
             &mut src,
             data.len() as u64,
             0o644,
+            0,
             0,
             0,
         )
@@ -3144,8 +3162,8 @@ mod tests {
         let mut dev = MemoryBackend::new(8 * 1024 * 1024);
         let opts = FormatOpts::default();
         let mut hfs = crate::fs::hfs_plus::HfsPlus::format(&mut dev, &opts).unwrap();
-        hfs.create_dir(&mut dev, "/a", 0o755, 0, 0).unwrap();
-        hfs.create_dir(&mut dev, "/a/b", 0o755, 0, 0).unwrap();
+        hfs.create_dir(&mut dev, "/a", 0o755, 0, 0, 0).unwrap();
+        hfs.create_dir(&mut dev, "/a/b", 0o755, 0, 0, 0).unwrap();
         let data = b"deep";
         let mut src = std::io::Cursor::new(data);
         hfs.create_file(
@@ -3154,6 +3172,7 @@ mod tests {
             &mut src,
             data.len() as u64,
             0o644,
+            0,
             0,
             0,
         )
@@ -3180,8 +3199,17 @@ mod tests {
         };
         let data = vec![0xAAu8; 12_000]; // ~3 blocks at 4 KiB.
         let mut src = std::io::Cursor::new(&data);
-        hfs.create_file(&mut dev, "/big", &mut src, data.len() as u64, 0o644, 0, 0)
-            .unwrap();
+        hfs.create_file(
+            &mut dev,
+            "/big",
+            &mut src,
+            data.len() as u64,
+            0o644,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
         hfs.remove(&mut dev, "/big").unwrap();
         let after = {
             let w = hfs_test_writer(&hfs);
@@ -3207,7 +3235,7 @@ mod tests {
         };
         let mut hfs = crate::fs::hfs_plus::HfsPlus::format(&mut dev, &opts).unwrap();
         for i in 0..200 {
-            hfs.create_dir(&mut dev, &format!("/d{i:03}"), 0o755, 0, 0)
+            hfs.create_dir(&mut dev, &format!("/d{i:03}"), 0o755, 0, 0, 0)
                 .unwrap();
         }
         hfs.flush(&mut dev).unwrap();
@@ -3314,6 +3342,7 @@ mod tests {
             0o644 | crate::fs::hfs_plus::catalog::mode::S_IFREG,
             0,
             0,
+            0,
             *b"\0\0\0\0",
             *b"\0\0\0\0",
             &fork,
@@ -3375,6 +3404,7 @@ mod tests {
             0o644 | crate::fs::hfs_plus::catalog::mode::S_IFREG,
             0,
             0,
+            0,
             *b"\0\0\0\0",
             *b"\0\0\0\0",
             &fork,
@@ -3419,6 +3449,7 @@ mod tests {
             0o644 | crate::fs::hfs_plus::catalog::mode::S_IFREG,
             0,
             0,
+            0,
             *b"\0\0\0\0",
             *b"\0\0\0\0",
             &fork,
@@ -3445,8 +3476,17 @@ mod tests {
         // Source file with distinctive bytes.
         let data = b"hard-link payload\n".repeat(64); // ~ 1 KiB
         let mut src = std::io::Cursor::new(&data);
-        hfs.create_file(&mut dev, "/src", &mut src, data.len() as u64, 0o644, 0, 0)
-            .unwrap();
+        hfs.create_file(
+            &mut dev,
+            "/src",
+            &mut src,
+            data.len() as u64,
+            0o644,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
         let link_inode = hfs.create_hardlink(&mut dev, "/src", "/dst").unwrap();
         // The iNode "number" returned by `create_hardlink` is the CNID
         // of the iNode file in PD — Apple uses the CNID as the link
@@ -3484,7 +3524,7 @@ mod tests {
 
         let data = b"x";
         let mut src = std::io::Cursor::new(&data[..]);
-        hfs.create_file(&mut dev, "/file", &mut src, 1, 0o644, 0, 0)
+        hfs.create_file(&mut dev, "/file", &mut src, 1, 0o644, 0, 0, 0)
             .unwrap();
         // Same source / destination path: error.
         assert!(hfs.create_hardlink(&mut dev, "/file", "/file").is_err());
@@ -3529,7 +3569,7 @@ mod tests {
 
         let data = b"three-way link\n";
         let mut src = std::io::Cursor::new(&data[..]);
-        hfs.create_file(&mut dev, "/a", &mut src, data.len() as u64, 0o644, 0, 0)
+        hfs.create_file(&mut dev, "/a", &mut src, data.len() as u64, 0o644, 0, 0, 0)
             .unwrap();
         let _ = hfs.create_hardlink(&mut dev, "/a", "/b").unwrap();
         // Creating a hard link *to an existing hard link* is not

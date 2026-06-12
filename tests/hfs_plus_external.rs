@@ -120,7 +120,7 @@ fn writer_image_passes_fsck_hfs() {
     let (mut dev, mut hfs) = fresh_image(&tmp, &opts);
 
     // /etc + /etc/conf
-    hfs.create_dir(&mut dev, "/etc", 0o755, 0, 0).unwrap();
+    hfs.create_dir(&mut dev, "/etc", 0o755, 0, 0, 0).unwrap();
     let body = b"x=1\n";
     let mut src = Cursor::new(&body[..]);
     hfs.create_file(
@@ -131,14 +131,24 @@ fn writer_image_passes_fsck_hfs() {
         0o644,
         0,
         0,
+        0,
     )
     .unwrap();
 
     // /readme — bigger file that will exercise several extents
     let big: Vec<u8> = (0..16 * 1024).map(|i| (i & 0xFF) as u8).collect();
     let mut src = Cursor::new(&big[..]);
-    hfs.create_file(&mut dev, "/readme", &mut src, big.len() as u64, 0o644, 0, 0)
-        .unwrap();
+    hfs.create_file(
+        &mut dev,
+        "/readme",
+        &mut src,
+        big.len() as u64,
+        0o644,
+        0,
+        0,
+        0,
+    )
+    .unwrap();
 
     // /link -> etc/conf  (symlink target is a relative path)
     hfs.create_symlink(&mut dev, "/link", "etc/conf", 0o777, 0, 0)
@@ -184,6 +194,7 @@ fn writer_journaled_image_passes_fsck_hfs() {
         &mut src,
         body.len() as u64,
         0o644,
+        0,
         0,
         0,
     )
@@ -426,7 +437,7 @@ fn dump_fstool_catalog_leaf() {
         ..FormatOpts::default()
     };
     let (mut dev, mut hfs) = fresh_image(&tmp, &opts);
-    hfs.create_dir(&mut dev, "/etc", 0o755, 0, 0).unwrap();
+    hfs.create_dir(&mut dev, "/etc", 0o755, 0, 0, 0).unwrap();
     let body = b"x=1\n";
     let mut src = Cursor::new(&body[..]);
     hfs.create_file(
@@ -437,12 +448,22 @@ fn dump_fstool_catalog_leaf() {
         0o644,
         0,
         0,
+        0,
     )
     .unwrap();
     let big: Vec<u8> = (0..16 * 1024).map(|i| (i & 0xFF) as u8).collect();
     let mut src = Cursor::new(&big[..]);
-    hfs.create_file(&mut dev, "/readme", &mut src, big.len() as u64, 0o644, 0, 0)
-        .unwrap();
+    hfs.create_file(
+        &mut dev,
+        "/readme",
+        &mut src,
+        big.len() as u64,
+        0o644,
+        0,
+        0,
+        0,
+    )
+    .unwrap();
     hfs.create_symlink(&mut dev, "/link", "etc/conf", 0o777, 0, 0)
         .unwrap();
     hfs.create_hardlink(&mut dev, "/readme", "/alias").unwrap();
@@ -533,7 +554,7 @@ fn writer_large_directory_grows_catalog_passes_fsck() {
         ..FormatOpts::default()
     };
     let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
-    hfs.create_dir(&mut dev, "/big", 0o755, 0, 0).unwrap();
+    hfs.create_dir(&mut dev, "/big", 0o755, 0, 0, 0).unwrap();
     for i in 0..6000 {
         let body = b"x";
         let mut src = Cursor::new(&body[..]);
@@ -543,6 +564,7 @@ fn writer_large_directory_grows_catalog_passes_fsck() {
             &mut src,
             body.len() as u64,
             0o644,
+            0,
             0,
             0,
         )

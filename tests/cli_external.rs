@@ -2115,6 +2115,7 @@ fn cli_shell_put_preserves_mtime() {
         ("fat32", "64M"),
         ("exfat", "64M"),
         ("ntfs", "32M"),
+        ("hfs+", "32M"),
     ] {
         let img = NamedTempFile::new().unwrap();
         assert!(

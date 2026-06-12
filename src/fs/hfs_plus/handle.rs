@@ -654,7 +654,9 @@ pub(super) fn open_file_rw<'a>(
             )
         })?;
         let mut empty = std::io::Cursor::new(Vec::<u8>::new());
-        fs.create_file(dev, path_str, &mut empty, 0, meta.mode, meta.uid, meta.gid)?;
+        fs.create_file(
+            dev, path_str, &mut empty, 0, meta.mode, meta.uid, meta.gid, meta.mtime,
+        )?;
     }
 
     // Read the catalog body and assemble the merged run list.
