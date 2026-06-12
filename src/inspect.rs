@@ -703,10 +703,9 @@ impl AnyFs {
     ) -> Result<()> {
         self.require_mutable("add")?;
         let meta = std::fs::symlink_metadata(host_src)?;
-        let fmeta = crate::fs::FileMeta {
-            mode: host_mode_from_meta(&meta, false),
-            ..crate::fs::FileMeta::default()
-        };
+        // Preserve the host file's mode/owner/timestamps, matching the
+        // `build`/`create` path — not just the mode.
+        let fmeta = crate::repack::host_meta_to_fs(&meta);
         let dest = std::path::Path::new(dest_path);
         let src = crate::fs::FileSource::HostPath(host_src.to_path_buf());
         self.as_filesystem_dyn(move |fs| fs.create_file(dev, dest, src, fmeta))
@@ -723,10 +722,10 @@ impl AnyFs {
     ) -> Result<()> {
         self.require_mutable("add")?;
         let meta = std::fs::symlink_metadata(host_src)?;
-        let fmeta = crate::fs::FileMeta {
-            mode: host_mode_from_meta(&meta, true),
-            ..crate::fs::FileMeta::default()
-        };
+        // Preserve the host directory's mode/owner/timestamps (the tree's
+        // children are handled by the recursive populate below, which already
+        // carries host metadata).
+        let fmeta = crate::repack::host_meta_to_fs(&meta);
         let dest = std::path::Path::new(dest_path);
         self.as_filesystem_dyn(|fs| fs.create_dir(dev, dest, fmeta))?;
         // Walk the host source recursively through the trait. Errors
@@ -968,24 +967,6 @@ impl AnyFs {
             Self::Archive(_, _, name) => name,
             Self::Ramfs(_) => "ramfs",
         }
-    }
-}
-
-/// Best-effort mode for a host file pulled in via `add_file` / `add_dir_tree`.
-/// On Unix: the actual permission bits. On Windows: a fixed 0o755 for
-/// directories and 0o644 for everything else (we don't have POSIX bits
-/// to read).
-fn host_mode_from_meta(meta: &std::fs::Metadata, is_dir: bool) -> u16 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = is_dir;
-        (meta.permissions().mode() & 0o7777) as u16
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = meta;
-        if is_dir { 0o755 } else { 0o644 }
     }
 }
 

@@ -2042,3 +2042,98 @@ fn cli_shell_put_quit_persists_across_backends() {
         }
     }
 }
+
+/// `fstool shell` quoting: a filename containing spaces round-trips only when
+/// quoted (single or double), and an unquoted space is treated as an argument
+/// separator (error), not silently joined.
+#[test]
+fn cli_shell_quoted_paths() {
+    let srcdir = tempfile::tempdir().unwrap();
+    let hostfile = srcdir.path().join("my file.txt");
+    std::fs::write(&hostfile, b"quoted body\n").unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+    let create = Command::new(FSTOOL)
+        .args(["create", "--type", "ext4", "--size", "16M", "-o"])
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(create.status.success());
+
+    // Double-quoted host + image paths; single-quoted dir.
+    let script = format!(
+        "mkdir 'a dir'\nput \"{}\" \"/a dir/has space.txt\"\nls \"/a dir\"\nquit\n",
+        hostfile.display()
+    );
+    let (out, ok) = shell_script(img.path(), &script);
+    assert!(ok, "shell exited non-zero: {out}");
+    assert!(
+        out.contains("has space.txt"),
+        "quoted spaced filename not listed: {out:?}"
+    );
+
+    // Read it back by a fresh process using a single-quoted path.
+    let cat = Command::new(FSTOOL)
+        .arg("cat")
+        .arg(img.path())
+        .arg("/a dir/has space.txt")
+        .output()
+        .unwrap();
+    assert!(cat.status.success(), "cat of spaced path failed");
+    assert_eq!(cat.stdout, b"quoted body\n");
+
+    // An *unquoted* space must error (require quotes), not silently split.
+    let (out, _) = shell_script(img.path(), "cd /a dir\nquit\n");
+    assert!(
+        out.contains("too many arguments"),
+        "unquoted spaced path should be rejected: {out:?}"
+    );
+}
+
+/// `put` preserves the host file's mtime (it used to drop every timestamp to
+/// zero). Checked on ext4, whose getattr round-trips mtime.
+#[test]
+fn cli_shell_put_preserves_mtime() {
+    use std::time::{Duration, SystemTime};
+
+    let srcdir = tempfile::tempdir().unwrap();
+    let hostfile = srcdir.path().join("dated.txt");
+    std::fs::write(&hostfile, b"has a date\n").unwrap();
+    // A fixed, non-zero mtime well in the past.
+    let when = SystemTime::UNIX_EPOCH + Duration::from_secs(1_615_779_296); // 2021-03-15
+    let f = std::fs::File::options()
+        .write(true)
+        .open(&hostfile)
+        .unwrap();
+    f.set_modified(when).unwrap();
+    drop(f);
+
+    let img = NamedTempFile::new().unwrap();
+    assert!(
+        Command::new(FSTOOL)
+            .args(["create", "--type", "ext4", "--size", "16M", "-o"])
+            .arg(img.path())
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let (out, ok) = shell_script(
+        img.path(),
+        &format!("put \"{}\" /dated.txt\nquit\n", hostfile.display()),
+    );
+    assert!(ok, "put failed: {out}");
+
+    // `info` reports `mtime:  <epoch>  (...)`. It must be the host value, not 0.
+    let (info, ok) = shell_script(img.path(), "info /dated.txt\nquit\n");
+    assert!(ok, "info failed: {info}");
+    let mtime_line = info
+        .lines()
+        .find(|l| l.trim_start().starts_with("mtime:"))
+        .unwrap_or("");
+    assert!(
+        mtime_line.contains("1615779296"),
+        "put did not preserve host mtime (line: {mtime_line:?})"
+    );
+}

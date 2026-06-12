@@ -1506,8 +1506,11 @@ pub fn populate_fs_from_source_dyn(
     walk_source_into_sink(source, &mut sink)
 }
 
-/// Convert host `Metadata` into a public [`crate::fs::FileMeta`].
-fn host_meta_to_fs(meta: &std::fs::Metadata) -> crate::fs::FileMeta {
+/// Convert host `Metadata` into a public [`crate::fs::FileMeta`], preserving
+/// mode / uid / gid / mtime / atime / ctime. Shared with the shell's
+/// `put` (`AnyFs::add_file` / `add_dir_tree`) so an interactively-added file
+/// keeps its host timestamps and ownership, exactly like a `build`/`create`.
+pub(crate) fn host_meta_to_fs(meta: &std::fs::Metadata) -> crate::fs::FileMeta {
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     #[cfg(unix)]

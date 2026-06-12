@@ -499,7 +499,9 @@ save OUT[.tar[.gz|.zst|.xz]]
                     for a `--new-ramfs` session; `fstool repack OUT image -t …`
                     then builds an exactly-sized real filesystem from it.
 help | ?            print this help
-quit | exit         leave{ro_note}\n{cache_note}"
+quit | exit         leave
+(paths with spaces must be quoted: cd \"my dir\" or cd 'my dir'; \\ is a
+ literal character, e.g. a native NTFS path \\Windows\\System32){ro_note}\n{cache_note}"
         );
         output.write_all(body.as_bytes())?;
         Ok(())
@@ -511,10 +513,9 @@ quit | exit         leave{ro_note}\n{cache_note}"
         arg: &str,
         output: &mut impl Write,
     ) -> Result<()> {
-        let target = if arg.is_empty() {
-            self.cwd.clone()
-        } else {
-            self.resolve(arg)
+        let target = match single_arg("ls", arg)? {
+            None => self.cwd.clone(),
+            Some(p) => self.resolve(&p),
         };
         let entries = self.list(dev, &target)?;
         for e in &entries {
@@ -536,10 +537,9 @@ quit | exit         leave{ro_note}\n{cache_note}"
     }
 
     fn cmd_cd(&mut self, dev: &mut dyn BlockDevice, arg: &str) -> Result<()> {
-        let target = if arg.is_empty() {
-            "/".to_string()
-        } else {
-            self.resolve(arg)
+        let target = match single_arg("cd", arg)? {
+            None => "/".to_string(),
+            Some(p) => self.resolve(&p),
         };
         // Verify it's actually a directory by listing it. Cheap, and gives
         // a useful error if the path is wrong.
@@ -554,12 +554,9 @@ quit | exit         leave{ro_note}\n{cache_note}"
         arg: &str,
         output: &mut impl Write,
     ) -> Result<()> {
-        if arg.is_empty() {
-            return Err(fstool::Error::InvalidArgument(
-                "cat: PATH is required".into(),
-            ));
-        }
-        let path = self.resolve(arg);
+        let p = single_arg("cat", arg)?
+            .ok_or_else(|| fstool::Error::InvalidArgument("cat: PATH is required".into()))?;
+        let path = self.resolve(&p);
         self.fs.copy_file_to(dev, &path, output)?;
         Ok(())
     }
@@ -570,25 +567,19 @@ quit | exit         leave{ro_note}\n{cache_note}"
         arg: &str,
         output: &mut impl Write,
     ) -> Result<()> {
-        let mut parts = arg.splitn(2, char::is_whitespace);
-        let host_str = parts.next().unwrap_or("").trim();
-        let dest_arg = parts.next().unwrap_or("").trim();
-        if host_str.is_empty() {
-            return Err(fstool::Error::InvalidArgument(
-                "put: HOST is required".into(),
-            ));
-        }
-        let host = Path::new(host_str);
+        let (host_str, dest_arg) = one_or_two_args("put", "HOST", arg)?;
+        let host = Path::new(&host_str);
         let meta = std::fs::symlink_metadata(host)?;
-        let dest = if dest_arg.is_empty() {
-            let leaf = host.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
-                fstool::Error::InvalidArgument(
-                    "put: HOST has no usable leaf name; specify DEST explicitly".into(),
-                )
-            })?;
-            join(&self.cwd, leaf)
-        } else {
-            self.resolve(dest_arg)
+        let dest = match dest_arg {
+            Some(d) => self.resolve(&d),
+            None => {
+                let leaf = host.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+                    fstool::Error::InvalidArgument(
+                        "put: HOST has no usable leaf name; specify DEST explicitly".into(),
+                    )
+                })?;
+                join(&self.cwd, leaf)
+            }
         };
         if meta.is_dir() {
             self.fs.add_dir_tree(dev, &dest, host)?;
@@ -620,15 +611,8 @@ quit | exit         leave{ro_note}\n{cache_note}"
         arg: &str,
         output: &mut impl Write,
     ) -> Result<()> {
-        let mut parts = arg.splitn(2, char::is_whitespace);
-        let src_arg = parts.next().unwrap_or("").trim();
-        let dest_arg = parts.next().unwrap_or("").trim();
-        if src_arg.is_empty() {
-            return Err(fstool::Error::InvalidArgument(
-                "get: SRC (a path inside the image) is required".into(),
-            ));
-        }
-        let src = self.resolve(src_arg);
+        let (src_arg, dest_arg) = one_or_two_args("get", "SRC", arg)?;
+        let src = self.resolve(&src_arg);
         let attrs = self.getattr(dev, &src)?;
         let leaf = src
             .rsplit('/')
@@ -636,13 +620,14 @@ quit | exit         leave{ro_note}\n{cache_note}"
             .unwrap_or("image_root");
 
         // Resolve the host destination: an existing directory receives the
-        // basename; otherwise DEST is the literal target path; empty DEST
+        // basename; otherwise DEST is the literal target path; omitted DEST
         // means the basename in the host's current directory.
-        let dest: std::path::PathBuf = if dest_arg.is_empty() {
-            std::path::PathBuf::from(leaf)
-        } else {
-            let d = std::path::PathBuf::from(dest_arg);
-            if d.is_dir() { d.join(leaf) } else { d }
+        let dest: std::path::PathBuf = match dest_arg {
+            None => std::path::PathBuf::from(leaf),
+            Some(d) => {
+                let d = std::path::PathBuf::from(d);
+                if d.is_dir() { d.join(leaf) } else { d }
+            }
         };
 
         let src_disp = path_style::display_path(&src, self.kind, self.style);
@@ -683,13 +668,12 @@ quit | exit         leave{ro_note}\n{cache_note}"
         output: &mut impl Write,
     ) -> Result<()> {
         use fstool::repack::RepackSink;
-        let out = arg.trim();
-        if out.is_empty() {
-            return Err(fstool::Error::InvalidArgument(
+        let out = single_arg("save", arg)?.ok_or_else(|| {
+            fstool::Error::InvalidArgument(
                 "save: OUT (a host path, e.g. snap.tar / snap.tar.zst) is required".into(),
-            ));
-        }
-        let path = std::path::Path::new(out);
+            )
+        })?;
+        let path = std::path::Path::new(&out);
         let codec = crate::tar_output_codec(path);
         let file = std::fs::File::create(path)?;
         let buffered: Box<dyn Write> = Box::new(std::io::BufWriter::with_capacity(64 * 1024, file));
@@ -793,12 +777,9 @@ quit | exit         leave{ro_note}\n{cache_note}"
         arg: &str,
         output: &mut impl Write,
     ) -> Result<()> {
-        if arg.is_empty() {
-            return Err(fstool::Error::InvalidArgument(
-                "rm: PATH is required".into(),
-            ));
-        }
-        let path = self.resolve(arg);
+        let p = single_arg("rm", arg)?
+            .ok_or_else(|| fstool::Error::InvalidArgument("rm: PATH is required".into()))?;
+        let path = self.resolve(&p);
         if path == "/" {
             return Err(fstool::Error::InvalidArgument(
                 "rm: refusing to remove /".into(),
@@ -818,12 +799,9 @@ quit | exit         leave{ro_note}\n{cache_note}"
         arg: &str,
         output: &mut impl Write,
     ) -> Result<()> {
-        if arg.is_empty() {
-            return Err(fstool::Error::InvalidArgument(
-                "mkdir: PATH is required".into(),
-            ));
-        }
-        let path = self.resolve(arg);
+        let p = single_arg("mkdir", arg)?
+            .ok_or_else(|| fstool::Error::InvalidArgument("mkdir: PATH is required".into()))?;
+        let path = self.resolve(&p);
         self.fs.mkdir(dev, &path)?;
         self.fs.flush(dev)?;
         dev.sync()?;
@@ -839,16 +817,16 @@ quit | exit         leave{ro_note}\n{cache_note}"
         output: &mut impl Write,
     ) -> Result<()> {
         // No path → image-level summary, unchanged behaviour.
-        if arg.is_empty() {
+        let Some(p) = single_arg("info", arg)? else {
             writeln!(output, "fs kind: {}", self.fs.kind_string())?;
             return Ok(());
-        }
+        };
 
         // With a path → per-file metadata. `getattr` returns the
         // POSIX-ish fields every backend can answer; `list_xattrs`
         // surfaces fs-specific properties (NTFS DOS attrs, ADS, security
         // descriptors; ext / squashfs xattrs; HFS+ Finder info; …).
-        let path = self.resolve(arg);
+        let path = self.resolve(&p);
         let attrs = self.getattr(dev, &path)?;
 
         writeln!(output, "path:   {}", crate::safety::sanitize_name(&path))?;
@@ -985,14 +963,14 @@ quit | exit         leave{ro_note}\n{cache_note}"
         let mut limit: Option<usize> = None;
         let mut reverse = false;
         let mut long = false;
-        let mut toks = arg.split_whitespace();
-        let next_val = |toks: &mut std::str::SplitWhitespace, flag: &str| -> Result<String> {
-            toks.next().map(str::to_string).ok_or_else(|| {
+        let mut toks = tokenize(arg)?.into_iter();
+        let next_val = |toks: &mut std::vec::IntoIter<String>, flag: &str| -> Result<String> {
+            toks.next().ok_or_else(|| {
                 fstool::Error::InvalidArgument(format!("find: {flag} needs a value"))
             })
         };
         while let Some(tok) = toks.next() {
-            match tok {
+            match tok.as_str() {
                 "-name" => name = Some(next_val(&mut toks, "-name")?),
                 "-type" => {
                     let t = next_val(&mut toks, "-type")?;
@@ -1024,7 +1002,7 @@ quit | exit         leave{ro_note}\n{cache_note}"
                     });
                 }
                 "-limit" | "-n" => {
-                    let v = next_val(&mut toks, tok)?;
+                    let v = next_val(&mut toks, &tok)?;
                     limit = Some(v.parse().map_err(|_| {
                         fstool::Error::InvalidArgument(format!("find: bad -limit {v:?}"))
                     })?);
@@ -1036,7 +1014,7 @@ quit | exit         leave{ro_note}\n{cache_note}"
                         "find: unknown option {tok:?}"
                     )));
                 }
-                _ if start.is_none() => start = Some(self.resolve(tok)),
+                _ if start.is_none() => start = Some(self.resolve(&tok)),
                 _ => {
                     return Err(fstool::Error::InvalidArgument(
                         "find: only one starting PATH is supported".into(),
@@ -1195,7 +1173,7 @@ quit | exit         leave{ro_note}\n{cache_note}"
         let (mut invert, mut list, mut count) = (false, false, false);
         let mut pattern: Option<String> = None;
         let mut paths: Vec<String> = Vec::new();
-        for tok in arg.split_whitespace() {
+        for tok in tokenize(arg)? {
             if pattern.is_none() && tok.starts_with('-') && tok.len() > 1 {
                 for f in tok[1..].chars() {
                     match f {
@@ -1213,9 +1191,9 @@ quit | exit         leave{ro_note}\n{cache_note}"
                     }
                 }
             } else if pattern.is_none() {
-                pattern = Some(tok.to_string());
+                pattern = Some(tok);
             } else {
-                paths.push(self.resolve(tok));
+                paths.push(self.resolve(&tok));
             }
         }
         let pattern = pattern
@@ -1333,6 +1311,96 @@ fn split_cmd(line: &str) -> (&str, &str) {
         Some(i) => (&line[..i], line[i..].trim()),
         None => (line, ""),
     }
+}
+
+/// Split a command's argument string into tokens, honoring single (`'…'`)
+/// and double (`"…"`) quotes so a path or filename containing spaces can be
+/// passed as one argument.
+///
+/// Outside quotes, runs of non-whitespace are tokens and whitespace
+/// separates them; a quoted span groups everything up to its matching close
+/// quote — including spaces and the *other* quote character (`'a "b" c'` is
+/// the single token `a "b" c`). Quote marks are removed and adjacent runs
+/// concatenate (`a" "b` → the one token `a b`, `""` → an empty token).
+///
+/// Backslashes are ordinary characters, never escapes, so a native-style
+/// NTFS/FAT path such as `\Windows\System32` survives intact; use quotes —
+/// not `\ ` — to pass a space. Returns an error on an unterminated quote.
+fn tokenize(s: &str) -> Result<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    // Whether the current token has begun. Distinguishes "no token yet"
+    // from "an empty token from `''`/`\"\"`" so the latter is preserved.
+    let mut started = false;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' => {
+                started = true;
+                let mut closed = false;
+                for q in chars.by_ref() {
+                    if q == c {
+                        closed = true;
+                        break;
+                    }
+                    cur.push(q);
+                }
+                if !closed {
+                    return Err(fstool::Error::InvalidArgument(format!(
+                        "unterminated {} quote — close it to pass a path with spaces",
+                        if c == '\'' { "single" } else { "double" }
+                    )));
+                }
+            }
+            c if c.is_whitespace() => {
+                if started {
+                    tokens.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            c => {
+                started = true;
+                cur.push(c);
+            }
+        }
+    }
+    if started {
+        tokens.push(cur);
+    }
+    Ok(tokens)
+}
+
+/// Parse a command's argument string as a single optional path, with quote
+/// support. `Ok(None)` when empty. Errors when more than one token is present
+/// so a path containing spaces must be quoted rather than silently split or
+/// swallowed — the behavior a user expects from a shell.
+fn single_arg(cmd: &str, rest: &str) -> Result<Option<String>> {
+    let mut toks = tokenize(rest)?;
+    match toks.len() {
+        0 => Ok(None),
+        1 => Ok(Some(toks.pop().unwrap())),
+        _ => Err(fstool::Error::InvalidArgument(format!(
+            "{cmd}: too many arguments — quote a path containing spaces, e.g. {cmd} \"my file\""
+        ))),
+    }
+}
+
+/// Parse a command's argument string as one required path plus one optional
+/// path (`put HOST [DEST]`, `get SRC [DEST]`), with quote support. Errors on
+/// zero tokens (naming the required one) or more than two.
+fn one_or_two_args(cmd: &str, first_name: &str, rest: &str) -> Result<(String, Option<String>)> {
+    let mut toks = tokenize(rest)?.into_iter();
+    let first = toks.next().ok_or_else(|| {
+        fstool::Error::InvalidArgument(format!("{cmd}: {first_name} is required"))
+    })?;
+    let second = toks.next();
+    if toks.next().is_some() {
+        return Err(fstool::Error::InvalidArgument(format!(
+            "{cmd}: too many arguments — quote paths containing spaces, e.g. \
+             {cmd} \"my file\" \"/dest dir\""
+        )));
+    }
+    Ok((first, second))
 }
 
 /// Create a host symlink at `dest` pointing at `target`. Removes any existing
@@ -1825,6 +1893,57 @@ mod tests {
         assert_eq!(normalize_path("/"), "/");
         assert_eq!(normalize_path(""), "/");
         assert_eq!(normalize_path("///"), "/");
+    }
+
+    #[test]
+    fn tokenize_quotes_and_spaces() {
+        let toks = |s: &str| tokenize(s).unwrap();
+        // Plain whitespace splitting.
+        assert_eq!(toks("a b c"), ["a", "b", "c"]);
+        assert_eq!(toks("   "), Vec::<String>::new());
+        assert_eq!(toks(""), Vec::<String>::new());
+        // Double and single quotes group spaces into one token.
+        assert_eq!(toks(r#""my file""#), ["my file"]);
+        assert_eq!(toks("'my file'"), ["my file"]);
+        assert_eq!(toks(r#"put "a b" "/c d""#), ["put", "a b", "/c d"]);
+        // Each quote style is literal inside the other.
+        assert_eq!(toks(r#"'a "b" c'"#), [r#"a "b" c"#]);
+        assert_eq!(toks(r#""it's here""#), ["it's here"]);
+        // Adjacent runs concatenate; empty quotes yield an empty token.
+        assert_eq!(toks(r#"a" "b"#), ["a b"]);
+        assert_eq!(toks(r#""""#), [""]);
+        // Backslash is an ordinary character (native NTFS/FAT paths), not an
+        // escape — so a space still needs quoting.
+        assert_eq!(toks(r"\Windows\System32"), [r"\Windows\System32"]);
+        assert_eq!(toks(r#""\Program Files\x""#), [r"\Program Files\x"]);
+    }
+
+    #[test]
+    fn tokenize_rejects_unterminated_quote() {
+        assert!(tokenize(r#"cd "oops"#).is_err());
+        assert!(tokenize("cd 'oops").is_err());
+    }
+
+    #[test]
+    fn single_arg_requires_quoting_for_spaces() {
+        assert_eq!(single_arg("cd", "").unwrap(), None);
+        assert_eq!(
+            single_arg("cd", r#""my dir""#).unwrap().as_deref(),
+            Some("my dir")
+        );
+        assert_eq!(single_arg("cd", "plain").unwrap().as_deref(), Some("plain"));
+        // Unquoted spaces are multiple tokens → error, not a silent join.
+        assert!(single_arg("cd", "my dir").is_err());
+    }
+
+    #[test]
+    fn one_or_two_args_shapes() {
+        assert!(one_or_two_args("put", "HOST", "").is_err());
+        let (a, b) = one_or_two_args("put", "HOST", "host.txt").unwrap();
+        assert_eq!((a.as_str(), b), ("host.txt", None));
+        let (a, b) = one_or_two_args("put", "HOST", r#""a b" "/c d""#).unwrap();
+        assert_eq!((a.as_str(), b.as_deref()), ("a b", Some("/c d")));
+        assert!(one_or_two_args("put", "HOST", "a b c").is_err());
     }
 
     #[test]
