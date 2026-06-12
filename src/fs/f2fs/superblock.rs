@@ -211,18 +211,34 @@ pub fn load(dev: &mut dyn BlockDevice) -> Result<Superblock> {
             "f2fs: device too small to hold a superblock".into(),
         ));
     }
+    let total_size = dev.total_size();
     let mut buf = vec![0u8; 0x400];
     dev.read_at(SB_OFFSET_PRIMARY, &mut buf)?;
     if let Some(sb) = Superblock::decode(&buf) {
-        return Ok(sb);
+        return validate_geometry(sb, total_size);
     }
     dev.read_at(SB_OFFSET_BACKUP, &mut buf)?;
     if let Some(sb) = Superblock::decode(&buf) {
-        return Ok(sb);
+        return validate_geometry(sb, total_size);
     }
     Err(crate::Error::InvalidImage(
         "f2fs: superblock magic not found in either primary or backup slot".into(),
     ))
+}
+
+/// Reject a superblock whose `block_count` is larger than the device could
+/// physically hold. `block_count` is otherwise attacker-controlled and feeds
+/// directory-walk loop bounds (see `mod.rs::list_inode`); an inflated value
+/// would let a tiny image drive a ~1e9-iteration loop.
+fn validate_geometry(sb: Superblock, total_size: u64) -> Result<Superblock> {
+    let max_blocks = total_size / sb.block_size() as u64;
+    if sb.block_count > max_blocks {
+        return Err(crate::Error::InvalidImage(format!(
+            "f2fs: superblock block_count {} exceeds device capacity {max_blocks} blocks",
+            sb.block_count
+        )));
+    }
+    Ok(sb)
 }
 
 #[cfg(test)]
