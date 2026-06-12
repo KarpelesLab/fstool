@@ -481,6 +481,19 @@ pub fn from_superblock(sb: &super::superblock::Superblock) -> crate::Result<Layo
         })?;
     let num_groups = group_input_blocks.div_ceil(sb.blocks_per_group);
 
+    // `num_groups` feeds `Vec::with_capacity(num_groups)` plus a push loop;
+    // it is derived from attacker-controlled fields and can claim billions of
+    // groups from a tiny image → OOM/abort before any real read. Each group
+    // must occupy at least its SB-relative slice of the volume, so a sane
+    // image always satisfies `num_groups <= blocks_count`. Reject anything
+    // that can't plausibly fit before allocating.
+    if num_groups == 0 || num_groups as u64 > sb.blocks_count as u64 {
+        return Err(crate::Error::InvalidImage(format!(
+            "ext: implausible group count {} for blocks_count {}",
+            num_groups, sb.blocks_count
+        )));
+    }
+
     // `inodes_count` must not claim more inodes than the group geometry can
     // hold; otherwise `read_inode` derives a group index past `groups.len()`.
     let max_inodes = sb.inodes_per_group as u64 * num_groups as u64;
