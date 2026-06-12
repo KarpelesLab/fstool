@@ -935,15 +935,24 @@ impl AnyFs {
             // AFFS (like classic HFS) persists a buffered model on flush once a
             // writer is attached; a read-only handle's flush is a no-op.
             Self::Affs(affs) => crate::fs::Filesystem::flush(affs.as_mut(), dev),
-            // Read-only / immediate-write handles have nothing buffered to
-            // flush.
+            // NTFS / XFS / exFAT batch directory writes in an in-memory
+            // `DirBatch` (and stage bitmap/FAT/MFT updates) that is only
+            // drained by the backend's own flush. They must route to it: a
+            // bare `put`/`rm` followed by exit otherwise loses the staged
+            // directory entry entirely. Each backend's flush is a no-op when
+            // no writer is attached, so a read-only handle stays read-only.
+            // F2FS is build-once (a re-opened image is read-only) so its flush
+            // no-ops here, but route it for consistency. This used to be a
+            // blanket `Ok(())` no-op — correct before the DirBatch cache
+            // landed, a silent data-loss bug after it.
+            Self::Ntfs(ntfs) => crate::fs::Filesystem::flush(ntfs.as_mut(), dev),
+            Self::Xfs(xfs) => crate::fs::Filesystem::flush(xfs.as_mut(), dev),
+            Self::Exfat(exfat) => crate::fs::Filesystem::flush(exfat.as_mut(), dev),
+            Self::F2fs(f2fs) => crate::fs::Filesystem::flush(f2fs.as_mut(), dev),
+            // Genuinely read-only or in-memory handles: nothing buffered.
             Self::Tar(_)
-            | Self::Xfs(_)
-            | Self::Exfat(_)
             | Self::HfsPlus(_)
             | Self::Apfs(_)
-            | Self::Ntfs(_)
-            | Self::F2fs(_)
             | Self::Squashfs(_)
             | Self::Iso9660(_)
             // ramfs is in-memory: nothing to persist.

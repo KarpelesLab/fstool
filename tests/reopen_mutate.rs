@@ -116,6 +116,53 @@ fn reopen_add_then_verify(path: &Path) {
     }
 }
 
+/// Regression guard for the `AnyFs::flush` data-loss bug.
+///
+/// The CLI (`fstool shell`, `add`, `rm`) drives writes through
+/// [`inspect::AnyFs`] and persists them with [`AnyFs::flush`] — *not* the
+/// `Filesystem` trait flush that `reopen_add_then_verify` exercises. NTFS,
+/// XFS and exFAT batch directory entries in an in-memory `DirBatch` that
+/// only the backend's own flush drains; `AnyFs::flush` used to route those
+/// three to a blanket `Ok(())` no-op, so a bare `put` followed by exit (no
+/// intervening read to trigger the on-demand serialize) silently dropped
+/// the new directory entry. This walks the exact AnyFs path — create the
+/// fs, reopen via `AnyFs::open`, `add_file` a **non-resident**-sized file,
+/// `AnyFs::flush`, drop, then reopen and read it back — with no read
+/// between add and flush.
+fn anyfs_put_flush_survives(path: &Path) {
+    // 6 KiB: comfortably past NTFS's resident-data threshold and exFAT's
+    // first cluster, so the file needs a real directory entry + data runs.
+    let body: Vec<u8> = (0..6144).map(|i| (i % 251) as u8).collect();
+    let host = NamedTempFile::new().unwrap();
+    std::fs::write(host.path(), &body).unwrap();
+
+    // Phase 2: reopen through AnyFs, add the file, flush through AnyFs.
+    // Crucially: no list/read/cat between add_file and flush.
+    {
+        let mut dev = FileBackend::open(path).unwrap();
+        let mut any = inspect::AnyFs::open(&mut dev).unwrap();
+        any.add_file(&mut dev, "/page.html", host.path())
+            .expect("reopened AnyFs handle must accept a new file");
+        any.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+    // Phase 3: reopen and confirm the entry persisted with correct bytes.
+    {
+        let mut dev = FileBackend::open(path).unwrap();
+        let mut fs = inspect::open(&mut dev).unwrap();
+        let names = root_names(&mut *fs, &mut dev);
+        assert!(
+            names.iter().any(|n| n == "page.html"),
+            "AnyFs::flush dropped the staged directory entry: {names:?}"
+        );
+        assert_eq!(
+            read_file(&mut *fs, &mut dev, "/page.html"),
+            body,
+            "AnyFs::flush persisted a wrong/empty file body"
+        );
+    }
+}
+
 // ----------------------------------------------------------------------
 // ext4
 // ----------------------------------------------------------------------
@@ -238,6 +285,7 @@ fn exfat_reopen_mutate() {
         dev.sync().unwrap();
     }
     reopen_add_then_verify(tmp.path());
+    anyfs_put_flush_survives(tmp.path());
 
     if which("fsck.exfat") {
         let out = Command::new("fsck.exfat")
@@ -253,6 +301,51 @@ fn exfat_reopen_mutate() {
         );
     } else {
         eprintln!("skipping fsck.exfat oracle: not installed (self-check only)");
+    }
+}
+
+// ----------------------------------------------------------------------
+// NTFS (DirBatch directory writes; AnyFs::flush must drain them)
+// ----------------------------------------------------------------------
+#[test]
+fn ntfs_reopen_mutate() {
+    use fstool::fs::ntfs::Ntfs;
+    use fstool::fs::ntfs::format::FormatOpts;
+    let tmp = NamedTempFile::new().unwrap();
+    {
+        let mut dev = FileBackend::create(tmp.path(), 32 * 1024 * 1024).unwrap();
+        let opts = FormatOpts {
+            volume_label: "FSTOOL".to_string(),
+            ..Default::default()
+        };
+        let mut fs: Box<dyn Filesystem> = Box::new(Ntfs::format(&mut dev, &opts).unwrap());
+        fs.create_file(
+            &mut dev,
+            Path::new("/seed.txt"),
+            src(SEED),
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+    reopen_add_then_verify(tmp.path());
+    anyfs_put_flush_survives(tmp.path());
+
+    if which("ntfsfix") {
+        let out = Command::new("ntfsfix")
+            .arg("--no-action")
+            .arg(tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "ntfsfix not clean after reopen-mutate:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    } else {
+        eprintln!("skipping ntfsfix oracle: not installed (self-check only)");
     }
 }
 
@@ -283,6 +376,7 @@ fn xfs_reopen_mutate() {
         dev.sync().unwrap();
     }
     reopen_add_then_verify(tmp.path());
+    anyfs_put_flush_survives(tmp.path());
 
     if which("xfs_repair") {
         let out = Command::new("xfs_repair")
