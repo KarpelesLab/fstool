@@ -343,6 +343,14 @@ pub(crate) fn replay_journal(ext: &super::Ext, dev: &mut dyn BlockDevice) -> Res
     let mut idx = jsb.start;
     let mut expected_tid = jsb.sequence;
     let mut replayed = false;
+    // A forged log can chain identical empty descriptors that all share the
+    // same tid, so the inner descriptor loop never makes forward progress and
+    // spins forever. The usable ring is `first..maxlen`; replay can never
+    // legitimately visit more journal blocks than the ring holds. Cap total
+    // blocks consumed across the whole replay to that size and bail on
+    // overrun.
+    let ring_size = jsb.maxlen.saturating_sub(jsb.first).max(1) as u64;
+    let mut blocks_visited: u64 = 0;
     'transactions: loop {
         let blk = read_journal_block(ext, dev, &journal_inode, idx)?;
         let magic = u32::from_be_bytes(blk[0..4].try_into().unwrap());
@@ -368,6 +376,16 @@ pub(crate) fn replay_journal(ext: &super::Ext, dev: &mut dyn BlockDevice) -> Res
         // every tag's data payload to its FS-home block as we go.
         let mut current_desc = blk;
         loop {
+            // Each descriptor block, its data payloads, and each peeked block
+            // consume one ring slot. If we have walked more blocks than the
+            // ring can hold, the log is cyclic/forged — refuse rather than
+            // spin forever.
+            blocks_visited += 1;
+            if blocks_visited > ring_size {
+                return Err(crate::Error::InvalidImage(
+                    "ext4: journal replay exceeded ring size — cyclic descriptors".into(),
+                ));
+            }
             let (data_targets, _) = parse_descriptor_tags(&current_desc, bs)?;
             let saw_last_tag = data_targets
                 .iter()
