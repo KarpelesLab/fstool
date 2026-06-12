@@ -73,9 +73,17 @@ mod tests {
 
     #[test]
     fn safe_component_accepts_normal_names() {
-        for n in ["file", "a.txt", "weird name", "A:ROSE Includes", "résumé"] {
+        for n in ["file", "a.txt", "weird name", "résumé"] {
             assert!(safe_component(n), "{n:?} should be a safe component");
         }
+        // ':' is an ordinary filename byte on Unix, so a colon-bearing name is a
+        // single normal component there. On Windows the same string is a
+        // drive-relative path (`A:` prefix) and is correctly rejected as unsafe
+        // to join onto a host base.
+        #[cfg(not(windows))]
+        assert!(safe_component("A:ROSE Includes"));
+        #[cfg(windows)]
+        assert!(!safe_component("A:ROSE Includes"));
     }
 
     #[test]
