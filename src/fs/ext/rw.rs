@@ -140,6 +140,22 @@ impl<'a> Ext2FileHandle<'a> {
         let mut data = 0u64;
         let mut meta = 0u64;
 
+        // A forged inode can alias the same metadata block across multiple
+        // indirect slots, so a handful of pointers fan out into ~1e9 reads.
+        // Track every metadata (indirection) block we descend into and reject
+        // any repeat: a well-formed tree never points at the same metadata
+        // block twice.
+        let mut visited: Vec<u32> = Vec::new();
+        let mut visit = |blk: u32| -> Result<()> {
+            if visited.contains(&blk) {
+                return Err(crate::Error::InvalidImage(format!(
+                    "ext: indirect-block tree aliases metadata block {blk}"
+                )));
+            }
+            visited.push(blk);
+            Ok(())
+        };
+
         // Direct.
         for b in &inode.block[..N_DIRECT] {
             if *b != 0 {
@@ -149,6 +165,7 @@ impl<'a> Ext2FileHandle<'a> {
         // Single-indirect.
         let ind = inode.block[IDX_INDIRECT];
         if ind != 0 {
+            visit(ind)?;
             meta += 1;
             let buf = self.read_indirect_block(ind)?;
             for i in 0..ptrs as usize {
@@ -161,11 +178,13 @@ impl<'a> Ext2FileHandle<'a> {
         // Double-indirect.
         let dind = inode.block[IDX_DOUBLE_INDIRECT];
         if dind != 0 {
+            visit(dind)?;
             meta += 1;
             let outer = self.read_indirect_block(dind)?;
             for i in 0..ptrs as usize {
                 let sub = read_u32_le(&outer, i * 4);
                 if sub != 0 {
+                    visit(sub)?;
                     meta += 1;
                     let inner = self.read_indirect_block(sub)?;
                     for j in 0..ptrs as usize {
@@ -180,16 +199,19 @@ impl<'a> Ext2FileHandle<'a> {
         // Triple-indirect (rarely used, but support for completeness).
         let tind = inode.block[IDX_TRIPLE_INDIRECT];
         if tind != 0 {
+            visit(tind)?;
             meta += 1;
             let l1 = self.read_indirect_block(tind)?;
             for i in 0..ptrs as usize {
                 let dind2 = read_u32_le(&l1, i * 4);
                 if dind2 != 0 {
+                    visit(dind2)?;
                     meta += 1;
                     let l2 = self.read_indirect_block(dind2)?;
                     for j in 0..ptrs as usize {
                         let sub = read_u32_le(&l2, j * 4);
                         if sub != 0 {
+                            visit(sub)?;
                             meta += 1;
                             let inner = self.read_indirect_block(sub)?;
                             for k in 0..ptrs as usize {
@@ -231,8 +253,19 @@ impl<'a> Ext2FileHandle<'a> {
         let (_, indices) = extent::decode_idx_iblock(&bytes)?;
         let mut runs = Vec::new();
         let mut meta_blocks = Vec::with_capacity(indices.len());
+        // The inline root's children sit at `header.depth - 1`. Pass the
+        // expected child depth down so each recursion can verify the tree
+        // strictly shrinks toward the leaves; visited tracking rejects cycles.
+        let child_depth = header.depth.checked_sub(1).ok_or_else(|| {
+            crate::Error::InvalidImage("ext4: depth ≥ 1 root with depth 0 header".into())
+        })?;
         for idx in &indices {
-            self.collect_extent_tree(idx.leaf as u32, &mut runs, &mut meta_blocks)?;
+            self.collect_extent_tree(
+                idx.leaf as u32,
+                child_depth,
+                &mut runs,
+                &mut meta_blocks,
+            )?;
         }
         Ok(ExtentTreeState { runs, meta_blocks })
     }
@@ -245,21 +278,50 @@ impl<'a> Ext2FileHandle<'a> {
     fn collect_extent_tree(
         &mut self,
         blk: u32,
+        expected_depth: u16,
         runs: &mut Vec<ExtentRun>,
         meta_blocks: &mut Vec<u32>,
     ) -> Result<()> {
         let bs = self.ext.layout.block_size as usize;
+        // Reject cycles: a forged index entry pointing back at an ancestor
+        // (or any already-walked tree block) would recurse forever and
+        // overflow the stack. `meta_blocks` records every block visited so
+        // far in this walk, so it doubles as the visited-set.
+        if meta_blocks.contains(&blk) {
+            return Err(crate::Error::InvalidImage(format!(
+                "ext4: extent tree cycle through physical block {blk}"
+            )));
+        }
         let buf = self.read_indirect_block(blk)?;
         let header = extent::decode_header(&buf[..12])?;
+        // The header's declared depth must match what the parent expected;
+        // anything else means the tree doesn't strictly shrink toward the
+        // leaves (a forged or circular tree that could recurse unboundedly).
+        if header.depth != expected_depth {
+            return Err(crate::Error::InvalidImage(format!(
+                "ext4: extent node depth {} != expected {expected_depth}",
+                header.depth
+            )));
+        }
         meta_blocks.push(blk);
         if header.depth == 0 {
             let (_, mut leaf_runs) = extent::decode_leaf_block(&buf[..bs])?;
             runs.append(&mut leaf_runs);
         } else {
+            // Each idx entry reads `buf[off..off+12]`; bound the count to the
+            // per-block index capacity before iterating to avoid OOB slicing.
+            let max_entries = (bs.saturating_sub(12) / 12) as u16;
+            if header.entries > max_entries {
+                return Err(crate::Error::InvalidImage(format!(
+                    "ext4: extent index claims {} entries, block holds at most {max_entries}",
+                    header.entries
+                )));
+            }
+            let child_depth = header.depth - 1;
             for i in 0..header.entries as usize {
                 let off = 12 + i * 12;
                 let idx = extent::decode_idx(&buf[off..off + 12]);
-                self.collect_extent_tree(idx.leaf as u32, runs, meta_blocks)?;
+                self.collect_extent_tree(idx.leaf as u32, child_depth, runs, meta_blocks)?;
             }
         }
         Ok(())
