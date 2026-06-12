@@ -184,6 +184,22 @@ impl JournalLog {
         }
         let start = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
         let end = u64::from_be_bytes(hdr[16..24].try_into().unwrap());
+        // HFS-5 / HFS-2: validate the ring geometry before any code path
+        // computes `buf_size - JHDR_SIZE` or `start/end - JHDR_SIZE` (which
+        // underflow and panic in debug) or walks `[start, end)` in replay.
+        // A valid header has room for the journal header itself, and both
+        // cursors lie within the usable ring `[JHDR_SIZE, buf_size]`.
+        let jhdr = u64::from(JHDR_SIZE);
+        if buf_size < jhdr {
+            return Err(crate::Error::InvalidImage(format!(
+                "hfs+ journal: buf_size {buf_size} smaller than header ({JHDR_SIZE})"
+            )));
+        }
+        if start < jhdr || start > buf_size || end < jhdr || end > buf_size {
+            return Err(crate::Error::InvalidImage(format!(
+                "hfs+ journal: start {start} / end {end} outside ring [{JHDR_SIZE}, {buf_size}]"
+            )));
+        }
         Ok(Some(Self {
             buf_off,
             buf_size,
@@ -274,7 +290,9 @@ impl JournalLog {
         let bytes_used: u32 = BLHDR_SIZE.checked_add(data_total).ok_or_else(|| {
             crate::Error::Unsupported("hfs+ journal: transaction overflows u32".into())
         })?;
-        if u64::from(bytes_used) > self.buf_size - u64::from(JHDR_SIZE) {
+        // HFS-5: saturating subtraction — `load` rejects buf_size < JHDR_SIZE,
+        // but stay defensive against an underflow panic in debug builds.
+        if u64::from(bytes_used) > self.buf_size.saturating_sub(u64::from(JHDR_SIZE)) {
             return Err(crate::Error::Unsupported(
                 "hfs+ journal: transaction larger than journal buffer".into(),
             ));
@@ -314,8 +332,10 @@ impl JournalLog {
         tx[8..12].copy_from_slice(&csum.to_be_bytes());
 
         // 5. Write the transaction into the ring at `end`.
-        let usable = self.buf_size - u64::from(JHDR_SIZE);
-        let tx_off_in_ring = self.end - u64::from(JHDR_SIZE);
+        // HFS-5: saturating subtraction guards against a debug-build panic
+        // if `buf_size`/`end` are ever below JHDR_SIZE.
+        let usable = self.buf_size.saturating_sub(u64::from(JHDR_SIZE));
+        let tx_off_in_ring = self.end.saturating_sub(u64::from(JHDR_SIZE));
         let new_end;
         if tx_off_in_ring + u64::from(bytes_used) > usable {
             // Won't fit before the wrap point. Restart at JHDR_SIZE.
@@ -374,7 +394,21 @@ pub(crate) fn replay(
     }
     let mut cursor = log.start;
     let end = log.end;
+    // HFS-2: cap the number of transactions we will replay. Every valid
+    // transaction is at least BLHDR_SIZE bytes, so the usable ring can hold
+    // at most `usable / BLHDR_SIZE` of them. An attacker-controlled
+    // `bytes_used` cycle or non-advancing cursor would otherwise loop
+    // forever; bound it hard and error past the cap.
+    let usable = log.buf_size.saturating_sub(u64::from(JHDR_SIZE));
+    let max_tx = (usable / u64::from(BLHDR_SIZE)).max(1) + 1;
+    let mut tx_left = max_tx;
     while cursor != end {
+        if tx_left == 0 {
+            return Err(crate::Error::InvalidImage(
+                "hfs+ journal: transaction count exceeded ring capacity (cycle?)".into(),
+            ));
+        }
+        tx_left -= 1;
         let mut hdr_fixed = [0u8; BLHDR_FIXED_SIZE];
         dev.read_at(log.buf_off + cursor, &mut hdr_fixed)?;
         let num_blocks = u16::from_be_bytes(hdr_fixed[2..4].try_into().unwrap()) as usize;
@@ -384,6 +418,19 @@ pub(crate) fn replay(
                 "hfs+ journal: malformed block list (num={num_blocks}, bytes={bytes_used})"
             )));
         }
+        // HFS-2: the transaction must fit within the usable ring from the
+        // current cursor — reject a `bytes_used` that overruns the buffer.
+        let tx_off_in_ring = cursor.saturating_sub(u64::from(JHDR_SIZE));
+        if u64::from(bytes_used) > usable.saturating_sub(tx_off_in_ring) {
+            return Err(crate::Error::InvalidImage(format!(
+                "hfs+ journal: block list bytes_used {bytes_used} overruns ring at cursor {cursor}"
+            )));
+        }
+        // HFS-3: the concatenated block data lives in the
+        // `bytes_used - BLHDR_SIZE` bytes after the header region. Bound the
+        // sum of per-block `bsize` to that window so a single oversized
+        // entry cannot trigger a ~4 GiB allocation.
+        let mut data_budget = (bytes_used - BLHDR_SIZE) as usize;
         let info_bytes = num_blocks * BINFO_SIZE;
         let mut info = vec![0u8; info_bytes];
         dev.read_at(log.buf_off + cursor + BLHDR_FIXED_SIZE as u64, &mut info)?;
@@ -392,6 +439,12 @@ pub(crate) fn replay(
             let slot = i * BINFO_SIZE;
             let sector = u64::from_be_bytes(info[slot..slot + 8].try_into().unwrap());
             let bsize = u32::from_be_bytes(info[slot + 8..slot + 12].try_into().unwrap()) as usize;
+            if bsize > data_budget {
+                return Err(crate::Error::InvalidImage(format!(
+                    "hfs+ journal: block data {bsize} exceeds remaining transaction bytes {data_budget}"
+                )));
+            }
+            data_budget -= bsize;
             let mut data = vec![0u8; bsize];
             dev.read_at(data_cursor, &mut data)?;
             let target = sector * JOURNAL_SECTOR;
