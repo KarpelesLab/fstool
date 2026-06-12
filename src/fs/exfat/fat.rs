@@ -113,18 +113,28 @@ impl Fat {
 
     /// Walk the cluster chain starting at `start` and return every cluster
     /// in order. Stops at an EOC marker. Errors on out-of-range, FREE-in-
-    /// chain, BAD-in-chain, or a chain that exceeds the FAT's capacity
-    /// (loop guard).
-    pub fn chain(&self, start: u32) -> crate::Result<Vec<u32>> {
+    /// chain, BAD-in-chain, or a chain that exceeds the volume's cluster
+    /// count (loop guard).
+    ///
+    /// `cluster_count` is the volume's true ClusterCount: valid data
+    /// clusters live in `[2, cluster_count + 2)`. The in-memory FAT is
+    /// allocated in whole sectors and may hold more entries than that, so
+    /// the chain walk must bound itself by `cluster_count` rather than by
+    /// `entries.len()` — otherwise a malformed FAT can drive a chain (and
+    /// the buffer subsequently allocated from `chain.len()`) far past the
+    /// real volume size.
+    pub fn chain(&self, start: u32, cluster_count: u32) -> crate::Result<Vec<u32>> {
+        let max_cluster = (cluster_count as usize) + 2;
+        let bound = max_cluster.min(self.entries.len());
         let mut out = Vec::new();
         let mut cur = start;
         loop {
-            if cur < 2 || (cur as usize) >= self.entries.len() {
+            if cur < 2 || (cur as usize) >= bound {
                 return Err(crate::Error::InvalidImage(format!(
                     "exfat: cluster {cur} out of range while walking a chain"
                 )));
             }
-            if out.len() > self.entries.len() {
+            if out.len() > cluster_count as usize {
                 return Err(crate::Error::InvalidImage(
                     "exfat: cluster chain loops".into(),
                 ));
@@ -173,27 +183,28 @@ mod tests {
     fn chain_walks_to_eoc() {
         // [0]=media, [1]=EOC, [2]→3, [3]→5, [4]=FREE, [5]=EOC.
         let fat = build(&[0xFFFF_FFF8, 0xFFFF_FFFF, 3, 5, FREE, EOC]);
-        assert_eq!(fat.chain(2).unwrap(), vec![2, 3, 5]);
+        // 6 entries → 4 data clusters (indices 2..=5).
+        assert_eq!(fat.chain(2, 4).unwrap(), vec![2, 3, 5]);
     }
 
     #[test]
     fn chain_rejects_free_break() {
         let fat = build(&[0xFFFF_FFF8, EOC, 3, FREE]);
-        assert!(fat.chain(2).is_err());
+        assert!(fat.chain(2, 2).is_err());
     }
 
     #[test]
     fn chain_rejects_bad_in_chain() {
         let fat = build(&[0xFFFF_FFF8, EOC, 3, BAD]);
-        assert!(fat.chain(2).is_err());
+        assert!(fat.chain(2, 2).is_err());
     }
 
     #[test]
     fn chain_rejects_out_of_range_start() {
         let fat = build(&[0xFFFF_FFF8, EOC, EOC]);
         // cluster 5 is past capacity.
-        assert!(fat.chain(5).is_err());
+        assert!(fat.chain(5, 1).is_err());
         // cluster 1 is reserved and not a valid start.
-        assert!(fat.chain(1).is_err());
+        assert!(fat.chain(1, 1).is_err());
     }
 }

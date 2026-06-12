@@ -496,7 +496,7 @@ impl Exfat {
         // Otherwise walk the FAT chain — but only return as many clusters
         // as the file actually needs. (The FAT chain may, in principle,
         // run longer; in well-formed images it does not.)
-        let chain = self.fat.chain(first_cluster)?;
+        let chain = self.fat.chain(first_cluster, self.boot.cluster_count)?;
         if (chain.len() as u32) < n {
             return Err(crate::Error::InvalidImage(format!(
                 "exfat: FAT chain has {} clusters but file needs {n}",
@@ -549,8 +549,12 @@ impl Exfat {
             }
             v
         } else {
-            self.fat.chain(first_cluster)?
+            self.fat.chain(first_cluster, self.boot.cluster_count)?
         };
+        // `chain` is now bounded by ClusterCount (both the NoFatChain branch
+        // above and `Fat::chain` clamp to it), so `total` can never exceed
+        // `cluster_count * cb` — the buffer allocation is bounded by the
+        // real volume size rather than by an attacker-supplied length.
         let total = chain.len() as u64 * cb;
         let out_len = match hint_byte_len {
             Some(b) => b.min(total),
@@ -735,7 +739,7 @@ impl Exfat {
 
     /// Walk the FAT chain of a directory and collect every cluster.
     fn dir_chain(&self, first_cluster: u32) -> Result<Vec<u32>> {
-        self.fat.chain(first_cluster)
+        self.fat.chain(first_cluster, self.boot.cluster_count)
     }
 
     /// Read the entire byte content of a directory (all its clusters in
