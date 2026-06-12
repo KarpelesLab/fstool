@@ -199,6 +199,13 @@ pub fn probe(path: &Path) -> Result<bool> {
     Ok(u32::from_be_bytes(head) == KOLY_MAGIC)
 }
 
+/// Upper bound on a single chunk's uncompressed sector span. Real images
+/// use at most a few thousand sectors (2 MiB) per chunk; this cap (`1<<24`
+/// sectors = 8 GiB) sits far above any legitimate value while keeping a
+/// hostile `sector_count` from driving a huge `vec![0u8; sector_count*512]`
+/// allocation in [`DmgBackend::decode_chunk`].
+const MAX_CHUNK_SECTORS: u64 = 1 << 24;
+
 /// Read-only DMG backend.
 ///
 /// Holds the source file, the decoded koly trailer, and all per-partition
@@ -292,6 +299,42 @@ impl DmgBackend {
             let m = mish::decode_mish(&raw)?;
             chunks.extend(m.chunks);
         }
+
+        // Bound every chunk against the declared geometry before any read so
+        // a hostile descriptor can't later drive an unbounded allocation:
+        //
+        // - `sector_count` (uncompressed span) must stay within the cap that
+        //   `decode_chunk` enforces, so the plaintext buffer is bounded.
+        // - the compressed payload `[offset, offset+length)` must lie inside
+        //   the data fork, so `read_compressed_payload` can't be asked to
+        //   allocate and read a ~TiB-sized buffer from a tiny file.
+        for c in &chunks {
+            if c.sector_count > MAX_CHUNK_SECTORS {
+                return Err(crate::Error::InvalidImage(format!(
+                    "dmg: chunk sector_count {} exceeds maximum {MAX_CHUNK_SECTORS}",
+                    c.sector_count
+                )));
+            }
+            let comp_end = c
+                .compressed_offset_in_fork
+                .checked_add(c.compressed_length)
+                .ok_or_else(|| {
+                    crate::Error::InvalidImage(
+                        "dmg: chunk compressed extent overflows u64".into(),
+                    )
+                })?;
+            if comp_end > trailer.data_fork_length {
+                return Err(crate::Error::InvalidImage(format!(
+                    "dmg: chunk compressed extent (offset {} + length {} = {}) exceeds \
+                     data fork length {}",
+                    c.compressed_offset_in_fork,
+                    c.compressed_length,
+                    comp_end,
+                    trailer.data_fork_length
+                )));
+            }
+        }
+
         chunks.sort_by_key(|c| c.virtual_sector_start);
 
         // Sanity: chunks shouldn't overlap. We don't fail loud on this
@@ -357,6 +400,17 @@ impl DmgBackend {
     /// arbitrary byte ranges of a deflate stream isn't possible without
     /// running the inflate state machine to that point anyway.
     fn decode_chunk(&mut self, chunk: &Chunk) -> Result<Vec<u8>> {
+        // `sector_count` is attacker-controlled with no magnitude bound in the
+        // on-disk format. A single tiny chunk could otherwise request a ~512
+        // TiB allocation on the first read. Real chunks are small (typically
+        // 4096 sectors / 2 MiB at most); cap well above that but far below the
+        // point where the allocation becomes a denial-of-service.
+        if chunk.sector_count > MAX_CHUNK_SECTORS {
+            return Err(crate::Error::InvalidImage(format!(
+                "dmg: chunk sector_count {} exceeds maximum {MAX_CHUNK_SECTORS}",
+                chunk.sector_count
+            )));
+        }
         let plain_len = (chunk.sector_count as usize)
             .checked_mul(512)
             .ok_or_else(|| {

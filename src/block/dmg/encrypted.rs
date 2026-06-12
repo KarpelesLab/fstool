@@ -362,6 +362,47 @@ impl EncryptedDmgBackend {
                 "encrcdsa: block_size is zero".into(),
             ));
         }
+        // `block_size` is attacker-controlled and sizes a per-chunk
+        // `vec![0u8; block_size]` in `decrypt_chunk`. Real images use 512 B to
+        // a few tens of KiB; cap at 1 MiB so a hostile header can't request a
+        // ~4 GiB allocation per chunk read.
+        const MAX_BLOCK_SIZE: u32 = 1 << 20;
+        if header.block_size > MAX_BLOCK_SIZE {
+            return Err(crate::Error::InvalidImage(format!(
+                "encrcdsa: block_size {} exceeds maximum {MAX_BLOCK_SIZE}",
+                header.block_size
+            )));
+        }
+        // Cross-check the declared geometry against the actual file. `data_size`
+        // is `n_chunks * block_size` for v2 images and the encrypted payload
+        // must physically fit between `data_offset` and end-of-file. Rejecting
+        // a `n_chunks` that the file can't possibly back stops a tiny image
+        // from advertising a huge virtual size (and huge chunk indices).
+        let file_len = file.metadata()?.len();
+        let computed_data_size = header
+            .n_chunks
+            .checked_mul(header.block_size as u64)
+            .ok_or_else(|| {
+                crate::Error::InvalidImage("encrcdsa: n_chunks * block_size overflows u64".into())
+            })?;
+        if header.data_size != computed_data_size {
+            return Err(crate::Error::InvalidImage(format!(
+                "encrcdsa: data_size {} != n_chunks {} * block_size {} = {}",
+                header.data_size, header.n_chunks, header.block_size, computed_data_size
+            )));
+        }
+        let data_end = header
+            .data_offset
+            .checked_add(header.data_size)
+            .ok_or_else(|| {
+                crate::Error::InvalidImage("encrcdsa: data_offset + data_size overflows u64".into())
+            })?;
+        if data_end > file_len {
+            return Err(crate::Error::InvalidImage(format!(
+                "encrcdsa: data extent (offset {} + size {} = {}) exceeds file length {}",
+                header.data_offset, header.data_size, data_end, file_len
+            )));
+        }
 
         // Derive the KEK with PBKDF2-HMAC-SHA1. The output is 24 bytes (=
         // 3DES key length). Reject a zero iteration count up front —
@@ -397,12 +438,8 @@ impl EncryptedDmgBackend {
         let mut hmac_key = [0u8; 20];
         hmac_key.copy_from_slice(&keyblob_plain[aes_key_len..aes_key_len + 20]);
 
-        let virtual_size = header
-            .n_chunks
-            .checked_mul(header.block_size as u64)
-            .ok_or_else(|| {
-                crate::Error::InvalidImage("encrcdsa: n_chunks * block_size overflows u64".into())
-            })?;
+        // `n_chunks * block_size`, already computed and overflow-checked above.
+        let virtual_size = computed_data_size;
 
         Ok(Self {
             file,
