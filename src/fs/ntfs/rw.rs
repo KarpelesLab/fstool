@@ -530,23 +530,40 @@ impl<'a> NtfsFileHandle<'a> {
         let mut cursor = first;
         let mut root_off_in_rec: Option<(usize, usize, usize)> = None;
         let mut alloc_runs: Option<Vec<Extent>> = None;
-        while cursor + 4 <= bytes_in_use {
+        // Clamp the scan bound to the record's real length: a malformed
+        // `bytes_in_use` must never push the cursor past `rec`.
+        let scan_end = bytes_in_use.min(rec.len());
+        while cursor + 16 <= scan_end {
             let tc = u32::from_le_bytes(rec[cursor..cursor + 4].try_into().unwrap());
             if tc == 0xFFFF_FFFF {
                 break;
             }
             let len = u32::from_le_bytes(rec[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+            // Reject degenerate / out-of-bounds attribute records: `len < 16`
+            // would loop forever; an overrun would slice past `rec`.
+            if len < 16 || cursor + len > scan_end {
+                break;
+            }
             let non_resident = rec[cursor + 8] != 0;
             let name_len = rec[cursor + 9] as usize;
             let name_off =
                 u16::from_le_bytes(rec[cursor + 10..cursor + 12].try_into().unwrap()) as usize;
-            let attr_name = if name_len == 0 {
-                String::new()
-            } else {
-                decode_utf16le(&rec[cursor + name_off..cursor + name_off + name_len * 2])
+            let name_end = cursor
+                .checked_add(name_off)
+                .and_then(|s| name_len.checked_mul(2).and_then(|n| s.checked_add(n)));
+            let attr_name = match name_end {
+                _ if name_len == 0 => String::new(),
+                Some(end) if end <= cursor + len => {
+                    decode_utf16le(&rec[cursor + name_off..end])
+                }
+                // Name field overruns the attribute — skip safely.
+                _ => {
+                    cursor += len;
+                    continue;
+                }
             };
             if attr_name == "$I30" {
-                if tc == super::attribute::TYPE_INDEX_ROOT && !non_resident {
+                if tc == super::attribute::TYPE_INDEX_ROOT && !non_resident && len >= 0x16 {
                     let value_off =
                         u16::from_le_bytes(rec[cursor + 0x14..cursor + 0x16].try_into().unwrap())
                             as usize;
@@ -554,13 +571,19 @@ impl<'a> NtfsFileHandle<'a> {
                         u32::from_le_bytes(rec[cursor + 0x10..cursor + 0x14].try_into().unwrap())
                             as usize;
                     root_off_in_rec = Some((cursor, value_off, value_len));
-                } else if tc == super::attribute::TYPE_INDEX_ALLOCATION && non_resident {
+                } else if tc == super::attribute::TYPE_INDEX_ALLOCATION
+                    && non_resident
+                    && len >= 0x22
+                {
                     let runs_off =
                         u16::from_le_bytes(rec[cursor + 0x20..cursor + 0x22].try_into().unwrap())
                             as usize;
-                    let runs_bytes = &rec[cursor + runs_off..cursor + len];
-                    if let Ok(rs) = super::run_list::decode(runs_bytes) {
-                        alloc_runs = Some(rs);
+                    // Bounds-check the run-list slice against the attribute.
+                    if runs_off <= len && cursor + len <= rec.len() {
+                        let runs_bytes = &rec[cursor + runs_off..cursor + len];
+                        if let Ok(rs) = super::run_list::decode(runs_bytes) {
+                            alloc_runs = Some(rs);
+                        }
                     }
                 }
             }
@@ -814,10 +837,17 @@ fn patch_entries_for_record(buf: &mut [u8], start_off: usize, rec_no: u64, new_l
         let is_last = flags & 0x02 != 0;
         let key_len =
             u16::from_le_bytes(buf[cursor + 10..cursor + 12].try_into().unwrap()) as usize;
-        if !is_last && key_len >= 66 {
+        // The key must fit inside the entry, and the $FILE_NAME fields we
+        // write (key_off+40..key_off+56) must fit inside `buf`. Cross-check
+        // both before treating this as a $FILE_NAME key.
+        let key_off = cursor + 16;
+        if !is_last
+            && key_len >= 66
+            && entry_len >= 16 + key_len
+            && key_off + 56 <= buf.len()
+        {
             let file_ref = u64::from_le_bytes(buf[cursor..cursor + 8].try_into().unwrap());
             if (file_ref & 0x0000_FFFF_FFFF_FFFF) == rec_no {
-                let key_off = cursor + 16;
                 // Patch allocated_size / real_size (rounded to next 4 KiB
                 // for the allocated value — matches what create_file emits).
                 let allocated = (new_len + 4095) & !4095;

@@ -86,11 +86,14 @@ fn read_signed_le(b: &[u8]) -> i64 {
     for (i, &byte) in b.iter().enumerate() {
         v |= (byte as i64) << (8 * i);
     }
-    // Sign-extend from the high byte's MSB.
-    let sign_bit = 1i64 << (8 * n - 1);
-    if v & sign_bit != 0 {
-        let mask = !((1i64 << (8 * n)).wrapping_sub(1));
-        v |= mask;
+    // Sign-extend from the high byte's MSB. For n == 8 all 64 bits are
+    // already present, so no extension is needed (and `1 << 64` would be an
+    // out-of-range shift). Only extend when n < 8.
+    if n < 8 {
+        let sign_bit = 1i64 << (8 * n - 1);
+        if v & sign_bit != 0 {
+            v |= -1i64 << (8 * n);
+        }
     }
     v
 }
@@ -133,5 +136,39 @@ mod tests {
         let runs = decode(&[0x11, 0x04, 0x10, 0x11, 0x04, 0xFF, 0x00]).unwrap();
         assert_eq!(runs[0].lcn, Some(0x10));
         assert_eq!(runs[1].lcn, Some(0x0F));
+    }
+
+    #[test]
+    fn read_signed_le_full_width() {
+        // NTFS-1 regression: an 8-byte offset field must not perform an
+        // out-of-range `1 << 64` shift. All 64 bits are present, so no
+        // sign-extension is applied beyond the value itself.
+        assert_eq!(read_signed_le(&[0xFF; 8]), -1);
+        assert_eq!(read_signed_le(&0i64.to_le_bytes()), 0);
+        assert_eq!(read_signed_le(&i64::MIN.to_le_bytes()), i64::MIN);
+        assert_eq!(read_signed_le(&i64::MAX.to_le_bytes()), i64::MAX);
+        assert_eq!(read_signed_le(&0x1234_5678_9abc_def0i64.to_le_bytes()), 0x1234_5678_9abc_def0);
+    }
+
+    #[test]
+    fn decode_eight_byte_offset_positive() {
+        // header 0x81 = 1-byte length, 8-byte offset. Positive 8-byte LCN
+        // delta must decode to the exact value without panicking.
+        let runs = decode(&[
+            0x81, 0x04, 0xF0, 0xDE, 0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12, 0x00,
+        ])
+        .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].length, 4);
+        assert_eq!(runs[0].lcn, Some(0x1234_5678_9abc_def0));
+    }
+
+    #[test]
+    fn decode_eight_byte_offset_negative_is_clean_error() {
+        // An 8-byte delta of -1 from base 0 yields a negative absolute LCN.
+        // The decoder must reject it cleanly rather than panic on the
+        // sign-extension shift (NTFS-1).
+        let runs = decode(&[0x81, 0x04, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+        assert!(matches!(runs, Err(crate::Error::InvalidImage(_))));
     }
 }

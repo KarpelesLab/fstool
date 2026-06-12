@@ -203,7 +203,9 @@ impl Ntfs {
     }
 
     pub fn total_bytes(&self) -> u64 {
-        self.boot.total_sectors * u64::from(self.boot.bytes_per_sector)
+        self.boot
+            .total_sectors
+            .saturating_mul(u64::from(self.boot.bytes_per_sector))
     }
 
     pub fn cluster_size(&self) -> u32 {
@@ -533,63 +535,67 @@ impl Ntfs {
         out: &mut Vec<IndexEntry>,
         visited: &mut std::collections::HashSet<u64>,
     ) -> Result<()> {
-        if !visited.insert(vcn) {
-            return Err(crate::Error::InvalidImage(
-                "ntfs: cycle in $INDEX_ALLOCATION tree".into(),
-            ));
-        }
         let cluster_size = u64::from(self.boot.cluster_size());
         let block_len = checked_alloc_len(block_size as u64, dev.total_size(), "index block")?;
-        let target_bytes = vcn.checked_mul(cluster_size).ok_or_else(|| {
-            crate::Error::InvalidImage("ntfs: index VCN byte offset overflow".into())
-        })?;
-        let mut walked: u64 = 0;
         let mut block_buf = vec![0u8; block_len];
-        let mut found_offset: Option<u64> = None;
-        for ext in alloc_runs {
-            let span = ext.length.checked_mul(cluster_size).ok_or_else(|| {
-                crate::Error::InvalidImage("ntfs: index extent span overflow".into())
-            })?;
-            let walked_end = walked.checked_add(span).ok_or_else(|| {
-                crate::Error::InvalidImage("ntfs: index run-list offset overflow".into())
-            })?;
-            if target_bytes < walked_end {
-                let local = target_bytes - walked;
-                match ext.lcn {
-                    Some(lcn) => {
-                        found_offset = Some(
-                            lcn.checked_mul(cluster_size)
-                                .and_then(|b| b.checked_add(local))
-                                .ok_or_else(|| {
-                                    crate::Error::InvalidImage(
-                                        "ntfs: index LCN byte offset overflow".into(),
-                                    )
-                                })?,
-                        );
-                    }
-                    None => {
-                        return Err(crate::Error::InvalidImage(
-                            "ntfs: $INDEX_ALLOCATION points to a sparse VCN".into(),
-                        ));
-                    }
-                }
-                break;
+        // Explicit work-list instead of recursion: a long (non-cyclic) INDX
+        // chain would otherwise overflow the stack. `visited` doubles as the
+        // cycle guard.
+        let mut stack: Vec<u64> = vec![vcn];
+        while let Some(vcn) = stack.pop() {
+            if !visited.insert(vcn) {
+                return Err(crate::Error::InvalidImage(
+                    "ntfs: cycle in $INDEX_ALLOCATION tree".into(),
+                ));
             }
-            walked = walked_end;
-        }
-        let phys = found_offset.ok_or_else(|| {
-            crate::Error::InvalidImage(format!("ntfs: index VCN {vcn} not in run list"))
-        })?;
-        dev.read_at(phys, &mut block_buf)?;
-        mft::apply_fixup(&mut block_buf, self.boot.bytes_per_sector as usize)?;
-        let blk_hdr = index::IndexBlockHeader::parse(&block_buf)?;
-        let entries_start = blk_hdr.entries_start();
-        let entries_len = blk_hdr.entries_byte_len();
-        let children = index::walk_index_node(&block_buf, entries_start, entries_len, |e| {
-            out.push(e.clone());
-        })?;
-        for child in children {
-            self.descend_index(dev, alloc_runs, block_size, child, out, visited)?;
+            let target_bytes = vcn.checked_mul(cluster_size).ok_or_else(|| {
+                crate::Error::InvalidImage("ntfs: index VCN byte offset overflow".into())
+            })?;
+            let mut walked: u64 = 0;
+            let mut found_offset: Option<u64> = None;
+            for ext in alloc_runs {
+                let span = ext.length.checked_mul(cluster_size).ok_or_else(|| {
+                    crate::Error::InvalidImage("ntfs: index extent span overflow".into())
+                })?;
+                let walked_end = walked.checked_add(span).ok_or_else(|| {
+                    crate::Error::InvalidImage("ntfs: index run-list offset overflow".into())
+                })?;
+                if target_bytes < walked_end {
+                    let local = target_bytes - walked;
+                    match ext.lcn {
+                        Some(lcn) => {
+                            found_offset = Some(
+                                lcn.checked_mul(cluster_size)
+                                    .and_then(|b| b.checked_add(local))
+                                    .ok_or_else(|| {
+                                        crate::Error::InvalidImage(
+                                            "ntfs: index LCN byte offset overflow".into(),
+                                        )
+                                    })?,
+                            );
+                        }
+                        None => {
+                            return Err(crate::Error::InvalidImage(
+                                "ntfs: $INDEX_ALLOCATION points to a sparse VCN".into(),
+                            ));
+                        }
+                    }
+                    break;
+                }
+                walked = walked_end;
+            }
+            let phys = found_offset.ok_or_else(|| {
+                crate::Error::InvalidImage(format!("ntfs: index VCN {vcn} not in run list"))
+            })?;
+            dev.read_at(phys, &mut block_buf)?;
+            mft::apply_fixup(&mut block_buf, self.boot.bytes_per_sector as usize)?;
+            let blk_hdr = index::IndexBlockHeader::parse(&block_buf)?;
+            let entries_start = blk_hdr.entries_start();
+            let entries_len = blk_hdr.entries_byte_len();
+            let children = index::walk_index_node(&block_buf, entries_start, entries_len, |e| {
+                out.push(e.clone());
+            })?;
+            stack.extend(children);
         }
         Ok(())
     }
