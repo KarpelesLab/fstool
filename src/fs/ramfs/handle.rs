@@ -57,8 +57,22 @@ impl Write for RamFileHandle<'_> {
         if buf.is_empty() {
             return Ok(0);
         }
+        // `pos` is attacker-controllable (an O_APPEND/seek client can park it
+        // at an arbitrary offset). Compute the end with checked arithmetic and
+        // refuse to materialise a Vec beyond a sane ceiling rather than letting
+        // the resize abort the process or wrap on overflow.
+        let end = self
+            .pos
+            .checked_add(buf.len() as u64)
+            .filter(|&e| e <= super::MAX_RAM_FILE_LEN)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "ramfs: write past maximum in-memory file size",
+                )
+            })?;
         let start = self.pos as usize;
-        let end = start + buf.len();
+        let end = end as usize;
         let data = self.data_mut();
         if data.len() < end {
             // Grow, zero-filling any gap between the old EOF and `start`.
@@ -100,6 +114,14 @@ impl FileHandle for RamFileHandle<'_> {
     }
 
     fn set_len(&mut self, new_len: u64) -> Result<()> {
+        // Reject an attacker-sized length before allocating: a multi-exabyte
+        // `resize` would abort the process.
+        if new_len > super::MAX_RAM_FILE_LEN {
+            return Err(crate::Error::InvalidArgument(format!(
+                "ramfs: set_len {new_len} exceeds maximum in-memory file size {}",
+                super::MAX_RAM_FILE_LEN
+            )));
+        }
         let new_len = new_len as usize;
         self.data_mut().resize(new_len, 0);
         if self.pos > new_len as u64 {

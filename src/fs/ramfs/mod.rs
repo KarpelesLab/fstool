@@ -34,6 +34,20 @@ use crate::{Error, Result};
 /// The root directory's inode number.
 const ROOT_INO: u64 = 1;
 
+/// Upper bound on the `Vec::with_capacity` hint taken from a source-declared
+/// file size. A malicious source (e.g. a tar PAX header claiming
+/// `size = u64::MAX`) must not turn the hint into an allocation abort; the
+/// vector still grows to the real byte count via `read_to_end`. Matches the
+/// 8 MiB `MEM_CAP` used by the default backend in `fs/mod.rs`.
+const CAPACITY_HINT_CAP: u64 = 8 * 1024 * 1024;
+
+/// Hard ceiling on how large a single ramfs file may be grown to via a
+/// seek-past-end write or an explicit `set_len`/`truncate`. A FUSE client (or
+/// any caller) can request an arbitrary offset/length; materialising a
+/// multi-exabyte `Vec` would abort the process. 1 GiB is far above any
+/// realistic in-memory file yet bounds a crafted request to a clean error.
+const MAX_RAM_FILE_LEN: u64 = 1024 * 1024 * 1024;
+
 /// Per-inode permission/ownership/timestamp metadata.
 #[derive(Debug, Clone, Copy)]
 struct InodeMeta {
@@ -298,7 +312,11 @@ impl Filesystem for Ramfs {
         meta: FileMeta,
     ) -> Result<()> {
         let (mut reader, len) = src.open()?;
-        let mut data = Vec::with_capacity(len as usize);
+        // `len` is a source-declared size (e.g. a tar PAX header can claim
+        // u64::MAX); honouring it as a capacity hint would abort on the
+        // allocation. Cap the hint and let `read_to_end` grow the Vec to
+        // the bytes actually present.
+        let mut data = Vec::with_capacity(len.min(CAPACITY_HINT_CAP) as usize);
         reader.by_ref().take(len).read_to_end(&mut data)?;
         self.insert_regular(path, data, meta)
     }
@@ -311,7 +329,9 @@ impl Filesystem for Ramfs {
         len: u64,
         meta: FileMeta,
     ) -> Result<()> {
-        let mut data = Vec::with_capacity(len as usize);
+        // See `create_file`: `len` is source-declared, so cap the capacity
+        // hint and let `read_to_end` grow to the real byte count.
+        let mut data = Vec::with_capacity(len.min(CAPACITY_HINT_CAP) as usize);
         body.take(len).read_to_end(&mut data)?;
         self.insert_regular(path, data, meta)
     }
@@ -583,6 +603,13 @@ impl Filesystem for Ramfs {
     }
 
     fn truncate(&mut self, _dev: &mut dyn BlockDevice, path: &Path, new_size: u64) -> Result<()> {
+        // Reject an attacker-sized length before allocating: a multi-exabyte
+        // `resize` would abort the process.
+        if new_size > MAX_RAM_FILE_LEN {
+            return Err(Error::InvalidArgument(format!(
+                "ramfs: truncate to {new_size} exceeds maximum in-memory file size {MAX_RAM_FILE_LEN}"
+            )));
+        }
         let ino = self.resolve(path)?;
         match &mut self.inodes.get_mut(&ino).expect("live inode").body {
             Body::File(v) => {
