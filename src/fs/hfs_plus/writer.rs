@@ -3145,7 +3145,7 @@ mod tests {
         let mut dev = MemoryBackend::new(8 * 1024 * 1024);
         let opts = FormatOpts::default();
         let mut hfs = crate::fs::hfs_plus::HfsPlus::format(&mut dev, &opts).unwrap();
-        hfs.create_symlink(&mut dev, "/link", "../target/path", 0o777, 0, 0)
+        hfs.create_symlink(&mut dev, "/link", "../target/path", 0o777, 0, 0, 0)
             .unwrap();
         hfs.flush(&mut dev).unwrap();
 
@@ -3530,7 +3530,7 @@ mod tests {
         assert!(hfs.create_hardlink(&mut dev, "/file", "/file").is_err());
 
         // Symlinks may not be hard-linked.
-        hfs.create_symlink(&mut dev, "/sym", "/file", 0o777, 0, 0)
+        hfs.create_symlink(&mut dev, "/sym", "/file", 0o777, 0, 0, 0)
             .unwrap();
         assert!(hfs.create_hardlink(&mut dev, "/sym", "/sym-link").is_err());
     }

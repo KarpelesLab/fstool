@@ -291,6 +291,7 @@ impl HfsPlus {
 
     /// Create a symlink at `path` whose target is the UTF-8 byte string
     /// `target`. Finder type `slnk` / creator `rhap`, mode S_IFLNK.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_symlink(
         &mut self,
         dev: &mut dyn BlockDevice,
@@ -299,6 +300,7 @@ impl HfsPlus {
         mode: u16,
         uid: u32,
         gid: u32,
+        mtime: u32,
     ) -> Result<u32> {
         let (parent_id, name) = self.resolve_create_target(path)?;
         let w = self
@@ -319,7 +321,7 @@ impl HfsPlus {
             mode | catalog::mode::S_IFLNK,
             uid,
             gid,
-            0, // mod_date: symlinks fall back to the volume create date
+            unix_to_hfs_time(mtime),
             *b"slnk",
             *b"rhap",
             &fork,
@@ -350,6 +352,7 @@ impl HfsPlus {
         mode: u16,
         uid: u32,
         gid: u32,
+        mtime: u32,
     ) -> Result<u32> {
         let (parent_id, name) = self.resolve_create_target(path)?;
         let w = self
@@ -381,7 +384,7 @@ impl HfsPlus {
             mode | kind_bits,
             uid,
             gid,
-            0, // mod_date: device nodes fall back to the volume create date
+            unix_to_hfs_time(mtime),
             *b"\0\0\0\0",
             *b"\0\0\0\0",
             &ForkData::default(),
@@ -1489,7 +1492,7 @@ impl crate::fs::Filesystem for HfsPlus {
             crate::Error::InvalidArgument("hfs+: non-UTF-8 symlink target".into())
         })?;
         let mode = meta.mode;
-        self.create_symlink(dev, s, t, mode, meta.uid, meta.gid)
+        self.create_symlink(dev, s, t, mode, meta.uid, meta.gid, meta.mtime)
             .map(|_| ())
     }
 
@@ -1506,8 +1509,10 @@ impl crate::fs::Filesystem for HfsPlus {
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("hfs+: non-UTF-8 path".into()))?;
         let mode = if meta.mode != 0 { meta.mode } else { 0o644 };
-        self.create_device(dev, s, kind, major, minor, mode, meta.uid, meta.gid)
-            .map(|_| ())
+        self.create_device(
+            dev, s, kind, major, minor, mode, meta.uid, meta.gid, meta.mtime,
+        )
+        .map(|_| ())
     }
 
     fn remove(&mut self, dev: &mut dyn BlockDevice, path: &std::path::Path) -> Result<()> {

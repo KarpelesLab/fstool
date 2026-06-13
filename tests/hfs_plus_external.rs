@@ -151,7 +151,7 @@ fn writer_image_passes_fsck_hfs() {
     .unwrap();
 
     // /link -> etc/conf  (symlink target is a relative path)
-    hfs.create_symlink(&mut dev, "/link", "etc/conf", 0o777, 0, 0)
+    hfs.create_symlink(&mut dev, "/link", "etc/conf", 0o777, 0, 0, 0)
         .unwrap();
 
     // /alias hardlinks /readme. Promotion moves /readme into the
@@ -279,7 +279,7 @@ fn writer_device_nodes_round_trip() {
         ("/srv.sock", DeviceKind::Socket, 0, 0),
     ];
     for (path, kind, major, minor) in plan {
-        hfs.create_device(&mut dev, path, kind, major, minor, 0o644, 0, 0)
+        hfs.create_device(&mut dev, path, kind, major, minor, 0o644, 0, 0, 0)
             .unwrap();
     }
     hfs.flush(&mut dev).unwrap();
@@ -464,7 +464,7 @@ fn dump_fstool_catalog_leaf() {
         0,
     )
     .unwrap();
-    hfs.create_symlink(&mut dev, "/link", "etc/conf", 0o777, 0, 0)
+    hfs.create_symlink(&mut dev, "/link", "etc/conf", 0o777, 0, 0, 0)
         .unwrap();
     hfs.create_hardlink(&mut dev, "/readme", "/alias").unwrap();
     hfs.flush(&mut dev).unwrap();
