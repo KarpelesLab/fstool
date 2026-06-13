@@ -1622,6 +1622,60 @@ fn writer_format_emits_multiple_security_descriptors() {
     );
 }
 
+/// A file created on a *reopened* volume (the `fstool shell put` / FUSE-create
+/// path, not format-time `build`) must still carry a resolvable Everyone-access
+/// security descriptor. Without one (security_id 0 / no `$SECURITY_DESCRIPTOR`)
+/// Windows reports the file as having no permissions and refuses to open it.
+#[test]
+fn reopen_then_create_file_carries_user_security() {
+    use super::format::{build_security_descriptor, security_id_for};
+    use super::secure::SecurityClass;
+
+    // Format, flush, drop — a bare on-disk volume with no user files yet.
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    ntfs.flush(&mut dev).unwrap();
+    drop(ntfs);
+
+    // Reopen (no format) and add a file — the reopen-mutate path.
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    ntfs.create_file(
+        &mut dev,
+        "/added.txt",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"hi\n".to_vec())),
+            len: 3,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+    drop(ntfs);
+
+    // Reopen once more and confirm the file's security descriptor is the
+    // permissive User class (Everyone: FILE_ALL_ACCESS), resolvable via $Secure.
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    let rec = ntfs.lookup_path(&mut dev, "/added.txt").unwrap();
+    let sid = read_security_id_for_record(&mut ntfs, &mut dev, rec);
+    assert_ne!(
+        sid, 0,
+        "reopened-volume file has security_id 0 — Windows would deny access"
+    );
+    assert_eq!(
+        sid,
+        security_id_for(SecurityClass::User),
+        "reopened-volume file must carry the User (Everyone-access) security id"
+    );
+    let xa = ntfs.read_xattrs(&mut dev, "/added.txt").unwrap();
+    let sd = xa
+        .get(xattr_keys::SECURITY)
+        .expect("file must carry a resolvable security descriptor");
+    assert_eq!(
+        sd,
+        &build_security_descriptor(SecurityClass::User),
+        "resolved SD differs from the Everyone-access User descriptor"
+    );
+}
+
 /// Exercise the directory-batch cache's eviction path: build more
 /// directories with pending children than the batch cache holds
 /// (`DEFAULT_CAPACITY`), so directories are serialized mid-run on
