@@ -1066,10 +1066,48 @@ impl crate::fs::Filesystem for Fat32 {
             EntryKind::Regular
         };
         let mut attrs = FileAttrs::defaults_for(kind, u64::from(entry.file_size), 0);
+        // FAT has no Unix mode; derive read/write permission from the only
+        // bit it does carry — ATTR_READ_ONLY. A set read-only bit drops the
+        // write bits (0o444 / 0o555); otherwise the kind-appropriate default
+        // from `defaults_for` (0o644 / 0o755) stands.
+        if entry.attr & dir::ATTR_READ_ONLY != 0 {
+            attrs.mode = match kind {
+                EntryKind::Dir => 0o555,
+                _ => 0o444,
+            };
+        }
         attrs.mtime = entry.mtime;
         attrs.atime = entry.mtime;
         attrs.ctime = entry.mtime;
         Ok(attrs)
+    }
+
+    /// Update attributes on `path`. FAT carries no Unix mode, uid, or gid,
+    /// so the only attribute we can honour from a `chmod` is the requested
+    /// mode's owner-write bit, which maps onto the directory entry's
+    /// `ATTR_READ_ONLY` bit: a mode with no owner-write (`0o200` clear) sets
+    /// read-only; otherwise it clears read-only. uid/gid are silently
+    /// ignored (FAT has no owners). The write date/time is left intact when
+    /// only the attribute byte changes.
+    ///
+    /// TODO: honour `attrs.mtime` by rewriting the entry's write date/time
+    /// (via `unix_to_dos_datetime`) when set; today only the mode is applied.
+    fn set_attrs(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &Path,
+        attrs: crate::fs::SetAttrs,
+    ) -> Result<()> {
+        let Some(mode) = attrs.mode else {
+            // Nothing FAT can represent was requested (uid/gid/times only).
+            return Ok(());
+        };
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("fat32: non-UTF-8 path".into()))?;
+        // No owner-write bit → read-only; otherwise writable.
+        let read_only = (mode & 0o200) == 0;
+        self.set_entry_readonly(dev, s, read_only)
     }
 
     fn read_file<'a>(
@@ -1319,6 +1357,69 @@ mod tests {
         assert_eq!(&got[100..116], &patch);
         // 116..200 unchanged.
         assert!(got[116..].iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn set_attrs_read_only_round_trip() {
+        use crate::fs::SetAttrs;
+        let (mut dev, mut fs) = fresh_volume();
+        // Create a file with a real mtime so we can confirm it survives the
+        // attribute flip (the entry's write date/time must not be clobbered).
+        let mtime = 1_615_779_298u32;
+        fs.create_file(
+            &mut dev,
+            Path::new("ro.txt"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(vec![0x42u8; 64])),
+                len: 64,
+            },
+            FileMeta {
+                mtime,
+                ..FileMeta::default()
+            },
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        // Baseline: a writable file reports 0o644 (FAT 2s resolution rounds
+        // the odd second down, so compare against the rounded value).
+        let base = fs.getattr(&mut dev, Path::new("ro.txt")).unwrap();
+        assert_eq!(base.mode, 0o644);
+        let want_mtime = base.mtime;
+        assert_ne!(want_mtime, 0);
+
+        // chmod 0o444 → read-only set; reopen the volume and confirm.
+        fs.set_attrs(
+            &mut dev,
+            Path::new("ro.txt"),
+            SetAttrs {
+                mode: Some(0o444),
+                ..SetAttrs::default()
+            },
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+        let mut fs = Fat32::open(&mut dev).unwrap();
+        let a = fs.getattr(&mut dev, Path::new("ro.txt")).unwrap();
+        assert_eq!(a.mode, 0o444);
+        // The write time must be intact — only the attr byte changed.
+        assert_eq!(a.mtime, want_mtime);
+
+        // chmod 0o644 → read-only cleared; reopen and confirm.
+        fs.set_attrs(
+            &mut dev,
+            Path::new("ro.txt"),
+            SetAttrs {
+                mode: Some(0o644),
+                ..SetAttrs::default()
+            },
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+        let mut fs = Fat32::open(&mut dev).unwrap();
+        let a = fs.getattr(&mut dev, Path::new("ro.txt")).unwrap();
+        assert_eq!(a.mode, 0o644);
+        assert_eq!(a.mtime, want_mtime);
     }
 
     #[test]

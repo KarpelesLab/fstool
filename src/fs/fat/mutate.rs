@@ -524,6 +524,51 @@ impl Fat32 {
         Ok(())
     }
 
+    /// Set or clear the `ATTR_READ_ONLY` bit on the 8.3 entry for `path`,
+    /// rewriting only that entry's 32-byte slot in place. Used by the
+    /// cross-filesystem `chmod`: FAT has no Unix mode, so the requested
+    /// mode's owner-write bit maps onto this single attribute bit.
+    ///
+    /// Only byte 11 (the attr field) of the slot is touched, so the
+    /// entry's write date/time and every other field are preserved.
+    pub(super) fn set_entry_readonly(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        read_only: bool,
+    ) -> Result<()> {
+        // The lookup below reads on-disk directory blocks; serialize any
+        // staged entries first so a just-created file is locatable.
+        self.flush_dir_batches(dev)?;
+        let (parent_cluster, leaf) = self.resolve_parent(dev, path)?;
+        let Some(FoundEntry {
+            chain,
+            mut bytes,
+            entry_pos,
+            entry,
+            ..
+        }) = self.find_entry(dev, parent_cluster, &leaf)?
+        else {
+            return Err(crate::Error::InvalidArgument(format!(
+                "fat32: {path:?} not found"
+            )));
+        };
+        let mut attr = entry.attr;
+        if read_only {
+            attr |= dir::ATTR_READ_ONLY;
+        } else {
+            attr &= !dir::ATTR_READ_ONLY;
+        }
+        if attr == entry.attr {
+            return Ok(()); // already in the desired state
+        }
+        // Patch byte 11 (the attr field) of the 8.3 slot only, leaving the
+        // write date/time and all other fields untouched.
+        bytes[entry_pos + 11] = attr;
+        self.write_dir_range(dev, &chain, &bytes, entry_pos, entry_pos + dir::ENTRY_SIZE)?;
+        Ok(())
+    }
+
     /// Split `path` into (parent_dir_cluster, leaf_name). Errors if the
     /// path is `/` or if the parent doesn't exist.
     pub(super) fn resolve_parent(
