@@ -2148,3 +2148,62 @@ fn cli_shell_put_preserves_mtime() {
         );
     }
 }
+
+/// `chmod MODE PATH` works across every writable backend via the real shell
+/// binary. Filesystems with Unix modes (ext) store the bits; DOS-attribute
+/// filesystems (NTFS/FAT/exFAT) map the owner-write bit to READ-ONLY, so a
+/// `chmod 444` reads back as 0o444 and `chmod 644` as 0o644 everywhere.
+#[test]
+fn cli_shell_chmod_across_backends() {
+    let srcdir = tempfile::tempdir().unwrap();
+    let hostfile = srcdir.path().join("f.txt");
+    std::fs::write(&hostfile, b"perm test\n").unwrap();
+
+    // Sizes chosen to satisfy each backend's minimum.
+    for (ty, size) in [
+        ("ext4", "16M"),
+        ("ntfs", "32M"),
+        ("xfs", "300M"),
+        ("fat32", "64M"),
+        ("exfat", "64M"),
+        ("hfs+", "32M"),
+    ] {
+        let img = NamedTempFile::new().unwrap();
+        assert!(
+            Command::new(FSTOOL)
+                .args(["create", "--type", ty, "--size", size, "-o"])
+                .arg(img.path())
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "{ty}: create failed"
+        );
+
+        // put → chmod 444 → read mode (fresh process each time).
+        let script = format!(
+            "put \"{}\" /f.txt\nchmod 444 /f.txt\nquit\n",
+            hostfile.display()
+        );
+        let (out, ok) = shell_script(img.path(), &script);
+        assert!(ok, "{ty}: put+chmod failed: {out}");
+
+        let mode_of = |img: &std::path::Path| -> String {
+            let (info, ok) = shell_script(img, "info /f.txt\nquit\n");
+            assert!(ok, "{ty}: info failed: {info}");
+            info.lines()
+                .find(|l| l.trim_start().starts_with("mode:"))
+                .and_then(|l| {
+                    l.split_whitespace()
+                        .nth(1)
+                        .map(|s| s.trim_start_matches('0').to_string())
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(mode_of(img.path()), "444", "{ty}: chmod 444 not reflected");
+
+        let (out, ok) = shell_script(img.path(), "chmod 644 /f.txt\nquit\n");
+        assert!(ok, "{ty}: chmod 644 failed: {out}");
+        assert_eq!(mode_of(img.path()), "644", "{ty}: chmod 644 not reflected");
+    }
+}

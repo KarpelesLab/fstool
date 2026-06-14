@@ -1912,7 +1912,7 @@ impl crate::fs::Filesystem for Ntfs {
     ///
     /// NTFS has no POSIX mode. The only mode bit it can represent is the
     /// owner-write bit, which maps onto `$STANDARD_INFORMATION`'s
-    /// `FILE_ATTRIBUTE_READONLY` (0x01) — the same bit [`getattr`] reads
+    /// `FILE_ATTRIBUTE_READONLY` (0x01) — the same bit `getattr` reads
     /// back to synthesise `0o444` vs `0o644`. So:
     ///
     /// * `mode & 0o200 == 0` (owner has no write) → set READONLY.
@@ -1923,7 +1923,7 @@ impl crate::fs::Filesystem for Ntfs {
     /// and are silently ignored (never an error).
     ///
     /// The whole MFT record is rewritten through the LFS journal via
-    /// [`rw::commit_txn`], the same redo/undo machinery the file-handle
+    /// `rw::commit_txn`, the same redo/undo machinery the file-handle
     /// `flush_record` path uses, so a subsequent reopen sees the change
     /// and `ntfsfix` stays happy.
     fn set_attrs(
