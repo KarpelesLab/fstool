@@ -937,6 +937,20 @@ impl AnyFs {
         self.as_filesystem_dyn(|fs| fs.flush(dev))
     }
 
+    /// Update metadata (mode / owner / timestamps) on an existing path.
+    /// Delegates to each backend's [`crate::fs::Filesystem::set_attrs`];
+    /// backends that can't represent a requested field ignore it, and ones
+    /// with no mutable-metadata support return `Unsupported`.
+    pub fn set_attrs(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &Path,
+        attrs: crate::fs::SetAttrs,
+    ) -> Result<()> {
+        self.require_mutable("chmod")?;
+        self.as_filesystem_dyn(|fs| fs.set_attrs(dev, path, attrs))
+    }
+
     /// One-line FS summary, used by `fstool info`'s heading.
     ///
     /// A single exhaustive `match` so the compiler forces every variant to

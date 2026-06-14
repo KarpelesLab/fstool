@@ -417,6 +417,11 @@ impl Shell {
                 self.cmd_mkdir(dev, rest, output)?;
                 Ok(false)
             }
+            "chmod" => {
+                self.require_writable("chmod")?;
+                self.cmd_chmod(dev, rest, output)?;
+                Ok(false)
+            }
             "info" => {
                 self.cmd_info(dev, rest, output)?;
                 Ok(false)
@@ -476,6 +481,8 @@ get SRC [DEST]      copy a file or directory out of the image to the host
                     host cwd, or names a target/existing dir; works read-only)
 rm PATH             remove a file or empty directory
 mkdir PATH          create an empty directory
+chmod MODE PATH     set permission bits (octal, e.g. 644 / 0755). On NTFS/FAT/
+                    exFAT the owner-write bit maps to the READ-ONLY attribute
 info [PATH]         no arg → image summary; with PATH → file metadata
                     (kind/mode/owner/size/blocks/nlink/inode/atime/mtime
                     /ctime/rdev) plus any extended attributes
@@ -807,6 +814,49 @@ quit | exit         leave
         dev.sync()?;
         self.invalidate_cache();
         writeln!(output, "mkdir {path}")?;
+        Ok(())
+    }
+
+    /// `chmod MODE PATH` — set the permission bits on an existing entry.
+    /// MODE is octal (`644`, `0755`, `+x`-style symbolic forms are not
+    /// supported). Filesystems with real Unix modes (ext/xfs/hfs+/apfs/…)
+    /// store the bits verbatim; DOS-attribute filesystems (NTFS/FAT/exFAT)
+    /// map the owner-write bit to their READ-ONLY attribute (which is what
+    /// their reported mode is derived from). Backends that can't represent
+    /// permissions at all return a clear `Unsupported` error.
+    fn cmd_chmod(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        arg: &str,
+        output: &mut impl Write,
+    ) -> Result<()> {
+        let (mode_str, path_arg) = one_or_two_args("chmod", "MODE", arg)?;
+        let path_arg = path_arg.ok_or_else(|| {
+            fstool::Error::InvalidArgument("chmod: usage: chmod MODE PATH".into())
+        })?;
+        let mode = u16::from_str_radix(mode_str.trim_start_matches("0o"), 8).map_err(|_| {
+            fstool::Error::InvalidArgument(format!(
+                "chmod: invalid octal MODE {mode_str:?} (e.g. 644, 0755)"
+            ))
+        })?;
+        if mode & !0o7777 != 0 {
+            return Err(fstool::Error::InvalidArgument(format!(
+                "chmod: MODE {mode_str:?} has bits outside 0o7777"
+            )));
+        }
+        let path = self.resolve(&path_arg);
+        self.fs.set_attrs(
+            dev,
+            std::path::Path::new(&path),
+            fstool::fs::SetAttrs {
+                mode: Some(mode),
+                ..Default::default()
+            },
+        )?;
+        self.fs.flush(dev)?;
+        dev.sync()?;
+        self.invalidate_cache();
+        writeln!(output, "chmod {mode:04o} {path}")?;
         Ok(())
     }
 
