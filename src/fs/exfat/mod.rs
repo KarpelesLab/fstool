@@ -1262,6 +1262,97 @@ impl Exfat {
         Ok(())
     }
 
+    /// Apply attribute changes to the file/dir at `path`.
+    ///
+    /// exFAT has no Unix permission model — the only writable permission
+    /// bit is FileAttributes' READ-ONLY flag (bit 0). We map the requested
+    /// mode's owner-write bit onto it: clearing owner-write sets READ-ONLY,
+    /// setting owner-write clears it. uid/gid are ignored (no owners).
+    /// `mtime`, if given, is written to the LastModified timestamp.
+    ///
+    /// Because the FileAttributes word and the LastModified timestamp both
+    /// live in the primary FileDirectoryEntry and are covered by the set's
+    /// EntrySetChecksum, the checksum is recomputed over the whole set and
+    /// the primary entry is rewritten in place.
+    pub fn set_attrs(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        mode: Option<u16>,
+        mtime: Option<u32>,
+    ) -> Result<()> {
+        if mode.is_none() && mtime.is_none() {
+            return Ok(());
+        }
+        // The lookup + write below touch on-disk directory entries;
+        // serialize any staged entries first so they are present.
+        self.flush_dir_batches(dev)?;
+
+        let parts = split_path(path);
+        if parts.is_empty() {
+            return Err(crate::Error::InvalidArgument(
+                "exfat: cannot set attributes on root".into(),
+            ));
+        }
+        let (last, prefix) = parts.split_last().unwrap();
+        let mut parent_cluster = self.boot.first_cluster_of_root_directory;
+        for part in prefix {
+            let bytes = self.read_dir_bytes(dev, parent_cluster)?;
+            let next = iter_file_sets(&bytes)?
+                .into_iter()
+                .find(|e| self.name_matches(&e.name_utf16, part))
+                .ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!(
+                        "exfat: no such entry {part:?} under {path:?}"
+                    ))
+                })?;
+            if !next.is_directory {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "exfat: {part:?} is not a directory"
+                )));
+            }
+            parent_cluster = next.first_cluster;
+        }
+
+        let (pos, set, total) = self
+            .find_entry_in_dir(dev, parent_cluster, last)?
+            .ok_or_else(|| {
+                crate::Error::InvalidArgument(format!(
+                    "exfat: no such entry {last:?} under {path:?}"
+                ))
+            })?;
+
+        // Read the full entry set (primary + secondaries) so we can
+        // recompute the SetChecksum after mutating the primary.
+        let disk_off = self.dir_pos_to_disk_offset(parent_cluster, pos)?;
+        let mut set_bytes = vec![0u8; total];
+        dev.read_at(disk_off, &mut set_bytes)?;
+
+        // Mutate FileAttributes (bytes 4..6 of the primary).
+        if let Some(m) = mode {
+            let mut attrs = set.file_attributes;
+            if m & 0o200 == 0 {
+                attrs |= dir::ATTR_READ_ONLY;
+            } else {
+                attrs &= !dir::ATTR_READ_ONLY;
+            }
+            set_bytes[4..6].copy_from_slice(&attrs.to_le_bytes());
+        }
+        // Mutate LastModified timestamp (bytes 12..16 of the primary).
+        if let Some(t) = mtime {
+            set_bytes[12..16].copy_from_slice(&t.to_le_bytes());
+        }
+
+        // Recompute the SetChecksum (skips the primary's bytes 2..3) and
+        // write it into the primary's checksum field.
+        let csum = dir::set_checksum(&set_bytes);
+        set_bytes[2..4].copy_from_slice(&csum.to_le_bytes());
+
+        // Only the primary entry's bytes changed, so write just that slot.
+        dev.write_at(disk_off, &set_bytes[..ENTRY_SIZE])?;
+        Ok(())
+    }
+
     /// Flush all dirty state back to disk: rewrite the FAT image (both
     /// copies if NumberOfFats == 2 — currently we only emit one), rewrite
     /// the allocation bitmap, and `sync()` the device.
@@ -1471,10 +1562,40 @@ impl crate::fs::Filesystem for Exfat {
             EntryKind::Regular
         };
         let mut attrs = FileAttrs::defaults_for(kind, set.data_length, set.first_cluster);
+        // exFAT has no Unix mode — only a READ-ONLY bit in FileAttributes.
+        // Derive a sensible mode from it: read-only entries drop the write
+        // bits, everything else gets the usual file/dir defaults.
+        let read_only = set.file_attributes & dir::ATTR_READ_ONLY != 0;
+        attrs.mode = match (set.is_directory, read_only) {
+            (true, true) => 0o555,
+            (true, false) => 0o755,
+            (false, true) => 0o444,
+            (false, false) => 0o644,
+        };
         attrs.mtime = exfat_timestamp_to_unix(set.last_modified_timestamp);
         attrs.atime = exfat_timestamp_to_unix(set.last_accessed_timestamp);
         attrs.ctime = exfat_timestamp_to_unix(set.create_timestamp);
         Ok(attrs)
+    }
+
+    /// Apply attribute changes. exFAT only models a READ-ONLY bit, so the
+    /// requested mode's owner-write bit drives it; `mtime` updates the
+    /// LastModified timestamp. uid/gid/atime/ctime have no on-disk home
+    /// here and are ignored.
+    fn set_attrs(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        attrs: crate::fs::SetAttrs,
+    ) -> Result<()> {
+        if attrs.mode.is_none() && attrs.mtime.is_none() {
+            return Ok(());
+        }
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        let mtime = attrs.mtime.map(unix_to_exfat_timestamp);
+        Exfat::set_attrs(self, dev, s, attrs.mode, mtime)
     }
 }
 
@@ -2077,6 +2198,89 @@ mod tests {
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).unwrap();
         assert_eq!(buf, payload);
+    }
+
+    /// chmod round-trip: create a file, mark it read-only via set_attrs,
+    /// reopen and confirm getattr reports 0o444, then clear it back to
+    /// 0o644. The mtime set at create time must survive both writes.
+    #[test]
+    fn set_attrs_read_only_round_trip() {
+        use crate::fs::{Filesystem, SetAttrs};
+        use std::path::Path;
+
+        let (mut dev, mut fs) = fresh_volume("CHMOD");
+        let payload: &[u8] = b"chmod me";
+        // 1_600_000_000 → 2020-09-13, well within exFAT's range.
+        let mtime = 1_600_000_000u32;
+        let mut reader: &[u8] = payload;
+        fs.create_file(
+            &mut dev,
+            "/f.txt",
+            &mut reader,
+            payload.len() as u64,
+            unix_to_exfat_timestamp(mtime),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        // Baseline: a freshly-created regular file is 0o644.
+        let exp_mtime = exfat_timestamp_to_unix(unix_to_exfat_timestamp(mtime));
+        {
+            let mut fs2 = Exfat::open(&mut dev).unwrap();
+            let a = fs2.getattr(&mut dev, Path::new("/f.txt")).unwrap();
+            assert_eq!(a.mode, 0o644);
+            assert_eq!(a.mtime, exp_mtime);
+        }
+
+        // chmod 0o444 → READ-ONLY set.
+        {
+            let mut fs2 = Exfat::open(&mut dev).unwrap();
+            Filesystem::set_attrs(
+                &mut fs2,
+                &mut dev,
+                Path::new("/f.txt"),
+                SetAttrs {
+                    mode: Some(0o444),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            fs2.flush(&mut dev).unwrap();
+        }
+        {
+            let mut fs2 = Exfat::open(&mut dev).unwrap();
+            let a = fs2.getattr(&mut dev, Path::new("/f.txt")).unwrap();
+            assert_eq!(a.mode, 0o444, "read-only file should read back as 0o444");
+            assert_eq!(a.mtime, exp_mtime, "mtime must be preserved across chmod");
+        }
+
+        // chmod 0o644 → READ-ONLY cleared.
+        {
+            let mut fs2 = Exfat::open(&mut dev).unwrap();
+            Filesystem::set_attrs(
+                &mut fs2,
+                &mut dev,
+                Path::new("/f.txt"),
+                SetAttrs {
+                    mode: Some(0o644),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            fs2.flush(&mut dev).unwrap();
+        }
+        {
+            let mut fs2 = Exfat::open(&mut dev).unwrap();
+            let a = fs2.getattr(&mut dev, Path::new("/f.txt")).unwrap();
+            assert_eq!(a.mode, 0o644, "writable file should read back as 0o644");
+            assert_eq!(a.mtime, exp_mtime);
+            // Content must be intact — we only rewrote the primary entry.
+            let mut r = fs2.open_file_reader(&mut dev, "/f.txt").unwrap();
+            use std::io::Read;
+            let mut buf = Vec::new();
+            r.read_to_end(&mut buf).unwrap();
+            assert_eq!(buf, payload);
+        }
     }
 
     #[test]
