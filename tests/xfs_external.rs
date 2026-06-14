@@ -447,6 +447,79 @@ fn open_file_rw_round_trip_passes_xfs_repair() {
     assert_xfs_repair_clean(tmp.path());
 }
 
+/// `set_attrs` (the cross-filesystem `chmod`/`chown`/`utimes` primitive)
+/// must (a) persist the new permission bits while preserving the file
+/// type, (b) round-trip uid/gid/mtime, and (c) leave the inode CRC valid
+/// so `xfs_repair -n` stays clean. Create a file, change its attrs, reopen
+/// from disk, and read them back.
+#[test]
+fn set_attrs_round_trip_passes_xfs_repair() {
+    let Some(_) = which("xfs_repair") else {
+        eprintln!("skipping: xfs_repair not installed");
+        return;
+    };
+
+    use fstool::fs::{Filesystem, SetAttrs};
+
+    let size: u64 = 64 * 1024 * 1024;
+    let tmp = NamedTempFile::new().unwrap();
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let opts = FormatOpts {
+        uuid: [0x5au8; 16],
+        ..Default::default()
+    };
+    // First lifecycle: format + create a file (default mode 0o644) + flush.
+    {
+        let mut x = xfs::format(&mut dev, &opts).unwrap();
+        x.begin_writes(opts.uuid);
+        let rootino = x.superblock().rootino;
+        let body = vec![0xCCu8; 64];
+        let mut src = std::io::Cursor::new(body.clone());
+        x.add_file(
+            &mut dev,
+            rootino,
+            "chmod.bin",
+            EntryMeta::default(),
+            body.len() as u64,
+            &mut src,
+        )
+        .unwrap();
+        x.flush_writes(&mut dev).unwrap();
+    }
+    // Second lifecycle: reopen, set_attrs, flush.
+    {
+        let mut x = Xfs::open(&mut dev).unwrap();
+        Filesystem::set_attrs(
+            &mut x,
+            &mut dev,
+            std::path::Path::new("/chmod.bin"),
+            SetAttrs {
+                mode: Some(0o600),
+                uid: Some(4242),
+                gid: Some(2424),
+                mtime: Some(1_700_000_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        Filesystem::flush(&mut x, &mut dev).unwrap();
+    }
+    // Third lifecycle: reopen fresh and confirm the new attrs landed.
+    {
+        let mut x = Xfs::open(&mut dev).unwrap();
+        let a = Filesystem::getattr(&mut x, &mut dev, std::path::Path::new("/chmod.bin")).unwrap();
+        assert_eq!(a.mode, 0o600, "permission bits did not round-trip");
+        assert_eq!(a.kind, fstool::fs::EntryKind::Regular, "file type changed");
+        assert_eq!(a.uid, 4242, "uid did not round-trip");
+        assert_eq!(a.gid, 2424, "gid did not round-trip");
+        assert_eq!(a.mtime, 1_700_000_000, "mtime did not round-trip");
+    }
+    dev.sync().unwrap();
+    drop(dev);
+
+    assert_xfs_repair_clean(tmp.path());
+}
+
 // `mkfs.xfs` + populating with enough entries to force the root
 // directory into `di_format=BTREE` would be the canonical fixture for
 // the new B-tree-directory reader, but neither `xfs_io` (no `creat`

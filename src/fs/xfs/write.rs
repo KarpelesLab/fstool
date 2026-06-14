@@ -2288,6 +2288,64 @@ impl Xfs {
         self.add_file(dev, parent_ino, &name, meta, size, src)
     }
 
+    /// Update the requested in-core inode fields of the file at `path`.
+    /// `None` fields are left untouched. The permission bits replace the
+    /// low 12 bits of `di_mode` while the S_IFMT type bits are preserved,
+    /// so a `chmod` never changes a file into a directory (or vice versa).
+    ///
+    /// We patch the raw on-disk inode in place — same approach the clone
+    /// path uses to OR the REFLINK flag onto an existing inode (see
+    /// [`clone_file_path`](Self::clone_file_path)): read the inode bytes,
+    /// overwrite the affected big-endian fields at their fixed offsets,
+    /// re-stamp the v3 CRC32C over the whole inode, and write it back.
+    /// Going through the raw buffer (rather than re-encoding via
+    /// [`V3DinodeBuilder`]) keeps the data/attr forks and every field we
+    /// don't touch byte-identical.
+    pub fn set_attrs_path(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        attrs: crate::fs::SetAttrs,
+    ) -> Result<()> {
+        self.ensure_write_state(dev)?;
+        // Materialize any staged directory entries so a file created this
+        // session is reachable and its inode address is final.
+        self.flush_dir_batches(dev)?;
+
+        let (ino, mut buf, core) = self.resolve_path(dev, path)?;
+
+        if let Some(mode) = attrs.mode {
+            // Keep the S_IFMT type bits; replace only the 0o7777 perms.
+            let new_mode = (core.mode & super::inode::S_IFMT) | (mode & 0o7777);
+            buf[2..4].copy_from_slice(&new_mode.to_be_bytes());
+        }
+        if let Some(uid) = attrs.uid {
+            buf[8..12].copy_from_slice(&uid.to_be_bytes());
+        }
+        if let Some(gid) = attrs.gid {
+            buf[12..16].copy_from_slice(&gid.to_be_bytes());
+        }
+        // Timestamps: 32-bit big-endian seconds + 32-bit big-endian nsec.
+        // We only carry whole seconds (matching SetAttrs), so zero nsec.
+        if let Some(atime) = attrs.atime {
+            buf[32..36].copy_from_slice(&atime.to_be_bytes());
+            buf[36..40].copy_from_slice(&0u32.to_be_bytes());
+        }
+        if let Some(mtime) = attrs.mtime {
+            buf[40..44].copy_from_slice(&mtime.to_be_bytes());
+            buf[44..48].copy_from_slice(&0u32.to_be_bytes());
+        }
+        if let Some(ctime) = attrs.ctime {
+            buf[48..52].copy_from_slice(&ctime.to_be_bytes());
+            buf[52..56].copy_from_slice(&0u32.to_be_bytes());
+        }
+
+        super::inode::stamp_v3_inode_crc(&mut buf);
+        let off = self.ino_byte_offset(ino)?;
+        dev.write_at(off, &buf)?;
+        Ok(())
+    }
+
     /// Clone `src_path` to a new file at `dst_path` by sharing extents:
     /// the destination inode points at the **same** physical FSBs as
     /// the source, and a refcount record is inserted into each

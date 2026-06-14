@@ -906,6 +906,18 @@ impl crate::fs::Filesystem for Xfs {
         })
     }
 
+    fn set_attrs(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        attrs: crate::fs::SetAttrs,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("xfs: non-UTF-8 path".into()))?;
+        self.set_attrs_path(dev, s, attrs)
+    }
+
     fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         self.flush_writes(dev)
     }
