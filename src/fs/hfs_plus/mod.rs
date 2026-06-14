@@ -431,6 +431,90 @@ impl HfsPlus {
         writer::remove_entry(w, parent_id, &name)
     }
 
+    /// Update permission / ownership / mtime metadata on the entry at
+    /// `path`, in place in the in-memory writer model. Fields left
+    /// `None` in `attrs` are preserved. The new mode keeps the on-disk
+    /// `S_IFMT` type bits and replaces only the `0o7777` permission
+    /// bits. `mtime` is written to `contentModDate` (and the mod /
+    /// access dates) via the usual Unix→HFS+ conversion. The change is
+    /// staged in `writer.catalog`; [`Self::flush`] serialises it.
+    ///
+    /// `atime` and `ctime` have no independent on-disk home in our
+    /// record layout (HFS+ keeps a single `accessDate` derived from the
+    /// mod date) so they are accepted but not separately stored.
+    pub fn set_attrs(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        path: &str,
+        attrs: crate::fs::SetAttrs,
+    ) -> Result<()> {
+        // Nothing to do — avoid resolving the path for an empty request.
+        if attrs.mode.is_none()
+            && attrs.uid.is_none()
+            && attrs.gid.is_none()
+            && attrs.mtime.is_none()
+        {
+            return Ok(());
+        }
+        let (parent_id, name) = self.resolve_create_target(path)?;
+        let w = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: volume is read-only".into()))?;
+        let key = writer::OwnedKey {
+            parent_id,
+            name: name.clone(),
+        };
+        let body = w.catalog.get_mut(&key).ok_or_else(|| {
+            crate::Error::InvalidArgument(format!(
+                "hfs+: no such entry {:?} under CNID {parent_id}",
+                name.to_string_lossy()
+            ))
+        })?;
+        // Both FILE and FOLDER record bodies place the dates at offset
+        // 12 (createDate, contentModDate, …) and the 16-byte
+        // HFSPlusBSDInfo at offset 32: ownerID 32..36, groupID 36..40,
+        // adminFlags 40, ownerFlags 41, fileMode 42..44, special 44..48.
+        // A thread record has neither, so reject it.
+        const BSD_OFF: usize = 32;
+        const MODE_OFF: usize = BSD_OFF + 10; // 42..44
+        const UID_OFF: usize = BSD_OFF; // 32..36
+        const GID_OFF: usize = BSD_OFF + 4; // 36..40
+        const MTIME_OFF: usize = 16; // contentModDate 16..20
+        if body.len() < BSD_OFF + 16 {
+            return Err(crate::Error::InvalidImage(
+                "hfs+: catalog record too short for BSDInfo (thread record?)".into(),
+            ));
+        }
+        let rec_type = i16::from_be_bytes([body[0], body[1]]);
+        if rec_type != catalog::REC_FILE && rec_type != catalog::REC_FOLDER {
+            return Err(crate::Error::InvalidArgument(
+                "hfs+: set_attrs target is not a file or folder record".into(),
+            ));
+        }
+        if let Some(mode) = attrs.mode {
+            let old = u16::from_be_bytes([body[MODE_OFF], body[MODE_OFF + 1]]);
+            let new = (old & catalog::mode::S_IFMT) | (mode & 0o7777);
+            body[MODE_OFF..MODE_OFF + 2].copy_from_slice(&new.to_be_bytes());
+        }
+        if let Some(uid) = attrs.uid {
+            body[UID_OFF..UID_OFF + 4].copy_from_slice(&uid.to_be_bytes());
+        }
+        if let Some(gid) = attrs.gid {
+            body[GID_OFF..GID_OFF + 4].copy_from_slice(&gid.to_be_bytes());
+        }
+        if let Some(mtime) = attrs.mtime {
+            let hfs = unix_to_hfs_time(mtime);
+            // Update contentModDate, attributeModDate, and accessDate —
+            // the three dates `push_catalog_dates` keeps in lock-step —
+            // leaving createDate (12..16) and backupDate (28..32) alone.
+            body[MTIME_OFF..MTIME_OFF + 4].copy_from_slice(&hfs.to_be_bytes()); // contentModDate
+            body[20..24].copy_from_slice(&hfs.to_be_bytes()); // attributeModDate
+            body[24..28].copy_from_slice(&hfs.to_be_bytes()); // accessDate
+        }
+        Ok(())
+    }
+
     #[doc(hidden)]
     #[cfg(test)]
     pub fn test_writer(&self) -> Option<&writer::Writer> {
@@ -1533,6 +1617,18 @@ impl crate::fs::Filesystem for HfsPlus {
         self.list_path(dev, s)
     }
 
+    fn set_attrs(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        attrs: crate::fs::SetAttrs,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: non-UTF-8 path".into()))?;
+        self.set_attrs(dev, s, attrs)
+    }
+
     fn read_file<'a>(
         &'a mut self,
         dev: &'a mut dyn BlockDevice,
@@ -1870,6 +1966,68 @@ mod tests {
             matches!(rec, catalog::CatalogRecord::File(_)),
             "canonical path should resolve to the created file"
         );
+    }
+
+    /// `set_attrs(mode)` must persist the new permission bits while
+    /// preserving the on-disk `S_IFMT` type bits: format → reopen →
+    /// create a file → chmod 0o600 → flush → reopen → getattr reports
+    /// mode 0o600, kind still Regular, and the new uid/gid/mtime stick.
+    #[test]
+    fn set_attrs_mode_round_trips() {
+        use crate::fs::{EntryKind, Filesystem, SetAttrs};
+        use std::path::Path;
+
+        let mut dev = crate::block::MemoryBackend::new(8 * 1024 * 1024);
+        let opts = writer::FormatOpts::default();
+
+        // Format, flush, and reopen so set_attrs runs against a
+        // reconstructed (open_writable) writer model, not a fresh format.
+        let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+        hfs.flush(&mut dev).unwrap();
+        let mut hfs = HfsPlus::open(&mut dev).unwrap();
+
+        let data = b"chmod me\n".to_vec();
+        let mut src = std::io::Cursor::new(&data);
+        hfs.create_file(
+            &mut dev,
+            "/file",
+            &mut src,
+            data.len() as u64,
+            0o644,
+            7,
+            9,
+            0,
+        )
+        .unwrap();
+
+        // chmod 0o600 + chown 1000:1000 + set mtime through the trait API.
+        Filesystem::set_attrs(
+            &mut hfs,
+            &mut dev,
+            Path::new("/file"),
+            SetAttrs {
+                mode: Some(0o600),
+                uid: Some(1000),
+                gid: Some(1000),
+                mtime: Some(1_700_000_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        hfs.flush(&mut dev).unwrap();
+
+        // Reopen and confirm the new metadata survived the serialise round-trip.
+        let mut hfs = HfsPlus::open(&mut dev).unwrap();
+        let attrs = Filesystem::getattr(&mut hfs, &mut dev, Path::new("/file")).unwrap();
+        assert_eq!(attrs.mode, 0o600, "permission bits should be chmod'd");
+        assert_eq!(
+            attrs.kind,
+            EntryKind::Regular,
+            "S_IFMT type bits must be preserved"
+        );
+        assert_eq!(attrs.uid, 1000);
+        assert_eq!(attrs.gid, 1000);
+        assert_eq!(attrs.mtime, 1_700_000_000);
     }
 
     /// A file with an empty resource fork must not be reported as having one:
@@ -2554,6 +2712,94 @@ mod tests {
         assert!(
             out.status.success(),
             "fsck.hfsplus failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    /// A `set_attrs` chmod must leave the on-disk image structurally
+    /// clean: format → create file → chmod 0o600 + chown + mtime →
+    /// flush → run `fsck.hfsplus -fn`, which must exit 0. Silently
+    /// skipped when the binary isn't on PATH. (`fsck` exit 8 is the
+    /// "errors found" code we must never produce.)
+    #[test]
+    fn set_attrs_chmod_passes_fsck_hfsplus() {
+        use crate::fs::{Filesystem, SetAttrs};
+        use std::process::Command;
+
+        let fsck = match Command::new("sh")
+            .arg("-c")
+            .arg("command -v fsck.hfsplus")
+            .output()
+        {
+            Ok(o) if o.status.success() && !o.stdout.is_empty() => {
+                String::from_utf8_lossy(&o.stdout).trim().to_string()
+            }
+            _ => return, // not installed; skip
+        };
+
+        let tmp = tempfile::NamedTempFile::new().expect("tmp");
+        let path = tmp.path().to_path_buf();
+        let total: u64 = 8 * 1024 * 1024;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        f.set_len(total).unwrap();
+        drop(f);
+
+        let mut dev = crate::block::FileBackend::open(&path).unwrap();
+        let opts = writer::FormatOpts {
+            volume_name: "chmodVol".into(),
+            ..writer::FormatOpts::default()
+        };
+        let payload: Vec<u8> = (0..4096).map(|i| (i & 0xFF) as u8).collect();
+        {
+            let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+            let mut src = std::io::Cursor::new(&payload);
+            hfs.create_file(
+                &mut dev,
+                "/chmod.bin",
+                &mut src,
+                payload.len() as u64,
+                0o644,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+            hfs.flush(&mut dev).unwrap();
+        }
+        {
+            let mut hfs = HfsPlus::open(&mut dev).unwrap();
+            Filesystem::set_attrs(
+                &mut hfs,
+                &mut dev,
+                std::path::Path::new("/chmod.bin"),
+                SetAttrs {
+                    mode: Some(0o600),
+                    uid: Some(501),
+                    gid: Some(20),
+                    mtime: Some(1_700_000_000),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            hfs.flush(&mut dev).unwrap();
+        }
+        crate::block::BlockDevice::sync(&mut dev).unwrap();
+        drop(dev);
+
+        let out = Command::new(&fsck)
+            .arg("-fn")
+            .arg(&path)
+            .output()
+            .expect("run fsck.hfsplus");
+        assert!(
+            out.status.success(),
+            "fsck.hfsplus reported errors after chmod (exit {:?}):\nstdout:\n{}\nstderr:\n{}",
+            out.status.code(),
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
         );
