@@ -1908,6 +1908,148 @@ impl crate::fs::Filesystem for Ntfs {
         })
     }
 
+    /// Apply a cross-filesystem `chmod` / `utimes` to an NTFS object.
+    ///
+    /// NTFS has no POSIX mode. The only mode bit it can represent is the
+    /// owner-write bit, which maps onto `$STANDARD_INFORMATION`'s
+    /// `FILE_ATTRIBUTE_READONLY` (0x01) — the same bit [`getattr`] reads
+    /// back to synthesise `0o444` vs `0o644`. So:
+    ///
+    /// * `mode & 0o200 == 0` (owner has no write) → set READONLY.
+    /// * otherwise                                → clear READONLY.
+    ///
+    /// `atime` / `mtime` / `ctime` are written into the matching $SI
+    /// FILETIME fields when supplied. `uid` / `gid` carry no NTFS meaning
+    /// and are silently ignored (never an error).
+    ///
+    /// The whole MFT record is rewritten through the LFS journal via
+    /// [`rw::commit_txn`], the same redo/undo machinery the file-handle
+    /// `flush_record` path uses, so a subsequent reopen sees the change
+    /// and `ntfsfix` stays happy.
+    fn set_attrs(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        attrs: crate::fs::SetAttrs,
+    ) -> Result<()> {
+        // uid/gid have no per-file NTFS representation — accept and ignore.
+        // Nothing to do at all if the caller asked for none of the fields
+        // we can honour.
+        if attrs.mode.is_none()
+            && attrs.atime.is_none()
+            && attrs.mtime.is_none()
+            && attrs.ctime.is_none()
+        {
+            return Ok(());
+        }
+
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ntfs: non-UTF-8 path".into()))?;
+
+        // A freshly `open`ed image has `writer: None`; reconstruct it so
+        // reopened (already-formatted) volumes accept the edit. Also make
+        // sure we're not sitting on a foreign / dirty journal.
+        self.ensure_writer(dev)?;
+        Self::ensure_clean_log(self, dev)?;
+
+        let rec_no = self.lookup_path(dev, s)?;
+
+        let (rec_size, sector_size) = {
+            let w = self
+                .writer
+                .as_ref()
+                .ok_or_else(|| crate::Error::Unsupported("ntfs: writer not initialised".into()))?;
+            (
+                w.layout.mft_record_size as usize,
+                w.layout.bytes_per_sector as usize,
+            )
+        };
+        let mft_off = self
+            .writer
+            .as_ref()
+            .expect("writer present")
+            .mft_offset(rec_no)?;
+
+        // Read the raw (fixup-installed) record so we have exact undo
+        // bytes, then a fixed-up logical copy to patch.
+        let mut raw = vec![0u8; rec_size];
+        dev.read_at(mft_off, &mut raw)?;
+        let mut rec = raw.clone();
+        mft::apply_fixup(&mut rec, sector_size)?;
+        let hdr = mft::RecordHeader::parse(&rec)?;
+
+        // Locate the resident $STANDARD_INFORMATION value within the record.
+        let mut si_val_off: Option<usize> = None;
+        for attr_res in AttributeIter::new(&rec, hdr.first_attribute_offset as usize) {
+            let attr = attr_res?;
+            if attr.type_code == TYPE_STANDARD_INFORMATION
+                && let AttributeKind::Resident { .. } = attr.kind
+            {
+                // Resident header: value_offset is a u16 at attr+0x14.
+                let value_off = u16::from_le_bytes(
+                    rec[attr.offset + 0x14..attr.offset + 0x16]
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+                si_val_off = Some(attr.offset + value_off);
+                break;
+            }
+        }
+        let si_off = si_val_off.ok_or_else(|| {
+            crate::Error::InvalidImage(format!(
+                "ntfs: record {rec_no} has no resident $STANDARD_INFORMATION"
+            ))
+        })?;
+
+        // $STANDARD_INFORMATION value layout (offsets from si_off):
+        //   0x00 created  0x08 modified  0x10 mft_changed  0x18 accessed
+        //   0x20 file_attributes (u32 LE)
+        if let Some(mode) = attrs.mode {
+            let fa_off = si_off + 0x20;
+            let mut fa = u32::from_le_bytes(rec[fa_off..fa_off + 4].try_into().unwrap());
+            if mode & 0o200 == 0 {
+                fa |= 0x1; // FILE_ATTRIBUTE_READONLY
+            } else {
+                fa &= !0x1;
+            }
+            rec[fa_off..fa_off + 4].copy_from_slice(&fa.to_le_bytes());
+        }
+
+        // Timestamps: unix → FILETIME into the matching $SI fields.
+        let mut put_time = |off: usize, secs: u32| {
+            let ft = format::unix_to_filetime(secs);
+            rec[si_off + off..si_off + off + 8].copy_from_slice(&ft.to_le_bytes());
+        };
+        if let Some(t) = attrs.mtime {
+            put_time(0x08, t);
+        }
+        if let Some(t) = attrs.ctime {
+            put_time(0x10, t);
+        }
+        if let Some(t) = attrs.atime {
+            put_time(0x18, t);
+        }
+
+        // Re-install the update sequence array (bump the USN so a reopen's
+        // apply_fixup accepts the rewritten record) and journal the whole
+        // record as one redo/undo pair.
+        let usa_off = u16::from_le_bytes([rec[4], rec[5]]) as usize;
+        let usn = u16::from_le_bytes([raw[usa_off], raw[usa_off + 1]]).wrapping_add(1);
+        mft::install_fixup(&mut rec, sector_size, usn);
+
+        let entry = logfile::RedoEntry {
+            target_offset: mft_off,
+            redo_bytes: rec,
+            undo_bytes: raw,
+        };
+        rw::commit_txn(self, dev, &[entry])?;
+
+        // Push volume-level state so a reopen sees the rewritten record.
+        self.flush(dev)?;
+        Ok(())
+    }
+
     /// Surface NTFS's native metadata (DOS attributes, object id, reparse
     /// data, alternate data streams, security descriptor, short name, raw
     /// timestamps) as `user.ntfs.*` / `system.ntfs_security` xattrs so it

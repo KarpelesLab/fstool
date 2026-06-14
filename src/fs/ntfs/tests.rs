@@ -1755,3 +1755,82 @@ fn dir_batch_eviction_round_trip() {
         }
     }
 }
+
+/// Cross-filesystem `chmod` over NTFS: `set_attrs` maps the owner-write
+/// bit onto `$STANDARD_INFORMATION`'s READONLY flag, and the change
+/// round-trips through a reopen (getattr re-derives the mode from that
+/// same flag). Also exercises the timestamp path.
+#[test]
+fn set_attrs_chmod_roundtrips_readonly_bit() {
+    use crate::fs::{Filesystem, SetAttrs};
+    use std::path::Path;
+
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    ntfs.create_file(
+        &mut dev,
+        "/perm.txt",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"hi\n".to_vec())),
+            len: 3,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+
+    // Freshly created regular file is writable → 0o644.
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    assert_eq!(
+        ntfs.getattr(&mut dev, Path::new("/perm.txt")).unwrap().mode,
+        0o644
+    );
+
+    // chmod 0o444: owner loses write → READONLY set.
+    ntfs.set_attrs(
+        &mut dev,
+        Path::new("/perm.txt"),
+        SetAttrs {
+            mode: Some(0o444),
+            uid: Some(1000), // uid/gid must be ignored, not error.
+            gid: Some(1000),
+            atime: None,
+            mtime: Some(1_700_000_000),
+            ctime: None,
+        },
+    )
+    .unwrap();
+
+    // Reopen from disk and confirm the bit persisted.
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    let a = ntfs.getattr(&mut dev, Path::new("/perm.txt")).unwrap();
+    assert_eq!(a.mode, 0o444, "READONLY should be set after chmod 0444");
+    assert_eq!(a.mtime, 1_700_000_000, "mtime should round-trip");
+
+    // chmod 0o644: owner regains write → READONLY cleared.
+    ntfs.set_attrs(
+        &mut dev,
+        Path::new("/perm.txt"),
+        SetAttrs {
+            mode: Some(0o644),
+            uid: None,
+            gid: None,
+            atime: None,
+            mtime: None,
+            ctime: None,
+        },
+    )
+    .unwrap();
+
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    assert_eq!(
+        ntfs.getattr(&mut dev, Path::new("/perm.txt")).unwrap().mode,
+        0o644,
+        "READONLY should be cleared after chmod 0644"
+    );
+
+    // The file's data must still be intact after the metadata rewrites.
+    let mut r = ntfs.open_file_reader(&mut dev, "/perm.txt").unwrap();
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"hi\n");
+}

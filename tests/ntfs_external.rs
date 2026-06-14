@@ -946,3 +946,143 @@ fn large_directory_scales_and_mounts_clean() {
 // The image produced by `build_image_with_tree` above should yield
 // hello.txt, sub/, link → hello.txt at the mount point.
 // ---------------------------------------------------------------------
+
+/// Cross-filesystem `chmod` over NTFS via [`Filesystem::set_attrs`]:
+/// the owner-write bit maps onto `$STANDARD_INFORMATION`'s READONLY DOS
+/// attribute. This test rewrites the bit on a reopened image, confirms
+/// the change round-trips through `getattr`, and validates that:
+///
+/// * `ntfsfix --no-action` still reports a clean mount afterwards, and
+/// * (best-effort, when ntfs-3g can read the file) `ntfsinfo -F` shows
+///   the READONLY flag toggling on then off.
+#[test]
+fn set_attrs_chmod_readonly_validates_with_ntfs3g() {
+    use fstool::fs::{Filesystem, SetAttrs};
+    use std::path::Path;
+
+    let Some(_) = which("ntfsfix") else {
+        eprintln!("skipping: ntfsfix not installed");
+        return;
+    };
+
+    let img = build_image_with_tree(16 * 1024 * 1024);
+
+    // chmod 0o444 on /hello.txt: owner loses write → READONLY set.
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut ntfs = Ntfs::open(&mut dev).unwrap();
+        ntfs.set_attrs(
+            &mut dev,
+            Path::new("/hello.txt"),
+            SetAttrs {
+                mode: Some(0o444),
+                uid: None,
+                gid: None,
+                atime: None,
+                mtime: None,
+                ctime: None,
+            },
+        )
+        .unwrap();
+        dev.sync().unwrap();
+    }
+
+    // Reopen and confirm getattr re-derives 0o444 from the READONLY bit.
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut ntfs = Ntfs::open(&mut dev).unwrap();
+        assert_eq!(
+            ntfs.getattr(&mut dev, Path::new("/hello.txt"))
+                .unwrap()
+                .mode,
+            0o444,
+            "READONLY should be set after chmod 0444"
+        );
+    }
+
+    // ntfsfix must stay clean after the metadata rewrite.
+    let out = Command::new("ntfsfix")
+        .arg("--no-action")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("Mounting volume... OK"),
+        "ntfsfix not clean after chmod 0444:\n{combined}"
+    );
+
+    // Best-effort ntfs-3g cross-check: ntfsinfo -F should list READONLY.
+    if which("ntfsinfo").is_some() {
+        let out = Command::new("ntfsinfo")
+            .arg("-F")
+            .arg("/hello.txt")
+            .arg(img.path())
+            .output()
+            .unwrap();
+        let info = String::from_utf8_lossy(&out.stdout).to_uppercase();
+        if out.status.success() && info.contains("FILE ATTRIBUTES") {
+            // ntfsinfo prints the parsed DOS attribute flags, e.g.
+            // "File attributes: READONLY ARCHIVE (0x00000021)".
+            let line = info
+                .lines()
+                .find(|l| l.contains("FILE ATTRIBUTES"))
+                .unwrap_or("");
+            assert!(
+                line.contains("READONLY"),
+                "ntfsinfo -F did not show READONLY after chmod 0444:\n{info}"
+            );
+        }
+    }
+
+    // chmod 0o644: owner regains write → READONLY cleared.
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut ntfs = Ntfs::open(&mut dev).unwrap();
+        ntfs.set_attrs(
+            &mut dev,
+            Path::new("/hello.txt"),
+            SetAttrs {
+                mode: Some(0o644),
+                uid: None,
+                gid: None,
+                atime: None,
+                mtime: None,
+                ctime: None,
+            },
+        )
+        .unwrap();
+        dev.sync().unwrap();
+    }
+
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut ntfs = Ntfs::open(&mut dev).unwrap();
+        assert_eq!(
+            ntfs.getattr(&mut dev, Path::new("/hello.txt"))
+                .unwrap()
+                .mode,
+            0o644,
+            "READONLY should be cleared after chmod 0644"
+        );
+    }
+
+    let out = Command::new("ntfsfix")
+        .arg("--no-action")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("Mounting volume... OK"),
+        "ntfsfix not clean after chmod 0644:\n{combined}"
+    );
+}

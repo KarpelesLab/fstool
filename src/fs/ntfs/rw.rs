@@ -662,20 +662,34 @@ impl<'a> NtfsFileHandle<'a> {
     /// `ensure_clean_log` sees the dirty marker, walks the RCRD pages,
     /// re-applies the redo bytes, and re-stamps clean.
     fn commit_txn(&mut self, entries: &[super::logfile::RedoEntry]) -> Result<()> {
+        commit_txn(self.fs, self.dev, entries)
+    }
+}
+
+/// Journal `entries` (each a redo/undo record write) and apply them
+/// in place, following the same restart-page protocol as
+/// [`NtfsFileHandle::commit_txn`]. Factored out so non-handle mutations
+/// (e.g. [`super::Ntfs::set_attrs`]) can reuse the journal machinery.
+pub(super) fn commit_txn(
+    fs: &mut super::Ntfs,
+    dev: &mut dyn BlockDevice,
+    entries: &[super::logfile::RedoEntry],
+) -> Result<()> {
+    {
         if entries.is_empty() {
             return Ok(());
         }
-        let (logfile_offset, log_size) = locate_logfile(self.fs, self.dev)?;
+        let (logfile_offset, log_size) = locate_logfile(fs, dev)?;
         if log_size < 4 * super::logfile::LOG_PAGE_SIZE as u64 {
             // Tiny log — fall back to direct writes (no journal).
             for e in entries {
-                self.dev.write_at(e.target_offset, &e.redo_bytes)?;
+                dev.write_at(e.target_offset, &e.redo_bytes)?;
             }
             return Ok(());
         }
 
         // Pick a starting LSN past the existing current_lsn.
-        let prev_view = super::logfile::read_current_restart(self.dev, logfile_offset)?;
+        let prev_view = super::logfile::read_current_restart(dev, logfile_offset)?;
         let prev_lsn = prev_view.map(|(v, _)| v.current_lsn).unwrap_or(0);
         let mut next_lsn = prev_lsn + 1;
 
@@ -700,7 +714,7 @@ impl<'a> NtfsFileHandle<'a> {
             if chunk_end == chunk_start + 1 {
                 // Even one record doesn't fit — bail to direct writes.
                 for e in entries {
-                    self.dev.write_at(e.target_offset, &e.redo_bytes)?;
+                    dev.write_at(e.target_offset, &e.redo_bytes)?;
                 }
                 return Ok(());
             }
@@ -709,7 +723,7 @@ impl<'a> NtfsFileHandle<'a> {
                 super::logfile::build_record_page(&entries[chunk_start..chunk_end], next_lsn)?;
             let off = rcrd_region_start
                 + (page_idx * super::logfile::LOG_PAGE_SIZE as u64) % rcrd_region_size;
-            self.dev.write_at(off, &page)?;
+            dev.write_at(off, &page)?;
             last_lsn = ll;
             next_lsn = ll + 1;
             page_idx += 1;
@@ -718,27 +732,29 @@ impl<'a> NtfsFileHandle<'a> {
 
         // Stamp restart pages: dirty, current_lsn = last_lsn.
         let dirty_page = super::logfile::build_restart_page(last_lsn, log_size, false);
-        self.dev.write_at(logfile_offset, &dirty_page)?;
-        self.dev.write_at(
+        dev.write_at(logfile_offset, &dirty_page)?;
+        dev.write_at(
             logfile_offset + super::logfile::LOG_PAGE_SIZE as u64,
             &dirty_page,
         )?;
 
         // Apply in-place writes.
         for e in entries {
-            self.dev.write_at(e.target_offset, &e.redo_bytes)?;
+            dev.write_at(e.target_offset, &e.redo_bytes)?;
         }
 
         // Stamp restart pages: clean.
         let clean_page = super::logfile::build_restart_page(last_lsn, log_size, true);
-        self.dev.write_at(logfile_offset, &clean_page)?;
-        self.dev.write_at(
+        dev.write_at(logfile_offset, &clean_page)?;
+        dev.write_at(
             logfile_offset + super::logfile::LOG_PAGE_SIZE as u64,
             &clean_page,
         )?;
         Ok(())
     }
+}
 
+impl<'a> NtfsFileHandle<'a> {
     /// Read the `flags` u16 from the current on-disk MFT record. Falls
     /// back to `FLAG_IN_USE` when the record can't be parsed.
     fn read_existing_flags(&mut self) -> Result<u16> {
@@ -1122,7 +1138,7 @@ impl super::Ntfs {
     /// 3. **All-zero log.** Legacy / unformatted log. Treated as clean.
     ///
     /// Any other shape (foreign journal, torn write) → refuse.
-    fn ensure_clean_log(fs: &mut super::Ntfs, dev: &mut dyn BlockDevice) -> Result<()> {
+    pub(super) fn ensure_clean_log(fs: &mut super::Ntfs, dev: &mut dyn BlockDevice) -> Result<()> {
         let (logfile_offset, log_size) = locate_logfile(fs, dev)?;
         if log_size == 0 {
             return Ok(());
