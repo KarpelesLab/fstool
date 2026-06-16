@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.18](https://github.com/KarpelesLab/fstool/compare/v0.4.17...v0.4.18) - 2026-06-16
+
+### Added
+
+- *(hfs+)* set_attrs for cross-filesystem chmod/chown
+- *(xfs)* implement set_attrs for cross-filesystem chmod/chown/utimes
+- *(exfat)* set_attrs for cross-fs chmod via the READ-ONLY bit
+- *(fat)* implement set_attrs so cross-fs chmod works on FAT32
+- *(ntfs)* implement set_attrs so cross-fs chmod works on NTFS
+- *(shell)* add `chmod MODE PATH` + AnyFs::set_attrs wrapper
+- *(shell)* quote-aware argument parsing; preserve host timestamps on put
+
+### Fixed
+
+- *(ext)* scan all directory blocks when unlinking an entry ([#29](https://github.com/KarpelesLab/fstool/pull/29))
+- *(hfs+)* preserve mtime on symlinks and device nodes
+- *(hfs+)* store per-file modification times in catalog records
+- *(fat)* store and surface file modification times
+- *(exfat)* surface on-disk timestamps in getattr
+
+### Other
+
+- *(cli)* cross-backend chmod end-to-end; fix ntfs set_attrs doc links
+- *(ntfs)* pin Everyone-access security descriptor on the put path
+
 ## [0.4.17](https://github.com/KarpelesLab/fstool/compare/v0.4.16...v0.4.17) - 2026-06-12
 
 ### Fixed
