@@ -3322,49 +3322,64 @@ impl Ext {
             .find(|(i, _)| *i == dir_inode)
             .map(|(_, i)| *i)
             .unwrap();
-        let dir_block_num = self.file_block(dev, &inode_copy, 0)?;
-        self.ensure_block_staged(dev, dir_block_num)?;
-        if !self.dir_blocks.iter().any(|(b, _)| *b == dir_block_num) {
-            self.track_dir_block(dir_block_num, dir_inode);
-        }
+        let bs = self.layout.block_size;
         let with_filetype = self.has_filetype();
-        let usable = dir::usable_dir_len(self.layout.block_size, self.has_metadata_csum());
-        let block = self
-            .data_blocks
-            .iter_mut()
-            .find(|(b, _)| *b == dir_block_num)
-            .map(|(_, bytes)| bytes)
-            .unwrap();
+        let usable = dir::usable_dir_len(bs, self.has_metadata_csum());
+        // Scan EVERY directory block, not just the first. A directory with
+        // more than ~one block of names keeps entries in later blocks
+        // (`create_file` appends there), so the target can live in any block;
+        // looking only at block 0 made `rename`/`remove` fail for entries
+        // past the first ~4 KiB. Clamp the block count to the device size so a
+        // forged `i_size` can't drive a huge scan (same guard as `list_inode`).
+        let device_blocks = self.sb.blocks_count as u64;
+        let n_blocks = (inode_copy.size.div_ceil(bs) as u64).min(device_blocks) as u32;
+        for blk_idx in 0..n_blocks {
+            let dir_block_num = self.file_block(dev, &inode_copy, blk_idx)?;
+            if dir_block_num == 0 {
+                continue; // sparse hole
+            }
+            self.ensure_block_staged(dev, dir_block_num)?;
+            if !self.dir_blocks.iter().any(|(b, _)| *b == dir_block_num) {
+                self.track_dir_block(dir_block_num, dir_inode);
+            }
+            let block = self
+                .data_blocks
+                .iter_mut()
+                .find(|(b, _)| *b == dir_block_num)
+                .map(|(_, bytes)| bytes)
+                .unwrap();
 
-        let mut off = 0usize;
-        let mut prev_off: Option<usize> = None;
-        loop {
-            let entry = dir::decode_entry(&block[off..], with_filetype).ok_or_else(|| {
-                crate::Error::InvalidImage("corrupt dir entry while unlinking".into())
-            })?;
-            let rec_len = entry.rec_len;
-            if entry.inode != 0 && entry.name == name {
-                match prev_off {
-                    Some(p) => {
-                        // Absorb this entry's rec_len into the previous one.
-                        let prev = dir::decode_entry(&block[p..], with_filetype)
-                            .expect("prev entry decodes");
-                        let merged = (prev.rec_len + rec_len) as u16;
-                        block[p + 4..p + 6].copy_from_slice(&merged.to_le_bytes());
+            let mut off = 0usize;
+            let mut prev_off: Option<usize> = None;
+            loop {
+                let entry = dir::decode_entry(&block[off..], with_filetype).ok_or_else(|| {
+                    crate::Error::InvalidImage("corrupt dir entry while unlinking".into())
+                })?;
+                let rec_len = entry.rec_len;
+                if entry.inode != 0 && entry.name == name {
+                    match prev_off {
+                        Some(p) => {
+                            // Absorb this entry's rec_len into the previous one.
+                            let prev = dir::decode_entry(&block[p..], with_filetype)
+                                .expect("prev entry decodes");
+                            let merged = (prev.rec_len + rec_len) as u16;
+                            block[p + 4..p + 6].copy_from_slice(&merged.to_le_bytes());
+                        }
+                        None => {
+                            // First entry of this block: just void the inode,
+                            // leaving a free slot spanning its rec_len.
+                            block[off..off + 4].fill(0);
+                        }
                     }
-                    None => {
-                        // First entry (normally "."): just void the inode.
-                        block[off..off + 4].fill(0);
-                    }
+                    return Ok(());
                 }
-                return Ok(());
+                let next = off + rec_len;
+                if next >= usable {
+                    break;
+                }
+                prev_off = Some(off);
+                off = next;
             }
-            let next = off + rec_len;
-            if next >= usable {
-                break;
-            }
-            prev_off = Some(off);
-            off = next;
         }
         Err(crate::Error::InvalidArgument(format!(
             "ext: entry {name:?} not found in directory"
