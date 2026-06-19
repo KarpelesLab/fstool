@@ -2,9 +2,10 @@
 name = "fstool"
 version = "0.4.18"
 edition = "2024"
-# Bumped from 1.85 by the `purecrypto` dependency (encrypted-DMG crypto),
-# whose own MSRV is 1.95.
-rust-version = "1.95"
+# Floor is the edition-2024 minimum (1.85) bumped to 1.88 by the
+# `purecrypto` dependency (encrypted-DMG crypto), whose MSRV is 1.88 as of
+# 0.6.14.
+rust-version = "1.88"
 description = "Build disk images and filesystems (ext2/3/4, MBR, GPT) from a directory tree and TOML spec, in the spirit of genext2fs."
 license = "MIT"
 repository = "https://github.com/KarpelesLab/fstool"
@@ -134,7 +135,7 @@ rustyline = { version = "15", optional = true }
 # toolkit (KarpelesLab, MIT). Opt-in via the `dmg-encrypted` feature; we
 # pull only the symmetric/hash/kdf modules (`kdf` re-enables `hash` +
 # `cipher`), not its TLS/PQC/RSA surface.
-purecrypto = { version = "0.4", optional = true, default-features = false, features = ["std", "cipher", "hash", "kdf"] }
+purecrypto = { version = "0.6.14", optional = true, default-features = false, features = ["std", "cipher", "hash", "kdf"] }
 
 # FUSE adapter — Linux uses libfuse, macOS uses macFUSE. Off by default
 # (see the `fuse` feature). `fuser` is the maintained successor to
