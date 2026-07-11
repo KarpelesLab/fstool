@@ -1,0 +1,37 @@
+# WebAssembly bindings for fstool — powers the browser UI (web/).
+# Standalone crate (its own [workspace]) so it never perturbs the root
+# `fstool` package or its crates.io publishing.
+[package]
+name = "fstool-wasm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "WebAssembly bindings exposing fstool's in-memory inspect/convert API to JavaScript."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# All codec features, but NOT `readline`/`fuse` (neither builds for wasm).
+# The `js` uuid randomness backend is wired in by fstool's own
+# `cfg(target_arch = "wasm32")` dependency table.
+fstool = { path = "../..", default-features = false, features = [
+    "gzip", "xz", "lzma", "lz4", "zstd", "lzo",
+    "cab", "amiga-lzx", "lha", "arc", "sit", "sevenz", "rar",
+    "dmg-bzip2", "dmg-lzfse", "dmg-encrypted",
+] }
+# Pinned to the wasm-bindgen CLI version used by CI / local dev; the crate
+# and the CLI that post-processes the .wasm must match exactly.
+wasm-bindgen = "=0.2.121"
+console_error_panic_hook = "0.1"
+serde_json = "1"
+
+[profile.release]
+# Smaller wasm: optimise for size and strip debug info.
+opt-level = "s"
+lto = true
+strip = true
+
+[workspace]

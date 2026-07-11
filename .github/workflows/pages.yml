@@ -1,0 +1,75 @@
+name: Deploy web UI to GitHub Pages
+
+# Builds the fstool WebAssembly bundle and publishes the static web/ site.
+# Everything the site does runs client-side in the visitor's browser.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "src/**"
+      - "crates/fstool-wasm/**"
+      - "web/**"
+      - "Cargo.toml"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment; cancel superseded runs.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (with wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/fstool-wasm
+
+      # Pinned to the wasm-bindgen crate version in crates/fstool-wasm/Cargo.toml.
+      - name: Install wasm-bindgen-cli
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.121
+
+      - name: Build wasm
+        working-directory: crates/fstool-wasm
+        run: cargo build --release --target wasm32-unknown-unknown
+
+      - name: Generate JS bindings
+        run: |
+          wasm-bindgen \
+            --target web \
+            --out-dir web/pkg \
+            --no-typescript \
+            crates/fstool-wasm/target/wasm32-unknown-unknown/release/fstool_wasm.wasm
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

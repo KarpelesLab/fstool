@@ -23,6 +23,30 @@ fstool repack out.img out.tar                    # convert ext4 → tar (and bac
 fstool repack base.tar patch.tar flat.tar        # OCI-style layer merge with .wh.* whiteouts
 ```
 
+## Web UI (runs in your browser)
+
+fstool also ships as a static, client-side web app: upload any archive or disk
+image, browse what's inside, extract individual files, and convert the whole
+thing to another format — **entirely in the browser**, with nothing uploaded.
+It's fstool compiled to WebAssembly, driving the same readers/writers as the
+CLI over an in-memory block device.
+
+- Site: `web/` (deployed to GitHub Pages by `.github/workflows/pages.yml`).
+- Bindings: `crates/fstool-wasm` (a `wasm-bindgen` wrapper).
+- Library surface: [`fstool::memconv`](src/memconv.rs) — a byte-in / byte-out
+  API (`probe(&[u8])`, `MemImage::open(Vec<u8>)`, `.list()`, `.read_file()`,
+  `.convert(target) -> Vec<u8>`) built on the first-class in-memory
+  [`MemoryBackend`](src/block/memory.rs). Use it from any host program to
+  inspect or transcode an image without ever touching the filesystem:
+
+  ```rust
+  let mut img = fstool::memconv::MemImage::open(std::fs::read("in.tar.gz")?)?;
+  let ext4 = img.convert("ext4")?;         // repack to an ext4 image, in RAM
+  std::fs::write("out.img", ext4)?;
+  ```
+
+See [web/README.md](web/README.md) for the build and local-dev steps.
+
 ## Filesystem support
 
 | Filesystem | Read | Write | In-place edits | Notes                                                                                                              |

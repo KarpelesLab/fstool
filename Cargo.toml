@@ -158,3 +158,7 @@ env_logger = "0.11"
 # production `compcol` LZFSE decoder must round-trip (compcol's LZFSE is
 # decode-only). Not linked into the shipped binary.
 lzfse_rust = "0.2"
+
+# wasm32 needs a browser randomness source for uuid v4 generation.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { version = "1", features = ["v4", "js"] }

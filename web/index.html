@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>fstool — inspect &amp; convert disk images in your browser</title>
+  <meta name="description" content="Inspect any archive or disk image and convert it to another filesystem format — entirely in your browser. Files never leave your machine." />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>💾</text></svg>" />
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">💾</span>
+      <span class="name">fstool</span>
+      <span class="tag">web</span>
+    </div>
+    <nav class="links">
+      <a href="https://github.com/KarpelesLab/fstool" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://crates.io/crates/fstool" target="_blank" rel="noopener">crates.io</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <h1>Inspect &amp; convert disk images and archives</h1>
+      <p class="sub">
+        Drop in a <code>tar</code>, <code>zip</code>, <code>ext4</code>, <code>qcow2</code>,
+        <code>squashfs</code>, <code>iso</code>, DMG, and more — browse what's inside, pull out
+        individual files, and convert the whole thing to another format.
+        Everything runs <strong>in your browser</strong>; nothing is uploaded.
+      </p>
+    </section>
+
+    <section id="drop" class="dropzone" tabindex="0" aria-label="Upload a file">
+      <input id="file" type="file" hidden />
+      <div class="drop-inner">
+        <div class="drop-icon">⬆</div>
+        <div class="drop-text">
+          <strong>Drop a file here</strong> or <button id="pick" class="link-btn" type="button">browse</button>
+        </div>
+        <div class="drop-hint">archives &amp; disk images · processed locally</div>
+      </div>
+    </section>
+
+    <section id="status" class="status" hidden>
+      <span class="spinner" aria-hidden="true"></span>
+      <span id="status-text">Working…</span>
+    </section>
+
+    <section id="error" class="error" hidden></section>
+
+    <section id="workspace" class="workspace" hidden>
+      <div class="panel meta-panel">
+        <div class="file-line">
+          <span id="file-name" class="file-name"></span>
+          <span id="file-size" class="file-size"></span>
+          <button id="reset" class="ghost-btn" type="button">Clear</button>
+        </div>
+        <div id="badges" class="badges"></div>
+        <div id="partition-picker" class="partition-picker" hidden>
+          <label for="partition-select">Partition</label>
+          <select id="partition-select"></select>
+          <button id="open-partition" class="ghost-btn" type="button">Open</button>
+        </div>
+      </div>
+
+      <div class="columns">
+        <div class="panel tree-panel">
+          <div class="panel-head">
+            <span>Contents</span>
+            <span id="fs-kind" class="pill"></span>
+          </div>
+          <div id="tree" class="tree" role="tree"></div>
+        </div>
+
+        <div class="panel convert-panel">
+          <div class="panel-head"><span>Convert</span></div>
+          <p class="convert-hint">Repack the whole image into another format and download the result.</p>
+          <div class="convert-controls">
+            <select id="target" aria-label="Target format"></select>
+            <button id="convert" class="primary-btn" type="button">Convert &amp; download</button>
+          </div>
+          <div id="convert-note" class="convert-note"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span>fstool runs as WebAssembly. Your files stay on this device.</span>
+  </footer>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

@@ -18,10 +18,13 @@
 //!
 //! ## Streaming guarantee
 //!
-//! The whole point of this trait is to support multi-gigabyte images without
-//! buffering them in RAM. Backends MUST NOT pull the full device into memory.
-//! [`MemoryBackend`] is the only intentionally in-RAM backend and exists for
-//! tests; it carries a soft cap to prevent accidental use on huge images.
+//! File-backed backends MUST NOT pull the full device into memory; that is
+//! what lets fstool handle multi-gigabyte images. [`MemoryBackend`] is the
+//! deliberate exception — a first-class in-RAM backend used wherever there is
+//! no host filesystem (most importantly the WebAssembly build, where an
+//! uploaded file is inspected and converted entirely in memory; see
+//! [`crate::memconv`]). Its footprint is bounded by the caller's input size,
+//! so use it where that is acceptable and a file backend elsewhere.
 
 use std::io::{Read, Seek, Write};
 

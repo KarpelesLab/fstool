@@ -22,6 +22,7 @@ pub mod fs;
 pub mod fuse_adapter;
 pub mod inspect;
 pub mod macroman;
+pub mod memconv;
 pub mod merge;
 pub mod part;
 pub mod path_style;
