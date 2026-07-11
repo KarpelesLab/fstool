@@ -20,6 +20,10 @@
 }
 
 * { box-sizing: border-box; }
+/* Author `display` rules (e.g. .status{display:flex}) override the UA
+   `[hidden]{display:none}` rule, so `hidden` alone wouldn't hide those
+   elements. Force it to win. */
+[hidden] { display: none !important; }
 html, body { margin: 0; }
 body {
   background: var(--bg);
