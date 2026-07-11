@@ -4,6 +4,8 @@
 [![Crates.io](https://img.shields.io/crates/v/fstool.svg)](https://crates.io/crates/fstool)
 [![docs.rs](https://docs.rs/fstool/badge.svg)](https://docs.rs/fstool)
 
+**Try it in your browser (no install): <https://karpeleslab.github.io/fstool/>**
+
 Build, inspect, modify, and repack disk images and filesystem images.
 In the spirit of `genext2fs`, but covering whole disks, multiple filesystems,
 and round-tripping between formats — all from a TOML spec or directly from
@@ -24,6 +26,8 @@ fstool repack base.tar patch.tar flat.tar        # OCI-style layer merge with .w
 ```
 
 ## Web UI (runs in your browser)
+
+**▶ Live demo: <https://karpeleslab.github.io/fstool/>**
 
 fstool also ships as a static, client-side web app: upload any archive or disk
 image, browse what's inside, extract individual files, and convert the whole
