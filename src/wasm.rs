@@ -5,21 +5,23 @@
 //! WebAssembly memory, and the result handed back as a `Uint8Array` for
 //! download. No file ever leaves the page.
 //!
-//! JavaScript surface (all JSON payloads are strings the caller `JSON.parse`s):
+//! Built as the `fstool` crate's `cdylib` for `wasm32-unknown-unknown` with
+//! `--features wasm`, then post-processed by `wasm-bindgen`. The generated ES
+//! module (`bundler` target) initialises the wasm on import, so JavaScript
+//! just imports and calls:
 //!
 //! ```js
-//! import init, { probe, supported_targets, Image } from './fstool_wasm.js';
-//! await init();
-//! const report = JSON.parse(probe(bytes));          // { compression, partition_table, filesystem, content_size }
-//! const img = new Image(bytes);                      // throws on unrecognised input
-//! const entries = JSON.parse(img.list('/'));         // [{ name, kind, size }, …]
-//! const fileBytes = img.read_file('/etc/hostname');  // Uint8Array
-//! const out = img.convert('tar.gz');                 // Uint8Array
+//! import { probe, supported_targets, Image } from './wasm/fstool.js';
+//! const report = JSON.parse(probe(bytes));           // { compression, partition_table, filesystem, content_size }
+//! const img = new Image(bytes);                       // throws on unrecognised input
+//! const entries = JSON.parse(img.list('/'));          // [{ name, kind, size }, …]
+//! const fileBytes = img.readFile('/etc/hostname');    // Uint8Array
+//! const out = img.convert('tar.gz');                  // Uint8Array
 //! ```
 
 use wasm_bindgen::prelude::*;
 
-use fstool::memconv::{self, MemImage};
+use crate::memconv::{self, MemImage};
 
 /// Install a panic hook that surfaces Rust panics in the browser console.
 #[wasm_bindgen(start)]

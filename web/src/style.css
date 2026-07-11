@@ -20,10 +20,6 @@
 }
 
 * { box-sizing: border-box; }
-/* Author `display` rules (e.g. .status{display:flex}) override the UA
-   `[hidden]{display:none}` rule, so `hidden` alone wouldn't hide those
-   elements. Force it to win. */
-[hidden] { display: none !important; }
 html, body { margin: 0; }
 body {
   background: var(--bg);
@@ -34,6 +30,7 @@ body {
   display: flex;
   flex-direction: column;
 }
+#app { display: contents; }
 code { font-family: var(--mono); font-size: 0.9em; background: var(--panel-2); padding: 0.05em 0.35em; border-radius: 4px; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
@@ -67,7 +64,6 @@ main { flex: 1; width: 100%; max-width: 1000px; margin: 0 auto; padding: 1.5rem 
 .drop-icon { font-size: 2rem; color: var(--accent); }
 .drop-text { font-size: 1.05rem; margin-top: 0.4rem; }
 .drop-hint { color: var(--muted); font-size: 0.85rem; margin-top: 0.35rem; }
-.link-btn { background: none; border: none; color: var(--accent); cursor: pointer; font: inherit; padding: 0; text-decoration: underline; }
 
 .status {
   display: flex; align-items: center; gap: 0.7rem; justify-content: center;
@@ -96,7 +92,7 @@ main { flex: 1; width: 100%; max-width: 1000px; margin: 0 auto; padding: 1.5rem 
   padding: 0.25rem 0.7rem; border-radius: 7px; cursor: pointer; font: inherit; font-size: 0.85rem;
 }
 .ghost-btn:hover { border-color: var(--accent); color: var(--text); }
-.partition-picker .ghost-btn, .partition-picker { margin-left: 0; }
+.partition-picker > .ghost-btn { margin-left: 0; }
 
 .badges { display: flex; flex-wrap: wrap; gap: 0.45rem; margin-top: 0.7rem; }
 .badge {
@@ -121,6 +117,7 @@ main { flex: 1; width: 100%; max-width: 1000px; margin: 0 auto; padding: 1.5rem 
 }
 
 .tree { max-height: 60vh; overflow: auto; padding: 0.4rem 0.3rem; }
+.node { min-width: max-content; }
 .row {
   display: flex; align-items: center; gap: 0.5rem; padding: 0.28rem 0.5rem;
   border-radius: 7px; cursor: default; font-size: 0.92rem; white-space: nowrap;
@@ -130,7 +127,7 @@ main { flex: 1; width: 100%; max-width: 1000px; margin: 0 auto; padding: 1.5rem 
 .row .icon { width: 1.1rem; text-align: center; }
 .row .rname { font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; }
 .row .rsize { margin-left: auto; color: var(--muted); font-family: var(--mono); font-size: 0.78rem; padding-left: 0.8rem; }
-.row.dir > .rname { color: var(--text); }
+.row.dir { cursor: pointer; }
 .row.file { cursor: pointer; }
 .row.file:hover .rname { color: var(--accent); text-decoration: underline; }
 .row .dl { opacity: 0; color: var(--accent); font-size: 0.75rem; }

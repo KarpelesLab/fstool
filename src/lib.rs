@@ -29,5 +29,9 @@ pub mod path_style;
 pub mod repack;
 pub mod resfork;
 pub mod spec;
+/// WebAssembly bindings (browser UI). Only compiled for `wasm32` with the
+/// `wasm` feature; see `src/wasm.rs`.
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+pub mod wasm;
 
 pub use error::{Error, Result};

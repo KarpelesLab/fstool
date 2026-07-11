@@ -12,9 +12,17 @@ repository = "https://github.com/KarpelesLab/fstool"
 readme = "README.md"
 keywords = ["filesystem", "ext4", "ext2", "gpt", "image"]
 categories = ["filesystem", "command-line-utilities"]
+# Keep the published crate to the library + CLI source. The browser UI and CI
+# config are repo-only and would just bloat the crates.io tarball. (The wasm
+# bindings live in-crate at src/wasm.rs behind the `wasm` feature.)
+exclude = ["/web", "/.github"]
 
 [lib]
 name = "fstool"
+# `cdylib` is what wasm-bindgen consumes to build the browser bundle (see the
+# `wasm` feature + src/wasm.rs); `rlib` is what the CLI and other Rust crates
+# link against. Native builds emit both — the cdylib is a small extra artifact.
+crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
 [[bin]]
@@ -38,6 +46,11 @@ default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "cab", "amiga-lzx", "lha"
 # (`default-features = false`) to drop the dependency — the shell then falls
 # back to a plain line-buffered reader. No effect on piped/non-TTY input.
 readline = ["dep:rustyline"]
+# WebAssembly bindings (src/wasm.rs) for the browser UI. Pulls in
+# `wasm-bindgen`; build with `--no-default-features --features
+# wasm,<codecs…> --target wasm32-unknown-unknown`, then run `wasm-bindgen`.
+# Off by default so native library/CLI builds don't carry the dependency.
+wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook"]
 # Every codec is served by `compcol` (one uniform crate): gzip/zlib/deflate/
 # xz/lzma/zstd/lz4/lzo, plus the CAB + Amiga-LZX archive codecs and the DMG
 # bzip2/lzfse decoders. The `gzip` feature also covers zip DEFLATE, DMG zlib,
@@ -159,6 +172,11 @@ env_logger = "0.11"
 # decode-only). Not linked into the shipped binary.
 lzfse_rust = "0.2"
 
-# wasm32 needs a browser randomness source for uuid v4 generation.
+# wasm32 needs a browser randomness source for uuid v4 generation, plus the
+# wasm-bindgen glue when the `wasm` feature is on.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 uuid = { version = "1", features = ["v4", "js"] }
+# Pinned to the wasm-bindgen CLI version CI installs; the crate and the CLI
+# that post-processes the .wasm must match exactly.
+wasm-bindgen = { version = "=0.2.121", optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }

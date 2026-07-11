@@ -1,14 +1,14 @@
 name: Deploy web UI to GitHub Pages
 
-# Builds the fstool WebAssembly bundle and publishes the static web/ site.
-# Everything the site does runs client-side in the visitor's browser.
+# Builds the fstool WebAssembly bundle (from the `fstool` crate's `wasm`
+# feature) and the Vue/Vite site, then publishes it. Everything the site does
+# runs client-side in the visitor's browser.
 
 on:
   push:
     branches: [master]
     paths:
       - "src/**"
-      - "crates/fstool-wasm/**"
       - "web/**"
       - "Cargo.toml"
       - ".github/workflows/pages.yml"
@@ -24,6 +24,10 @@ concurrency:
   group: pages
   cancel-in-progress: true
 
+env:
+  # Codec features minus readline/fuse (neither builds for wasm); plus `wasm`.
+  WASM_FEATURES: "wasm,gzip,xz,lzma,lz4,zstd,lzo,cab,amiga-lzx,lha,arc,sit,sevenz,rar,dmg-bzip2,dmg-lzfse,dmg-encrypted"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -37,31 +41,44 @@ jobs:
 
       - name: Cache cargo + build
         uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: crates/fstool-wasm
 
-      # Pinned to the wasm-bindgen crate version in crates/fstool-wasm/Cargo.toml.
+      # Pinned to the wasm-bindgen version in Cargo.toml.
       - name: Install wasm-bindgen-cli
         uses: taiki-e/install-action@v2
         with:
           tool: wasm-bindgen-cli@0.2.121
 
-      - name: Build wasm
-        working-directory: crates/fstool-wasm
-        run: cargo build --release --target wasm32-unknown-unknown
+      - name: Build wasm (fstool cdylib)
+        run: |
+          cargo build --release --lib \
+            --target wasm32-unknown-unknown \
+            --no-default-features --features "$WASM_FEATURES"
 
-      - name: Generate JS bindings
+      - name: Generate JS bindings (bundler target)
         run: |
           wasm-bindgen \
-            --target web \
-            --out-dir web/pkg \
+            --target bundler \
+            --out-dir web/src/wasm \
             --no-typescript \
-            crates/fstool-wasm/target/wasm32-unknown-unknown/release/fstool_wasm.wasm
+            target/wasm32-unknown-unknown/release/fstool.wasm
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build site
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: web
+          path: web/dist
 
   deploy:
     needs: build

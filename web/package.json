@@ -1,0 +1,21 @@
+{
+  "name": "fstool-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Browser UI for fstool — inspect & convert disk images entirely client-side.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "vite": "^6.0.7",
+    "vite-plugin-top-level-await": "^1.4.4",
+    "vite-plugin-wasm": "^3.4.0"
+  }
+}

@@ -35,8 +35,10 @@ thing to another format — **entirely in the browser**, with nothing uploaded.
 It's fstool compiled to WebAssembly, driving the same readers/writers as the
 CLI over an in-memory block device.
 
-- Site: `web/` (deployed to GitHub Pages by `.github/workflows/pages.yml`).
-- Bindings: `crates/fstool-wasm` (a `wasm-bindgen` wrapper).
+- Site: `web/` — a Vue 3 + Vite app (deployed to GitHub Pages by
+  `.github/workflows/pages.yml`).
+- Bindings: [`src/wasm.rs`](src/wasm.rs), compiled as the crate's `cdylib`
+  behind the `wasm` feature (`--features wasm --target wasm32-unknown-unknown`).
 - Library surface: [`fstool::memconv`](src/memconv.rs) — a byte-in / byte-out
   API (`probe(&[u8])`, `MemImage::open(Vec<u8>)`, `.list()`, `.read_file()`,
   `.convert(target) -> Vec<u8>`) built on the first-class in-memory
