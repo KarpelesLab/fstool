@@ -46,7 +46,6 @@
 //!   the same direct/indirect-node chain a file uses.
 
 use std::collections::BTreeMap;
-use std::io::Read;
 
 use crate::Result;
 use crate::block::BlockDevice;
@@ -375,7 +374,7 @@ impl Writer {
         &mut self,
         dev: &mut dyn BlockDevice,
         nid: u32,
-        mut src: Box<dyn crate::fs::ReadSeek + Send>,
+        src: &mut dyn std::io::Read,
         total: u64,
     ) -> Result<(u64, u64)> {
         // Inline fast path.
@@ -739,11 +738,27 @@ impl Writer {
     }
 
     /// Create a regular file. Caller streams via `src`.
+    /// Adapter: open a [`FileSource`] and stream it forward.
     pub fn add_file(
         &mut self,
         dev: &mut dyn BlockDevice,
         path: &std::path::Path,
         src: FileSource,
+        meta: FileMeta,
+    ) -> Result<u32> {
+        let total = src.len()?;
+        let (mut reader, _) = src.open()?;
+        self.add_file_from_reader(dev, path, &mut *reader, total, meta)
+    }
+
+    /// Streaming primitive: write `total` bytes read forward from `body`
+    /// into a fresh inode — inline data or node/data blocks, no buffering.
+    pub fn add_file_from_reader(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        body: &mut dyn std::io::Read,
+        total: u64,
         meta: FileMeta,
     ) -> Result<u32> {
         let (parent_nid, leaf, existing) = self.resolve_for_create(path)?;
@@ -777,8 +792,7 @@ impl Writer {
             },
         );
 
-        let (reader, total) = src.open()?;
-        let (size, blocks) = self.stream_into_inode(dev, nid, reader, total)?;
+        let (size, blocks) = self.stream_into_inode(dev, nid, body, total)?;
         let ino = self.inodes.get_mut(&nid).unwrap();
         ino.size = size;
         ino.blocks = blocks;

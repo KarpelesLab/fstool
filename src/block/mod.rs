@@ -77,24 +77,20 @@ pub fn open_image(path: &Path) -> crate::Result<Box<dyn BlockDevice>> {
     }
 }
 
-/// Like [`open_image`], but transparently decompresses `.tar.gz` /
-/// `.tar.zst` / `.xz` / etc. into a [`tempfile::NamedTempFile`] before
-/// opening it as a `FileBackend`. The temp file is returned alongside
-/// the device so the caller can hold it alive for the duration of the
-/// borrow — when the tempfile drops, the underlying file is unlinked.
+/// Like [`open_image`], but transparently decompresses `.gz` / `.zst` /
+/// `.xz` / etc. into an in-memory [`MemoryBackend`] before returning it,
+/// giving random access to a compressed *image* without a host temp file
+/// (so it works in wasm too). The whole image is held in RAM — for a
+/// compressed *archive* (tar/…) prefer the streaming readers instead.
 ///
-/// For uncompressed paths the returned tempfile slot is `None` and the
-/// behaviour matches [`open_image`] exactly.
-pub fn open_image_maybe_compressed(
-    path: &Path,
-) -> crate::Result<(Box<dyn BlockDevice>, Option<tempfile::NamedTempFile>)> {
+/// For uncompressed paths the behaviour matches [`open_image`] exactly.
+pub fn open_image_maybe_compressed(path: &Path) -> crate::Result<Box<dyn BlockDevice>> {
     match crate::compression::detect_path(path)? {
         Some(algo) => {
-            let tmp = crate::compression::decompress_to_tempfile(path, algo)?;
-            let dev = FileBackend::open(tmp.path())?;
-            Ok((Box::new(dev), Some(tmp)))
+            let bytes = crate::compression::decompress_to_memory(path, algo)?;
+            Ok(Box::new(MemoryBackend::from_bytes(bytes)))
         }
-        None => Ok((open_image(path)?, None)),
+        None => open_image(path),
     }
 }
 
@@ -119,25 +115,18 @@ pub fn open_image_read_only(path: &Path) -> crate::Result<Box<dyn BlockDevice>> 
     }
 }
 
-/// Read-only counterpart of [`open_image_maybe_compressed`]. The
-/// decompressed tempfile is still opened read-write at the FS layer
-/// (it's a throwaway), but the returned [`BlockDevice`] is wrapped
-/// in a read-only `FileBackend` so the caller can't accidentally
-/// mutate it either.
-pub fn open_image_maybe_compressed_read_only(
-    path: &Path,
-) -> crate::Result<(Box<dyn BlockDevice>, Option<tempfile::NamedTempFile>)> {
+/// Read-only counterpart of [`open_image_maybe_compressed`]. For a
+/// compressed source the decompressed bytes live in a throwaway
+/// [`MemoryBackend`], so any mutation lands on that copy and is discarded —
+/// same effect the read-only wrapper gave before. Uncompressed sources go
+/// through [`open_image_read_only`], which opens the file `O_RDONLY`.
+pub fn open_image_maybe_compressed_read_only(path: &Path) -> crate::Result<Box<dyn BlockDevice>> {
     match crate::compression::detect_path(path)? {
         Some(algo) => {
-            let tmp = crate::compression::decompress_to_tempfile(path, algo)?;
-            // The tempfile itself isn't the artifact under
-            // protection — the user's original .gz / .zst is. We
-            // still wrap the FileBackend read-only so any FS-side
-            // write attempt errors cleanly inside the shell session.
-            let dev = FileBackend::open_read_only(tmp.path())?;
-            Ok((Box::new(dev), Some(tmp)))
+            let bytes = crate::compression::decompress_to_memory(path, algo)?;
+            Ok(Box::new(MemoryBackend::from_bytes(bytes)))
         }
-        None => Ok((open_image_read_only(path)?, None)),
+        None => open_image_read_only(path),
     }
 }
 

@@ -21,8 +21,6 @@
 //!   the first $FILE_NAME / extended $Extend population are rejected with
 //!   [`crate::Error::Unsupported`].
 
-use std::io::Read;
-
 use crate::Result;
 use crate::block::BlockDevice;
 use crate::fs::dir_batch::{DEFAULT_CAPACITY, DirBatch};
@@ -272,6 +270,9 @@ impl super::Ntfs {
     }
 
     /// Create a regular file at `path` populated from `src` with metadata `meta`.
+    /// Adapter: open a [`FileSource`] and stream it forward. Never buffers
+    /// the whole body (small resident `$DATA` aside — that's an NTFS format
+    /// requirement, ≤ a few hundred bytes).
     pub fn create_file(
         &mut self,
         dev: &mut dyn BlockDevice,
@@ -279,11 +280,24 @@ impl super::Ntfs {
         src: FileSource,
         meta: FileMeta,
     ) -> Result<()> {
+        let file_size = src.len().map_err(crate::Error::from)?;
+        let (mut reader, _len) = src.open().map_err(crate::Error::from)?;
+        self.create_file_from_reader(dev, path, &mut reader, file_size, meta)
+    }
+
+    /// Streaming primitive: write `file_size` bytes read forward from `body`.
+    pub fn create_file_from_reader(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        body: &mut dyn std::io::Read,
+        file_size: u64,
+        meta: FileMeta,
+    ) -> Result<()> {
         self.ensure_writer(dev)?;
         let (parent_path, base_name) = split_parent(path)?;
         let parent_rec = self.resolve_dir(dev, &parent_path)?;
-        let file_size = src.len().map_err(crate::Error::from)?;
-        let (mut reader, _len) = src.open().map_err(crate::Error::from)?;
+        let reader = body;
 
         let writer = self.writer.as_mut().expect("writer present");
         let rec_no = writer.allocate_mft_record(dev)?;

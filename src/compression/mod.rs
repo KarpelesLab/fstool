@@ -655,31 +655,20 @@ pub fn detect_path(path: &std::path::Path) -> Result<Option<Algo>> {
     Ok(detect_magic(&head[..n]))
 }
 
-/// Decompress `src` into a new temp file and return both. The temp
-/// file's path is returned so callers (e.g. `inspect::with_target_device`)
-/// can open it as a `BlockDevice`. The `NamedTempFile` is kept alive by
-/// the caller — once it's dropped, the file is deleted.
-pub fn decompress_to_tempfile(
-    src: &std::path::Path,
-    algo: Algo,
-) -> Result<tempfile::NamedTempFile> {
-    use std::io::Write;
+/// Decompress `src` fully into memory. Callers (e.g.
+/// [`crate::block::open_image_maybe_compressed`]) wrap the returned bytes in
+/// a [`crate::block::MemoryBackend`] to expose a compressed image as a
+/// random-access `BlockDevice` — no host temp file, so it works in wasm too.
+///
+/// The result is the **decompressed** size, held in RAM. For a compressed
+/// *archive* (tar/…) prefer [`make_reader`] and stream it; use this only when
+/// random access to the whole image is genuinely required.
+pub fn decompress_to_memory(src: &std::path::Path, algo: Algo) -> Result<Vec<u8>> {
     let f = std::fs::File::open(src)?;
     let mut reader = make_reader(algo, std::io::BufReader::new(f))?;
-    let tmp = tempfile::NamedTempFile::new()?;
-    {
-        let mut out = std::io::BufWriter::new(tmp.as_file());
-        let mut buf = [0u8; 64 * 1024];
-        loop {
-            let n = reader.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            out.write_all(&buf[..n])?;
-        }
-        out.flush()?;
-    }
-    Ok(tmp)
+    let mut out = Vec::new();
+    reader.read_to_end(&mut out)?;
+    Ok(out)
 }
 
 /// Stream-compress `src` (a plain file path) into `dst` (the final

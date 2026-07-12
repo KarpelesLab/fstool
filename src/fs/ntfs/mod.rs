@@ -1756,6 +1756,22 @@ impl crate::fs::Filesystem for Ntfs {
         self.create_file(dev, s, src, meta)
     }
 
+    /// Stream a borrowed body forward — resident `$DATA` (tiny) or
+    /// non-resident clusters, no whole-file buffering.
+    fn create_file_streaming(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        body: &mut dyn std::io::Read,
+        len: u64,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ntfs: non-UTF-8 path".into()))?;
+        self.create_file_from_reader(dev, s, body, len, meta)
+    }
+
     fn create_dir(
         &mut self,
         dev: &mut dyn BlockDevice,

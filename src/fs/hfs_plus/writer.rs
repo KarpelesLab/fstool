@@ -1478,7 +1478,7 @@ fn layout_special(
 /// `writer.overflow_extents` keyed by `(FORK_DATA, file_id, start_fork_block)`.
 /// `flush()` later turns the queued entries into extents-overflow
 /// B-tree records.
-pub(crate) fn stream_data_to_blocks<R: Read>(
+pub(crate) fn stream_data_to_blocks<R: Read + ?Sized>(
     writer: &mut Writer,
     dev: &mut dyn BlockDevice,
     src: &mut R,

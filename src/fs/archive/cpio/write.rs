@@ -8,7 +8,7 @@ use crate::block::BlockDevice;
 use crate::fs::archive::ArchiveBuilder;
 use crate::fs::archive::tree;
 use crate::fs::archive::writer::Cursor;
-use crate::fs::{DeviceKind, FileMeta, FileSource};
+use crate::fs::{DeviceKind, FileMeta};
 use crate::{Error, Result};
 
 const NEWC_HEADER_LEN: usize = 110;
@@ -121,11 +121,12 @@ impl CpioWriter {
 }
 
 impl ArchiveBuilder for CpioWriter {
-    fn add_file(
+    fn add_file_streaming(
         &mut self,
         dev: &mut dyn BlockDevice,
         path: &str,
-        src: FileSource,
+        body: &mut dyn std::io::Read,
+        len: u64,
         meta: FileMeta,
     ) -> Result<()> {
         let name = tree::normalise_path(path);
@@ -133,7 +134,6 @@ impl ArchiveBuilder for CpioWriter {
         if name.is_empty() {
             return Err(Error::InvalidArgument("cpio: empty file path".into()));
         }
-        let (mut reader, len) = src.open()?;
         if len > u64::from(u32::MAX) {
             return Err(Error::Unsupported(
                 "cpio: newc format caps individual files at 4 GiB".into(),
@@ -165,7 +165,7 @@ impl ArchiveBuilder for CpioWriter {
         let mut buf = [0u8; 64 * 1024];
         while remaining > 0 {
             let want = remaining.min(buf.len() as u64) as usize;
-            reader.read_exact(&mut buf[..want]).map_err(Error::from)?;
+            body.read_exact(&mut buf[..want]).map_err(Error::from)?;
             self.cursor.write(dev, &buf[..want])?;
             remaining -= want as u64;
         }

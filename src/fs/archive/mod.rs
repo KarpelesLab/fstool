@@ -301,13 +301,34 @@ impl ArchiveIndex {
 /// (never a borrow of the device) — the device is passed in on every
 /// call, mirroring the [`Filesystem`](crate::fs::Filesystem) methods.
 pub trait ArchiveBuilder: Send {
+    /// Stream one file's `len`-byte body straight to the device, reading
+    /// `body` **forward once** (never seeking it). This is the primitive;
+    /// the archive length is known up front so no writer needs to buffer the
+    /// whole file or seek the source. (`ar` is the one deferred exception —
+    /// its GNU long-name table precedes the members, so it retains bodies
+    /// until `finish`.)
+    fn add_file_streaming(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        body: &mut dyn std::io::Read,
+        len: u64,
+        meta: FileMeta,
+    ) -> Result<()>;
+
+    /// Adapter: open a [`FileSource`] and stream it forward via
+    /// [`add_file_streaming`](Self::add_file_streaming). Never buffers the
+    /// whole body.
     fn add_file(
         &mut self,
         dev: &mut dyn BlockDevice,
         path: &str,
         src: FileSource,
         meta: FileMeta,
-    ) -> Result<()>;
+    ) -> Result<()> {
+        let (mut reader, len) = src.open()?;
+        self.add_file_streaming(dev, path, &mut reader, len, meta)
+    }
 
     fn add_dir(&mut self, dev: &mut dyn BlockDevice, path: &str, meta: FileMeta) -> Result<()>;
 
@@ -438,11 +459,26 @@ impl crate::fs::Filesystem for ArchiveFs {
         }
     }
 
-    /// The builder writes each entry's header + body straight to the
-    /// device cursor as `create_file` is called, so the streaming repack
-    /// path can hand us a body without spooling it to a temp file first
-    /// (small bodies buffer in RAM; larger ones spill, same as every other
-    /// stream-through backend).
+    /// Stream a borrowed body straight to the builder — the repack hot path.
+    /// The body is read forward once into the archive; nothing is buffered.
+    fn create_file_streaming(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &Path,
+        body: &mut dyn std::io::Read,
+        len: u64,
+        meta: FileMeta,
+    ) -> Result<()> {
+        let s = self.path_str(path)?.to_string();
+        match self.builder.as_mut() {
+            Some(b) => b.add_file_streaming(dev, &s, body, len, meta),
+            None => Err(self.write_refused("write")),
+        }
+    }
+
+    /// The builder writes each entry's header + body straight to the device
+    /// cursor as files arrive, so the streaming repack path hands us a body
+    /// with no buffering (the `ar` builder is the deferred exception).
     fn streams_immediately(&self) -> bool {
         true
     }

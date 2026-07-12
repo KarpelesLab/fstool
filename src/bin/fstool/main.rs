@@ -983,26 +983,20 @@ fn repack_cmd(
         // through for a compressed-tar source.
     }
 
-    // Compressed-tar source: decompress once to a tempfile and treat
-    // that plain `.tar` as the source — the unified walker then handles
-    // it like any other image, for every destination.
-    let _decompressed; // keeps the tempfile alive for the call
-    let src_owned: String = if let Some(algo) = tar_input_codec(srcs[0].as_str()) {
-        let raw = srcs[0].as_str();
-        let path = std::path::Path::new(raw.split(':').next().unwrap_or(raw));
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or(raw);
-        // Decompressing a multi-GB archive is the dominant silent cost
-        // before files start streaming — announce it.
-        fstool::repack::phase(&format!("decompressing {name} …"));
-        let tmp = fstool::compression::decompress_to_tempfile(path, algo)?;
-        let p = tmp.path().to_string_lossy().into_owned();
-        _decompressed = Some(tmp);
-        p
-    } else {
-        _decompressed = None;
-        srcs[0].clone()
-    };
-    let src = src_owned.as_str();
+    // Compressed source that fell through the streaming fast paths (a
+    // compressed tar → a non-streaming destination such as ar / hfs / apfs):
+    // `with_target_device` → `open_image_maybe_compressed` decompresses it
+    // into an in-memory device and the unified walker handles it like any
+    // other image. Announce the decompress, which is the dominant cost.
+    let src = srcs[0].as_str();
+    if let Some(algo) = tar_input_codec(src) {
+        let raw = src.split(':').next().unwrap_or(src);
+        let name = std::path::Path::new(raw)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(raw);
+        fstool::repack::phase(&format!("decompressing {name} ({}) …", algo.name()));
+    }
     let src_target = fstool::inspect::Target::parse(src);
 
     // Open the source once and walk it; the source FS stays open across

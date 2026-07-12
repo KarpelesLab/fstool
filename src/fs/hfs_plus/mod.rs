@@ -250,7 +250,7 @@ impl HfsPlus {
     /// Create a regular file at the given absolute path, streaming
     /// `len` bytes from `src` into freshly allocated allocation blocks.
     #[allow(clippy::too_many_arguments)]
-    pub fn create_file<R: std::io::Read>(
+    pub fn create_file<R: std::io::Read + ?Sized>(
         &mut self,
         dev: &mut dyn BlockDevice,
         path: &str,
@@ -1546,6 +1546,23 @@ impl crate::fs::Filesystem for HfsPlus {
             meta.mtime,
         )
         .map(|_| ())
+    }
+
+    /// Stream a borrowed body forward into freshly-allocated blocks — no
+    /// buffering; the length is known up front and the source is read once.
+    fn create_file_streaming(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        body: &mut dyn std::io::Read,
+        len: u64,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: non-UTF-8 path".into()))?;
+        self.create_file(dev, s, body, len, meta.mode, meta.uid, meta.gid, meta.mtime)
+            .map(|_| ())
     }
 
     fn create_dir(

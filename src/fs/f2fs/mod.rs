@@ -444,6 +444,20 @@ impl crate::fs::Filesystem for F2fs {
         self.create_file(dev, path, src, meta).map(|_| ())
     }
 
+    /// Stream a borrowed body forward into a fresh inode — no buffering.
+    fn create_file_streaming(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        body: &mut dyn std::io::Read,
+        len: u64,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        self.writer_mut()?
+            .add_file_from_reader(dev, path, body, len, meta)
+            .map(|_| ())
+    }
+
     fn create_dir(
         &mut self,
         dev: &mut dyn BlockDevice,

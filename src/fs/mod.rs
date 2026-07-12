@@ -100,14 +100,6 @@ pub enum FileSource {
     /// the filesystem may either allocate zero blocks (true hole) or allocate
     /// data blocks and leave them zero, depending on its feature flags.
     Zero(u64),
-    /// Stream from an owned temporary file. The handle lives inside the
-    /// source, so deferred-write backends (SquashFS / ISO 9660 / GRF,
-    /// which keep the `FileSource` and read it at `flush`) keep the
-    /// backing bytes until they're consumed — then the temp file is
-    /// deleted on drop. Used by the default
-    /// [`Filesystem::create_file_streaming`] to bridge a borrowed reader
-    /// into the `FileSource` API without buffering the whole file in RAM.
-    TempFile(tempfile::NamedTempFile),
 }
 
 impl FileSource {
@@ -117,7 +109,6 @@ impl FileSource {
             FileSource::HostPath(p) => Ok(std::fs::metadata(p)?.len()),
             FileSource::Reader { len, .. } => Ok(*len),
             FileSource::Zero(n) => Ok(*n),
-            FileSource::TempFile(t) => Ok(t.as_file().metadata()?.len()),
         }
     }
 
@@ -139,15 +130,6 @@ impl FileSource {
             }
             FileSource::Reader { reader, len } => Ok((reader, len)),
             FileSource::Zero(n) => Ok((Box::new(ZeroReader { remaining: n }), n)),
-            FileSource::TempFile(t) => {
-                // Re-open the temp file by path for an independent cursor;
-                // the `NamedTempFile` is dropped here, but on a deferred
-                // backend the source was opened at flush time so the file
-                // still exists. (The backend owns the source until then.)
-                let len = t.as_file().metadata()?.len();
-                let f = File::open(t.path())?;
-                Ok((Box::new(f), len))
-            }
         }
     }
 }
@@ -540,17 +522,18 @@ pub trait Filesystem {
     /// intermediate tempfile or a `Seek`/`Send` bound. Implementations
     /// MUST NOT retain `body` past the call.
     ///
-    /// Default: spool `body` into a tempfile and delegate to
-    /// `create_file(FileSource::HostPath(..))` — correct everywhere, so
-    /// no backend regresses. Backends whose writer already consumes a
-    /// `&mut dyn Read` (ext, FAT32, the archive core, …) override this
-    /// for true zero-copy streaming.
-    /// Whether [`create_file`](Self::create_file) consumes its
-    /// `FileSource` synchronously (`true`) rather than storing it to read
-    /// later at `flush` (`false` — e.g. SquashFS / ISO 9660 / GRF, which
-    /// keep every source until they serialise). Immediate backends let
-    /// [`create_file_streaming`](Self::create_file_streaming) buffer small
-    /// files in memory instead of spilling each one to a temp file.
+    /// Default: buffer `body` into memory and delegate to
+    /// `create_file(FileSource::Reader(..))` — correct everywhere, so no
+    /// backend regresses. Backends whose writer already consumes a `&mut dyn
+    /// Read` (ext, FAT32, the archive core, …) override this for true
+    /// zero-copy streaming and never buffer.
+    ///
+    /// Deferred backends (SquashFS / ISO 9660 / GRF) keep the `FileSource`
+    /// and read it at `flush`, so the buffered bytes stay resident until
+    /// then — bounded by RAM, not a temp file. This keeps the library free of
+    /// any host-filesystem dependency (so it works in wasm/`MemoryBackend`
+    /// too); a backend that must bound huge inputs to disk should override
+    /// this method with its own streaming write.
     fn streams_immediately(&self) -> bool {
         false
     }
@@ -563,35 +546,22 @@ pub trait Filesystem {
         len: u64,
         meta: FileMeta,
     ) -> crate::Result<()> {
-        // For backends that consume the source now, buffer small files in
-        // memory: this avoids creating, copying into, fsync-ing and
-        // reading back a temp file *per file* — the dominant per-file cost
-        // when repacking many small files. Larger files (and deferred
-        // backends, which must keep the bytes until `flush`) spill to a
-        // temp file — but we never fsync it: it's read back in this same
-        // process from the page cache, so durability is irrelevant.
-        const MEM_CAP: u64 = 8 * 1024 * 1024;
-        if self.streams_immediately() && len <= MEM_CAP {
-            let mut buf = Vec::with_capacity(len as usize);
-            body.take(len).read_to_end(&mut buf)?;
-            let actual = buf.len() as u64;
-            return self.create_file(
-                dev,
-                path,
-                FileSource::Reader {
-                    reader: Box::new(io::Cursor::new(buf)),
-                    len: actual,
-                },
-                meta,
-            );
-        }
-        let mut tmp = tempfile::NamedTempFile::new()?;
-        let mut limited = body.take(len);
-        io::copy(&mut limited, tmp.as_file_mut())?;
-        // Deferred backends (SquashFS / ISO 9660 / GRF) store the
-        // `FileSource` and read it at `flush`; `FileSource::TempFile`
-        // keeps the bytes alive until then.
-        self.create_file(dev, path, FileSource::TempFile(tmp), meta)
+        // Buffer the exact bytes, then hand them to `create_file` as a
+        // seekable in-memory source. Cap the pre-allocation so a bogus
+        // `len` can't request a gigantic reservation up front.
+        const RESERVE_CAP: u64 = 64 * 1024 * 1024;
+        let mut buf = Vec::with_capacity(len.min(RESERVE_CAP) as usize);
+        body.take(len).read_to_end(&mut buf)?;
+        let actual = buf.len() as u64;
+        self.create_file(
+            dev,
+            path,
+            FileSource::Reader {
+                reader: Box::new(io::Cursor::new(buf)),
+                len: actual,
+            },
+            meta,
+        )
     }
 
     /// Create a directory at `path`.
@@ -751,9 +721,9 @@ pub trait Filesystem {
     /// backends share extents (zero data copy, refcount-btree updates);
     /// everything else falls back to the default byte-copy.
     ///
-    /// **Default behaviour.** Spools `src` to a host tempfile so the
-    /// read-borrow on `self` is dropped, then runs `create_file(dst,
-    /// FileSource::TempFile, ...)`. Best-effort metadata via
+    /// **Default behaviour.** Buffers `src` into memory so the read-borrow
+    /// on `self` is dropped, then runs `create_file(dst,
+    /// FileSource::Reader, ...)`. Best-effort metadata via
     /// [`Self::getattr`] (mode / uid / gid / mtime); falls back to
     /// [`FileMeta::default`] when the source backend has no `getattr`
     /// implementation.
@@ -775,48 +745,35 @@ pub trait Filesystem {
         dst: &Path,
     ) -> crate::Result<()> {
         // Best-effort metadata snapshot before the read borrow.
-        let (meta, size) = match self.getattr(dev, src) {
-            Ok(a) => (
-                FileMeta {
-                    mode: a.mode,
-                    uid: a.uid,
-                    gid: a.gid,
-                    mtime: a.mtime,
-                    atime: a.atime,
-                    ctime: a.ctime,
-                },
-                a.size,
-            ),
-            // Unknown size → take the conservative temp-file path below.
-            Err(_) => (FileMeta::default(), u64::MAX),
+        let meta = match self.getattr(dev, src) {
+            Ok(a) => FileMeta {
+                mode: a.mode,
+                uid: a.uid,
+                gid: a.gid,
+                mtime: a.mtime,
+                atime: a.atime,
+                ctime: a.ctime,
+            },
+            Err(_) => FileMeta::default(),
         };
-        // Buffer the source so the read borrow ends before `create_file`.
-        // Small files go through memory (no temp file); larger ones spool
-        // to a temp file — never fsync'd, as it's read back in-process.
-        const MEM_CAP: u64 = 8 * 1024 * 1024;
-        if size <= MEM_CAP {
-            let mut buf = Vec::with_capacity(size as usize);
-            {
-                let mut reader = self.read_file(dev, src)?;
-                reader.read_to_end(&mut buf).map_err(crate::Error::from)?;
-            }
-            let actual = buf.len() as u64;
-            return self.create_file(
-                dev,
-                dst,
-                FileSource::Reader {
-                    reader: Box::new(io::Cursor::new(buf)),
-                    len: actual,
-                },
-                meta,
-            );
-        }
-        let mut tmp = tempfile::NamedTempFile::new().map_err(crate::Error::from)?;
+        // Buffer the source into memory so the read borrow on `self` ends
+        // before `create_file`. Held in RAM (not a temp file) so the
+        // library stays host-filesystem-free.
+        let mut buf = Vec::new();
         {
             let mut reader = self.read_file(dev, src)?;
-            io::copy(&mut reader, &mut tmp).map_err(crate::Error::from)?;
+            reader.read_to_end(&mut buf).map_err(crate::Error::from)?;
         }
-        self.create_file(dev, dst, FileSource::TempFile(tmp), meta)
+        let actual = buf.len() as u64;
+        self.create_file(
+            dev,
+            dst,
+            FileSource::Reader {
+                reader: Box::new(io::Cursor::new(buf)),
+                len: actual,
+            },
+            meta,
+        )
     }
 
     /// Clone an arbitrary byte range `src[src_off..src_off+len]` into

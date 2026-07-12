@@ -780,6 +780,23 @@ impl crate::fs::Filesystem for Xfs {
         self.add_file_path(dev, s, em, len, &mut reader).map(|_| ())
     }
 
+    /// Stream a borrowed body forward into freshly-allocated extents — no
+    /// buffering. The file length is known up front; the source is read once.
+    fn create_file_streaming(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        body: &mut dyn std::io::Read,
+        len: u64,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("xfs: non-UTF-8 path".into()))?;
+        let em = entry_meta_from(meta);
+        self.add_file_path(dev, s, em, len, body).map(|_| ())
+    }
+
     fn create_dir(
         &mut self,
         dev: &mut dyn BlockDevice,

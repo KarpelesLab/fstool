@@ -767,6 +767,28 @@ impl Filesystem for Hfs {
         Ok(())
     }
 
+    /// Stream a borrowed body forward into freshly-allocated blocks — no
+    /// buffering; the length is known up front and the source is read once.
+    fn create_file_streaming(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &Path,
+        body: &mut dyn std::io::Read,
+        len: u64,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| Error::InvalidArgument("hfs: non-UTF-8 path".into()))?;
+        let w = self.writer.as_mut().ok_or(Error::Immutable {
+            kind: "hfs",
+            op: "add",
+        })?;
+        w.insert_file(dev, s, body, len, meta.mtime)?;
+        self.rebuild_index();
+        Ok(())
+    }
+
     fn create_dir(
         &mut self,
         _dev: &mut dyn BlockDevice,

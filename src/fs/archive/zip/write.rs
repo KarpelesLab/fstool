@@ -25,7 +25,7 @@ use crate::block::BlockDevice;
 use crate::fs::archive::ArchiveBuilder;
 use crate::fs::archive::tree;
 use crate::fs::archive::writer::Cursor;
-use crate::fs::{DeviceKind, FileMeta, FileSource, ReadSeek};
+use crate::fs::{DeviceKind, FileMeta};
 use crate::{Error, Result};
 
 const U32_MAX: u64 = 0xffff_ffff;
@@ -132,7 +132,7 @@ impl ZipWriter {
         unix_mode: u32,
         meta: &FileMeta,
         is_dir: bool,
-        mut body: Option<(Box<dyn ReadSeek + Send>, u64)>,
+        mut body: Option<(&mut dyn std::io::Read, u64)>,
         inline: &[u8],
     ) -> Result<()> {
         let uncomp = body
@@ -188,7 +188,7 @@ impl ZipWriter {
 
         // --- body ---
         let (crc, comp_size) = match body.take() {
-            Some((mut reader, len)) => self.stream_body(dev, &mut reader, len, method)?,
+            Some((reader, len)) => self.stream_body(dev, reader, len, method)?,
             None => {
                 let crc = crc32fast::hash(inline);
                 self.cursor.write(dev, inline)?;
@@ -226,7 +226,7 @@ impl ZipWriter {
     fn stream_body(
         &mut self,
         dev: &mut dyn BlockDevice,
-        reader: &mut Box<dyn ReadSeek + Send>,
+        reader: &mut dyn std::io::Read,
         len: u64,
         method: Compression,
     ) -> Result<(u32, u64)> {
@@ -252,7 +252,7 @@ impl ZipWriter {
     fn stream_deflate(
         &mut self,
         dev: &mut dyn BlockDevice,
-        reader: &mut Box<dyn ReadSeek + Send>,
+        reader: &mut dyn std::io::Read,
         len: u64,
         crc: &mut crc32fast::Hasher,
         buf: &mut [u8],
@@ -284,7 +284,7 @@ impl ZipWriter {
     fn stream_deflate(
         &mut self,
         _dev: &mut dyn BlockDevice,
-        _reader: &mut Box<dyn ReadSeek + Send>,
+        _reader: &mut dyn std::io::Read,
         _len: u64,
         _crc: &mut crc32fast::Hasher,
         _buf: &mut [u8],
@@ -296,28 +296,20 @@ impl ZipWriter {
 }
 
 impl ArchiveBuilder for ZipWriter {
-    fn add_file(
+    fn add_file_streaming(
         &mut self,
         dev: &mut dyn BlockDevice,
         path: &str,
-        src: FileSource,
+        body: &mut dyn std::io::Read,
+        len: u64,
         meta: FileMeta,
     ) -> Result<()> {
         let name = Self::norm(path);
         if name.is_empty() {
             return Err(Error::InvalidArgument("zip: empty file path".into()));
         }
-        let (reader, len) = src.open()?;
         let unix_mode = 0o100000 | u32::from(meta.mode);
-        self.write_entry(
-            dev,
-            &name,
-            unix_mode,
-            &meta,
-            false,
-            Some((reader, len)),
-            &[],
-        )
+        self.write_entry(dev, &name, unix_mode, &meta, false, Some((body, len)), &[])
     }
 
     fn add_dir(&mut self, dev: &mut dyn BlockDevice, path: &str, meta: FileMeta) -> Result<()> {

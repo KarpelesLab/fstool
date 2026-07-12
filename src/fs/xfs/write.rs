@@ -1141,7 +1141,7 @@ impl Xfs {
     /// Create a regular file at `name` under the directory inode
     /// `parent_ino`, streaming up to `size` bytes from `src` (which
     /// reads in 64 KiB chunks). Returns the new inode number.
-    pub fn add_file<R: Read>(
+    pub fn add_file<R: Read + ?Sized>(
         &mut self,
         dev: &mut dyn BlockDevice,
         parent_ino: u64,
@@ -2275,7 +2275,7 @@ impl Xfs {
     // ----------------------------------------------------------------
 
     /// Path-based equivalent of [`Self::add_file`].
-    pub fn add_file_path<R: Read>(
+    pub fn add_file_path<R: Read + ?Sized>(
         &mut self,
         dev: &mut dyn BlockDevice,
         path: &str,
@@ -2732,7 +2732,7 @@ fn existing_parent(block: &[u8], is_v5: bool) -> Result<u64> {
 /// Read up to `buf.len()` bytes from `r`, returning how many actually
 /// came back (may be less than `buf.len()` only if `r` hit EOF). Wraps
 /// `Read::read` in a loop because the trait may return short.
-fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+fn read_exact_or_eof<R: Read + ?Sized>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut total = 0;
     while total < buf.len() {
         let n = r.read(&mut buf[total..])?;

@@ -11,7 +11,7 @@ use crate::block::BlockDevice;
 use crate::fs::archive::ArchiveBuilder;
 use crate::fs::archive::tree;
 use crate::fs::archive::writer::Cursor;
-use crate::fs::{DeviceKind, FileMeta, FileSource};
+use crate::fs::{DeviceKind, FileMeta};
 use crate::{Error, Result};
 
 struct Member {
@@ -90,17 +90,21 @@ fn write_member(
 }
 
 impl ArchiveBuilder for ArWriter {
-    fn add_file(
+    // Deferred exception: GNU `ar`'s long-name table (`//`) precedes the
+    // members, so their layout isn't known until every file has been seen.
+    // We therefore retain each body until `finish`. Bounded by the total
+    // archive size; `ar` is only used for small `.a` files.
+    fn add_file_streaming(
         &mut self,
         _dev: &mut dyn BlockDevice,
         path: &str,
-        src: FileSource,
+        body: &mut dyn std::io::Read,
+        len: u64,
         meta: FileMeta,
     ) -> Result<()> {
         let name = flat_name(path)?;
-        let (mut reader, len) = src.open()?;
         let mut data = Vec::with_capacity(len.min(1 << 20) as usize);
-        reader.read_to_end(&mut data).map_err(Error::from)?;
+        body.take(len).read_to_end(&mut data).map_err(Error::from)?;
         self.members.push(Member {
             name,
             mtime: u64::from(meta.mtime),

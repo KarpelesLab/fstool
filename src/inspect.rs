@@ -1235,9 +1235,7 @@ pub fn with_target_device<F, R>(target: &Target, op: F) -> Result<R>
 where
     F: FnOnce(&mut dyn BlockDevice) -> Result<R>,
 {
-    // _tmp keeps the decompressed temp file alive for the duration of
-    // the borrow — when it drops, the file is unlinked.
-    let (mut disk, _tmp) = crate::block::open_image_maybe_compressed(&target.path)?;
+    let mut disk = crate::block::open_image_maybe_compressed(&target.path)?;
     match target.partition {
         None => op(disk.as_mut()),
         Some(idx) => {
@@ -1261,14 +1259,14 @@ where
 /// — belt-and-braces protection for callers like `fstool shell
 /// --ro` that promise not to mutate the source image.
 ///
-/// Compressed sources keep working: the decompressed tempfile is
-/// still opened RO at the BlockDevice layer; on session exit the
-/// tempfile drops, taking its decompressed bytes with it.
+/// Compressed sources keep working: they're decompressed into an
+/// in-memory [`crate::block::MemoryBackend`]; on session exit the
+/// backend drops, taking its decompressed bytes with it.
 pub fn with_target_device_read_only<F, R>(target: &Target, op: F) -> Result<R>
 where
     F: FnOnce(&mut dyn BlockDevice) -> Result<R>,
 {
-    let (mut disk, _tmp) = crate::block::open_image_maybe_compressed_read_only(&target.path)?;
+    let mut disk = crate::block::open_image_maybe_compressed_read_only(&target.path)?;
     match target.partition {
         None => op(disk.as_mut()),
         Some(idx) => {
