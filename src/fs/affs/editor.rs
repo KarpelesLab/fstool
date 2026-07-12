@@ -7,6 +7,8 @@
 //! and extension blocks — leaving every other block byte-for-byte unchanged.
 //! RAM use is bounded by the bitmap, never by file contents.
 
+use std::io::Read;
+
 use crate::block::BlockDevice;
 use crate::{Error, Result};
 
@@ -258,20 +260,27 @@ impl AffsEditor {
         Ok(new)
     }
 
-    /// Create a regular file under `parent_block` with `data`. Returns the
-    /// file-header block.
+    /// Create a regular file under `parent_block`, streaming exactly `len`
+    /// bytes of contents forward from `body`. Returns the file-header block.
+    ///
+    /// `body` is read once, in order: every block (header, data, extension) is
+    /// allocated up front from `len`, then each data block is filled from the
+    /// next payload-sized run of `body` as it arrives — the file contents are
+    /// never held in memory in full.
     pub(super) fn create_file(
         &mut self,
         dev: &mut dyn BlockDevice,
         parent_block: u32,
         name: &str,
-        data: &[u8],
+        body: &mut dyn Read,
+        len: u64,
         mtime: u32,
     ) -> Result<u32> {
         Self::validate_name(name)?;
         let ffs = self.variant.ffs;
         let payload = if ffs { BSIZE } else { BSIZE - 24 };
-        let ndata = data.len().div_ceil(payload);
+        let len = len as usize;
+        let ndata = len.div_ceil(payload);
         let next_ext = if ndata > MAX_DATABLK {
             (ndata - MAX_DATABLK).div_ceil(MAX_DATABLK)
         } else {
@@ -289,22 +298,21 @@ impl AffsEditor {
             eblocks.push(self.alloc()?);
         }
 
-        // Data blocks.
+        // Data blocks: pull each payload-sized chunk forward from `body`.
+        let mut remaining = len;
         for (i, &db) in dblocks.iter().enumerate() {
-            let start = i * payload;
-            let end = (start + payload).min(data.len());
-            let chunk = &data[start..end];
+            let chunk = payload.min(remaining);
+            remaining -= chunk;
+            let data_off = if ffs { 0 } else { 24 };
             let mut blk = vec![0u8; BSIZE];
-            if ffs {
-                blk[..chunk.len()].copy_from_slice(chunk);
-            } else {
+            body.read_exact(&mut blk[data_off..data_off + chunk])?;
+            if !ffs {
                 put_u32(&mut blk, OFF_TYPE, T_DATA as u32);
                 put_u32(&mut blk, 0x04, header); // headerKey = file header
                 put_u32(&mut blk, 0x08, i as u32 + 1); // seqNum (1-based)
-                put_u32(&mut blk, 0x0c, chunk.len() as u32); // dataSize
+                put_u32(&mut blk, 0x0c, chunk as u32); // dataSize
                 let next = dblocks.get(i + 1).copied().unwrap_or(0);
                 put_u32(&mut blk, 0x10, next); // nextData
-                blk[24..24 + chunk.len()].copy_from_slice(chunk);
                 fix_checksum(&mut blk, 0x14);
             }
             self.write_block(dev, db, &blk)?;
@@ -348,7 +356,7 @@ impl AffsEditor {
             dblocks.first().copied().unwrap_or(0),
         );
         put_ptr_table(&mut hdr, &dblocks[..first_chunk]);
-        put_u32(&mut hdr, OFF_BYTE_SIZE, data.len() as u32);
+        put_u32(&mut hdr, OFF_BYTE_SIZE, len as u32);
         Self::set_dates(&mut hdr, mtime);
         put_name(&mut hdr, name);
         put_u32(&mut hdr, OFF_NEXT_SAME_HASH, old_head);

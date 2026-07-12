@@ -690,9 +690,52 @@ impl crate::fs::FilesystemFactory for Affs {
     }
 }
 
+impl Affs {
+    /// Shared write path behind [`Filesystem::create_file`] and
+    /// [`Filesystem::create_file_streaming`]: place a file at `s` from exactly
+    /// `len` bytes read forward from `body`.
+    fn write_file_from_reader(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        s: &str,
+        body: &mut dyn std::io::Read,
+        len: u64,
+        mtime: u32,
+    ) -> Result<()> {
+        if matches!(self.mode, Write::None) {
+            return Err(Error::Immutable {
+                kind: "affs",
+                op: "add",
+            });
+        }
+        if let Write::Format(w) = &mut self.mode {
+            // TODO(streaming): `AffsWriter` keeps the whole volume as an
+            // in-memory tree and (re)serialises every block at `flush`, when
+            // the cross-volume block allocation, hash chains and bitmap are
+            // computed. A file's bytes must therefore live in `Entry.data`
+            // until then, so the Format path buffers the body in full here.
+            // Streaming would require an incremental on-disk allocator like
+            // the InPlace `AffsEditor`.
+            let mut data = Vec::with_capacity(len as usize);
+            body.take(len).read_to_end(&mut data)?;
+            w.insert_file(s, data, mtime)?;
+            return Ok(());
+        }
+        // In-place: stream the file's data blocks straight to disk and link
+        // the header into the parent — no whole-file buffer.
+        let (parent, name) = self.parent_block_and_name(s)?;
+        if let Write::InPlace(ed) = &mut self.mode {
+            ed.create_file(dev, parent, name, body, len, mtime)?;
+        }
+        self.refresh_index(dev)
+    }
+}
+
 impl Filesystem for Affs {
     fn streams_immediately(&self) -> bool {
-        // create_file reads its source into memory synchronously.
+        // `create_file_streaming` is overridden below, so this is consulted
+        // only via the default path: the InPlace editor consumes the body
+        // synchronously (Format buffers it — see the TODO there).
         true
     }
 
@@ -706,25 +749,22 @@ impl Filesystem for Affs {
         let s = path
             .to_str()
             .ok_or_else(|| Error::InvalidArgument("affs: non-UTF-8 path".into()))?;
-        if matches!(self.mode, Write::None) {
-            return Err(Error::Immutable {
-                kind: "affs",
-                op: "add",
-            });
-        }
         let (mut reader, len) = src.open()?;
-        let mut data = Vec::with_capacity(len as usize);
-        std::io::Read::take(&mut reader, len).read_to_end(&mut data)?;
-        if let Write::Format(w) = &mut self.mode {
-            w.insert_file(s, data, meta.mtime)?;
-            return Ok(());
-        }
-        // In-place: write the file's blocks directly, link into the parent.
-        let (parent, name) = self.parent_block_and_name(s)?;
-        if let Write::InPlace(ed) = &mut self.mode {
-            ed.create_file(dev, parent, name, &data, meta.mtime)?;
-        }
-        self.refresh_index(dev)
+        self.write_file_from_reader(dev, s, &mut reader, len, meta.mtime)
+    }
+
+    fn create_file_streaming(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &Path,
+        body: &mut dyn std::io::Read,
+        len: u64,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| Error::InvalidArgument("affs: non-UTF-8 path".into()))?;
+        self.write_file_from_reader(dev, s, body, len, meta.mtime)
     }
 
     fn create_dir(

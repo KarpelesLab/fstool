@@ -442,6 +442,38 @@ impl MutationCapability {
     }
 }
 
+/// How the files of a source can be reached — the read-side counterpart of
+/// [`MutationCapability`]. Returned by [`Filesystem::access_mode`].
+///
+/// This is the *forward-scan flag*: it tells a caller whether addressing an
+/// individual file is cheap (an index / positional structure exists) or
+/// requires walking the archive from the start. A single forward pass — a
+/// `repack`, or one `walk_*` — is always cheap; the distinction matters for
+/// *random* per-file access (`list` of a deep path, `read_file` of one entry),
+/// which on a [`Sequential`](Self::Sequential) source costs a fresh O(n) scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessMode {
+    /// The format carries an index or positional structure (inode table,
+    /// extent maps, a central directory, a seekable device): any file is
+    /// reachable in roughly constant time via `read_at`. All real
+    /// filesystems, indexed archives (zip), and disk-image containers.
+    RandomAccess,
+    /// No index — the format is an ordered stream of entries, so reaching a
+    /// given file means scanning forward from the start (O(n) per lookup).
+    /// Sequential archives (tar, cpio, ar) and whole-file-compressed streams.
+    /// Cheap to walk once; expensive to address repeatedly.
+    Sequential,
+}
+
+impl AccessMode {
+    /// Whether reaching an individual file requires an (expensive) forward
+    /// scan — `true` for [`Sequential`](Self::Sequential). Callers use this
+    /// to gate or warn before doing random per-file access on such a source.
+    pub fn requires_forward_scan(self) -> bool {
+        matches!(self, Self::Sequential)
+    }
+}
+
 /// What kind of zero-copy extent sharing — *reflinks* — the backend
 /// can express. Returned by [`Filesystem::clone_capability`].
 ///
@@ -704,6 +736,16 @@ pub trait Filesystem {
     /// [`Self::mutation_capability`] directly.
     fn supports_mutation(&self) -> bool {
         self.mutation_capability().supports_add_remove()
+    }
+
+    /// How this filesystem's files can be reached on read — the forward-scan
+    /// flag. Default [`AccessMode::RandomAccess`]: every real filesystem,
+    /// indexed archive, and disk-image container addresses files via an index
+    /// or positional structure. Sequential archives (tar, cpio, ar) override
+    /// to [`AccessMode::Sequential`] so callers can avoid — or warn about —
+    /// O(n) forward scans for random per-file access.
+    fn access_mode(&self) -> AccessMode {
+        AccessMode::RandomAccess
     }
 
     /// Reflink / clone capability of this filesystem — does it natively

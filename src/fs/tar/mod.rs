@@ -485,6 +485,11 @@ impl crate::fs::Filesystem for Tar {
         Ok(())
     }
 
+    fn access_mode(&self) -> crate::fs::AccessMode {
+        // tar has no index — a file is reached by scanning forward.
+        crate::fs::AccessMode::Sequential
+    }
+
     fn mutation_capability(&self) -> crate::fs::MutationCapability {
         crate::fs::MutationCapability::Streaming
     }

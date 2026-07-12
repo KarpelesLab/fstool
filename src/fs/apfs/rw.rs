@@ -349,6 +349,47 @@ impl<'a> MutatorCx<'a> {
         Ok(())
     }
 
+    /// Stream exactly `len` bytes forward from `reader` into the extent
+    /// starting at `paddr`, writing one block at a time — the whole body
+    /// is never held in memory. A short read (the reader yields fewer
+    /// than `len` bytes) zero-pads the remaining blocks so the extent's
+    /// on-disk size still matches `len`, mirroring
+    /// [`Self::write_extent_bytes`] and the single-pass writer's
+    /// truncation handling. The caller is responsible for `paddr` having
+    /// come from a recent [`Self::alloc_extent`] sized for `len`.
+    pub(crate) fn write_extent_from_reader(
+        &mut self,
+        paddr: u64,
+        reader: &mut dyn std::io::Read,
+        len: u64,
+    ) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let bs = self.block_size as usize;
+        let bs_u64 = bs as u64;
+        let blocks = len.div_ceil(bs_u64);
+        let mut blk = vec![0u8; bs];
+        let mut remaining = len;
+        for i in 0..blocks {
+            let want = (remaining as usize).min(bs);
+            blk.fill(0);
+            // Fill `blk[..want]`, tolerating short reads; anything the
+            // reader doesn't supply stays zero (block is re-zeroed above).
+            let mut got = 0;
+            while got < want {
+                let n = reader.read(&mut blk[got..want]).map_err(crate::Error::Io)?;
+                if n == 0 {
+                    break;
+                }
+                got += n;
+            }
+            self.dev.write_at((paddr + i) * bs_u64, &blk)?;
+            remaining -= want as u64;
+        }
+        Ok(())
+    }
+
     /// Reserve and return the next free APFS object id. Bumps the
     /// internal counter so a second call returns a different value.
     #[allow(dead_code)] // used by commit-4+ callers

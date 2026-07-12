@@ -770,6 +770,31 @@ impl AnyFs {
     /// everything else (including APFS / exFAT whose writers aren't
     /// implemented yet — those return `Unsupported` per-call from
     /// individual methods) reports `Mutable`.
+    /// How the inner filesystem addresses files on read — the forward-scan
+    /// flag (see [`crate::fs::AccessMode`]). Sequential archives report
+    /// [`Sequential`](crate::fs::AccessMode::Sequential); everything else
+    /// reports [`RandomAccess`](crate::fs::AccessMode::RandomAccess).
+    pub fn access_mode(&self) -> crate::fs::AccessMode {
+        match self {
+            Self::Ext(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            Self::Fat32(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            Self::HfsPlus(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            Self::Hfs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            Self::Affs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            Self::Ntfs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            Self::F2fs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            Self::Squashfs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            Self::Xfs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            Self::Iso9660(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            Self::Tar(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            Self::Apfs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            Self::Exfat(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            Self::Grf(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            Self::Archive(fs, _, _) => crate::fs::Filesystem::access_mode(fs.as_ref()),
+            Self::Ramfs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+        }
+    }
+
     pub fn mutation_capability(&self) -> crate::fs::MutationCapability {
         match self {
             Self::Ext(ext) => crate::fs::Filesystem::mutation_capability(ext.as_ref()),

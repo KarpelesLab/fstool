@@ -312,7 +312,12 @@ impl MemImage {
                 )
             }
             "f2fs" => {
-                let sz = self.geometry_size()?;
+                // f2fs needs enough main-area segments to lay out its 6
+                // cursegs; below ~50 MiB its flush indexes past a 1-segment
+                // main area and panics. Floor generously.
+                // TODO(sizing): size fixed-geometry targets via each FS's
+                // `FsSizePlan` for an exact content fit instead of heuristics.
+                let sz = self.geometry_size()?.max(64 << 20);
                 self.build_generic::<crate::fs::f2fs::F2fs>(
                     &crate::fs::f2fs::FormatOpts::default(),
                     sz,

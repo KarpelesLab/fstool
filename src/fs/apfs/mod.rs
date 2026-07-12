@@ -1183,6 +1183,28 @@ impl Apfs {
         mode: u16,
         mtime_ns: u64,
     ) -> Result<()> {
+        // Thin adapter over the streaming variant: an in-memory body is
+        // just a `Cursor` read forward once. Kept for callers/tests that
+        // already hold the bytes.
+        let mut cursor = std::io::Cursor::new(data);
+        self.create_file_at_streaming(dev, path, &mut cursor, data.len() as u64, mode, mtime_ns)
+    }
+
+    /// Like [`Self::create_file_at`] but streams the body forward from a
+    /// borrowed reader instead of materialising it. Exactly `len` bytes
+    /// are pulled from `body` and written block-at-a-time into a freshly
+    /// bump-allocated extent — the whole file is never buffered in RAM.
+    /// A short read is zero-padded (see
+    /// [`rw::MutatorCx::write_extent_from_reader`]).
+    pub fn create_file_at_streaming(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        body: &mut dyn std::io::Read,
+        len: u64,
+        mode: u16,
+        mtime_ns: u64,
+    ) -> Result<()> {
         let (parent_oid, name) = self.resolve_parent_and_name(dev, path)?;
         let (layout, case_fold) = self.drec_layout_for_writes();
         rw::commit_with_mutator(self, dev, |cx| {
@@ -1193,13 +1215,13 @@ impl Apfs {
             }
             let oid = cx.alloc_oid();
             let bs = cx.block_size();
-            let size = data.len() as u64;
-            // Allocate one extent + write the body. Empty files skip
-            // the extent and the matching FILE_EXTENT / DSTREAM_ID
+            let size = len;
+            // Allocate one extent + stream the body into it. Empty files
+            // skip the extent and the matching FILE_EXTENT / DSTREAM_ID
             // records — mirrors the single-pass writer's convention.
             if size > 0 {
                 let paddr = cx.alloc_extent(size)?;
-                cx.write_extent_bytes(paddr, data)?;
+                cx.write_extent_from_reader(paddr, body, size)?;
                 for (k, v) in write::build_file_extent_records(oid, 0, size, paddr, bs) {
                     cx.records.push((k, v));
                 }
@@ -1682,23 +1704,24 @@ impl crate::fs::Filesystem for Apfs {
         src: crate::fs::FileSource,
         meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        // Buffer the source bytes — both code paths need to know the
-        // file size up front (PendingWrite to stage the op, Write to
-        // bump-allocate an extent). APFS' streaming write happens
-        // inside the writer; at this layer we materialise the body
-        // first.
-        let (mut reader, size) = src
+        // Adapter over the streaming path: open the source as a forward
+        // reader and hand it to `create_file_streaming`. No whole-file
+        // Vec — the Write path streams block-at-a-time, the deferred
+        // PendingWrite path stages only what it must (see below).
+        let (mut reader, len) = src
             .open()
             .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
-        let mut data = Vec::with_capacity(size.min(64 * 1024 * 1024) as usize);
-        let n = std::io::Read::read_to_end(&mut reader, &mut data)
-            .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
-        if n as u64 != size {
-            // Pad with zeros so dstream.size still matches what the
-            // user asked for; mirrors the writer's truncation handling.
-            data.resize(size as usize, 0);
-        }
-        drop(reader);
+        self.create_file_streaming(dev, path, &mut reader, len, meta)
+    }
+
+    fn create_file_streaming(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        body: &mut dyn std::io::Read,
+        len: u64,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
         match &self.state {
             ApfsState::Read(_) => Err(crate::Error::Unsupported(
                 "apfs: create_file on a read-only image (use Apfs::open_writable for re-opens)"
@@ -1708,9 +1731,36 @@ impl crate::fs::Filesystem for Apfs {
                 let path_str = path
                     .to_str()
                     .ok_or_else(|| crate::Error::InvalidArgument("apfs: non-UTF-8 path".into()))?;
-                self.create_file_at(dev, path_str, &data, meta.mode, meta_mtime_ns(&meta))
+                // True forward streaming: the extent writer pulls exactly
+                // `len` bytes from `body` and lands them block-at-a-time.
+                self.create_file_at_streaming(
+                    dev,
+                    path_str,
+                    body,
+                    len,
+                    meta.mode,
+                    meta_mtime_ns(&meta),
+                )
             }
             ApfsState::PendingWrite(_) => {
+                // TODO(streaming): the PendingWrite model batches every
+                // create op in memory and replays them together through
+                // the single-pass writer at `flush` — so the body must
+                // outlive this call and can't be streamed straight to the
+                // device here. We buffer the bytes into the staged op.
+                // To stream this path too, `PendingOp::File` would need to
+                // hold a re-readable source (e.g. `FileSource::TempFile`)
+                // instead of a `Vec`, and `flush` would open+stream each
+                // at replay time via `add_file_from_reader`.
+                let mut data = Vec::with_capacity(len.min(64 * 1024 * 1024) as usize);
+                let n = std::io::Read::read_to_end(&mut std::io::Read::take(body, len), &mut data)
+                    .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+                if n as u64 != len {
+                    // Pad with zeros so dstream.size still matches what
+                    // the user asked for; mirrors the writer's truncation
+                    // handling.
+                    data.resize(len as usize, 0);
+                }
                 let pw = pending_write_mut(&mut self.state)?;
                 let (parent_oid, name) = pw.resolve_parent(path)?;
                 pw.ops.push(PendingOp::File {

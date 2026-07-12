@@ -1,11 +1,16 @@
-//! `ar` writer: GNU-format, members stored uncompressed.
+//! `ar` writer: members stored uncompressed, streamed straight to the
+//! device as they arrive.
 //!
-//! Member bodies are buffered in memory until [`finish`](ArWriter::finish)
-//! because GNU's `//` long-name string table must precede the members
-//! that reference it. `ar` archives are small by nature (object files,
-//! `.deb` control members), so this is an acceptable, documented cost.
-
-use std::io::Read;
+//! Names that fit the 16-byte header field (and carry no space) sit
+//! there directly, space-padded — the traditional/BSD layout, not GNU's
+//! trailing-`/` form, so BSD `ar` extracts them by name. Longer names
+//! (or any with a space) use the BSD `#1/<len>` convention — the name
+//! bytes are prepended to the body — rather than GNU's leading `//`
+//! string table. Neither form needs a forward reference, so each
+//! member's header + name + body flush to the device the moment
+//! [`add_file`](ArWriter::add_file) is called and no body is ever
+//! retained in memory. Our own reader ([`super::scan`]) decodes both
+//! forms, and GNU `ar` reads BSD `#1/` names too.
 
 use crate::block::BlockDevice;
 use crate::fs::archive::ArchiveBuilder;
@@ -14,26 +19,28 @@ use crate::fs::archive::writer::Cursor;
 use crate::fs::{DeviceKind, FileMeta};
 use crate::{Error, Result};
 
-struct Member {
-    name: String,
-    mtime: u64,
-    uid: u32,
-    gid: u32,
-    mode: u16,
-    data: Vec<u8>,
-}
-
 pub struct ArWriter {
     cursor: Cursor,
-    members: Vec<Member>,
+    /// Set once the 8-byte global header has been emitted.
+    began: bool,
 }
 
 impl ArWriter {
     pub fn new(dev: &dyn BlockDevice) -> Self {
         Self {
             cursor: Cursor::new(dev),
-            members: Vec::new(),
+            began: false,
         }
+    }
+
+    /// Emit the `!<arch>\n` global header before the first member (or on
+    /// `finish` for an empty archive).
+    fn ensure_magic(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        if !self.began {
+            self.cursor.write(dev, super::MAGIC)?;
+            self.began = true;
+        }
+        Ok(())
     }
 }
 
@@ -57,17 +64,16 @@ fn put(field: &mut [u8], s: &str) {
     field[..n].copy_from_slice(&b[..n]);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn write_member(
-    cur: &mut Cursor,
-    dev: &mut dyn BlockDevice,
+/// Build a 60-byte member header. `member_len` is the on-disk body
+/// length (for a BSD `#1/` member that includes the prepended name).
+fn member_header(
     name_field: &str,
     mtime: u64,
     uid: u32,
     gid: u32,
     mode: u16,
-    body: &[u8],
-) -> Result<()> {
+    member_len: u64,
+) -> [u8; 60] {
     let mut hdr = [b' '; 60];
     put(&mut hdr[0..16], name_field);
     put(&mut hdr[16..28], &mtime.to_string());
@@ -78,41 +84,61 @@ fn write_member(
         &mut hdr[40..48],
         &format!("{:o}", 0o100000u32 | u32::from(mode)),
     );
-    put(&mut hdr[48..58], &body.len().to_string());
+    put(&mut hdr[48..58], &member_len.to_string());
     hdr[58] = b'`';
     hdr[59] = b'\n';
-    cur.write(dev, &hdr)?;
-    cur.write(dev, body)?;
-    if body.len() % 2 == 1 {
-        cur.write(dev, b"\n")?;
-    }
-    Ok(())
+    hdr
 }
 
 impl ArchiveBuilder for ArWriter {
-    // Deferred exception: GNU `ar`'s long-name table (`//`) precedes the
-    // members, so their layout isn't known until every file has been seen.
-    // We therefore retain each body until `finish`. Bounded by the total
-    // archive size; `ar` is only used for small `.a` files.
     fn add_file_streaming(
         &mut self,
-        _dev: &mut dyn BlockDevice,
+        dev: &mut dyn BlockDevice,
         path: &str,
         body: &mut dyn std::io::Read,
         len: u64,
         meta: FileMeta,
     ) -> Result<()> {
         let name = flat_name(path)?;
-        let mut data = Vec::with_capacity(len.min(1 << 20) as usize);
-        body.take(len).read_to_end(&mut data).map_err(Error::from)?;
-        self.members.push(Member {
-            name,
-            mtime: u64::from(meta.mtime),
-            uid: meta.uid,
-            gid: meta.gid,
-            mode: meta.mode,
-            data,
-        });
+
+        // A name that fits the 16-byte field (and has no space, which
+        // trailing padding would swallow) sits there directly; anything
+        // longer uses the BSD `#1/<len>` inline form so nothing has to be
+        // buffered for a leading string table.
+        let bsd = name.len() > 16 || name.contains(' ');
+        let (name_field, member_len) = if bsd {
+            (format!("#1/{}", name.len()), name.len() as u64 + len)
+        } else {
+            (name.clone(), len)
+        };
+
+        self.ensure_magic(dev)?;
+        let hdr = member_header(
+            &name_field,
+            u64::from(meta.mtime),
+            meta.uid,
+            meta.gid,
+            meta.mode,
+            member_len,
+        );
+        self.cursor.write(dev, &hdr)?;
+        if bsd {
+            self.cursor.write(dev, name.as_bytes())?;
+        }
+
+        // Stream the body straight through (reader derefs to dyn Read).
+        let mut remaining = len;
+        let mut buf = [0u8; 64 * 1024];
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            body.read_exact(&mut buf[..want]).map_err(Error::from)?;
+            self.cursor.write(dev, &buf[..want])?;
+            remaining -= want as u64;
+        }
+        // Members are padded to an even offset with a newline.
+        if member_len % 2 == 1 {
+            self.cursor.write(dev, b"\n")?;
+        }
         Ok(())
     }
 
@@ -148,38 +174,9 @@ impl ArchiveBuilder for ArWriter {
     }
 
     fn finish(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
-        self.cursor.write(dev, super::MAGIC)?;
-
-        // Build the GNU long-name table and per-member name fields.
-        let mut table = Vec::new();
-        let mut name_fields = Vec::with_capacity(self.members.len());
-        for m in &self.members {
-            if m.name.len() <= 15 && !m.name.contains(' ') {
-                name_fields.push(format!("{}/", m.name));
-            } else {
-                let off = table.len();
-                table.extend_from_slice(m.name.as_bytes());
-                table.extend_from_slice(b"/\n");
-                name_fields.push(format!("/{off}"));
-            }
-        }
-        if !table.is_empty() {
-            write_member(&mut self.cursor, dev, "//", 0, 0, 0, 0, &table)?;
-        }
-
-        let members = std::mem::take(&mut self.members);
-        for (m, nf) in members.iter().zip(name_fields) {
-            write_member(
-                &mut self.cursor,
-                dev,
-                &nf,
-                m.mtime,
-                m.uid,
-                m.gid,
-                m.mode,
-                &m.data,
-            )?;
-        }
+        // Members are already on the device; just make sure an empty
+        // archive still carries the global header, then sync.
+        self.ensure_magic(dev)?;
         dev.sync()?;
         Ok(())
     }

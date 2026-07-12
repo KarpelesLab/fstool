@@ -8,9 +8,12 @@
 //!   string table for long names referenced as `/<offset>`, a `/`
 //!   symbol table that is skipped) plus the BSD layout (`#1/<len>` with
 //!   the name stored inline ahead of the data, `__.SYMDEF` skipped).
-//! - **Write:** GNU format. Members are stored uncompressed; long names
-//!   go through the `//` table. Because `ar` is flat, writing a nested
-//!   tree is refused with a message pointing at tar/zip/cpio.
+//! - **Write:** members stored uncompressed and streamed to the device
+//!   as they arrive. Short names use the classic inline field; long
+//!   names use the BSD `#1/<len>` form (name prepended to the body) so
+//!   no leading `//` table forces the bodies to be buffered. Because
+//!   `ar` is flat, writing a nested tree is refused with a message
+//!   pointing at tar/zip/cpio.
 
 mod scan;
 mod write;
