@@ -325,6 +325,21 @@ impl<R: Read> TarStreamReader<R> {
         self.bytes_consumed
     }
 
+    /// Read up to `buf.len()` bytes of the *current* entry's body, returning
+    /// `Ok(0)` at its end. Mirrors [`StreamEntry`]'s `Read` but on the reader
+    /// itself, so the generic [`crate::repack::ArchiveStream`] adapter can
+    /// pull the body after `next_entry` returned owned metadata.
+    pub fn read_body(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.body_remaining == 0 {
+            return Ok(0);
+        }
+        let want = (self.body_remaining as usize).min(buf.len());
+        let n = self.inner.read(&mut buf[..want])?;
+        self.body_remaining -= n as u64;
+        self.bytes_consumed += n as u64;
+        Ok(n)
+    }
+
     /// Advance to the next entry. The caller may read the entry's body
     /// via the returned [`StreamEntry`] (which implements `Read`); any
     /// unread bytes plus the 512-byte padding tail are skipped
@@ -574,6 +589,75 @@ impl<'a, R: Read> Read for StreamEntry<'a, R> {
         self.parent.body_remaining -= n as u64;
         self.parent.bytes_consumed += n as u64;
         Ok(n)
+    }
+}
+
+/// A [`TarStreamReader`] presented as the generic
+/// [`crate::repack::ArchiveStream`], so the format-agnostic
+/// [`crate::repack::walk_stream`] can drive a tar the same way it will drive
+/// cpio / ar.
+pub struct TarArchiveStream<R: Read> {
+    inner: TarStreamReader<R>,
+}
+
+impl<R: Read> TarArchiveStream<R> {
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner: TarStreamReader::new(inner),
+        }
+    }
+}
+
+impl<R: Read> crate::repack::ArchiveStream for TarArchiveStream<R> {
+    fn next_entry(&mut self) -> crate::Result<Option<crate::repack::StreamEntryMeta>> {
+        use crate::repack::{StreamEntryMeta, StreamKind};
+        let Some(se) = self.inner.next_entry()? else {
+            return Ok(None);
+        };
+        let e = &se.entry;
+        let kind = match e.kind {
+            EntryKind::Regular => StreamKind::Regular,
+            EntryKind::Dir => StreamKind::Dir,
+            EntryKind::Symlink => StreamKind::Symlink,
+            EntryKind::HardLink => StreamKind::HardLink,
+            EntryKind::CharDev => StreamKind::Char,
+            EntryKind::BlockDev => StreamKind::Block,
+            EntryKind::Fifo => StreamKind::Fifo,
+        };
+        // Hard-link targets are archive-relative; resolve `.`/`..` to the
+        // canonical absolute form. Symlink targets stay verbatim.
+        let link_target = match e.kind {
+            EntryKind::HardLink => e.link_target.as_deref().map(super::normalise_path),
+            _ => e.link_target.clone(),
+        };
+        Ok(Some(StreamEntryMeta {
+            path: e.path.clone(),
+            kind,
+            size: e.size,
+            link_target,
+            device_major: e.device_major,
+            device_minor: e.device_minor,
+            meta: crate::repack::RepackMeta {
+                mode: e.mode,
+                uid: e.uid,
+                gid: e.gid,
+                mtime: e.mtime as u32,
+                atime: e.mtime as u32,
+                ctime: e.mtime as u32,
+            },
+            xattrs: e
+                .xattrs
+                .iter()
+                .map(|x| crate::fs::XattrPair {
+                    name: x.name.clone(),
+                    value: x.value.clone(),
+                })
+                .collect(),
+        }))
+    }
+
+    fn read_body(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read_body(buf)
     }
 }
 

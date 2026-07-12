@@ -918,8 +918,9 @@ pub fn walk_source_into_sink(source: &Source, sink: &mut dyn RepackSink) -> Resu
             // is sequential, never seeked, so `Tar::open`'s upfront
             // index build is wasted work (it dominated profiles before
             // this arm was unified).
-            let mut reader = open_tar_stream(path, *codec)?;
-            walk_tar_stream(&mut reader, sink)
+            let reader = open_tar_stream(path, *codec)?;
+            let mut stream = crate::fs::tar::stream::TarArchiveStream::new(reader);
+            walk_stream(&mut stream, sink)
         }
         Source::Image(target) => walk_image(target, sink),
         Source::Layered(layers) => {
@@ -1204,71 +1205,87 @@ fn ensure_parents(
     Ok(())
 }
 
-/// Stream a (decompressed) tar `reader` straight into `sink` — the
-/// non-random-access counterpart to [`walk_anyfs`]. Drives
-/// `tar::stream::TarStreamReader`, which resolves PAX / GNU long-name +
-/// long-link overrides and exposes each entry's body as a `Read`. Bodies are
-/// streamed (never fully resident); parent directories are created on
-/// demand; hard links the destination can't represent fall back to a
-/// destination-sourced copy via [`RepackSink::materialise_copy`].
-///
-/// Used for compressed-tar sources so they never decompress to a
-/// tempfile. Does **not** call `sink.finish()` — the caller does that
-/// after any final bookkeeping (matching `walk_anyfs`).
-pub fn walk_tar_stream(reader: &mut dyn Read, sink: &mut dyn RepackSink) -> Result<()> {
-    use crate::fs::tar::EntryKind as TarKind;
-    use crate::fs::tar::stream::TarStreamReader;
+/// File-type of an entry yielded by an [`ArchiveStream`] — the kinds a
+/// sequential archive (tar / cpio / ar) can carry (a superset of the on-disk
+/// [`crate::fs::EntryKind`], adding `HardLink`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamKind {
+    Regular,
+    Dir,
+    Symlink,
+    HardLink,
+    Char,
+    Block,
+    Fifo,
+}
 
-    // Collapse `.` and empty path segments (a `tar -C dir .` archive
-    // emits `./`-prefixed members; the stream reader's `normalise_path`
-    // only fixes leading/trailing slashes, leaving interior `.`s that
-    // would otherwise create a bogus `/.` directory).
-    // Defense-in-depth: also drop `..` segments so a crafted tar member
-    // path can't ascend out of its destination subtree.
-    fn collapse(p: &str) -> String {
-        let mut out = String::new();
-        for seg in p
-            .split('/')
-            .filter(|s| !s.is_empty() && *s != "." && *s != "..")
-        {
-            out.push('/');
-            out.push_str(seg);
-        }
-        if out.is_empty() { "/".to_string() } else { out }
+/// One entry produced by an [`ArchiveStream`], in a format-agnostic shape.
+/// The reader has already resolved the format's quirks (PAX / GNU long
+/// names, hard-link target normalisation, …) into these fields; regular-file
+/// bodies are pulled separately via [`ArchiveStream::read_body`].
+pub struct StreamEntryMeta {
+    pub path: String,
+    pub kind: StreamKind,
+    pub size: u64,
+    /// Symlink target (verbatim) or resolved hard-link target.
+    pub link_target: Option<String>,
+    pub device_major: u32,
+    pub device_minor: u32,
+    pub meta: RepackMeta,
+    pub xattrs: Vec<XattrPair>,
+}
+
+/// A forward-only reader over a sequential archive — the generic source
+/// [`walk_stream`] consumes. `next_entry` advances to the next entry and
+/// returns its metadata; a regular file's body is then pulled with
+/// `read_body` until it returns `Ok(0)`, and any unread bytes are skipped by
+/// the following `next_entry`. Implemented by tar today
+/// ([`crate::fs::tar::stream::TarArchiveStream`]); cpio / ar can implement it
+/// too so a compressed `.cpio.gz` streams without a random-access device.
+pub trait ArchiveStream {
+    fn next_entry(&mut self) -> Result<Option<StreamEntryMeta>>;
+    fn read_body(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
+}
+
+/// Adapts the current entry's body of an [`ArchiveStream`] to [`Read`].
+struct StreamBody<'a>(&'a mut dyn ArchiveStream);
+
+impl Read for StreamBody<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read_body(buf)
     }
+}
 
-    let mut tsr = TarStreamReader::new(reader);
+/// Collapse `.`, empty, and `..` path segments to a canonical absolute path.
+/// (`tar -C dir .` emits `./`-prefixed members; dropping `..` is
+/// defense-in-depth so a crafted member can't ascend out of its subtree.)
+fn collapse_path(p: &str) -> String {
+    let mut out = String::new();
+    for seg in p
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+    {
+        out.push('/');
+        out.push_str(seg);
+    }
+    if out.is_empty() { "/".to_string() } else { out }
+}
+
+/// Stream any sequential archive straight into `sink` — the
+/// non-random-access counterpart to [`walk_anyfs`], generic over the archive
+/// format via [`ArchiveStream`]. Bodies are streamed (never fully resident);
+/// parent directories are created on demand; hard links the destination
+/// can't represent fall back to a destination-sourced copy via
+/// [`RepackSink::materialise_copy`]. Does **not** call `sink.finish()` — the
+/// caller does that after any final bookkeeping (matching `walk_anyfs`).
+pub fn walk_stream(stream: &mut dyn ArchiveStream, sink: &mut dyn RepackSink) -> Result<()> {
     let mut created: std::collections::HashSet<String> =
         std::collections::HashSet::from(["/".to_string()]);
     let mut entries_seen: u64 = 0;
 
-    while let Some(mut se) = tsr.next_entry()? {
+    while let Some(e) = stream.next_entry()? {
         check_entry_budget(&mut entries_seen)?;
-        // Snapshot metadata off the entry before borrowing `se` as the
-        // body reader for `put_file`.
-        let path = collapse(&se.entry.path);
-        let kind = se.entry.kind;
-        let size = se.entry.size;
-        let link = se.entry.link_target.clone();
-        let (dmaj, dmin) = (se.entry.device_major, se.entry.device_minor);
-        let meta = RepackMeta {
-            mode: se.entry.mode,
-            uid: se.entry.uid,
-            gid: se.entry.gid,
-            mtime: se.entry.mtime as u32,
-            atime: se.entry.mtime as u32,
-            ctime: se.entry.mtime as u32,
-        };
-        let xattrs: Vec<XattrPair> = se
-            .entry
-            .xattrs
-            .iter()
-            .map(|x| XattrPair {
-                name: x.name.clone(),
-                value: x.value.clone(),
-            })
-            .collect();
-
+        let path = collapse_path(&e.path);
         if path == "/" {
             // The archive's root entry (rare) — nothing to create.
             continue;
@@ -1276,40 +1293,66 @@ pub fn walk_tar_stream(reader: &mut dyn Read, sink: &mut dyn RepackSink) -> Resu
         note(&path);
         ensure_parents(&path, &mut created, sink)?;
 
-        match kind {
-            TarKind::Dir => {
-                sink.put_dir(&path, meta, &xattrs)?;
+        match e.kind {
+            StreamKind::Dir => {
+                sink.put_dir(&path, e.meta, &e.xattrs)?;
                 created.insert(path);
             }
-            TarKind::Regular => {
-                sink.put_file(&path, &mut se, size, meta, &xattrs)?;
-                note_bytes(size);
+            StreamKind::Regular => {
+                let mut body = StreamBody(&mut *stream);
+                sink.put_file(&path, &mut body, e.size, e.meta, &e.xattrs)?;
+                note_bytes(e.size);
             }
-            TarKind::Symlink => {
-                let target = link.as_deref().unwrap_or("");
-                sink.put_symlink(&path, target, meta, &xattrs)?;
+            StreamKind::Symlink => {
+                let target = e.link_target.as_deref().unwrap_or("");
+                sink.put_symlink(&path, target, e.meta, &e.xattrs)?;
             }
-            TarKind::HardLink => {
-                // tar link targets are archive-relative; resolve to the
-                // same absolute, `.`-collapsed form the entry paths use.
-                let raw = link.as_deref().unwrap_or("");
-                let target = collapse(&crate::fs::tar::normalise_path(raw));
-                if !sink.put_hardlink(&path, &target, meta, &xattrs)? {
-                    sink.materialise_copy(&path, &target, meta, &xattrs)?;
+            StreamKind::HardLink => {
+                // The reader resolved the target to an archive-absolute path;
+                // collapse again as defense-in-depth.
+                let raw = e.link_target.as_deref().unwrap_or("");
+                let target = collapse_path(raw);
+                if !sink.put_hardlink(&path, &target, e.meta, &e.xattrs)? {
+                    sink.materialise_copy(&path, &target, e.meta, &e.xattrs)?;
                 }
             }
-            TarKind::CharDev => {
-                sink.put_device(&path, DeviceKind::Char, dmaj, dmin, meta, &xattrs)?;
+            StreamKind::Char => {
+                sink.put_device(
+                    &path,
+                    DeviceKind::Char,
+                    e.device_major,
+                    e.device_minor,
+                    e.meta,
+                    &e.xattrs,
+                )?;
             }
-            TarKind::BlockDev => {
-                sink.put_device(&path, DeviceKind::Block, dmaj, dmin, meta, &xattrs)?;
+            StreamKind::Block => {
+                sink.put_device(
+                    &path,
+                    DeviceKind::Block,
+                    e.device_major,
+                    e.device_minor,
+                    e.meta,
+                    &e.xattrs,
+                )?;
             }
-            TarKind::Fifo => {
-                sink.put_device(&path, DeviceKind::Fifo, 0, 0, meta, &xattrs)?;
+            StreamKind::Fifo => {
+                sink.put_device(&path, DeviceKind::Fifo, 0, 0, e.meta, &e.xattrs)?;
             }
         }
     }
     Ok(())
+}
+
+/// Stream a (decompressed) tar `reader` into `sink`.
+#[deprecated(
+    since = "0.4.20",
+    note = "use `walk_stream` with a format-specific `ArchiveStream` \
+            (e.g. `tar::stream::TarArchiveStream`)"
+)]
+pub fn walk_tar_stream(reader: &mut dyn Read, sink: &mut dyn RepackSink) -> Result<()> {
+    let mut ts = crate::fs::tar::stream::TarArchiveStream::new(reader);
+    walk_stream(&mut ts, sink)
 }
 
 /// Recursively walk a host directory tree into `sink`, preserving host

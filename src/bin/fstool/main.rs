@@ -1358,8 +1358,9 @@ fn repack_stream_via_trait<F: fstool::fs::FilesystemFactory>(
         if lossy {
             sink = sink.lossy();
         }
-        let mut reader = fstool::repack::open_tar_stream(tar_path, codec)?;
-        fstool::repack::walk_tar_stream(&mut reader, &mut sink)?;
+        let reader = fstool::repack::open_tar_stream(tar_path, codec)?;
+        let mut stream = fstool::fs::tar::stream::TarArchiveStream::new(reader);
+        fstool::repack::walk_stream(&mut stream, &mut sink)?;
     }
     dst.flush(dst_dev)?;
     Ok(fstool::fs::Filesystem::image_len(&dst))
@@ -1390,8 +1391,9 @@ fn repack_tar_stream_to_tar(
         None => buffered,
     };
     let mut sink = fstool::repack::TarStreamSink::new(inner);
-    let mut reader = fstool::repack::open_tar_stream(tar_path, src_codec)?;
-    fstool::repack::walk_tar_stream(&mut reader, &mut sink)?;
+    let reader = fstool::repack::open_tar_stream(tar_path, src_codec)?;
+    let mut stream = fstool::fs::tar::stream::TarArchiveStream::new(reader);
+    fstool::repack::walk_stream(&mut stream, &mut sink)?;
     sink.finish()?;
     let written = sink.bytes_written();
     match dst_tar_codec {
@@ -1777,8 +1779,9 @@ fn repack_tar_stream_to_fs(
             let mut dst_ext = Ext::format_with(dst_dev.as_mut(), &opts)?;
             {
                 let mut sink = fstool::repack::FsSink::new(&mut dst_ext, dst_dev.as_mut());
-                let mut reader = fstool::repack::open_tar_stream(tar_path, codec)?;
-                fstool::repack::walk_tar_stream(&mut reader, &mut sink)?;
+                let reader = fstool::repack::open_tar_stream(tar_path, codec)?;
+                let mut stream = fstool::fs::tar::stream::TarArchiveStream::new(reader);
+                fstool::repack::walk_stream(&mut stream, &mut sink)?;
             }
             dst_ext.flush(dst_dev.as_mut())?;
             None
@@ -1797,8 +1800,9 @@ fn repack_tar_stream_to_fs(
             let mut dst_fat = fstool::fs::fat::Fat32::format(dst_dev.as_mut(), &opts)?;
             {
                 let mut sink = fstool::repack::FsSink::new(&mut dst_fat, dst_dev.as_mut()).lossy();
-                let mut reader = fstool::repack::open_tar_stream(tar_path, codec)?;
-                fstool::repack::walk_tar_stream(&mut reader, &mut sink)?;
+                let reader = fstool::repack::open_tar_stream(tar_path, codec)?;
+                let mut stream = fstool::fs::tar::stream::TarArchiveStream::new(reader);
+                fstool::repack::walk_stream(&mut stream, &mut sink)?;
             }
             dst_fat.flush(dst_dev.as_mut())?;
             None
