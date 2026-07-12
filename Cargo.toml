@@ -1,6 +1,6 @@
 [package]
 name = "fstool"
-version = "0.4.18"
+version = "0.4.19"
 edition = "2024"
 # Floor is the edition-2024 minimum (1.85) bumped to 1.88 by the
 # `purecrypto` dependency (encrypted-DMG crypto), whose MSRV is 1.88 as of

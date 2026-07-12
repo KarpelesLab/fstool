@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.19](https://github.com/KarpelesLab/fstool/compare/v0.4.18...v0.4.19) - 2026-07-12
+
+### Added
+
+- *(web)* in-browser WebAssembly UI + in-memory inspect/convert API
+
+### Fixed
+
+- *(hfs+)* restore create_file_streaming override clobbered in merge
+- *(web)* keep [hidden] elements hidden over author display rules
+
+### Other
+
+- de-link private intra-doc references (rustdoc -D warnings)
+- *(f2fs)* use map values()/keys() to satisfy clippy for_kv_map
+- *(fs)* sequential archives hold no index — forward-scan on read
+- *(fs)* honest per-file read seekability — no RAM-faked Seek
+- *(fs)* finish write-path streaming; add AccessMode capability
+- *(fs)* stream file bodies on write; drop tempfile dependency
+- *(web)* rebuild UI in Vue 3 + Vite; fold wasm bindings into fstool crate
+- link the live web demo in the README
+- lower MSRV to 1.88 (purecrypto 0.6.14)
+
 ## [0.4.18](https://github.com/KarpelesLab/fstool/compare/v0.4.17...v0.4.18) - 2026-06-16
 
 ### Added
