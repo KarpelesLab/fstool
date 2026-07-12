@@ -1,7 +1,7 @@
 //! Per-entry readers for the archive core: a bounded view over the
 //! device's compressed byte range, plus codec dispatch.
 
-use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 
 use super::{DataLocator, Method};
 use crate::Result;
@@ -76,10 +76,15 @@ fn unsupported_method(id: u16) -> crate::Error {
     ))
 }
 
-/// Open a random-access (`Read + Seek`) handle over one entry. For
-/// `Stored` this is a cheap bounded view; for compressed methods the
-/// whole body is inflated into memory once (documented RAM cost,
-/// mirroring the GRF backend).
+/// Open a random-access (`Read + Seek`) handle over one entry. Only
+/// `Stored` members are genuinely seekable — they map to a cheap
+/// bounded view over the device.
+///
+/// A compressed member (Deflate / any codec) is whole-member
+/// compressed and can only be read forward from the start, so its
+/// seekability would have to be faked by inflating the entire body
+/// into RAM. That's dishonest, so we refuse: callers wanting the bytes
+/// must stream them forward through [`open`] (`read_file`).
 pub fn open_ro<'a>(
     dev: &'a mut dyn BlockDevice,
     loc: DataLocator,
@@ -92,20 +97,11 @@ pub fn open_ro<'a>(
             pos: 0,
         })),
         Method::Unsupported(id) => Err(unsupported_method(id)),
-        _ => {
-            // Inflate fully, then hand back an owned in-memory handle so
-            // the device borrow is released.
-            let mut buf = Vec::with_capacity(loc.uncompressed_len.min(1 << 20) as usize);
-            {
-                let mut r = open(dev, loc)?;
-                r.read_to_end(&mut buf).map_err(crate::Error::from)?;
-            }
-            let len = buf.len() as u64;
-            Ok(Box::new(BufferedHandle {
-                cursor: Cursor::new(buf),
-                len,
-            }))
-        }
+        _ => Err(crate::Error::Unsupported(
+            "archive: member is compressed; only forward reads are supported \
+             (use read_file / open_file_reader)"
+                .into(),
+        )),
     }
 }
 
@@ -151,30 +147,6 @@ impl<'a> Seek for StoredHandle<'a> {
 }
 
 impl<'a> FileReadHandle for StoredHandle<'a> {
-    fn len(&self) -> u64 {
-        self.len
-    }
-}
-
-/// In-memory handle for an inflated body.
-struct BufferedHandle {
-    cursor: Cursor<Vec<u8>>,
-    len: u64,
-}
-
-impl Read for BufferedHandle {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.cursor.read(buf)
-    }
-}
-
-impl Seek for BufferedHandle {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.cursor.seek(pos)
-    }
-}
-
-impl FileReadHandle for BufferedHandle {
     fn len(&self) -> u64 {
         self.len
     }

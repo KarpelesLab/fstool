@@ -482,34 +482,36 @@ impl crate::fs::Filesystem for Grf {
             self.entries.get(&key).cloned().ok_or_else(|| {
                 crate::Error::InvalidArgument(format!("grf: no entry at {key:?}"))
             })?;
+        // TODO(streaming): grf member is whole-file zlib+DES; forward decode
+        // is inherently from-start, so `read_entry` materialises the whole
+        // body here. Acceptable for the forward path (no fake Seek offered).
         let bytes = self.read_entry(dev, &entry)?;
         Ok(Box::new(std::io::Cursor::new(bytes)))
     }
 
     fn open_file_ro<'a>(
         &'a mut self,
-        dev: &'a mut dyn BlockDevice,
+        _dev: &'a mut dyn BlockDevice,
         path: &std::path::Path,
     ) -> Result<Box<dyn crate::fs::FileReadHandle + 'a>> {
         // GRF stores each file as a single zlib stream (optionally
-        // per-block encrypted). Seek-friendly access requires the
-        // whole inflated body in RAM — the alternative would be
-        // re-decompressing from the start on every backward seek.
-        // For typical GRF assets (sub-MB sprites, sounds, scripts)
-        // this is fine; documented here so callers don't expect
-        // streaming-style memory bounds.
+        // per-block DES-encrypted). It is whole-member compressed and
+        // decodes only forward from the start, so a seekable handle
+        // could only be faked by inflating the entire body into RAM.
+        // That's dishonest — refuse and let callers stream forward via
+        // `read_file` instead.
         let key = normalise_path(
             path.to_str()
                 .ok_or_else(|| crate::Error::InvalidArgument("grf: non-UTF-8 path".into()))?,
         );
-        let entry =
-            self.entries.get(&key).cloned().ok_or_else(|| {
-                crate::Error::InvalidArgument(format!("grf: no entry at {key:?}"))
-            })?;
-        let bytes = self.read_entry(dev, &entry)?;
-        Ok(Box::new(GrfFileReadHandle {
-            cursor: std::io::Cursor::new(bytes),
-        }))
+        if !self.entries.contains_key(&key) {
+            return Err(crate::Error::InvalidArgument(format!(
+                "grf: no entry at {key:?}"
+            )));
+        }
+        Err(crate::Error::Unsupported(format!(
+            "grf: {key:?} is compressed; only forward reads are supported"
+        )))
     }
 
     fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
@@ -524,31 +526,6 @@ impl crate::fs::Filesystem for Grf {
 
     fn mutation_capability(&self) -> MutationCapability {
         MutationCapability::Mutable
-    }
-}
-
-/// Random-access (`Read + Seek + len`) view of a GRF entry's
-/// inflated body. Holds the decompressed bytes in RAM because GRF
-/// stores each file as a single zlib stream.
-struct GrfFileReadHandle {
-    cursor: std::io::Cursor<Vec<u8>>,
-}
-
-impl Read for GrfFileReadHandle {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.cursor.read(buf)
-    }
-}
-
-impl std::io::Seek for GrfFileReadHandle {
-    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        self.cursor.seek(pos)
-    }
-}
-
-impl crate::fs::FileReadHandle for GrfFileReadHandle {
-    fn len(&self) -> u64 {
-        self.cursor.get_ref().len() as u64
     }
 }
 
@@ -599,8 +576,11 @@ mod tests {
     }
 
     #[test]
-    fn open_file_ro_random_seek() {
-        use std::io::{Read, Seek, SeekFrom};
+    fn open_file_ro_refuses_compressed_member() {
+        // GRF members are whole-file zlib streams: honestly forward-only,
+        // so `open_file_ro` must refuse rather than fake Seek by buffering
+        // the whole body. The forward `read_file` path still works.
+        use std::io::Read;
         let mut dev = MemoryBackend::new(64 * 1024);
         let mut grf = Grf::format(&mut dev, &FormatOpts::default()).unwrap();
         let body: Vec<u8> = (0..1024u32).map(|i| (i & 0xff) as u8).collect();
@@ -617,19 +597,25 @@ mod tests {
         grf.flush(&mut dev).unwrap();
 
         let mut grf = Grf::open(&mut dev).unwrap();
-        let mut h = grf
-            .open_file_ro(&mut dev, std::path::Path::new("/blob.bin"))
+        // Random-access open is refused for a compressed member.
+        match grf.open_file_ro(&mut dev, std::path::Path::new("/blob.bin")) {
+            Err(crate::Error::Unsupported(_)) => {}
+            Ok(_) => panic!("open_file_ro must refuse a compressed grf member"),
+            Err(e) => panic!("expected Unsupported, got {e:?}"),
+        }
+        // A missing entry still reports InvalidArgument (not Unsupported).
+        match grf.open_file_ro(&mut dev, std::path::Path::new("/nope.bin")) {
+            Err(crate::Error::InvalidArgument(_)) => {}
+            Ok(_) => panic!("open_file_ro must fail for a missing entry"),
+            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+        }
+        // Forward read still returns the exact bytes.
+        let mut r = grf
+            .read_file(&mut dev, std::path::Path::new("/blob.bin"))
             .unwrap();
-        assert_eq!(h.len(), body.len() as u64);
-        // Seek mid-body, read 32 bytes, verify.
-        h.seek(SeekFrom::Start(500)).unwrap();
-        let mut chunk = [0u8; 32];
-        h.read_exact(&mut chunk).unwrap();
-        assert_eq!(&chunk[..], &body[500..532]);
-        // Backward seek and reread.
-        h.seek(SeekFrom::Current(-32)).unwrap();
-        h.read_exact(&mut chunk).unwrap();
-        assert_eq!(&chunk[..], &body[500..532]);
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
     }
 
     #[test]

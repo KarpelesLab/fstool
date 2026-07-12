@@ -250,7 +250,7 @@ impl HfsPlus {
     /// Create a regular file at the given absolute path, streaming
     /// `len` bytes from `src` into freshly allocated allocation blocks.
     #[allow(clippy::too_many_arguments)]
-    pub fn create_file<R: std::io::Read + ?Sized>(
+    pub fn create_file<R: std::io::Read>(
         &mut self,
         dev: &mut dyn BlockDevice,
         path: &str,
@@ -612,6 +612,34 @@ impl HfsPlus {
         dev: &'a mut dyn BlockDevice,
         path: &str,
     ) -> Result<HfsPlusFileReader<'a>> {
+        let file = self.resolve_regular_file(dev, path)?;
+        // HFSCompression: when UF_COMPRESSED is set, the data fork is
+        // empty and the logical content lives in the
+        // `com.apple.decmpfs` extended attribute (with optional
+        // overflow into the resource fork).
+        if file.bsd.owner_flags & decmpfs::UF_COMPRESSED != 0 {
+            // TODO(streaming): decmpfs should decode per-block lazily like
+            // squashfs (the resource-fork variant already carries a block
+            // table). For now the whole file is inflated into RAM here for
+            // the forward read; the seekable `open_file_ro` refuses instead
+            // of faking Seek over this buffer.
+            let bytes = self.read_decmpfs_file(dev, &file, path)?;
+            return Ok(HfsPlusFileReader::buffered(bytes));
+        }
+        let fork = self.open_data_fork(dev, &file)?;
+        Ok(HfsPlusFileReader::streaming(
+            dev,
+            fork,
+            file.data_fork.logical_size,
+        ))
+    }
+
+    /// Resolve `path` to the [`CatalogFile`] of the regular file it names,
+    /// following `hlnk`/`hfs+` hard-link indirection. Errors on
+    /// directories, symlinks, thread records and non-regular special
+    /// nodes. Shared by [`Self::open_file_reader`] (forward reads) and
+    /// [`crate::fs::Filesystem::open_file_ro`] (random access).
+    fn resolve_regular_file(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<CatalogFile> {
         let rec = self.lookup_path(dev, path)?;
         let file = match rec {
             CatalogRecord::File(f) => f,
@@ -639,23 +667,7 @@ impl HfsPlus {
                 file.bsd.file_mode
             )));
         }
-        // HFSCompression: when UF_COMPRESSED is set, the data fork is
-        // empty and the logical content lives in the
-        // `com.apple.decmpfs` extended attribute (with optional
-        // overflow into the resource fork). Materialise the
-        // decompressed bytes up front and hand back a cursor over
-        // them — the data is bounded by the header's uncompressed_size
-        // field.
-        if file.bsd.owner_flags & decmpfs::UF_COMPRESSED != 0 {
-            let bytes = self.read_decmpfs_file(dev, &file, path)?;
-            return Ok(HfsPlusFileReader::buffered(bytes));
-        }
-        let fork = self.open_data_fork(dev, &file)?;
-        Ok(HfsPlusFileReader::streaming(
-            dev,
-            fork,
-            file.data_fork.logical_size,
-        ))
+        Ok(file)
     }
 
     /// Open a streaming reader over a file's **resource fork** (fork type
@@ -1548,23 +1560,6 @@ impl crate::fs::Filesystem for HfsPlus {
         .map(|_| ())
     }
 
-    /// Stream a borrowed body forward into freshly-allocated blocks — no
-    /// buffering; the length is known up front and the source is read once.
-    fn create_file_streaming(
-        &mut self,
-        dev: &mut dyn BlockDevice,
-        path: &std::path::Path,
-        body: &mut dyn std::io::Read,
-        len: u64,
-        meta: crate::fs::FileMeta,
-    ) -> Result<()> {
-        let s = path
-            .to_str()
-            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: non-UTF-8 path".into()))?;
-        self.create_file(dev, s, body, len, meta.mode, meta.uid, meta.gid, meta.mtime)
-            .map(|_| ())
-    }
-
     fn create_dir(
         &mut self,
         dev: &mut dyn BlockDevice,
@@ -1769,8 +1764,22 @@ impl crate::fs::Filesystem for HfsPlus {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("hfs+: non-UTF-8 path".into()))?;
-        let r = self.open_file_reader(dev, s)?;
-        Ok(Box::new(r))
+        // An ordinary data fork is genuinely seekable (the streaming
+        // reader walks extents on demand). A decmpfs (UF_COMPRESSED) file
+        // is whole-member compressed and forward-only today — refuse
+        // rather than fake Seek by inflating the whole body into RAM.
+        let file = self.resolve_regular_file(dev, s)?;
+        if file.bsd.owner_flags & decmpfs::UF_COMPRESSED != 0 {
+            return Err(crate::Error::Unsupported(format!(
+                "hfs+: {s:?} is HFS-compressed (decmpfs); only forward reads are supported"
+            )));
+        }
+        let fork = self.open_data_fork(dev, &file)?;
+        Ok(Box::new(HfsPlusFileReader::streaming(
+            dev,
+            fork,
+            file.data_fork.logical_size,
+        )))
     }
 
     fn open_file_rw<'a>(

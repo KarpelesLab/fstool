@@ -136,12 +136,15 @@ impl Filesystem for SevenZFs {
     ) -> Result<Box<dyn FileReadHandle + 'a>> {
         #[cfg(feature = "sevenz")]
         match self.inner.lookup(path)? {
-            imp::Lookup::File(loc) => {
-                use std::io::Read;
-                let mut r = self.inner.open_file(dev, &loc)?;
-                let mut bytes = Vec::new();
-                r.read_to_end(&mut bytes).map_err(crate::Error::from)?;
-                return Ok(Box::new(imp::mem_handle(bytes)));
+            // A 7z entry lives in a (possibly solid) folder that decodes
+            // forward from the folder start — its bytes can't be produced
+            // seekably without inflating the whole folder into RAM, which
+            // would be faking Seek. Refuse; callers stream via `read_file`.
+            imp::Lookup::File(_) => {
+                return Err(crate::Error::Unsupported(format!(
+                    "7z: {} is compressed; only forward reads are supported",
+                    path.display()
+                )));
             }
             imp::Lookup::Unsupported(reason) => return Err(crate::Error::Unsupported(reason)),
             imp::Lookup::NotRegular => {}
@@ -1050,34 +1053,6 @@ mod imp {
             let n = self.inner.read(&mut buf[..want])?;
             self.remaining -= n as u64;
             Ok(n)
-        }
-    }
-
-    /// Wrap decoded bytes as a seekable [`FileReadHandle`].
-    pub fn mem_handle(bytes: Vec<u8>) -> MemHandle {
-        let len = bytes.len() as u64;
-        MemHandle {
-            cur: io::Cursor::new(bytes),
-            len,
-        }
-    }
-    pub struct MemHandle {
-        cur: io::Cursor<Vec<u8>>,
-        len: u64,
-    }
-    impl Read for MemHandle {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.cur.read(buf)
-        }
-    }
-    impl io::Seek for MemHandle {
-        fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
-            self.cur.seek(pos)
-        }
-    }
-    impl crate::fs::FileReadHandle for MemHandle {
-        fn len(&self) -> u64 {
-            self.len
         }
     }
 }
