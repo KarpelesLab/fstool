@@ -21,12 +21,14 @@
 //!   destination — preserving link semantics across FS types is a
 //!   separate problem.
 //!
-//! ## Random-access read path
+//! ## Sequential read path
 //!
-//! On `open`, the reader walks the whole archive once, recording each
-//! entry's metadata and (for regular files) the byte offset where its
-//! data begins. After that, `list_path` answers from the in-memory
-//! tree and `open_file_reader` seeks straight to the data.
+//! Tar has no on-disk index — a file is reached by scanning forward from
+//! the start. So the [`Tar`] handle holds **no** persistent index: every
+//! addressing operation (`list_path`, `open_file_reader`, `getattr`,
+//! `read_symlink`, `list_xattrs`) forward-scans the device once
+//! (`O(n)`), driven by the single [`Tar::for_each_entry`] primitive.
+//! `open` only validates the first block; it never builds a tree.
 
 pub mod header;
 pub mod pax;
@@ -126,25 +128,55 @@ pub struct Entry {
 }
 
 /// An opened tar archive.
-pub struct Tar {
+///
+/// Tar is a sequential format with no on-disk index, so this handle
+/// holds **no** persistent state — every read operation forward-scans
+/// the device via [`Tar::for_each_entry`]. `open` only validates the
+/// first block.
+pub struct Tar;
+
+/// A transient in-memory tree reconstructed by [`Tar::scan_index`] for a
+/// single operation, then dropped. Never persisted on the handle.
+struct TransientIndex {
     entries: Vec<Entry>,
-    /// Map from a *normalised* absolute path (always starts with `/`) to
-    /// the index into `entries`.
+    /// Normalised absolute path → index into `entries`.
     by_path: HashMap<String, usize>,
-    /// Map from a normalised absolute directory path to the list of
-    /// names contained directly underneath it (in archive order).
+    /// Normalised absolute directory path → direct child names (archive
+    /// order).
     children: HashMap<String, Vec<String>>,
 }
 
 impl Tar {
-    /// Scan `dev` from offset 0, parsing every tar entry until the
-    /// two-zero-block EOF marker. Returns the resolved in-memory index;
-    /// no file contents are read.
+    /// Open a tar archive. Does **not** scan — only light validation:
+    /// if the device holds at least one block, block 0 must be either an
+    /// all-zero block (an empty archive) or a header with a valid
+    /// checksum. Full parse errors surface per read operation.
     pub fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
+        let total = dev.total_size();
+        if total >= BLOCK_SIZE as u64 {
+            let mut block = [0u8; BLOCK_SIZE];
+            dev.read_at(0, &mut block)?;
+            if !header::is_zero_block(&block) && !Header::checksum_ok(&block) {
+                return Err(crate::Error::InvalidImage(
+                    "tar: bad header checksum at offset 0".into(),
+                ));
+            }
+        }
+        Ok(Self)
+    }
+
+    /// Forward-scan `dev` from offset 0, parsing every tar entry (ustar /
+    /// PAX / GNU long-name / long-link) until the two-zero-block EOF
+    /// marker, invoking `f` once per resolved [`Entry`]. Stops early when
+    /// `f` returns [`ControlFlow::Break`]. This is the single scanner
+    /// every read path reuses; nothing is retained across calls.
+    fn for_each_entry(
+        dev: &mut dyn BlockDevice,
+        mut f: impl FnMut(&Entry) -> std::ops::ControlFlow<()>,
+    ) -> Result<()> {
         let total = dev.total_size();
         let mut pos = 0u64;
         let mut block = [0u8; BLOCK_SIZE];
-        let mut entries: Vec<Entry> = Vec::new();
         // PAX overrides that should be applied to the NEXT plain header.
         let mut pending: PaxOverrides = PaxOverrides::default();
         let mut consecutive_zero = 0u32;
@@ -223,14 +255,14 @@ impl Tar {
             let size = pending.size.take().unwrap_or(h.size);
             let mtime = pending.mtime.take().unwrap_or(h.mtime);
             let xattrs = std::mem::take(&mut pending.xattrs);
-            // Strip trailing `/` from directory paths so the index is
+            // Strip trailing `/` from directory paths so paths are
             // consistent.
             let mut path = path;
             if path.ends_with('/') {
                 path.pop();
             }
             let path = normalise_path(&path);
-            entries.push(Entry {
+            let entry = Entry {
                 path,
                 kind,
                 mode: h.mode,
@@ -243,7 +275,7 @@ impl Tar {
                 device_minor: h.devminor,
                 data_offset: data_off,
                 xattrs,
-            });
+            };
 
             pos = data_off
                 + if matches!(kind, EntryKind::Regular) {
@@ -251,9 +283,25 @@ impl Tar {
                 } else {
                     0
                 };
-        }
 
-        // Build the path → entry and parent → children indexes.
+            if let std::ops::ControlFlow::Break(()) = f(&entry) {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Forward-scan and rebuild the full transient tree (flat entry list
+    /// plus path/children maps), exactly as the old `open` did — but the
+    /// result is used for a single operation and then dropped.
+    fn scan_index(dev: &mut dyn BlockDevice) -> Result<TransientIndex> {
+        let mut entries: Vec<Entry> = Vec::new();
+        Self::for_each_entry(dev, |e| {
+            entries.push(e.clone());
+            std::ops::ControlFlow::Continue(())
+        })?;
+
+        // Build the path → entry and parent → children maps.
         let mut by_path = HashMap::new();
         let mut children: HashMap<String, Vec<String>> = HashMap::new();
         // The root "/" exists implicitly even if the archive doesn't
@@ -288,29 +336,52 @@ impl Tar {
                 children.entry(e.path.clone()).or_default();
             }
         }
-        Ok(Self {
+        Ok(TransientIndex {
             entries,
             by_path,
             children,
         })
     }
 
-    pub fn entries(&self) -> &[Entry] {
-        &self.entries
+    /// Forward-scan for a single entry by (normalised) path, returning it
+    /// owned. Stops at the first match.
+    fn find_entry(dev: &mut dyn BlockDevice, path: &str) -> Result<Option<Entry>> {
+        let want = normalise_path(path);
+        let mut found: Option<Entry> = None;
+        Self::for_each_entry(dev, |e| {
+            if e.path == want {
+                found = Some(e.clone());
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        })?;
+        Ok(found)
     }
 
-    pub fn lookup(&self, path: &str) -> Option<&Entry> {
-        let path = normalise_path(path);
-        self.by_path.get(&path).map(|&i| &self.entries[i])
+    /// All entries, forward-scanned and returned owned. `O(n)`.
+    pub fn entries(&self, dev: &mut dyn BlockDevice) -> Result<Vec<Entry>> {
+        let mut entries = Vec::new();
+        Self::for_each_entry(dev, |e| {
+            entries.push(e.clone());
+            std::ops::ControlFlow::Continue(())
+        })?;
+        Ok(entries)
+    }
+
+    /// Look up a single entry by path, forward-scanning the device.
+    pub fn lookup(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<Option<Entry>> {
+        Self::find_entry(dev, path)
     }
 
     pub fn list_path(
         &self,
-        _dev: &mut dyn BlockDevice,
+        dev: &mut dyn BlockDevice,
         path: &str,
     ) -> Result<Vec<crate::fs::DirEntry>> {
         let path = normalise_path(path);
-        let entries = self.children.get(&path).ok_or_else(|| {
+        let idx = Self::scan_index(dev)?;
+        let entries = idx.children.get(&path).ok_or_else(|| {
             crate::Error::InvalidArgument(format!("tar: no such directory {path:?}"))
         })?;
         let mut out = Vec::with_capacity(entries.len());
@@ -322,10 +393,10 @@ impl Tar {
             };
             // Tar can have a file listed without its parent dir.
             // Synthesise the missing parent on the fly: list it as Dir.
-            let kind = self
+            let kind = idx
                 .by_path
                 .get(&child_path)
-                .map(|&i| match self.entries[i].kind {
+                .map(|&i| match idx.entries[i].kind {
                     EntryKind::Dir => crate::fs::EntryKind::Dir,
                     EntryKind::Regular | EntryKind::HardLink => crate::fs::EntryKind::Regular,
                     EntryKind::Symlink => crate::fs::EntryKind::Symlink,
@@ -335,11 +406,11 @@ impl Tar {
                 })
                 .unwrap_or(crate::fs::EntryKind::Dir);
             // "inode": fold the entry index for stability across runs.
-            let inode = self.by_path.get(&child_path).copied().unwrap_or(0) as u32 + 1;
+            let inode = idx.by_path.get(&child_path).copied().unwrap_or(0) as u32 + 1;
             let size = if matches!(kind, crate::fs::EntryKind::Regular) {
-                self.by_path
+                idx.by_path
                     .get(&child_path)
-                    .map(|&i| self.entries[i].size)
+                    .map(|&i| idx.entries[i].size)
                     .unwrap_or(0)
             } else {
                 0
@@ -360,8 +431,11 @@ impl Tar {
         dev: &'a mut dyn BlockDevice,
         path: &str,
     ) -> Result<TarFileReader<'a>> {
-        let e = self
-            .lookup(path)
+        // Scan for the entry, then (for a hard link) a second scan for
+        // its target — the target precedes the link, but a fresh forward
+        // scan is fine and keeps the handle index-free. Both scans end
+        // before `dev` is re-borrowed for the reader.
+        let e = Self::find_entry(dev, path)?
             .ok_or_else(|| crate::Error::InvalidArgument(format!("tar: no such entry {path:?}")))?;
         // A hard-link entry carries no body of its own — resolve to the
         // target's data range so callers (incl. the repack walker) read
@@ -372,7 +446,7 @@ impl Tar {
                 let tgt = e.link_target.clone().ok_or_else(|| {
                     crate::Error::InvalidArgument(format!("tar: hardlink {path:?} has no target"))
                 })?;
-                let te = self.lookup(&tgt).ok_or_else(|| {
+                let te = Self::find_entry(dev, &tgt)?.ok_or_else(|| {
                     crate::Error::InvalidArgument(format!(
                         "tar: hardlink {path:?} → {tgt:?} target not found"
                     ))
@@ -496,14 +570,13 @@ impl crate::fs::Filesystem for Tar {
 
     fn read_symlink(
         &mut self,
-        _dev: &mut dyn BlockDevice,
+        dev: &mut dyn BlockDevice,
         path: &std::path::Path,
     ) -> Result<std::path::PathBuf> {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("tar: non-UTF-8 path".into()))?;
-        let entry = self
-            .lookup(s)
+        let entry = Self::find_entry(dev, s)?
             .ok_or_else(|| crate::Error::InvalidArgument(format!("tar: no entry at {s:?}")))?;
         if !matches!(entry.kind, EntryKind::Symlink) {
             return Err(crate::Error::InvalidArgument(format!(
@@ -525,7 +598,7 @@ impl crate::fs::Filesystem for Tar {
     /// directory defaults.
     fn getattr(
         &mut self,
-        _dev: &mut dyn BlockDevice,
+        dev: &mut dyn BlockDevice,
         path: &std::path::Path,
     ) -> Result<crate::fs::FileAttrs> {
         let s = path
@@ -549,24 +622,26 @@ impl crate::fs::Filesystem for Tar {
             return Ok(dir_attrs(1));
         }
         let p = normalise_path(s);
-        let Some(&i) = self.by_path.get(&p) else {
+        let idx = Self::scan_index(dev)?;
+        let Some(&i) = idx.by_path.get(&p) else {
             // Intermediate directory present only as a path component.
-            if self.children.contains_key(&p) {
+            if idx.children.contains_key(&p) {
                 return Ok(dir_attrs(0));
             }
             return Err(crate::Error::InvalidArgument(format!(
                 "tar: no entry at {p:?}"
             )));
         };
-        let e = &self.entries[i];
+        let e = &idx.entries[i];
         let (kind, size) = match e.kind {
             EntryKind::Regular => (crate::fs::EntryKind::Regular, e.size),
             EntryKind::HardLink => {
                 let sz = e
                     .link_target
                     .as_ref()
-                    .and_then(|t| self.lookup(t))
-                    .map(|te| te.size)
+                    .map(|t| normalise_path(t))
+                    .and_then(|t| idx.by_path.get(&t).copied())
+                    .map(|ti| idx.entries[ti].size)
                     .unwrap_or(0);
                 (crate::fs::EntryKind::Regular, sz)
             }
@@ -601,14 +676,13 @@ impl crate::fs::Filesystem for Tar {
     /// Surface the `SCHILY.xattr.*` PAX records tar parsed for `path`.
     fn list_xattrs(
         &mut self,
-        _dev: &mut dyn BlockDevice,
+        dev: &mut dyn BlockDevice,
         path: &std::path::Path,
     ) -> Result<Vec<crate::fs::XattrPair>> {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("tar: non-UTF-8 path".into()))?;
-        Ok(self
-            .lookup(s)
+        Ok(Self::find_entry(dev, s)?
             .map(|e| {
                 e.xattrs
                     .iter()
@@ -1207,7 +1281,7 @@ mod tests {
             w.finish().unwrap();
         }
         let tar = Tar::open(&mut dev).unwrap();
-        let hello = tar.lookup("/hello.txt").unwrap();
+        let hello = tar.lookup(&mut dev, "/hello.txt").unwrap().unwrap();
         assert_eq!(hello.kind, EntryKind::Regular);
         assert_eq!(hello.mode, 0o640);
         assert_eq!(hello.size, 10);
@@ -1215,11 +1289,11 @@ mod tests {
         assert_eq!(hello.xattrs[0].name, "user.tag");
         assert_eq!(hello.xattrs[0].value, b"flag");
 
-        let sym = tar.lookup("/link-to-hello").unwrap();
+        let sym = tar.lookup(&mut dev, "/link-to-hello").unwrap().unwrap();
         assert_eq!(sym.kind, EntryKind::Symlink);
         assert_eq!(sym.link_target.as_deref(), Some("hello.txt"));
 
-        let nested = tar.lookup("/sub/inside.txt").unwrap();
+        let nested = tar.lookup(&mut dev, "/sub/inside.txt").unwrap().unwrap();
         let mut reader = tar.open_file_reader(&mut dev, "/sub/inside.txt").unwrap();
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).unwrap();

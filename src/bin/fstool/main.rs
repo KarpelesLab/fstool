@@ -3390,8 +3390,16 @@ fn print_partition_table(
     }
 }
 
-fn print_tar_info(tar: &fstool::fs::tar::Tar) {
-    let entries = tar.entries();
+fn print_tar_info(dev: &mut dyn fstool::block::BlockDevice, tar: &fstool::fs::tar::Tar) {
+    // Tar holds no index — forward-scan the device to summarise it.
+    let entries = match tar.entries(dev) {
+        Ok(e) => e,
+        Err(err) => {
+            println!("entries:           <scan failed: {err}>");
+            return;
+        }
+    };
+    let entries = &entries;
     let mut files = 0usize;
     let mut dirs = 0usize;
     let mut symlinks = 0usize;
@@ -3441,7 +3449,7 @@ fn print_fs_info(dev: &mut dyn fstool::block::BlockDevice, fs: &mut fstool::insp
     match fs {
         fstool::inspect::AnyFs::Ext(ext) => print_ext_info(ext),
         fstool::inspect::AnyFs::Fat32(fat) => print_fat_info(fat),
-        fstool::inspect::AnyFs::Tar(tar) => print_tar_info(tar),
+        fstool::inspect::AnyFs::Tar(tar) => print_tar_info(dev, tar),
         fstool::inspect::AnyFs::Xfs(xfs) => print_xfs_info(xfs),
         fstool::inspect::AnyFs::Exfat(exfat) => print_exfat_info(exfat),
         fstool::inspect::AnyFs::HfsPlus(hfs) => print_hfs_plus_info(hfs),

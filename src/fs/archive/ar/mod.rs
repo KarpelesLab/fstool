@@ -39,8 +39,10 @@ impl ArFormatOpts {
 pub struct ArFs(pub ArchiveFs);
 
 impl ArFs {
-    pub fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
-        Ok(Self(ArchiveFs::from_index(scan::scan(dev)?)))
+    pub fn open(_dev: &mut dyn BlockDevice) -> Result<Self> {
+        // ar is sequential: no on-disk index. The handle holds no
+        // members; every read op forward-scans the device via `scan`.
+        Ok(Self(ArchiveFs::sequential("ar", scan::scan)))
     }
 
     pub fn format(dev: &mut dyn BlockDevice, _opts: &ArFormatOpts) -> Result<Self> {

@@ -364,6 +364,15 @@ pub trait ArchiveBuilder: Send {
 /// an optional [`ArchiveBuilder`] for the write (repack) path.
 pub struct ArchiveFs {
     index: ArchiveIndex,
+    /// For **sequential** formats (cpio, ar) that carry no on-disk index:
+    /// a scanner that re-walks the device on every read op instead of
+    /// consulting a persistent member list. `None` for index-backed
+    /// formats (zip's central directory is authoritative) and write
+    /// handles. Its presence is what makes [`access_mode`] report
+    /// [`Sequential`](crate::fs::AccessMode::Sequential).
+    ///
+    /// [`access_mode`]: crate::fs::Filesystem::access_mode
+    rescan: Option<fn(&mut dyn BlockDevice) -> Result<ArchiveIndex>>,
     /// Present only when built via a format's `format()` (write mode).
     builder: Option<Box<dyn ArchiveBuilder>>,
     cap: MutationCapability,
@@ -375,10 +384,33 @@ pub struct ArchiveFs {
 }
 
 impl ArchiveFs {
-    /// Read-only handle over an already-scanned index.
+    /// Read-only handle over an already-scanned index. For formats with a
+    /// real on-disk index (zip's central directory) that stays
+    /// authoritative — the handle reports
+    /// [`RandomAccess`](crate::fs::AccessMode::RandomAccess).
     pub fn from_index(index: ArchiveIndex) -> Self {
         Self {
             index,
+            rescan: None,
+            builder: None,
+            cap: MutationCapability::Streaming,
+            scaffold: false,
+            flushed_len: None,
+        }
+    }
+
+    /// Read-only handle over a **sequential** archive (cpio, ar) that has
+    /// no on-disk index: the handle holds no members and forward-scans
+    /// the device via `scanner` on every read op, so it reports
+    /// [`Sequential`](crate::fs::AccessMode::Sequential). `kind` is the
+    /// format's short id (for errors).
+    pub fn sequential(
+        kind: &'static str,
+        scanner: fn(&mut dyn BlockDevice) -> Result<ArchiveIndex>,
+    ) -> Self {
+        Self {
+            index: ArchiveIndex::new(kind),
+            rescan: Some(scanner),
             builder: None,
             cap: MutationCapability::Streaming,
             scaffold: false,
@@ -391,6 +423,7 @@ impl ArchiveFs {
     pub fn writer(kind: &'static str, builder: Box<dyn ArchiveBuilder>) -> Self {
         Self {
             index: ArchiveIndex::new(kind),
+            rescan: None,
             builder: Some(builder),
             cap: MutationCapability::Streaming,
             scaffold: false,
@@ -402,10 +435,27 @@ impl ArchiveFs {
     pub fn scaffold(kind: &'static str) -> Self {
         Self {
             index: ArchiveIndex::new(kind),
+            rescan: None,
             builder: None,
             cap: MutationCapability::Immutable,
             scaffold: true,
             flushed_len: None,
+        }
+    }
+
+    /// Consult the archive's index, forward-scanning the device first
+    /// when the format is sequential (cpio/ar hold no persistent index),
+    /// or borrowing the prebuilt index otherwise (zip). The borrow of
+    /// `dev` ends when `f` returns, so callers can re-borrow it (e.g. to
+    /// open a body reader) afterwards.
+    fn with_index<R>(
+        &self,
+        dev: &mut dyn BlockDevice,
+        f: impl FnOnce(&ArchiveIndex) -> Result<R>,
+    ) -> Result<R> {
+        match self.rescan {
+            Some(scan) => f(&scan(dev)?),
+            None => f(&self.index),
         }
     }
 
@@ -528,10 +578,10 @@ impl crate::fs::Filesystem for ArchiveFs {
         Err(self.write_refused("rm"))
     }
 
-    fn list(&mut self, _dev: &mut dyn BlockDevice, path: &Path) -> Result<Vec<DirEntry>> {
+    fn list(&mut self, dev: &mut dyn BlockDevice, path: &Path) -> Result<Vec<DirEntry>> {
         self.guard_scaffold("list")?;
-        let s = self.path_str(path)?;
-        self.index.list(s)
+        let s = self.path_str(path)?.to_string();
+        self.with_index(dev, |idx| idx.list(&s))
     }
 
     fn read_file<'a>(
@@ -540,21 +590,12 @@ impl crate::fs::Filesystem for ArchiveFs {
         path: &Path,
     ) -> Result<Box<dyn Read + 'a>> {
         self.guard_scaffold("read")?;
-        let s = self.path_str(path)?;
-        let e = self.index.lookup(s).ok_or_else(|| {
-            crate::Error::InvalidArgument(format!("{}: no entry at {s:?}", self.index.kind))
-        })?;
-        // Clone the locator out of the index so the returned reader
+        let kind = self.index.kind;
+        let s = self.path_str(path)?.to_string();
+        // Resolve the locator (forward-scanning first for sequential
+        // formats), then let the `dev` borrow end so the returned reader
         // borrows only `dev`, not `self` (the tar trick).
-        let loc = match (e.kind, &e.data) {
-            (EntryKind::Regular | EntryKind::HardLink, Some(loc)) => loc.clone(),
-            _ => {
-                return Err(crate::Error::InvalidArgument(format!(
-                    "{}: {s:?} is not a regular file",
-                    self.index.kind
-                )));
-            }
-        };
+        let loc = self.with_index(dev, |idx| locate_body(idx, kind, &s))?;
         reader::open(dev, loc)
     }
 
@@ -564,19 +605,9 @@ impl crate::fs::Filesystem for ArchiveFs {
         path: &Path,
     ) -> Result<Box<dyn FileReadHandle + 'a>> {
         self.guard_scaffold("read")?;
-        let s = self.path_str(path)?;
-        let e = self.index.lookup(s).ok_or_else(|| {
-            crate::Error::InvalidArgument(format!("{}: no entry at {s:?}", self.index.kind))
-        })?;
-        let loc = match (e.kind, &e.data) {
-            (EntryKind::Regular | EntryKind::HardLink, Some(loc)) => loc.clone(),
-            _ => {
-                return Err(crate::Error::InvalidArgument(format!(
-                    "{}: {s:?} is not a regular file",
-                    self.index.kind
-                )));
-            }
-        };
+        let kind = self.index.kind;
+        let s = self.path_str(path)?.to_string();
+        let loc = self.with_index(dev, |idx| locate_body(idx, kind, &s))?;
         reader::open_ro(dev, loc)
     }
 
@@ -596,23 +627,22 @@ impl crate::fs::Filesystem for ArchiveFs {
         self.cap
     }
 
-    fn read_symlink(&mut self, _dev: &mut dyn BlockDevice, path: &Path) -> Result<PathBuf> {
+    fn read_symlink(&mut self, dev: &mut dyn BlockDevice, path: &Path) -> Result<PathBuf> {
         self.guard_scaffold("read")?;
-        let s = self.path_str(path)?;
-        let e = self.index.lookup(s).ok_or_else(|| {
-            crate::Error::InvalidArgument(format!("{}: no entry at {s:?}", self.index.kind))
-        })?;
-        if !matches!(e.kind, EntryKind::Symlink) {
-            return Err(crate::Error::InvalidArgument(format!(
-                "{}: {s:?} is not a symlink",
-                self.index.kind
-            )));
-        }
-        e.link_target.clone().map(PathBuf::from).ok_or_else(|| {
-            crate::Error::InvalidArgument(format!(
-                "{}: symlink {s:?} has no target",
-                self.index.kind
-            ))
+        let kind = self.index.kind;
+        let s = self.path_str(path)?.to_string();
+        self.with_index(dev, |idx| {
+            let e = idx.lookup(&s).ok_or_else(|| {
+                crate::Error::InvalidArgument(format!("{kind}: no entry at {s:?}"))
+            })?;
+            if !matches!(e.kind, EntryKind::Symlink) {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "{kind}: {s:?} is not a symlink"
+                )));
+            }
+            e.link_target.clone().map(PathBuf::from).ok_or_else(|| {
+                crate::Error::InvalidArgument(format!("{kind}: symlink {s:?} has no target"))
+            })
         })
     }
 
@@ -629,20 +659,22 @@ impl crate::fs::Filesystem for ArchiveFs {
         if path == Path::new("/") || path.as_os_str().is_empty() {
             return Ok(dir_attrs(1));
         }
-        let s = self.path_str(path)?;
-        let (e, inode) = {
-            let idx = self.index.by_path.get(s).copied();
-            match idx {
-                Some(i) => (self.index.entries[i].clone(), i as u32 + 1),
-                None => {
-                    // Could be a synthesised intermediate dir.
-                    if self.index.children.contains_key(s) {
-                        return Ok(dir_attrs(0));
-                    }
-                    // Fall back to the trait default (list the parent).
-                    return default_getattr(self, dev, path);
-                }
-            }
+        let s = self.path_str(path)?.to_string();
+        // Resolve against the index (forward-scanning first for
+        // sequential formats).
+        let resolved = self.with_index(dev, |idx| {
+            Ok(match idx.by_path.get(&s).copied() {
+                Some(i) => Resolved::Entry(idx.entries[i].clone(), i as u32 + 1),
+                // A synthesised intermediate dir (path component only).
+                None if idx.children.contains_key(&s) => Resolved::Dir,
+                None => Resolved::Missing,
+            })
+        })?;
+        let (e, inode) = match resolved {
+            Resolved::Entry(e, inode) => (e, inode),
+            Resolved::Dir => return Ok(dir_attrs(0)),
+            // Fall back to the trait default (list the parent).
+            Resolved::Missing => return default_getattr(self, dev, path),
         };
         let size = e.logical_size();
         Ok(FileAttrs {
@@ -661,6 +693,16 @@ impl crate::fs::Filesystem for ArchiveFs {
         })
     }
 
+    fn access_mode(&self) -> crate::fs::AccessMode {
+        // Sequential formats (cpio/ar) hold no index and forward-scan per
+        // read op; index-backed formats (zip) address files directly.
+        if self.rescan.is_some() {
+            crate::fs::AccessMode::Sequential
+        } else {
+            crate::fs::AccessMode::RandomAccess
+        }
+    }
+
     fn set_attrs(
         &mut self,
         _dev: &mut dyn BlockDevice,
@@ -668,6 +710,31 @@ impl crate::fs::Filesystem for ArchiveFs {
         _attrs: SetAttrs,
     ) -> Result<()> {
         Err(self.write_refused("set_attrs"))
+    }
+}
+
+/// Outcome of resolving a path against an [`ArchiveIndex`] in `getattr`.
+enum Resolved {
+    /// A stored entry plus its synthetic inode.
+    Entry(ArchiveEntry, u32),
+    /// A directory present only as a path component of a deeper entry.
+    Dir,
+    /// Not found — `getattr` falls back to the trait default.
+    Missing,
+}
+
+/// Resolve a regular-file body's [`DataLocator`] out of `idx`, cloning it
+/// so the returned value borrows nothing. Errors if the path is missing
+/// or isn't a regular/hard-link file.
+fn locate_body(idx: &ArchiveIndex, kind: &'static str, path: &str) -> Result<DataLocator> {
+    let e = idx
+        .lookup(path)
+        .ok_or_else(|| crate::Error::InvalidArgument(format!("{kind}: no entry at {path:?}")))?;
+    match (e.kind, &e.data) {
+        (EntryKind::Regular | EntryKind::HardLink, Some(loc)) => Ok(loc.clone()),
+        _ => Err(crate::Error::InvalidArgument(format!(
+            "{kind}: {path:?} is not a regular file"
+        ))),
     }
 }
 
@@ -809,6 +876,9 @@ macro_rules! impl_archive_fs_filesystem {
             }
             fn mutation_capability(&self) -> $crate::fs::MutationCapability {
                 self.0.mutation_capability()
+            }
+            fn access_mode(&self) -> $crate::fs::AccessMode {
+                self.0.access_mode()
             }
             fn read_symlink(
                 &mut self,
