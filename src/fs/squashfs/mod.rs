@@ -1655,6 +1655,70 @@ mod tests {
         assert!(listing.iter().any(|e| e.name == "sym_00003999"));
     }
 
+    /// Regression (Alpine minirootfs): with a *compressed* metadata table,
+    /// back-patching the directory inodes with their listing offsets changed
+    /// those inode metablocks' on-disk sizes, shifting the block offsets that
+    /// directory headers reference. Any directory whose children's inodes
+    /// landed in the 2nd+ dir-inode metablock then read back as garbage
+    /// ("metablock ... has invalid on-disk size") — e.g. /lib vanished,
+    /// breaking dynamic linking. The writer now iterates the inode/directory
+    /// layout to a fixpoint. This only reproduces under real compression
+    /// (uncompressed metablocks have content-independent offsets).
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn writer_dir_inodes_span_metablocks_gzip() {
+        let mut dev = crate::block::MemoryBackend::new(16 * 1024 * 1024);
+        let mut s = Squashfs::format(
+            &mut dev,
+            &FormatOpts {
+                block_size: 4096,
+                compression: Compression::Gzip,
+            },
+        )
+        .unwrap();
+        // 500 sibling dirs, each holding a file. 500+ dir inodes × 32 bytes
+        // span several 8 KiB metablocks, and gzip makes the back-patch shift
+        // their sizes — the exact conditions that broke the real image.
+        const N: usize = 500;
+        for i in 0..N {
+            s.create_dir(
+                &mut dev,
+                &format!("/top/d{i:04}"),
+                EntryMeta::default(),
+                Vec::new(),
+            )
+            .unwrap();
+            let body = format!("content-{i}\n").into_bytes();
+            let len = body.len() as u64;
+            s.create_file(
+                &mut dev,
+                &format!("/top/d{i:04}/f"),
+                FileSource::Reader {
+                    reader: Box::new(std::io::Cursor::new(body)),
+                    len,
+                },
+                EntryMeta::default(),
+                Vec::new(),
+            )
+            .unwrap();
+        }
+        s.flush(&mut dev).unwrap();
+
+        let s = Squashfs::open(&mut dev).unwrap();
+        let top = s.list_path(&mut dev, "/top").unwrap();
+        assert_eq!(top.len(), N, "/top lost children");
+        // Every child dir — including the last, whose inode lives in a late
+        // metablock — must be readable and hold its file.
+        for i in 0..N {
+            let d = format!("/top/d{i:04}");
+            let kids = s
+                .list_path(&mut dev, &d)
+                .unwrap_or_else(|e| panic!("{d} unreadable: {e}"));
+            assert_eq!(kids.len(), 1, "{d} should hold exactly one file");
+            assert_eq!(kids[0].name, "f");
+        }
+    }
+
     /// `open_file_ro` returns a Read+Seek+len handle backed by the
     /// same block walker as `open_file_reader`, but with a single
     /// decompressed-block cache so backward seeks within a block

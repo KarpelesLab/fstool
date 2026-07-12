@@ -1012,162 +1012,199 @@ impl WriteState {
             dir_raw_offsets.insert(d.clone(), off);
         }
 
-        // Compute inode metablock chunking (raw_offset -> (block_rel, in_block_offset)).
-        // The disk payload itself is recomputed after the dir-inode back-patch.
-        let (inode_block_rel_map, _) = chunk_raw_to_metablocks(&inode_table_raw, self.compression)?;
-        let raw_to_pos = |raw_off: usize| -> (u32, u16) {
-            let entry = inode_block_rel_map[raw_off / 8192];
-            (entry, (raw_off % 8192) as u16)
-        };
-        for path in nondir_raw_offsets.keys() {
-            let (b, o) = raw_to_pos(nondir_raw_offsets[path]);
-            inode_positions.insert(path.clone(), (b, o));
-        }
-        for path in dir_raw_offsets.keys() {
-            let (b, o) = raw_to_pos(dir_raw_offsets[path]);
-            inode_positions.insert(path.clone(), (b, o));
-        }
-
-        // ---- 8) Encode directory listings. ----
+        // ---- 8-11) Assemble inode + directory metadata to a fixpoint. ----
         //
-        // Each listing is one or more "runs", each starting with a 12-byte
-        // header. We emit a single run per directory whose entries share
-        // the same inode-table metablock; if a directory's children
-        // straddle multiple inode blocks we split into runs accordingly.
-        for d in self.dirs.keys() {
-            let entries = &listings[d];
-            let raw_start = dir_table_raw.len();
-            if entries.is_empty() {
-                dir_listing_offsets.insert(d.clone(), (raw_start, 0));
-                continue;
-            }
-            // Group entries by their child's inode metablock (block_rel)
-            // — within a run the entries' signed inode_number_offset is
-            // also bounded to fit i16.
-            let mut idx = 0;
-            while idx < entries.len() {
-                let (_name0, child0_path, _kind0) = &entries[idx];
-                let (start_block, _) = inode_positions[child0_path];
-                let base_inode = inode_numbers[child0_path];
-                let mut run_entries: Vec<&(String, String, u16)> = Vec::new();
-                while idx < entries.len() {
-                    let (_n, cp, _k) = &entries[idx];
-                    let (cb, _co) = inode_positions[cp];
-                    if cb != start_block {
-                        break;
-                    }
-                    let ci = inode_numbers[cp];
-                    let diff = ci as i64 - base_inode as i64;
-                    if !(-32768..=32767).contains(&diff) {
-                        break;
-                    }
-                    // Limit run size to 256 entries (spec: count is u32
-                    // stored as count-1, so up to 256 entries per run is
-                    // conservative).
-                    if run_entries.len() >= 256 {
-                        break;
-                    }
-                    run_entries.push(&entries[idx]);
-                    idx += 1;
-                }
-                // Header
-                let count_minus_one = (run_entries.len() - 1) as u32;
-                dir_table_raw.extend_from_slice(&count_minus_one.to_le_bytes());
-                dir_table_raw.extend_from_slice(&start_block.to_le_bytes());
-                dir_table_raw.extend_from_slice(&base_inode.to_le_bytes());
-                // Entries
-                for (name, child_path, kind) in run_entries {
-                    let (_b, in_off) = inode_positions[child_path];
-                    let ci = inode_numbers[child_path];
-                    let diff = ci as i64 - base_inode as i64;
-                    let signed = diff as i16;
-                    dir_table_raw.extend_from_slice(&in_off.to_le_bytes());
-                    dir_table_raw.extend_from_slice(&signed.to_le_bytes());
-                    dir_table_raw.extend_from_slice(&kind.to_le_bytes());
-                    let name_bytes = name.as_bytes();
-                    // Stored as len-1.
-                    let name_size = (name_bytes.len() - 1) as u16;
-                    dir_table_raw.extend_from_slice(&name_size.to_le_bytes());
-                    dir_table_raw.extend_from_slice(name_bytes);
-                }
-            }
-            let raw_size = dir_table_raw.len() - raw_start;
-            dir_listing_offsets.insert(d.clone(), (raw_start, raw_size));
-        }
-
-        // ---- 9) Chunk directory raw into metablocks. ----
-        let (dir_block_rel_map, dir_disk_payload) =
-            chunk_raw_to_metablocks(&dir_table_raw, self.compression)?;
-        let dir_raw_to_pos = |raw_off: usize| -> (u32, u16) {
-            let entry = dir_block_rel_map[raw_off / 8192];
-            (entry, (raw_off % 8192) as u16)
-        };
-
-        // ---- 10) Patch directory inodes with real listing offsets. ----
-        for d in self.dirs.keys() {
-            let (raw_off, listing_size) = dir_listing_offsets[d];
-            let (block_index, block_offset) = dir_raw_to_pos(raw_off);
-            let parent_inode = if d == "/" {
-                inode_numbers["/"]
-            } else {
-                let p = parent_path(d);
-                inode_numbers[&p]
+        // Back-patching the directory inodes with their listing offsets
+        // (step 10) changes the inode metablocks' *compressed* sizes, which
+        // shifts the on-disk block offsets (`block_rel`) that directory
+        // headers, the export table, and the root ref all reference — and
+        // those offsets feed the listing refs stored back inside the inodes.
+        // It's a fixpoint: rebuild the directory table, re-chunk, and re-patch
+        // until the inode table stops changing (2-3 rounds in practice; the
+        // cap guards against a pathological compressor that never settles).
+        // A single pass — the old behaviour — left `start_block` pointing at
+        // the pre-patch offsets, so any directory whose children's inodes
+        // landed in the 2nd+ dir-inode metablock read back as garbage.
+        let mut dir_disk_payload: Vec<u8> = Vec::new();
+        const MAX_META_ITERS: usize = 16;
+        let mut converged = false;
+        for _iter in 0..MAX_META_ITERS {
+            let (inode_block_rel_map, _) =
+                chunk_raw_to_metablocks(&inode_table_raw, self.compression)?;
+            let raw_to_pos = |raw_off: usize| -> (u32, u16) {
+                (inode_block_rel_map[raw_off / 8192], (raw_off % 8192) as u16)
             };
-            let inode_no = inode_numbers[d];
-            let dir_meta = &self.dirs[d];
-            let uid_idx = intern_id(dir_meta.meta.uid)?;
-            let gid_idx = intern_id(dir_meta.meta.gid)?;
-            let off = dir_raw_offsets[d];
-            let link_count = count_subdirs(&listings, d) as u32 + 2;
-            let xattr_idx = intern_xattr(&dir_meta.xattrs, &mut xattr_sets, &mut xattr_set_index);
-            if dir_is_ext[d] {
-                // ExtDir: 16-byte header + 24-byte payload + 0 index entries.
-                let mut buf = [0u8; 40];
-                buf[0..2].copy_from_slice(&INODE_EXT_DIR.to_le_bytes());
-                buf[2..4].copy_from_slice(&dir_meta.meta.mode.to_le_bytes());
-                buf[4..6].copy_from_slice(&uid_idx.to_le_bytes());
-                buf[6..8].copy_from_slice(&gid_idx.to_le_bytes());
-                buf[8..12].copy_from_slice(&dir_meta.meta.mtime.to_le_bytes());
-                buf[12..16].copy_from_slice(&inode_no.to_le_bytes());
-                // Payload: u32 link_count, u32 file_size (size+3),
-                //          u32 block_index, u32 parent_inode,
-                //          u16 index_count=0, u16 block_offset, u32 xattr.
-                buf[16..20].copy_from_slice(&link_count.to_le_bytes());
-                let stored: u32 = (listing_size as u32).saturating_add(3);
-                buf[20..24].copy_from_slice(&stored.to_le_bytes());
-                buf[24..28].copy_from_slice(&block_index.to_le_bytes());
-                buf[28..32].copy_from_slice(&parent_inode.to_le_bytes());
-                buf[32..34].copy_from_slice(&0u16.to_le_bytes()); // index_count
-                buf[34..36].copy_from_slice(&block_offset.to_le_bytes());
-                buf[36..40].copy_from_slice(&xattr_idx.to_le_bytes());
-                inode_table_raw[off..off + 40].copy_from_slice(&buf);
-            } else {
-                // BasicDir: 16-byte header + 16-byte payload.
-                let mut buf = [0u8; 32];
-                buf[0..2].copy_from_slice(&INODE_BASIC_DIR.to_le_bytes());
-                buf[2..4].copy_from_slice(&dir_meta.meta.mode.to_le_bytes());
-                buf[4..6].copy_from_slice(&uid_idx.to_le_bytes());
-                buf[6..8].copy_from_slice(&gid_idx.to_le_bytes());
-                buf[8..12].copy_from_slice(&dir_meta.meta.mtime.to_le_bytes());
-                buf[12..16].copy_from_slice(&inode_no.to_le_bytes());
-                buf[16..20].copy_from_slice(&block_index.to_le_bytes());
-                buf[20..24].copy_from_slice(&link_count.to_le_bytes());
-                let stored = if listing_size == 0 {
-                    3u16
+            inode_positions.clear();
+            for (path, &ro) in &nondir_raw_offsets {
+                inode_positions.insert(path.clone(), raw_to_pos(ro));
+            }
+            for (path, &ro) in &dir_raw_offsets {
+                inode_positions.insert(path.clone(), raw_to_pos(ro));
+            }
+            dir_table_raw.clear();
+            dir_listing_offsets.clear();
+
+            // ---- 8) Encode directory listings. ----
+            //
+            // Each listing is one or more "runs", each starting with a 12-byte
+            // header. We emit a single run per directory whose entries share
+            // the same inode-table metablock; if a directory's children
+            // straddle multiple inode blocks we split into runs accordingly.
+            for d in self.dirs.keys() {
+                let entries = &listings[d];
+                let raw_start = dir_table_raw.len();
+                if entries.is_empty() {
+                    dir_listing_offsets.insert(d.clone(), (raw_start, 0));
+                    continue;
+                }
+                // Group entries by their child's inode metablock (block_rel)
+                // — within a run the entries' signed inode_number_offset is
+                // also bounded to fit i16.
+                let mut idx = 0;
+                while idx < entries.len() {
+                    let (_name0, child0_path, _kind0) = &entries[idx];
+                    let (start_block, _) = inode_positions[child0_path];
+                    let base_inode = inode_numbers[child0_path];
+                    let mut run_entries: Vec<&(String, String, u16)> = Vec::new();
+                    while idx < entries.len() {
+                        let (_n, cp, _k) = &entries[idx];
+                        let (cb, _co) = inode_positions[cp];
+                        if cb != start_block {
+                            break;
+                        }
+                        let ci = inode_numbers[cp];
+                        let diff = ci as i64 - base_inode as i64;
+                        if !(-32768..=32767).contains(&diff) {
+                            break;
+                        }
+                        // Limit run size to 256 entries (spec: count is u32
+                        // stored as count-1, so up to 256 entries per run is
+                        // conservative).
+                        if run_entries.len() >= 256 {
+                            break;
+                        }
+                        run_entries.push(&entries[idx]);
+                        idx += 1;
+                    }
+                    // Header
+                    let count_minus_one = (run_entries.len() - 1) as u32;
+                    dir_table_raw.extend_from_slice(&count_minus_one.to_le_bytes());
+                    dir_table_raw.extend_from_slice(&start_block.to_le_bytes());
+                    dir_table_raw.extend_from_slice(&base_inode.to_le_bytes());
+                    // Entries
+                    for (name, child_path, kind) in run_entries {
+                        let (_b, in_off) = inode_positions[child_path];
+                        let ci = inode_numbers[child_path];
+                        let diff = ci as i64 - base_inode as i64;
+                        let signed = diff as i16;
+                        dir_table_raw.extend_from_slice(&in_off.to_le_bytes());
+                        dir_table_raw.extend_from_slice(&signed.to_le_bytes());
+                        dir_table_raw.extend_from_slice(&kind.to_le_bytes());
+                        let name_bytes = name.as_bytes();
+                        // Stored as len-1.
+                        let name_size = (name_bytes.len() - 1) as u16;
+                        dir_table_raw.extend_from_slice(&name_size.to_le_bytes());
+                        dir_table_raw.extend_from_slice(name_bytes);
+                    }
+                }
+                let raw_size = dir_table_raw.len() - raw_start;
+                dir_listing_offsets.insert(d.clone(), (raw_start, raw_size));
+            }
+
+            // ---- 9) Chunk directory raw into metablocks. ----
+            let (dir_block_rel_map, payload) =
+                chunk_raw_to_metablocks(&dir_table_raw, self.compression)?;
+            dir_disk_payload = payload;
+            let dir_raw_to_pos = |raw_off: usize| -> (u32, u16) {
+                let entry = dir_block_rel_map[raw_off / 8192];
+                (entry, (raw_off % 8192) as u16)
+            };
+
+            // ---- 10) Patch directory inodes with real listing offsets. ----
+            let mut changed = false;
+            for d in self.dirs.keys() {
+                let (raw_off, listing_size) = dir_listing_offsets[d];
+                let (block_index, block_offset) = dir_raw_to_pos(raw_off);
+                let parent_inode = if d == "/" {
+                    inode_numbers["/"]
                 } else {
-                    (listing_size as u16).saturating_add(3)
+                    let p = parent_path(d);
+                    inode_numbers[&p]
                 };
-                buf[24..26].copy_from_slice(&stored.to_le_bytes());
-                buf[26..28].copy_from_slice(&block_offset.to_le_bytes());
-                buf[28..32].copy_from_slice(&parent_inode.to_le_bytes());
-                inode_table_raw[off..off + 32].copy_from_slice(&buf);
+                let inode_no = inode_numbers[d];
+                let dir_meta = &self.dirs[d];
+                let uid_idx = intern_id(dir_meta.meta.uid)?;
+                let gid_idx = intern_id(dir_meta.meta.gid)?;
+                let off = dir_raw_offsets[d];
+                let link_count = count_subdirs(&listings, d) as u32 + 2;
+                let xattr_idx =
+                    intern_xattr(&dir_meta.xattrs, &mut xattr_sets, &mut xattr_set_index);
+                if dir_is_ext[d] {
+                    // ExtDir: 16-byte header + 24-byte payload + 0 index entries.
+                    let mut buf = [0u8; 40];
+                    buf[0..2].copy_from_slice(&INODE_EXT_DIR.to_le_bytes());
+                    buf[2..4].copy_from_slice(&dir_meta.meta.mode.to_le_bytes());
+                    buf[4..6].copy_from_slice(&uid_idx.to_le_bytes());
+                    buf[6..8].copy_from_slice(&gid_idx.to_le_bytes());
+                    buf[8..12].copy_from_slice(&dir_meta.meta.mtime.to_le_bytes());
+                    buf[12..16].copy_from_slice(&inode_no.to_le_bytes());
+                    // Payload: u32 link_count, u32 file_size (size+3),
+                    //          u32 block_index, u32 parent_inode,
+                    //          u16 index_count=0, u16 block_offset, u32 xattr.
+                    buf[16..20].copy_from_slice(&link_count.to_le_bytes());
+                    let stored: u32 = (listing_size as u32).saturating_add(3);
+                    buf[20..24].copy_from_slice(&stored.to_le_bytes());
+                    buf[24..28].copy_from_slice(&block_index.to_le_bytes());
+                    buf[28..32].copy_from_slice(&parent_inode.to_le_bytes());
+                    buf[32..34].copy_from_slice(&0u16.to_le_bytes()); // index_count
+                    buf[34..36].copy_from_slice(&block_offset.to_le_bytes());
+                    buf[36..40].copy_from_slice(&xattr_idx.to_le_bytes());
+                    if inode_table_raw[off..off + 40] != buf {
+                        inode_table_raw[off..off + 40].copy_from_slice(&buf);
+                        changed = true;
+                    }
+                } else {
+                    // BasicDir: 16-byte header + 16-byte payload.
+                    let mut buf = [0u8; 32];
+                    buf[0..2].copy_from_slice(&INODE_BASIC_DIR.to_le_bytes());
+                    buf[2..4].copy_from_slice(&dir_meta.meta.mode.to_le_bytes());
+                    buf[4..6].copy_from_slice(&uid_idx.to_le_bytes());
+                    buf[6..8].copy_from_slice(&gid_idx.to_le_bytes());
+                    buf[8..12].copy_from_slice(&dir_meta.meta.mtime.to_le_bytes());
+                    buf[12..16].copy_from_slice(&inode_no.to_le_bytes());
+                    buf[16..20].copy_from_slice(&block_index.to_le_bytes());
+                    buf[20..24].copy_from_slice(&link_count.to_le_bytes());
+                    let stored = if listing_size == 0 {
+                        3u16
+                    } else {
+                        (listing_size as u16).saturating_add(3)
+                    };
+                    buf[24..26].copy_from_slice(&stored.to_le_bytes());
+                    buf[26..28].copy_from_slice(&block_offset.to_le_bytes());
+                    buf[28..32].copy_from_slice(&parent_inode.to_le_bytes());
+                    if inode_table_raw[off..off + 32] != buf {
+                        inode_table_raw[off..off + 32].copy_from_slice(&buf);
+                        changed = true;
+                    }
+                }
+            }
+            // Fixpoint reached once a full patch pass rewrites nothing: the
+            // inode table (and thus every block_rel it induces) is stable.
+            if !changed {
+                converged = true;
+                break;
             }
         }
+        if !converged {
+            return Err(crate::Error::InvalidImage(
+                "squashfs: metadata block offsets did not converge".into(),
+            ));
+        }
 
-        // ---- 11) Re-encode inode metablocks after the back-patch. ----
-        // (The chunk boundaries stay the same because we only touched
-        // 32-byte windows that lie wholly within their metablocks: every
-        // dir inode is 32 contiguous bytes, no straddling.)
+        // ---- 11) Final inode-table payload. ----
+        // `inode_table_raw` is now the converged content (the last fixpoint
+        // round rewrote nothing), so this chunking reproduces exactly the
+        // `block_rel` offsets baked into `inode_positions` above.
         let (_, inode_disk_payload) = chunk_raw_to_metablocks(&inode_table_raw, self.compression)?;
         let inode_table_start = next_disk_offset;
         ensure_size(dev, next_disk_offset + inode_disk_payload.len() as u64)?;
