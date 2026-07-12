@@ -27,7 +27,7 @@
 //! the start. So the [`Tar`] handle holds **no** persistent index: every
 //! addressing operation (`list_path`, `open_file_reader`, `getattr`,
 //! `read_symlink`, `list_xattrs`) forward-scans the device once
-//! (`O(n)`), driven by the single [`Tar::for_each_entry`] primitive.
+//! (`O(n)`), driven by the single `for_each_entry` primitive.
 //! `open` only validates the first block; it never builds a tree.
 
 pub mod header;
@@ -131,7 +131,7 @@ pub struct Entry {
 ///
 /// Tar is a sequential format with no on-disk index, so this handle
 /// holds **no** persistent state — every read operation forward-scans
-/// the device via [`Tar::for_each_entry`]. `open` only validates the
+/// the device via `for_each_entry`. `open` only validates the
 /// first block.
 pub struct Tar;
 

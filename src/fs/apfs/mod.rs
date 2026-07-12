@@ -1195,7 +1195,7 @@ impl Apfs {
     /// are pulled from `body` and written block-at-a-time into a freshly
     /// bump-allocated extent — the whole file is never buffered in RAM.
     /// A short read is zero-padded (see
-    /// [`rw::MutatorCx::write_extent_from_reader`]).
+    /// `write_extent_from_reader`).
     pub fn create_file_at_streaming(
         &mut self,
         dev: &mut dyn BlockDevice,
