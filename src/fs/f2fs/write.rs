@@ -1150,7 +1150,7 @@ impl Writer {
         // blocks are routed through `place_data_block`, which transparently
         // handles direct-in-inode / direct-node / indirect-node / triple
         // indirect placement — exactly like a regular file.
-        for (&dir_nid, _) in self.spilled_dirs.clone().iter() {
+        for &dir_nid in self.spilled_dirs.clone().keys() {
             let parent_nid = *parent_of.get(&dir_nid).unwrap_or(&dir_nid);
             let kids = self.children.get(&dir_nid).cloned().unwrap_or_default();
 
@@ -1258,13 +1258,13 @@ impl Writer {
         }
 
         // 2) Write every direct-node block.
-        for (_, d) in self.direct_nodes.iter() {
+        for d in self.direct_nodes.values() {
             let ino = find_owner_of_dnode(self, d.nid);
             let blk = encode_direct_node_with_crc(&d.addrs, d.nid, ino);
             dev.write_at(d.on_disk_block as u64 * bs, &blk)?;
         }
         // 3) Write every indirect-node block.
-        for (_, ind) in self.indirect_nodes.iter() {
+        for ind in self.indirect_nodes.values() {
             let ino = find_owner_of_indirect(self, ind.nid);
             let blk = encode_indirect_node_with_crc(&ind.nids, ind.nid, ino);
             dev.write_at(ind.on_disk_block as u64 * bs, &blk)?;
@@ -1288,7 +1288,7 @@ impl Writer {
             }
             blocks_for.insert(nid, count);
         }
-        for (_, d) in self.direct_nodes.iter() {
+        for d in self.direct_nodes.values() {
             let owner = find_owner_of_dnode(self, d.nid);
             // The direct-node block itself.
             *blocks_for.entry(owner).or_insert(1) += 1;
@@ -1298,13 +1298,13 @@ impl Writer {
                 }
             }
         }
-        for (_, ind) in self.indirect_nodes.iter() {
+        for ind in self.indirect_nodes.values() {
             let owner = find_owner_of_indirect(self, ind.nid);
             *blocks_for.entry(owner).or_insert(1) += 1;
         }
 
         // 4) Write every inode block.
-        for (_, ino) in self.inodes.iter() {
+        for ino in self.inodes.values() {
             let kids = if ino.inline_flags & F2FS_INLINE_DENTRY != 0 {
                 self.children.get(&ino.nid).cloned()
             } else {
@@ -1324,13 +1324,13 @@ impl Writer {
         let mut pages: Vec<Vec<(u8, u32, u32)>> = vec![Vec::new(); nat_pages_per_pack];
         // Walk the union of all node records and assign each to its page.
         let mut all_nodes: Vec<(u32, u32, u32)> = Vec::new(); // (nid, ino_owner, block)
-        for (_, ino) in self.inodes.iter() {
+        for ino in self.inodes.values() {
             all_nodes.push((ino.nid, ino.nid, ino.on_disk_block));
         }
-        for (_, d) in self.direct_nodes.iter() {
+        for d in self.direct_nodes.values() {
             all_nodes.push((d.nid, find_owner_of_dnode(self, d.nid), d.on_disk_block));
         }
-        for (_, ind) in self.indirect_nodes.iter() {
+        for ind in self.indirect_nodes.values() {
             all_nodes.push((
                 ind.nid,
                 find_owner_of_indirect(self, ind.nid),
@@ -1629,14 +1629,14 @@ impl Writer {
 }
 
 fn find_owner_of_dnode(w: &Writer, dnid: u32) -> u32 {
-    for (_, ino) in w.inodes.iter() {
+    for ino in w.inodes.values() {
         for s in ino.i_nid.iter() {
             if *s == dnid {
                 return ino.nid;
             }
         }
     }
-    for (_, ind) in w.indirect_nodes.iter() {
+    for ind in w.indirect_nodes.values() {
         if ind.nids.contains(&dnid) {
             return find_owner_of_indirect(w, ind.nid);
         }
@@ -1646,7 +1646,7 @@ fn find_owner_of_dnode(w: &Writer, dnid: u32) -> u32 {
 
 fn find_owner_of_indirect(w: &Writer, inid: u32) -> u32 {
     // First check inodes — direct/indirect/triple slots.
-    for (_, ino) in w.inodes.iter() {
+    for ino in w.inodes.values() {
         for s in ino.i_nid.iter() {
             if *s == inid {
                 return ino.nid;
@@ -1655,7 +1655,7 @@ fn find_owner_of_indirect(w: &Writer, inid: u32) -> u32 {
     }
     // Triple-indirect: the indirect node may itself live under another
     // (top-level) indirect node. Walk up the chain.
-    for (_, parent) in w.indirect_nodes.iter() {
+    for parent in w.indirect_nodes.values() {
         if parent.nid == inid {
             continue;
         }
