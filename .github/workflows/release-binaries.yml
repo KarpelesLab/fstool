@@ -112,6 +112,43 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "${TAG}" "${{ steps.pack.outputs.asset }}" --clobber
 
+  build-fullrust:
+    name: build linux-x86_64-static (fullrust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # One step sets up the toolchain and builds — the same shape as the
+      # dtolnay/rust-toolchain + `cargo build` pair in the matrix job above,
+      # but it yields a static, libc-free x86_64-unknown-linux-fullrust binary
+      # (no C toolchain, no glibc — runs on any Linux kernel with nothing else).
+      # `readline` is dropped (rustyline's terminal layer is unix-only); every
+      # codec stays. `libc` is a cfg(unix) dep, so it's simply absent here.
+      - name: Build static libc-free binary (fullrust)
+        uses: KarpelesLab/fullrust@master
+        with:
+          args: >-
+            --release --bin fstool --no-default-features
+            --features gzip,xz,lzma,lz4,zstd,lzo,cab,amiga-lzx,lha,arc,sit,sevenz,rar,dmg-bzip2,dmg-lzfse,dmg-encrypted
+
+      - name: Stage archive contents
+        run: |
+          mkdir staging
+          cp target/x86_64-unknown-linux-fullrust/release/fstool staging/
+          cp README.md LICENSE staging/
+
+      - name: Pack archive
+        id: pack
+        run: |
+          asset="fstool-${TAG}-linux-x86_64-static.tar.gz"
+          tar -C staging -czf "${asset}" .
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${TAG}" "${{ steps.pack.outputs.asset }}" --clobber
+
   build-macos-universal:
     name: build macos universal
     runs-on: macos-latest
