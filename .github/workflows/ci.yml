@@ -124,6 +124,31 @@ jobs:
       - name: cargo test
         run: cargo test --all-targets --verbose
 
+  # Every other job runs `stable`, so nothing there would notice if a new
+  # dependency release — or a bit of syntax we reach for — quietly pushed the
+  # floor above the `rust-version` we publish in Cargo.toml. This job pins the
+  # declared MSRV and compiles against it, so that drift fails the PR instead
+  # of reaching crates.io. `--all-features` matches the clippy step (it pulls
+  # in `fuse`, hence libfuse3-dev). Keep the toolchain here in lockstep with
+  # `rust-version` in Cargo.toml.
+  msrv:
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@1.88
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check
+        run: cargo check --all-targets --all-features --verbose
+
   # Windows proves the Unix-only paths in populate_from_host_dir /
   # build_plan / file.rs are properly cfg-gated. Almost all external
   # cross-validation tests skip here (their tools aren't on the runner),
