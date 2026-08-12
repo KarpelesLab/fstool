@@ -64,6 +64,7 @@ pub const JBD2_DESCRIPTOR_BLOCK: u32 = 1;
 pub const JBD2_COMMIT_BLOCK: u32 = 2;
 pub const JBD2_SUPERBLOCK_V1: u32 = 3;
 pub const JBD2_SUPERBLOCK_V2: u32 = 4;
+pub const JBD2_REVOKE_BLOCK: u32 = 5;
 
 /// Descriptor-tag flag bits.
 pub const JBD2_FLAG_ESCAPE: u16 = 0x1;
@@ -78,6 +79,9 @@ pub const JSB_OFF_SEQUENCE: usize = 24;
 pub const JSB_OFF_START: usize = 28;
 pub const JSB_OFF_FEATURE_INCOMPAT: usize = 40;
 pub const JSB_OFF_UUID: usize = 48;
+pub const JBD2_FEATURE_INCOMPAT_64BIT: u32 = 0x0000_0002;
+pub const JBD2_FEATURE_INCOMPAT_CSUM_V2: u32 = 0x0000_0008;
+pub const JBD2_FEATURE_INCOMPAT_CSUM_V3: u32 = 0x0000_0010;
 
 /// Decoded view of the parts of the journal superblock we care about.
 #[derive(Debug, Clone, Copy)]
@@ -248,31 +252,50 @@ pub fn set_start(buf: &mut [u8], start: u32) {
     buf[JSB_OFF_START..JSB_OFF_START + 4].copy_from_slice(&start.to_be_bytes());
 }
 
-/// Decode one classic (non-V3, non-64BIT) tag from `buf`. Returns
+/// Decode one journal descriptor tag from `buf`. Returns
 /// `(t_blocknr, t_flags, tag_size_in_bytes_including_uuid)`.
 ///
-/// `is_first` controls whether we read a 16-byte UUID after the 8-byte
-/// header: per the kernel docs, the UUID is present "unless SAME_UUID is
-/// set". The first tag in a descriptor block always carries the UUID
-/// (it's the seed of the SAME_UUID chain); subsequent tags carry one
-/// only when their SAME_UUID flag is clear.
-pub fn decode_tag(buf: &[u8], is_first: bool) -> Result<(u32, u16, usize)> {
-    if buf.len() < 8 {
+/// JBD2 has four tag layouts selected by the journal superblock features:
+/// classic 8-byte, 64-bit 12-byte, checksum-v2 10/14-byte, and checksum-v3
+/// 16-byte. The UUID follows exactly when `SAME_UUID` is clear.
+pub fn decode_tag(buf: &[u8], feature_incompat: u32) -> Result<(u64, u16, usize)> {
+    let csum_v3 = feature_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3 != 0;
+    let csum_v2 = feature_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V2 != 0;
+    let is_64bit = feature_incompat & JBD2_FEATURE_INCOMPAT_64BIT != 0;
+    let tag_bytes = if csum_v3 {
+        16
+    } else {
+        8 + usize::from(csum_v2) * 2 + usize::from(is_64bit) * 4
+    };
+    if buf.len() < tag_bytes {
         return Err(crate::Error::InvalidImage(
             "ext: journal descriptor tag past end of block".into(),
         ));
     }
-    let blocknr = u32::from_be_bytes(buf[0..4].try_into().unwrap());
-    // t_checksum (low 16 bits, BE) at 4..6 — ignored without CSUM_V2.
-    let flags = u16::from_be_bytes(buf[6..8].try_into().unwrap());
-    let has_uuid = is_first || (flags & JBD2_FLAG_SAME_UUID) == 0;
-    let size = if has_uuid { 24 } else { 8 };
+    let block_lo = u32::from_be_bytes(buf[0..4].try_into().unwrap()) as u64;
+    let flags = if csum_v3 {
+        u32::from_be_bytes(buf[4..8].try_into().unwrap()) as u16
+    } else {
+        u16::from_be_bytes(buf[6..8].try_into().unwrap())
+    };
+    let block_hi = if is_64bit {
+        let off = if csum_v3 { 8 } else { 8 };
+        u32::from_be_bytes(buf[off..off + 4].try_into().unwrap()) as u64
+    } else {
+        0
+    };
+    let size = tag_bytes
+        + if flags & JBD2_FLAG_SAME_UUID == 0 {
+            16
+        } else {
+            0
+        };
     if buf.len() < size {
         return Err(crate::Error::InvalidImage(
             "ext: journal descriptor tag uuid past end of block".into(),
         ));
     }
-    Ok((blocknr, flags, size))
+    Ok(((block_hi << 32) | block_lo, flags, size))
 }
 
 /// Read journal-relative block `idx` and return its bytes. Maps through
@@ -343,103 +366,65 @@ pub(crate) fn replay_journal(ext: &super::Ext, dev: &mut dyn BlockDevice) -> Res
     let mut idx = jsb.start;
     let mut expected_tid = jsb.sequence;
     let mut replayed = false;
-    // A forged log can chain identical empty descriptors that all share the
-    // same tid, so the inner descriptor loop never makes forward progress and
-    // spins forever. The usable ring is `first..maxlen`; replay can never
-    // legitimately visit more journal blocks than the ring holds. Cap total
-    // blocks consumed across the whole replay to that size and bail on
-    // overrun.
     let ring_size = jsb.maxlen.saturating_sub(jsb.first).max(1) as u64;
     let mut blocks_visited: u64 = 0;
     'transactions: loop {
-        let blk = read_journal_block(ext, dev, &journal_inode, idx)?;
-        let magic = u32::from_be_bytes(blk[0..4].try_into().unwrap());
-        if magic != JBD2_MAGIC {
-            // Not a JBD2-tagged block — end of log.
-            break;
-        }
-        let blocktype = u32::from_be_bytes(blk[4..8].try_into().unwrap());
-        let tid = u32::from_be_bytes(blk[8..12].try_into().unwrap());
-        if tid != expected_tid {
-            // Sequence number mismatch — log ends here (stale data from
-            // an older transaction reused log space).
-            break;
-        }
-        if blocktype != JBD2_DESCRIPTOR_BLOCK {
-            // Either a stray commit (no data) or an unknown block; bail
-            // out of replay rather than guessing.
-            break;
-        }
-
-        // Walk descriptor blocks for this transaction until LAST_TAG
-        // appears or the next block stops being a descriptor. Apply
-        // every tag's data payload to its FS-home block as we go.
-        let mut current_desc = blk;
+        let mut pending = Vec::new();
+        let mut revoked = std::collections::HashSet::new();
+        let tid = expected_tid;
         loop {
-            // Each descriptor block, its data payloads, and each peeked block
-            // consume one ring slot. If we have walked more blocks than the
-            // ring can hold, the log is cyclic/forged — refuse rather than
-            // spin forever.
             blocks_visited += 1;
             if blocks_visited > ring_size {
                 return Err(crate::Error::InvalidImage(
-                    "ext4: journal replay exceeded ring size — cyclic descriptors".into(),
+                    "ext4: journal replay exceeded ring size".into(),
                 ));
             }
-            let (data_targets, _) = parse_descriptor_tags(&current_desc, bs)?;
-            let saw_last_tag = data_targets
-                .iter()
-                .any(|t| t.flags & JBD2_FLAG_LAST_TAG != 0);
+            let block = read_journal_block(ext, dev, &journal_inode, idx)?;
+            let magic = u32::from_be_bytes(block[0..4].try_into().unwrap());
+            if magic != JBD2_MAGIC {
+                break 'transactions;
+            }
+            let blocktype = u32::from_be_bytes(block[4..8].try_into().unwrap());
+            let sequence = u32::from_be_bytes(block[8..12].try_into().unwrap());
+            if sequence != tid {
+                break 'transactions;
+            }
             idx = ring_next(idx, &jsb);
-            for tag in &data_targets {
-                let mut payload = read_journal_block(ext, dev, &journal_inode, idx)?;
-                if tag.flags & JBD2_FLAG_ESCAPE != 0 {
-                    payload[0..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+
+            match blocktype {
+                JBD2_DESCRIPTOR_BLOCK => {
+                    let (tags, _) = parse_descriptor_tags(&block, bs, jsb.feature_incompat)?;
+                    for tag in tags {
+                        blocks_visited += 1;
+                        if blocks_visited > ring_size {
+                            return Err(crate::Error::InvalidImage(
+                                "ext4: journal replay exceeded ring size".into(),
+                            ));
+                        }
+                        let mut payload = read_journal_block(ext, dev, &journal_inode, idx)?;
+                        if tag.flags & JBD2_FLAG_ESCAPE != 0 {
+                            payload[0..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+                        }
+                        pending.push((tag.fs_block, payload));
+                        idx = ring_next(idx, &jsb);
+                    }
                 }
-                dev.write_at(tag.fs_block as u64 * bs as u64, &payload)?;
-                idx = ring_next(idx, &jsb);
+                JBD2_REVOKE_BLOCK => {
+                    revoked.extend(parse_revoke_records(&block, bs, jsb.feature_incompat)?);
+                }
+                JBD2_COMMIT_BLOCK => {
+                    for (fs_block, payload) in pending {
+                        if !revoked.contains(&fs_block) {
+                            dev.write_at(fs_block * bs as u64, &payload)?;
+                        }
+                    }
+                    replayed = true;
+                    expected_tid = expected_tid.wrapping_add(1);
+                    break;
+                }
+                _ => break 'transactions,
             }
-            if saw_last_tag {
-                break;
-            }
-            // Peek the next block: if it's another descriptor with the
-            // same tid, keep going; if it's a commit, finalise; if
-            // neither, bail.
-            let peek = read_journal_block(ext, dev, &journal_inode, idx)?;
-            let peek_magic = u32::from_be_bytes(peek[0..4].try_into().unwrap());
-            if peek_magic != JBD2_MAGIC {
-                break 'transactions;
-            }
-            let peek_type = u32::from_be_bytes(peek[4..8].try_into().unwrap());
-            let peek_tid = u32::from_be_bytes(peek[8..12].try_into().unwrap());
-            if peek_tid != tid {
-                break 'transactions;
-            }
-            if peek_type == JBD2_COMMIT_BLOCK {
-                break;
-            }
-            if peek_type != JBD2_DESCRIPTOR_BLOCK {
-                break 'transactions;
-            }
-            current_desc = peek;
         }
-
-        // Next block must be a commit block with the same tid.
-        let commit_buf = read_journal_block(ext, dev, &journal_inode, idx)?;
-        let cmagic = u32::from_be_bytes(commit_buf[0..4].try_into().unwrap());
-        let ctype = u32::from_be_bytes(commit_buf[4..8].try_into().unwrap());
-        let ctid = u32::from_be_bytes(commit_buf[8..12].try_into().unwrap());
-        let commit_seen = cmagic == JBD2_MAGIC && ctype == JBD2_COMMIT_BLOCK && ctid == tid;
-        idx = ring_next(idx, &jsb);
-
-        if !commit_seen {
-            // Descriptor sequence without a matching commit — partial
-            // transaction, don't apply it (replay is atomic).
-            break;
-        }
-
-        replayed = true;
-        expected_tid = expected_tid.wrapping_add(1);
     }
 
     if replayed {
@@ -464,7 +449,7 @@ pub(crate) fn ring_next(idx: u32, jsb: &JournalSuperblock) -> u32 {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ParsedTag {
-    pub fs_block: u32,
+    pub fs_block: u64,
     pub flags: u16,
 }
 
@@ -472,12 +457,13 @@ pub(crate) struct ParsedTag {
 pub(crate) fn parse_descriptor_tags(
     buf: &[u8],
     block_size: u32,
+    feature_incompat: u32,
 ) -> Result<(Vec<ParsedTag>, usize)> {
     let mut out = Vec::new();
     let mut off = 12usize;
     let mut first = true;
     while off + 8 <= block_size as usize {
-        let (fs_block, flags, sz) = decode_tag(&buf[off..], first)?;
+        let (fs_block, flags, sz) = decode_tag(&buf[off..], feature_incompat)?;
         if fs_block == 0 && flags == 0 && first {
             // Empty descriptor — bail.
             break;
@@ -491,6 +477,52 @@ pub(crate) fn parse_descriptor_tags(
     }
     let count = out.len();
     Ok((out, count))
+}
+
+pub(crate) fn parse_revoke_records(
+    buf: &[u8],
+    block_size: u32,
+    feature_incompat: u32,
+) -> Result<Vec<u64>> {
+    if buf.len() < 16 {
+        return Err(crate::Error::InvalidImage(
+            "ext: journal revoke block shorter than header".into(),
+        ));
+    }
+    let count = u32::from_be_bytes(buf[12..16].try_into().unwrap()) as usize;
+    let checksum_tail = if feature_incompat
+        & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3)
+        != 0
+    {
+        4
+    } else {
+        0
+    };
+    let limit = block_size as usize - checksum_tail;
+    if count < 16 || count > limit || count > buf.len() {
+        return Err(crate::Error::InvalidImage(format!(
+            "ext: journal revoke byte count {count} is out of bounds"
+        )));
+    }
+    let record_size = if feature_incompat & JBD2_FEATURE_INCOMPAT_64BIT != 0 {
+        8
+    } else {
+        4
+    };
+    if (count - 16) % record_size != 0 {
+        return Err(crate::Error::InvalidImage(
+            "ext: journal revoke records are misaligned".into(),
+        ));
+    }
+    let mut records = Vec::with_capacity((count - 16) / record_size);
+    for record in buf[16..count].chunks_exact(record_size) {
+        records.push(if record_size == 8 {
+            u64::from_be_bytes(record.try_into().unwrap())
+        } else {
+            u32::from_be_bytes(record.try_into().unwrap()) as u64
+        });
+    }
+    Ok(records)
 }
 
 /// Write a fresh transaction into the journal: descriptor, data payload
@@ -661,12 +693,58 @@ mod tests {
         ];
         let uuid = [0x42; 16];
         let buf = encode_descriptor_block(1024, 9, &blocks, &uuid, true, true);
-        let (tags, n) = parse_descriptor_tags(&buf, 1024).unwrap();
+        let (tags, n) = parse_descriptor_tags(&buf, 1024, 0).unwrap();
         assert_eq!(n, 3);
         assert_eq!(tags[0].fs_block, 100);
         assert_eq!(tags[1].fs_block, 200);
         assert_eq!(tags[2].fs_block, 300);
         assert!(tags[2].flags & JBD2_FLAG_LAST_TAG != 0);
+    }
+
+    #[test]
+    fn continuation_descriptor_first_tag_reuses_uuid() {
+        let blocks = [JournalBlock {
+            fs_block: 400,
+            bytes: vec![0; 1024],
+        }];
+        let uuid = [0x42; 16];
+        let buf = encode_descriptor_block(1024, 9, &blocks, &uuid, false, true);
+        let (tags, n) = parse_descriptor_tags(&buf, 1024, 0).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(tags[0].fs_block, 400);
+        assert!(tags[0].flags & JBD2_FLAG_SAME_UUID != 0);
+        assert!(tags[0].flags & JBD2_FLAG_LAST_TAG != 0);
+    }
+
+    #[test]
+    fn descriptor_without_same_uuid_carries_uuid_after_first_tag() {
+        let mut buf = vec![0u8; 1024];
+        buf[..12].copy_from_slice(&encode_header(JBD2_DESCRIPTOR_BLOCK, 9));
+        buf[12..16].copy_from_slice(&100u32.to_be_bytes());
+        buf[18..20].copy_from_slice(&0u16.to_be_bytes());
+        buf[20..36].fill(0x11);
+        buf[36..40].copy_from_slice(&200u32.to_be_bytes());
+        buf[42..44].copy_from_slice(&JBD2_FLAG_LAST_TAG.to_be_bytes());
+        buf[44..60].fill(0x22);
+
+        let (tags, n) = parse_descriptor_tags(&buf, 1024, 0).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(tags[0].fs_block, 100);
+        assert_eq!(tags[1].fs_block, 200);
+    }
+    #[test]
+    fn decodes_kernel_64bit_descriptor_tags() {
+        let mut buf = vec![0_u8; 1024];
+        buf[..12].copy_from_slice(&encode_header(JBD2_DESCRIPTOR_BLOCK, 9));
+        buf[12..16].copy_from_slice(&0x0050_0001_u32.to_be_bytes());
+        buf[16..18].copy_from_slice(&0_u16.to_be_bytes());
+        buf[18..20].copy_from_slice(&(JBD2_FLAG_SAME_UUID | JBD2_FLAG_LAST_TAG).to_be_bytes());
+        buf[20..24].copy_from_slice(&0_u32.to_be_bytes());
+
+        let (tags, n) = parse_descriptor_tags(&buf, 1024, JBD2_FEATURE_INCOMPAT_64BIT).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(tags[0].fs_block, 0x0050_0001);
+        assert_eq!(tags[0].flags, JBD2_FLAG_SAME_UUID | JBD2_FLAG_LAST_TAG);
     }
 
     #[test]
@@ -687,6 +765,18 @@ mod tests {
             1_234_567
         );
         assert_eq!(u32::from_be_bytes(buf[56..60].try_into().unwrap()), 890);
+    }
+
+    #[test]
+    fn decodes_64bit_revoke_records() {
+        let mut buf = vec![0_u8; 1024];
+        buf[..12].copy_from_slice(&encode_header(JBD2_REVOKE_BLOCK, 9));
+        buf[12..16].copy_from_slice(&32_u32.to_be_bytes());
+        buf[16..24].copy_from_slice(&0x0000_0001_0050_0001_u64.to_be_bytes());
+        buf[24..32].copy_from_slice(&0x0000_0000_0000_0042_u64.to_be_bytes());
+
+        let records = parse_revoke_records(&buf, 1024, JBD2_FEATURE_INCOMPAT_64BIT).unwrap();
+        assert_eq!(records, [0x0000_0001_0050_0001, 0x42]);
     }
 
     #[test]
