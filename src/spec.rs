@@ -850,7 +850,12 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
 }
 
 /// Map a partition-type string to a [`crate::part::PartitionKind`].
-fn parse_partition_kind(s: &str) -> Result<crate::part::PartitionKind> {
+///
+/// Accepts the semantic names (`"esp"`, `"linux"`, `"fat32"`, `"msdata"`,
+/// …), a raw MBR byte (`"0x83"`), or a GPT type UUID. `pub` so the
+/// in-memory authoring surface ([`crate::memedit`]) takes exactly the same
+/// spellings as a TOML spec.
+pub fn parse_partition_kind(s: &str) -> Result<crate::part::PartitionKind> {
     use crate::part::PartitionKind;
     let lower = s.to_ascii_lowercase();
     Ok(match lower.as_str() {

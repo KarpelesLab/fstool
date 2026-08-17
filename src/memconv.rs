@@ -698,7 +698,7 @@ fn maybe_decompress(bytes: &[u8]) -> Result<(Vec<u8>, Option<String>)> {
     }
 }
 
-fn entry_kind_str(k: EntryKind) -> &'static str {
+pub(crate) fn entry_kind_str(k: EntryKind) -> &'static str {
     match k {
         EntryKind::Regular => "file",
         EntryKind::Dir => "dir",
