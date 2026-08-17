@@ -15,7 +15,7 @@
 //! - **The root directory** — FAT32 stores it as an ordinary cluster chain
 //!   starting at `root_cluster`; FAT12/FAT16 store it in a fixed region
 //!   between the last FAT and the data area, sized at format time and
-//!   unable to grow. [`DirLayout`] papers over the difference: a directory
+//!   unable to grow. `DirLayout` papers over the difference: a directory
 //!   is a list of `(device offset, length)` chunks either way, and the
 //!   FAT12/16 root is addressed by the cluster number `0` — the same value
 //!   those volumes already use in a `..` entry pointing at the root.
