@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- *(ext)* journal recovery now honours revoke records across transactions.
+  Replay was single-pass and scoped each revoke to the transaction that
+  carried it, so a block revoked in transaction *N+1* was still replayed from
+  transaction *N* — it had already been written by the time the revoke record
+  was read. That is exactly the case revoke records exist to prevent (a
+  metadata block freed and reused as file data), so stale metadata could land
+  on live data. Recovery now runs the two passes JBD2 requires: a scan that
+  collects committed transactions and builds a revoke table keyed by the
+  highest revoking transaction id, then a replay that skips any block whose
+  revoke id is at or after the transaction replaying it (the kernel's
+  `jbd2_journal_test_revoke` rule, wrap-safe). An uncommitted tail
+  transaction's revoke records are discarded along with its writes.
+- *(ext)* `parse_descriptor_tags` walked the tag array in 8-byte steps
+  regardless of the journal's real tag size, so a trailing slot too short for
+  a 16-byte checksum-v3 tag failed the whole replay instead of ending the
+  array; it also read into the 4-byte checksum tail that checksum-v2/v3
+  descriptor blocks carry.
+
 ## [0.4.21](https://github.com/KarpelesLab/fstool/compare/v0.4.20...v0.4.21) - 2026-08-17
 
 ### Added

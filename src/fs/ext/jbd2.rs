@@ -252,6 +252,33 @@ pub fn set_start(buf: &mut [u8], start: u32) {
     buf[JSB_OFF_START..JSB_OFF_START + 4].copy_from_slice(&start.to_be_bytes());
 }
 
+/// Size of one descriptor tag (excluding a trailing UUID) for the journal's
+/// feature set — the kernel's `journal_tag_bytes()`. Four layouts: classic
+/// 8-byte, checksum-v2 10-byte, 64-bit 12-byte, 64-bit + checksum-v2
+/// 14-byte, and checksum-v3 a flat 16-byte.
+pub(crate) fn journal_tag_bytes(feature_incompat: u32) -> usize {
+    if feature_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3 != 0 {
+        return 16;
+    }
+    let csum_v2 = feature_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V2 != 0;
+    let is_64bit = feature_incompat & JBD2_FEATURE_INCOMPAT_64BIT != 0;
+    8 + usize::from(csum_v2) * 2 + usize::from(is_64bit) * 4
+}
+
+/// Bytes of a descriptor or revoke block that carry records. With
+/// checksum-v2/v3 the last four bytes are a `jbd2_journal_block_tail`
+/// checksum and are not part of the record array.
+pub(crate) fn descriptor_payload_len(block_size: u32, feature_incompat: u32) -> usize {
+    let tail = if feature_incompat & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3)
+        != 0
+    {
+        4
+    } else {
+        0
+    };
+    (block_size as usize).saturating_sub(tail)
+}
+
 /// Decode one journal descriptor tag from `buf`. Returns
 /// `(t_blocknr, t_flags, tag_size_in_bytes_including_uuid)`.
 ///
@@ -260,13 +287,8 @@ pub fn set_start(buf: &mut [u8], start: u32) {
 /// 16-byte. The UUID follows exactly when `SAME_UUID` is clear.
 pub fn decode_tag(buf: &[u8], feature_incompat: u32) -> Result<(u64, u16, usize)> {
     let csum_v3 = feature_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3 != 0;
-    let csum_v2 = feature_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V2 != 0;
     let is_64bit = feature_incompat & JBD2_FEATURE_INCOMPAT_64BIT != 0;
-    let tag_bytes = if csum_v3 {
-        16
-    } else {
-        8 + usize::from(csum_v2) * 2 + usize::from(is_64bit) * 4
-    };
+    let tag_bytes = journal_tag_bytes(feature_incompat);
     if buf.len() < tag_bytes {
         return Err(crate::Error::InvalidImage(
             "ext: journal descriptor tag past end of block".into(),
@@ -339,10 +361,44 @@ pub(crate) fn write_journal_block(
     Ok(())
 }
 
+/// `true` when transaction id `a` is at or after `b`, accounting for the
+/// 32-bit wrap. Mirrors the kernel's `tid_geq()`.
+fn tid_geq(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) >= 0
+}
+
+/// One data block staged by a committed transaction.
+struct StagedBlock {
+    /// Target block on the filesystem.
+    fs_block: u64,
+    /// Journal ring index holding the payload.
+    journal_idx: u32,
+    /// Tag flags (only `JBD2_FLAG_ESCAPE` matters at replay time).
+    flags: u16,
+}
+
+/// One committed transaction found during the scan pass.
+struct StagedTransaction {
+    tid: u32,
+    blocks: Vec<StagedBlock>,
+}
+
 /// Replay any committed-but-not-checkpointed transactions in the journal.
-/// Walks the log starting at `s_start`, transaction by transaction, and
-/// applies each transaction's data blocks to their target FS locations.
 /// On clean exit (`s_start == 0`) this is a no-op.
+///
+/// Recovery runs in the two passes JBD2 requires, because a revoke record
+/// suppresses replay of blocks from *earlier* transactions and can appear
+/// after them in the log:
+///
+/// 1. **Scan** — walk the log from `s_start`, collecting each committed
+///    transaction's tags and building a revoke table mapping a filesystem
+///    block to the highest transaction id that revoked it. A transaction
+///    with no commit block is partial and is dropped (replay is atomic).
+/// 2. **Replay** — apply the staged blocks in transaction order, skipping
+///    any block whose revoke id is at or after the transaction replaying
+///    it (the kernel's `jbd2_journal_test_revoke` rule). That is what stops
+///    stale metadata being written over a block that was since freed and
+///    reused as file data.
 ///
 /// Returns `true` if any work was replayed (caller may need to refresh
 /// in-memory bitmaps from disk).
@@ -365,15 +421,26 @@ pub(crate) fn replay_journal(ext: &super::Ext, dev: &mut dyn BlockDevice) -> Res
         )));
     }
 
+    // -- pass 1: scan ---------------------------------------------------
+    //
+    // Collect committed transactions and the revoke table. Nothing is
+    // written to the filesystem in this pass.
     let mut idx = jsb.start;
     let mut expected_tid = jsb.sequence;
-    let mut replayed = false;
+    // Filesystem block -> highest transaction id that revoked it.
+    let mut revoke_table: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+    let mut staged: Vec<StagedTransaction> = Vec::new();
+    // A forged log can chain descriptors that never make forward progress.
+    // The usable ring is `first..maxlen`; a scan can never legitimately
+    // visit more journal blocks than the ring holds.
     let ring_size = jsb.maxlen.saturating_sub(jsb.first).max(1) as u64;
     let mut blocks_visited: u64 = 0;
     'transactions: loop {
-        let mut pending = Vec::new();
-        let mut revoked = std::collections::HashSet::new();
         let tid = expected_tid;
+        let mut pending: Vec<StagedBlock> = Vec::new();
+        // Revokes seen in this transaction, held aside until it commits —
+        // an uncommitted transaction's records must not affect recovery.
+        let mut pending_revokes: Vec<u64> = Vec::new();
         loop {
             blocks_visited += 1;
             if blocks_visited > ring_size {
@@ -403,29 +470,65 @@ pub(crate) fn replay_journal(ext: &super::Ext, dev: &mut dyn BlockDevice) -> Res
                                 "ext4: journal replay exceeded ring size".into(),
                             ));
                         }
-                        let mut payload = read_journal_block(ext, dev, &journal_inode, idx)?;
-                        if tag.flags & JBD2_FLAG_ESCAPE != 0 {
-                            payload[0..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
-                        }
-                        pending.push((tag.fs_block, payload));
+                        // Record where the payload lives; pass 2 reads it.
+                        pending.push(StagedBlock {
+                            fs_block: tag.fs_block,
+                            journal_idx: idx,
+                            flags: tag.flags,
+                        });
                         idx = ring_next(idx, &jsb);
                     }
                 }
                 JBD2_REVOKE_BLOCK => {
-                    revoked.extend(parse_revoke_records(&block, bs, jsb.feature_incompat)?);
+                    pending_revokes.extend(parse_revoke_records(&block, bs, jsb.feature_incompat)?);
                 }
                 JBD2_COMMIT_BLOCK => {
-                    for (fs_block, payload) in pending {
-                        if !revoked.contains(&fs_block) {
-                            dev.write_at(fs_block * bs as u64, &payload)?;
-                        }
+                    for b in pending_revokes {
+                        // Keep the highest revoking tid per block.
+                        revoke_table
+                            .entry(b)
+                            .and_modify(|t| {
+                                if tid_geq(tid, *t) {
+                                    *t = tid;
+                                }
+                            })
+                            .or_insert(tid);
                     }
-                    replayed = true;
+                    staged.push(StagedTransaction {
+                        tid,
+                        blocks: pending,
+                    });
                     expected_tid = expected_tid.wrapping_add(1);
                     break;
                 }
+                // Anything else (including a partial transaction whose
+                // commit never landed) ends recovery. `pending` and
+                // `pending_revokes` are dropped: replay is atomic.
                 _ => break 'transactions,
             }
+        }
+    }
+
+    let replayed = !staged.is_empty();
+
+    // -- pass 2: replay --------------------------------------------------
+    //
+    // Now that the whole revoke table is known, apply each committed
+    // transaction in order.
+    for txn in &staged {
+        for b in &txn.blocks {
+            if let Some(&revoked_at) = revoke_table.get(&b.fs_block)
+                && tid_geq(revoked_at, txn.tid)
+            {
+                // Revoked by this or a later transaction — the block was
+                // freed and may now hold unrelated data. Leave it alone.
+                continue;
+            }
+            let mut payload = read_journal_block(ext, dev, &journal_inode, b.journal_idx)?;
+            if b.flags & JBD2_FLAG_ESCAPE != 0 {
+                payload[0..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+            }
+            dev.write_at(b.fs_block * bs as u64, &payload)?;
         }
     }
 
@@ -464,7 +567,11 @@ pub(crate) fn parse_descriptor_tags(
     let mut out = Vec::new();
     let mut off = 12usize;
     let mut first = true;
-    while off + 8 <= block_size as usize {
+    // Stop when a whole tag no longer fits, exactly as the kernel does —
+    // a short trailing slot is the end of the array, not a corrupt journal.
+    let limit = descriptor_payload_len(block_size, feature_incompat).min(buf.len());
+    let tag_bytes = journal_tag_bytes(feature_incompat);
+    while off + tag_bytes <= limit {
         let (fs_block, flags, sz) = decode_tag(&buf[off..], feature_incompat)?;
         if fs_block == 0 && flags == 0 && first {
             // Empty descriptor — bail.
@@ -795,5 +902,265 @@ mod tests {
         assert_eq!(ring_next(1, &jsb), 2);
         assert_eq!(ring_next(8, &jsb), 9);
         assert_eq!(ring_next(9, &jsb), 1);
+    }
+}
+
+#[cfg(test)]
+mod revoke_tests {
+    use super::*;
+    use crate::block::MemoryBackend;
+    use crate::fs::ext::{Ext, FormatOpts, FsKind};
+
+    /// Encode a revoke block naming `blocks` (32-bit records).
+    fn encode_revoke_block(block_size: u32, sequence: u32, blocks: &[u32]) -> Vec<u8> {
+        let mut out = vec![0u8; block_size as usize];
+        out[..12].copy_from_slice(&encode_header(JBD2_REVOKE_BLOCK, sequence));
+        let count = 16 + blocks.len() * 4;
+        out[12..16].copy_from_slice(&(count as u32).to_be_bytes());
+        for (i, &b) in blocks.iter().enumerate() {
+            let at = 16 + i * 4;
+            out[at..at + 4].copy_from_slice(&b.to_be_bytes());
+        }
+        out
+    }
+
+    /// A journalled ext4 image plus the decoded journal geometry.
+    struct Harness {
+        dev: MemoryBackend,
+        ext: Ext,
+        jsb_buf: Vec<u8>,
+        jsb: JournalSuperblock,
+        journal_inode: crate::fs::ext::Inode,
+        bs: u32,
+    }
+
+    fn harness() -> Harness {
+        let opts = FormatOpts {
+            kind: FsKind::Ext4,
+            block_size: 1024,
+            blocks_count: 4096,
+            inodes_count: 128,
+            journal_blocks: 64,
+            ..FormatOpts::default()
+        };
+        let total = opts.blocks_count as u64 * opts.block_size as u64;
+        let mut dev = MemoryBackend::new(total);
+        let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+        ext.flush(&mut dev).unwrap();
+        let journal_inode = ext.read_inode(&mut dev, ext.sb.journal_inum).unwrap();
+        let jsb_buf = read_journal_block(&ext, &mut dev, &journal_inode, 0).unwrap();
+        let jsb = JournalSuperblock::decode(&jsb_buf).unwrap();
+        let bs = ext.layout.block_size;
+        Harness {
+            dev,
+            ext,
+            jsb_buf,
+            jsb,
+            journal_inode,
+            bs,
+        }
+    }
+
+    impl Harness {
+        fn put(&mut self, idx: u32, bytes: &[u8]) {
+            write_journal_block(&self.ext, &mut self.dev, &self.journal_inode, idx, bytes).unwrap();
+        }
+
+        /// Point the journal at ring index `start` with first tid `seq`.
+        fn arm(&mut self, start: u32, seq: u32) {
+            let mut sb = self.jsb_buf.clone();
+            set_start(&mut sb, start);
+            set_sequence(&mut sb, seq);
+            write_journal_block(&self.ext, &mut self.dev, &self.journal_inode, 0, &sb).unwrap();
+        }
+
+        fn fs_block(&mut self, blk: u64) -> Vec<u8> {
+            let mut buf = vec![0u8; self.bs as usize];
+            self.dev.read_at(blk * self.bs as u64, &mut buf).unwrap();
+            buf
+        }
+
+        fn set_fs_block(&mut self, blk: u64, fill: u8) {
+            let buf = vec![fill; self.bs as usize];
+            self.dev.write_at(blk * self.bs as u64, &buf).unwrap();
+        }
+    }
+
+    /// A revoke in a *later* transaction must suppress replay of the same
+    /// block from an earlier one. This is the case a single-pass replay
+    /// cannot see: transaction N's write is already applied by the time
+    /// transaction N+1's revoke record shows up in the log.
+    const TARGET: u64 = 3000;
+    const UNTOUCHED: u64 = 3001;
+
+    #[test]
+    fn revoke_in_a_later_transaction_suppresses_an_earlier_write() {
+        let mut h = harness();
+        let bs = h.bs;
+        let uuid = h.jsb.uuid;
+        let first = h.jsb.first;
+
+        // Pre-stamp the target so we can tell "not replayed" from "replayed".
+        h.set_fs_block(TARGET, 0x55);
+        h.set_fs_block(UNTOUCHED, 0x55);
+
+        // Transaction 100: write TARGET and UNTOUCHED, then commit.
+        let blocks = [
+            JournalBlock {
+                fs_block: TARGET as u32,
+                bytes: vec![0xAA; bs as usize],
+            },
+            JournalBlock {
+                fs_block: UNTOUCHED as u32,
+                bytes: vec![0xBB; bs as usize],
+            },
+        ];
+        let mut idx = first;
+        h.put(
+            idx,
+            &encode_descriptor_block(bs, 100, &blocks, &uuid, true, true),
+        );
+        idx = ring_next(idx, &h.jsb);
+        h.put(idx, &vec![0xAA; bs as usize]);
+        idx = ring_next(idx, &h.jsb);
+        h.put(idx, &vec![0xBB; bs as usize]);
+        idx = ring_next(idx, &h.jsb);
+        h.put(idx, &encode_commit_block(bs, 100, 0, 0));
+        idx = ring_next(idx, &h.jsb);
+
+        // Transaction 101: revoke TARGET, then commit. The block was freed
+        // and may now hold unrelated data, so 100's copy must not land.
+        h.put(idx, &encode_revoke_block(bs, 101, &[TARGET as u32]));
+        idx = ring_next(idx, &h.jsb);
+        h.put(idx, &encode_commit_block(bs, 101, 0, 0));
+
+        h.arm(first, 100);
+        let mut dev = std::mem::replace(&mut h.dev, MemoryBackend::new(0));
+        let replayed = replay_journal(&h.ext, &mut dev).unwrap();
+        h.dev = dev;
+        assert!(replayed);
+
+        assert_eq!(
+            h.fs_block(TARGET)[0],
+            0x55,
+            "a block revoked by a later transaction must not be replayed"
+        );
+        assert_eq!(
+            h.fs_block(UNTOUCHED)[0],
+            0xBB,
+            "an unrevoked block from the same transaction must still replay"
+        );
+    }
+
+    /// The converse: a revoke in an *earlier* transaction must not suppress
+    /// a write made after it. `tid_geq(revoked_at, txn)` is the whole rule.
+    #[test]
+    fn revoke_before_the_write_does_not_suppress_it() {
+        let mut h = harness();
+        let bs = h.bs;
+        let uuid = h.jsb.uuid;
+        let first = h.jsb.first;
+        h.set_fs_block(TARGET, 0x55);
+
+        // Transaction 100: revoke TARGET, commit.
+        let mut idx = first;
+        h.put(idx, &encode_revoke_block(bs, 100, &[TARGET as u32]));
+        idx = ring_next(idx, &h.jsb);
+        h.put(idx, &encode_commit_block(bs, 100, 0, 0));
+        idx = ring_next(idx, &h.jsb);
+
+        // Transaction 101: write TARGET, commit.
+        let blocks = [JournalBlock {
+            fs_block: TARGET as u32,
+            bytes: vec![0xCC; bs as usize],
+        }];
+        h.put(
+            idx,
+            &encode_descriptor_block(bs, 101, &blocks, &uuid, true, true),
+        );
+        idx = ring_next(idx, &h.jsb);
+        h.put(idx, &vec![0xCC; bs as usize]);
+        idx = ring_next(idx, &h.jsb);
+        h.put(idx, &encode_commit_block(bs, 101, 0, 0));
+
+        h.arm(first, 100);
+        let mut dev = std::mem::replace(&mut h.dev, MemoryBackend::new(0));
+        replay_journal(&h.ext, &mut dev).unwrap();
+        h.dev = dev;
+
+        assert_eq!(
+            h.fs_block(TARGET)[0],
+            0xCC,
+            "a revoke from an earlier transaction must not block a later write"
+        );
+    }
+
+    /// A transaction whose commit block never landed is not replayed — and
+    /// neither are the revoke records it carried.
+    #[test]
+    fn uncommitted_tail_transaction_is_dropped_entirely() {
+        let mut h = harness();
+        let bs = h.bs;
+        let uuid = h.jsb.uuid;
+        let first = h.jsb.first;
+        h.set_fs_block(TARGET, 0x55);
+        h.set_fs_block(UNTOUCHED, 0x55);
+
+        // Transaction 100: write UNTOUCHED, commit — this one counts.
+        let committed = [JournalBlock {
+            fs_block: UNTOUCHED as u32,
+            bytes: vec![0xBB; bs as usize],
+        }];
+        let mut idx = first;
+        h.put(
+            idx,
+            &encode_descriptor_block(bs, 100, &committed, &uuid, true, true),
+        );
+        idx = ring_next(idx, &h.jsb);
+        h.put(idx, &vec![0xBB; bs as usize]);
+        idx = ring_next(idx, &h.jsb);
+        h.put(idx, &encode_commit_block(bs, 100, 0, 0));
+        idx = ring_next(idx, &h.jsb);
+
+        // Transaction 101: a descriptor + payload, then nothing. Its write
+        // must not land, and its revoke of UNTOUCHED must not take effect.
+        let torn = [JournalBlock {
+            fs_block: TARGET as u32,
+            bytes: vec![0xDD; bs as usize],
+        }];
+        h.put(idx, &encode_revoke_block(bs, 101, &[UNTOUCHED as u32]));
+        idx = ring_next(idx, &h.jsb);
+        h.put(
+            idx,
+            &encode_descriptor_block(bs, 101, &torn, &uuid, true, true),
+        );
+        idx = ring_next(idx, &h.jsb);
+        h.put(idx, &vec![0xDD; bs as usize]);
+
+        h.arm(first, 100);
+        let mut dev = std::mem::replace(&mut h.dev, MemoryBackend::new(0));
+        replay_journal(&h.ext, &mut dev).unwrap();
+        h.dev = dev;
+
+        assert_eq!(
+            h.fs_block(TARGET)[0],
+            0x55,
+            "an uncommitted transaction must not be replayed"
+        );
+        assert_eq!(
+            h.fs_block(UNTOUCHED)[0],
+            0xBB,
+            "an uncommitted transaction's revoke must not suppress a committed write"
+        );
+    }
+
+    #[test]
+    fn tid_geq_handles_the_32_bit_wrap() {
+        assert!(tid_geq(5, 5));
+        assert!(tid_geq(6, 5));
+        assert!(!tid_geq(5, 6));
+        // Wrapped: 1 is "after" u32::MAX.
+        assert!(tid_geq(1, u32::MAX));
+        assert!(!tid_geq(u32::MAX, 1));
     }
 }
