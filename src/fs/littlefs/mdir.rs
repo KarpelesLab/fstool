@@ -43,11 +43,13 @@ impl Geom {
         block as u64 * self.block_size as u64
     }
 
-    /// Largest commit body (everything after the revision count, before the
-    /// CRC tag) a metadata block can hold. littlefs reserves 40 bytes for
-    /// the tail, global state, a trailing delete and the CRC itself.
+    /// Largest total size of a pair's *entries* that a metadata block can
+    /// still hold once everything a commit appends to them is accounted
+    /// for: the tail (4+8), a global-state delta (4+12), the forward-CRC
+    /// (4+8) and the commit CRC (4+4). Padding needs no allowance, since
+    /// both the block and the program size are powers of two.
     pub fn commit_limit(&self) -> usize {
-        self.block_size as usize - 40
+        self.block_size as usize - 48
     }
 
     /// Size past which a metadata pair is split in two. littlefs caps a
@@ -155,16 +157,13 @@ impl Mdir {
             .position(|e| e.is_file() && e.name == name)
     }
 
-    /// Total commit size of this pair's contents.
-    fn body_size(&self) -> usize {
-        let mut n: usize = self.entries.iter().map(Entry::commit_size).sum();
-        if self.tail.is_some() {
-            n += 4 + 8;
-        }
-        if self.gdelta.is_some() {
-            n += 4 + 12;
-        }
-        n
+    /// Total size of this pair's entries. The tail and global-state
+    /// tags a commit appends are *not* counted here: they are what
+    /// [`Geom::commit_limit`] holds back room for, and counting them
+    /// twice would make a pair look unsplittable when it merely needs
+    /// its last entry moved along.
+    fn entries_size(&self) -> usize {
+        self.entries.iter().map(Entry::commit_size).sum()
     }
 }
 
@@ -516,11 +515,13 @@ pub fn write_compaction(
 }
 
 /// Whether `mdir`'s contents still fit one metadata block, or need to be
-/// split across two pairs first.
+/// split across two pairs first. Measured the same way [`split_point`]
+/// measures its candidates, so the two can never disagree about whether a
+/// given set of entries fits.
 pub fn needs_split(geom: &Geom, mdir: &Mdir) -> bool {
     // littlefs also caps a pair at 0xff ids, halving the split point until
     // both bounds hold.
-    mdir.body_size() > geom.split_limit() || mdir.entries.len() >= 0xff
+    mdir.entries_size() > geom.split_limit() || mdir.entries.len() >= 0xff
 }
 
 /// Pick how many leading entries stay in the pair when splitting, mirroring

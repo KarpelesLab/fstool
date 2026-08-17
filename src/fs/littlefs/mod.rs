@@ -410,6 +410,15 @@ impl LittleFs {
         self.inline_max
     }
 
+    /// Program (page) alignment commits are padded to. Not recorded in
+    /// the superblock — it is a property of the target flash — so for an
+    /// opened image this is recovered from the forward-CRC of the last
+    /// commit, falling back to a sensible default when the image carries
+    /// none.
+    pub fn program_size(&self) -> u32 {
+        self.geom.prog_size
+    }
+
     /// Blocks currently in use.
     pub fn used_blocks(&mut self, dev: &mut dyn BlockDevice) -> Result<u32> {
         Ok(self.allocator(dev)?.used())

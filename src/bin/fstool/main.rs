@@ -3720,6 +3720,7 @@ fn print_littlefs_info(
     println!("disk version:      {major}.{minor}");
     println!("block size:        {block_size}");
     println!("block count:       {block_count}");
+    println!("prog size:         {}", lfs.program_size());
     println!("inline max:        {}", lfs.inline_max());
     match lfs.used_blocks(dev) {
         Ok(used) => println!("blocks used:       {used} / {block_count}"),

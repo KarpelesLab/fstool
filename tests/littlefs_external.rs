@@ -63,7 +63,11 @@ def load(path):
     bs, bc = struct.unpack('<II', bytes(data[24:32]))
     ctx = UserContext(len(data))
     ctx.buffer = data
-    fs = LittleFS(context=ctx, block_size=bs, block_count=bc, mount=False)
+    # Caches have to fit inside a block, so derive them from the image
+    # rather than assuming the 4 KiB default geometry.
+    c = min(256, bs)
+    fs = LittleFS(context=ctx, block_size=bs, block_count=bc,
+                  read_size=c, prog_size=c, cache_size=c, mount=False)
     fs.mount()
     return fs, data
 
@@ -336,6 +340,58 @@ fn version_2_0_images_mount_in_the_reference_implementation() {
         .map(|s| s.to_string())
         .collect();
     assert_eq!(theirs, ours);
+}
+
+#[test]
+fn every_geometry_mounts_in_the_reference_implementation() {
+    let Some(h) = Harness::new() else {
+        eprintln!("skipping: no python with littlefs-python installed");
+        return;
+    };
+    // Block size sets the inline threshold, the metadata split point and
+    // every block's CTZ payload, so each geometry is a different layout
+    // to agree on — and small blocks are where the margins are tightest.
+    for (block_size, prog_size) in [(128u32, 8u32), (512, 128), (1024, 64), (16384, 512)] {
+        let img = h.image(&format!("geom-{block_size}-{prog_size}.img"));
+        let opts = LittleFsFormatOpts {
+            block_size,
+            prog_size,
+            ..LittleFsFormatOpts::default()
+        };
+        let (mut dev, mut fs) = create_image(&img, 4 * 1024 * 1024, &opts);
+        fs.create_dir(&mut dev, Path::new("/d"), FileMeta::default())
+            .unwrap();
+        put(&mut fs, &mut dev, "/d/tiny", b"x");
+        put(
+            &mut fs,
+            &mut dev,
+            "/d/spans-blocks",
+            &pattern(block_size as usize * 5 + 37),
+        );
+        // Enough entries that the directory has to split at any geometry.
+        for i in 0..40 {
+            put(
+                &mut fs,
+                &mut dev,
+                &format!("/e{i:02}"),
+                format!("{i}").as_bytes(),
+            );
+        }
+        fs.flush(&mut dev).unwrap();
+        let ours = manifest(&mut fs, &mut dev);
+        drop(dev);
+
+        let theirs: Vec<String> = h
+            .run("manifest", &img)
+            .lines()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            theirs, ours,
+            "disagreement at block_size={block_size} prog_size={prog_size}"
+        );
+        assert_eq!(theirs.len(), 43, "at block_size={block_size}");
+    }
 }
 
 #[test]

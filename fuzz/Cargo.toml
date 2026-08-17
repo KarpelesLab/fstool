@@ -26,3 +26,10 @@ path = "fuzz_targets/ext_list_corrupt_dir.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "littlefs_open"
+path = "fuzz_targets/littlefs_open.rs"
+test = false
+doc = false
+bench = false
