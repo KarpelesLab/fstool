@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.21](https://github.com/KarpelesLab/fstool/compare/v0.4.20...v0.4.21) - 2026-08-17
+
+### Added
+
+- *(fat)* read + write FAT12 and FAT16 alongside FAT32
+
+### Fixed
+
+- *(ext)* 60-byte symlinks inline, and used_dirs_count charged to group 0
+- *(fat)* don't link private `DirLayout` from the public module docs
+
+### Other
+
+- *(fat)* cross-validate FAT12/16 against dosfstools and mtools; document
+- *(deps)* bump compcol to 0.6.10
+
 ### Added
 
 - *(fat)* read + write FAT12 and FAT16 alongside FAT32. One backend serves
