@@ -5,11 +5,14 @@
 //! - [`block`] — `BlockDevice`: raw seekable byte storage. Backends include
 //!   on-disk files, in-memory buffers (for tests), and sub-range slices used to
 //!   give each partition an isolated view.
-//! - [`part`] — `PartitionTable`: MBR and GPT. (Coming in P2.)
-//! - [`fs`] — `Filesystem`: ext2/3/4 in v1; FAT32 deferred. (Coming in P3+.)
+//! - [`part`] — `PartitionTable`: MBR, GPT and APM.
+//! - [`fs`] — `Filesystem`: one trait over every backend — ext2/3/4,
+//!   FAT12/16/32, exFAT, XFS, HFS+, HFS, AFFS, APFS, NTFS, F2FS, littlefs,
+//!   SquashFS, ISO 9660, GRF, tar and the archive formats.
 //!
-//! High-level entry points for building or inspecting an image live at the
-//! crate root once P5 lands.
+//! High-level entry points: [`spec::build`] builds an image from a TOML
+//! spec, [`inspect`] opens and walks an existing one, [`repack`] converts
+//! between formats, and [`memconv`] / [`memedit`] do both in memory.
 
 pub mod analyze;
 pub mod block;

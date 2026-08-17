@@ -180,6 +180,9 @@ fstool create -t squashfs ./rootfs -o out.sqsh \
 
 # Force a v0x103 GRF with deflate level 9
 fstool create -t grf ./rootfs -o out.grf -O version=0x103,compression_level=9
+
+# littlefs sized to a flash part: 64 KiB erase blocks, 256-byte pages
+fstool create -t littlefs ./rootfs -o out.img -O block_size=65536,prog_size=256
 ```
 
 Each backend's `apply_options` validates keys; unknown keys are rejected
@@ -268,7 +271,7 @@ Recognised tar extensions: `.tar`, `.tar.gz`, `.tgz`, `.tar.xz`, `.txz`,
 matching Cargo feature). For images, the `:N` suffix selects partition
 *N* (1-indexed); without it, the source is opened as a bare filesystem.
 The source FS may be any readable type — `ext{2,3,4}`, FAT12/16/32, exFAT,
-XFS, HFS+, APFS, NTFS, F2FS, SquashFS, ISO 9660, tar, or GRF — and the
+XFS, HFS+, APFS, NTFS, F2FS, littlefs, SquashFS, ISO 9660, tar, or GRF — and the
 destination is sized automatically to fit unless `size` is set
 explicitly.
 
@@ -373,6 +376,10 @@ Every reader surfaces the metadata its format actually stores:
 ext, tar, the archive formats, F2FS, XFS, SquashFS, APFS, and HFS+ carry
 full POSIX mode/uid/gid + timestamps (HFS+ converts its 1904 epoch);
 ISO 9660 does too when Rock Ridge is present (plain/Joliet have none);
+littlefs stores none at all — no mode, owner, timestamps, symlinks or
+device nodes — so it reports synthesised modes on read and refuses
+symlink / device creation on write, and its user attributes ride through
+repack as `user.littlefs.<type>` xattrs;
 NTFS — which has no POSIX ownership — surfaces real timestamps + a mode
 synthesised from its DOS attributes, and carries its native metadata
 (DOS attrs, ADS, security descriptor, reparse data, …) through repack as
@@ -380,10 +387,11 @@ synthesised from its DOS attributes, and carries its native metadata
 
 `fstool repack` writes any destination implementing the `Filesystem`
 trait — `ext2/3/4`, FAT12/16/32, exFAT, tar, XFS, HFS+, APFS, NTFS, F2FS,
-SquashFS, ISO 9660, GRF. `add` / `rm` go through the same trait,
+littlefs, SquashFS, ISO 9660, GRF. `add` / `rm` go through the same trait,
 which means they work on any FS whose writer can re-open an existing
 image; today that's all of the mutable backends — ext, FAT12/16/32, exFAT,
-F2FS, XFS, HFS+, NTFS, APFS, and GRF. SquashFS, ISO 9660, and tar
+XFS, HFS+, NTFS, APFS, littlefs, and GRF (F2FS is build-once: a re-opened
+image is read-only). SquashFS, ISO 9660, and tar
 are repack-only (their `MutationCapability` is `Immutable` or
 `Streaming`, so `add` / `rm` fail fast with an actionable error and
 the user is steered to `repack`).
@@ -545,6 +553,14 @@ cargo install fstool --no-default-features --features gzip,lz4,xz,lzma
 Things explicitly out of scope today, in rough order of likely-to-change:
 
 - **ext4 write path**: `flex_bg` on the write path (reader is fine).
+- **littlefs metadata**: the format stores no modes, owners, timestamps,
+  symlinks or device nodes, so `create_symlink` / `create_device` return
+  `Unsupported` (a repack sink skips those entries) and modes are
+  synthesised on read. A metadata pair that empties out mid-chain is left
+  in place rather than merged back into its predecessor — it costs one
+  spare pair until the directory is removed. Wear-levelling relocation
+  (`block_cycles`) is not modelled: an image tool rewrites a pair in
+  place, which is a decision for the device that mounts it.
 - **APFS in-place edits**: `open_file_rw` rebuilds a fresh COW
   checkpoint over the entire file content, so it's whole-file
   granularity — partial-extent COW is not yet implemented, and
