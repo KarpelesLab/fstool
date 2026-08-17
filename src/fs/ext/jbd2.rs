@@ -279,8 +279,10 @@ pub fn decode_tag(buf: &[u8], feature_incompat: u32) -> Result<(u64, u16, usize)
         u16::from_be_bytes(buf[6..8].try_into().unwrap())
     };
     let block_hi = if is_64bit {
-        let off = if csum_v3 { 8 } else { 8 };
-        u32::from_be_bytes(buf[off..off + 4].try_into().unwrap()) as u64
+        // Both layouts put `t_blocknr_high` at offset 8: `journal_block_tag3_t`
+        // is {blocknr, flags, blocknr_high, checksum} and `journal_block_tag_t`
+        // is {blocknr, checksum, flags, blocknr_high}.
+        u32::from_be_bytes(buf[8..12].try_into().unwrap()) as u64
     } else {
         0
     };
@@ -509,7 +511,7 @@ pub(crate) fn parse_revoke_records(
     } else {
         4
     };
-    if (count - 16) % record_size != 0 {
+    if !(count - 16).is_multiple_of(record_size) {
         return Err(crate::Error::InvalidImage(
             "ext: journal revoke records are misaligned".into(),
         ));

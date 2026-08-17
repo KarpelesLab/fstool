@@ -40,25 +40,28 @@ fn read_default_mke2fs_ext4_image() {
     std::fs::write(srcdir.path().join("etc/conf"), b"x=1\n").unwrap();
 
     let tmp = NamedTempFile::new().unwrap();
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(tmp.path())
-        .unwrap();
-    file.set_len(100 * 1024 * 1024 * 1024).unwrap();
-    drop(file);
+    // Pin every knob that varies between mke2fs builds and platforms: without
+    // an explicit `-t ext4` the image inherits the local default, which is
+    // ext2 on some hosts, and the fixed label + UUID keep the image
+    // reproducible.
     let out = Command::new("mke2fs")
         .args([
             "-F",
+            "-t",
+            "ext4",
+            "-b",
+            "1024",
             "-L",
-            "fleet-work",
-            "-m",
-            "0",
+            "",
+            "-U",
+            "00000000-0000-0000-0000-000000000000",
             "-E",
-            "lazy_itable_init=0,lazy_journal_init=0",
+            "nodiscard",
             "-d",
         ])
         .arg(srcdir.path())
         .arg(tmp.path())
+        .arg("8192")
         .output()
         .unwrap();
     assert!(
