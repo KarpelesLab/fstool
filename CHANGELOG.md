@@ -20,6 +20,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   destination, and as a TOML spec `type`; `-O root_entries=` sizes the fixed
   root, which cannot grow once formatted.
 
+### Fixed
+
+- *(ext)* a symlink target of exactly 60 bytes was stored inline in `i_block`,
+  producing an inode `e2fsck` rejects ("Symlink … is invalid") and the kernel
+  refuses to look up ("invalid fast symlink length 60"). ext carries no
+  "is inline" flag — the reader infers it from size alone, and Linux tests
+  `i_size < 60` — so the bound is now strict in both the writer and the size
+  planner, which had the same off-by-one and would have under-reserved a block
+  per such symlink. ([#33](https://github.com/KarpelesLab/fstool/issues/33))
+- *(ext)* `bg_used_dirs_count` was charged to block group 0 for every
+  directory, so any image whose inodes reached a second group failed `e2fsck`
+  with "Directories count wrong for group #N". Each directory is now counted in
+  its own group, which also removes the only way to overflow the `u16` — per
+  group it is bounded by `inodes_per_group`.
+  ([#34](https://github.com/KarpelesLab/fstool/issues/34))
+
 ### Changed
 
 - *(fat)* `FatFormatOpts` gained `kind` and `root_entries` — struct literals

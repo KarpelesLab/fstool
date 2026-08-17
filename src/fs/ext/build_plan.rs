@@ -75,11 +75,13 @@ impl BuildPlan {
     }
 
     /// Record a symbolic link with a target of `target_len` bytes. Targets
-    /// ≤ 60 bytes use the inline "fast symlink" path (no data block); longer
-    /// ones get one block.
+    /// *under* 60 bytes use the inline "fast symlink" path (no data block);
+    /// 60 and longer get one block. The bound must match `add_symlink_to`'s
+    /// exactly — 60 is not representable inline, and counting it as inline
+    /// here would under-reserve the image by one block per such symlink.
     pub fn add_symlink(&mut self, target_len: usize) {
         self.n_symlinks += 1;
-        if target_len > 60 {
+        if target_len >= 60 {
             self.long_symlinks += 1;
         }
     }

@@ -1040,3 +1040,162 @@ fn large_file_round_trips_through_triple_indirect() {
     let got_hash = got.split_whitespace().next().unwrap();
     assert_eq!(got_hash, want_hash, "round-trip checksum mismatch");
 }
+
+/// Issue #33: a symlink target of exactly 60 bytes must go out of line.
+///
+/// ext carries no "is inline" flag — the reader infers it from size alone,
+/// and Linux's `ext4_inode_is_fast_symlink()` tests `i_size < 60`. Storing
+/// a 60-byte target in `i_block` therefore produces an inode e2fsck calls
+/// invalid and the kernel refuses to look up. It is a one-value window, so
+/// this brackets it: 59 must stay inline, 60 and 61 must get a block.
+#[test]
+fn symlink_target_of_exactly_60_bytes_is_not_stored_inline() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    let Some(_) = which("debugfs") else {
+        eprintln!("skipping: debugfs not installed");
+        return;
+    };
+    use fstool::block::BlockDevice;
+
+    let tmp = NamedTempFile::new().unwrap();
+    let opts = FormatOpts {
+        inodes_count: 64,
+        ..FormatOpts::default()
+    };
+    let mut dev = FileBackend::create(
+        tmp.path(),
+        opts.blocks_count as u64 * opts.block_size as u64,
+    )
+    .unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+
+    for n in [59usize, 60, 61] {
+        let target = "a".repeat(n);
+        ext.add_symlink_to(
+            &mut dev,
+            2,
+            format!("l{n}").as_bytes(),
+            target.as_bytes(),
+            FileMeta::with_mode(0o777),
+        )
+        .unwrap();
+    }
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    let out = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "e2fsck rejected the image:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // debugfs names the storage class outright ("Fast link dest" only
+    // appears for an inline target), so assert on the boundary rather than
+    // trusting e2fsck's silence.
+    for (n, want_fast) in [(59usize, true), (60, false), (61, false)] {
+        let out = Command::new("debugfs")
+            .arg("-R")
+            .arg(format!("stat /l{n}"))
+            .arg(tmp.path())
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            stat.contains("Fast link dest"),
+            want_fast,
+            "l{n} stored in the wrong class:\n{stat}"
+        );
+        assert_eq!(
+            stat.contains("Blockcount: 0\n") || stat.contains("Blockcount: 0 "),
+            want_fast,
+            "l{n} block accounting disagrees with its storage class:\n{stat}"
+        );
+    }
+
+    // And our own reader gets every target back verbatim.
+    let mut dev = FileBackend::open(tmp.path()).unwrap();
+    let ext = Ext::open(&mut dev).unwrap();
+    for n in [59usize, 60, 61] {
+        let ino = ext.path_to_inode(&mut dev, &format!("/l{n}")).unwrap();
+        assert_eq!(
+            ext.read_symlink_target(&mut dev, ino).unwrap(),
+            "a".repeat(n),
+            "l{n} round-trip"
+        );
+    }
+}
+
+/// Issue #34: `bg_used_dirs_count` is per-descriptor, so a tree whose
+/// inodes reach a second block group must charge each directory to its own
+/// group. Charging them all to group 0 makes e2fsck report
+/// "Directories count wrong for group #0/#1".
+#[test]
+fn used_dirs_count_is_charged_per_block_group() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    use fstool::block::BlockDevice;
+
+    // 1 KiB blocks keep inodes_per_group small, so a few hundred
+    // directories are enough to spill into group 1.
+    let opts = FormatOpts {
+        block_size: 1024,
+        blocks_count: 16384,
+        inodes_count: 1024,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let mut dev = FileBackend::create(
+        tmp.path(),
+        opts.blocks_count as u64 * opts.block_size as u64,
+    )
+    .unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+
+    let mut last_ino = 0u32;
+    for i in 0..600 {
+        last_ino = ext
+            .add_dir_to(
+                &mut dev,
+                2,
+                format!("d{i:03}").as_bytes(),
+                FileMeta::with_mode(0o755),
+            )
+            .unwrap();
+    }
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    // The premise of the test: we really did cross a group boundary.
+    assert!(
+        last_ino > ext.layout.inodes_per_group,
+        "test tree stayed inside one inode group ({last_ino} inodes)"
+    );
+    drop(dev);
+
+    let out = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("Directories count wrong"),
+        "used_dirs_count is not per-group:\n{stdout}"
+    );
+    assert!(
+        out.status.success(),
+        "e2fsck failed:\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

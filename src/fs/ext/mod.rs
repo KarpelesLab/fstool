@@ -900,7 +900,7 @@ impl Ext {
         inode.block[0] = blk;
         inode.blocks_512 = self.layout.block_size / 512;
 
-        self.groups[0].desc.used_dirs_count += 1;
+        self.bump_used_dirs(ino);
         self.push_inode(ino, inode);
         self.push_data_block(blk, block_bytes);
         self.track_dir_block(blk, ino);
@@ -941,7 +941,7 @@ impl Ext {
             self.track_dir_block(blk, ino);
         }
 
-        self.groups[0].desc.used_dirs_count += 1;
+        self.bump_used_dirs(ino);
         self.push_inode(ino, inode);
 
         // Add to root dir + bump root's link count (a new subdir's ".." is
@@ -1748,11 +1748,35 @@ impl Ext {
             )));
         }
         let ino = self.next_inode;
-        let g = ((ino - 1) / self.layout.inodes_per_group) as usize;
+        let g = self.inode_group(ino);
         let idx = (ino - 1) % self.layout.inodes_per_group;
         set_bit(&mut self.groups[g].inode_bitmap, idx);
         self.next_inode += 1;
         Ok(ino)
+    }
+
+    /// Which block group owns `ino`. Inode numbers are 1-based, so the
+    /// group is `(ino - 1) / inodes_per_group`.
+    fn inode_group(&self, ino: u32) -> usize {
+        ((ino - 1) / self.layout.inodes_per_group) as usize
+    }
+
+    /// Charge one directory to `ino`'s own block group. `bg_used_dirs_count`
+    /// is per-descriptor: e2fsck recounts it group by group, and the kernel
+    /// reads it in the Orlov allocator when placing a new directory. Sending
+    /// every directory to group 0 both fails that check and is the only way
+    /// to overflow the `u16` — counted per group it is bounded by
+    /// `inodes_per_group`.
+    fn bump_used_dirs(&mut self, ino: u32) {
+        let g = self.inode_group(ino);
+        self.groups[g].desc.used_dirs_count += 1;
+    }
+
+    /// Release one directory from `ino`'s own block group.
+    fn drop_used_dirs(&mut self, ino: u32) {
+        let g = self.inode_group(ino);
+        let d = &mut self.groups[g].desc;
+        d.used_dirs_count = d.used_dirs_count.saturating_sub(1);
     }
 
     /// Allocate a single data block. Scans groups in order and returns the
@@ -2436,7 +2460,7 @@ impl Ext {
         self.push_data_block(blk, block_bytes);
         self.track_dir_block(blk, ino);
         self.push_inode(ino, inode);
-        self.groups[0].desc.used_dirs_count += 1;
+        self.bump_used_dirs(ino);
 
         self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_DIR)?;
         self.patch_inode(dev, parent_ino, |i| i.links_count += 1)?;
@@ -2503,7 +2527,7 @@ impl Ext {
             self.track_dir_block(blk, ino);
         }
         self.push_inode(ino, inode);
-        self.groups[0].desc.used_dirs_count += 1;
+        self.bump_used_dirs(ino);
 
         self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_DIR)?;
         self.patch_inode(dev, parent_ino, |i| i.links_count += 1)?;
@@ -2722,7 +2746,7 @@ impl Ext {
         }
 
         self.push_inode(ino, inode);
-        self.groups[0].desc.used_dirs_count += 1;
+        self.bump_used_dirs(ino);
 
         self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_DIR)?;
         self.patch_inode(dev, parent_ino, |i| i.links_count += 1)?;
@@ -2811,9 +2835,16 @@ impl Ext {
             meta.mtime,
         );
 
-        // Fast symlink: target fits in i_block (60 bytes = 15 × 4).
+        // Fast symlink: the target lives in i_block (60 bytes = 15 × 4).
+        // The bound is strict. ext stores no "inline or not" flag — the
+        // reader infers it from size alone, and Linux's
+        // `ext4_inode_is_fast_symlink()` tests `i_size < 60`. A 60-byte
+        // target packed inline therefore reads back as a symlink with no
+        // data blocks and an out-of-line size, which e2fsck rejects
+        // ("Symlink … is invalid") and the kernel refuses to look up
+        // ("invalid fast symlink length 60"). 59 inlines, 60 gets a block.
         const FAST_MAX: usize = 60;
-        if target.len() <= FAST_MAX {
+        if target.len() < FAST_MAX {
             // Pack target bytes into i_block array.
             let mut packed = [0u8; FAST_MAX];
             packed[..target.len()].copy_from_slice(target);
@@ -2977,8 +3008,7 @@ impl Ext {
             self.patch_inode(dev, parent_ino, |i| {
                 i.links_count = i.links_count.saturating_sub(1);
             })?;
-            self.groups[0].desc.used_dirs_count =
-                self.groups[0].desc.used_dirs_count.saturating_sub(1);
+            self.drop_used_dirs(target_ino);
             return Ok(());
         }
 
