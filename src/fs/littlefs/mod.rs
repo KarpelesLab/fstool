@@ -972,12 +972,19 @@ fn pick_inline_max(geom: &Geom, requested: Option<u32>) -> Result<u32> {
 
 /// Split a path into its components, rejecting anything that would escape
 /// the volume root.
+///
+/// Both separators are accepted, as the FAT backend does: the trait hands
+/// us `&Path`s that callers build with `PathBuf::join` — including the
+/// trait's own default `total_file_bytes` walker — and on Windows that
+/// joins with a backslash. The cost is that a littlefs name *containing* a
+/// backslash can't be addressed by path, which matches how FAT behaves and
+/// is not a name any real volume uses.
 fn components(path: &Path) -> Result<Vec<&str>> {
     let s = path
         .to_str()
         .ok_or_else(|| Error::InvalidArgument("littlefs: non-UTF-8 path".into()))?;
     let mut out: Vec<&str> = Vec::new();
-    for c in s.split('/') {
+    for c in s.split(['/', '\\']) {
         match c {
             "" | "." => {}
             ".." => {

@@ -790,3 +790,36 @@ fn name_limits_are_enforced() {
         .is_err()
     );
 }
+
+#[test]
+fn paths_built_with_the_platform_separator_resolve() {
+    // The `Filesystem` trait is addressed with `&Path`, and callers build
+    // those with `PathBuf::join` — which uses a backslash on Windows. The
+    // default `total_file_bytes` walker does exactly that, so a splitter
+    // that only knew '/' failed there while passing everywhere else.
+    let (mut dev, mut fs) = fresh(512 * 1024);
+    for d in ["/usr", "/usr/local"] {
+        fs.create_dir(&mut dev, Path::new(d), FileMeta::default())
+            .unwrap();
+    }
+    write_file(&mut fs, &mut dev, "/usr/local/greeting", b"hi");
+
+    // Both spellings address the same entry, on every platform.
+    for p in [
+        "/usr/local/greeting",
+        "\\usr\\local\\greeting",
+        "/usr\\local/greeting",
+    ] {
+        let a = fs
+            .getattr(&mut dev, Path::new(p))
+            .unwrap_or_else(|e| panic!("{p:?}: {e}"));
+        assert_eq!(a.size, 2, "{p:?}");
+    }
+
+    // And the trait-level walk, which is what regressed.
+    assert_eq!(fs.total_file_bytes(&mut dev).unwrap(), 2);
+
+    // A path assembled the way the walker assembles it.
+    let joined = std::path::PathBuf::from("/").join("usr").join("local");
+    assert_eq!(fs.list(&mut dev, &joined).unwrap().len(), 1);
+}
