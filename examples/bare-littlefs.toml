@@ -1,0 +1,42 @@
+# Example fstool spec: a bare littlefs image for embedded flash.
+#
+#   fstool build examples/bare-littlefs.toml -o /tmp/lfs.img
+#   fstool info /tmp/lfs.img
+#
+# littlefs is the fail-safe filesystem used on microcontroller NOR/NAND
+# flash. Sizing is exact: the image is whatever the metadata pairs and the
+# file data need, so match `size` to the flash region you will write it to.
+
+[filesystem]
+type = "littlefs"
+
+# Total image size. littlefs derives its block count from this and the
+# block size below, so keep it a whole multiple of `block_size`.
+size = "1MiB"
+
+# Host directory whose contents become the image's tree. Optional —
+# omit it for an empty volume with just the root directory.
+# source = "./rootfs"
+
+# Erase-block size of the target flash. Must be a power of two, at least
+# 128 bytes. 4 KiB matches most NOR parts; some use 64 KiB.
+block_size = 4096
+
+[filesystem.options]
+# Program (page) size the target flash writes in. Commits are padded to
+# it so a device mounting this image can append in place.
+prog_size = 256
+
+# On-disk version: "2.1" (default, current) or "2.0" for firmware built
+# against a littlefs older than v2.5, whose reader predates forward-CRC
+# tags.
+version = "2.1"
+
+# Files at or below this many bytes are stored inside their directory's
+# metadata instead of getting blocks of their own. Defaults to an eighth
+# of a block.
+# inline_max = 512
+
+# Longest filename the volume accepts (must match what the firmware's
+# LFS_NAME_MAX allows). Default 255.
+# name_max = 255

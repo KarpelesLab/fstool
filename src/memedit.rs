@@ -181,6 +181,14 @@ pub fn creatable_filesystems() -> Vec<FsTypeInfo> {
             options: "fstype,intl,volume_name",
         },
         FsTypeInfo {
+            id: "littlefs",
+            label: "littlefs",
+            min_size: 16 << 10,
+            default_size: 4 << 20,
+            editable: true,
+            options: "block_size,block_count,prog_size,version,name_max,inline_max",
+        },
+        FsTypeInfo {
             id: "f2fs",
             label: "F2FS",
             min_size: 64 << 20,
@@ -216,6 +224,7 @@ fn canonical_fs_id(fs_type: &str) -> String {
         "vfat" => "fat32".to_string(),
         "hfsplus" => "hfs+".to_string(),
         "ofs" | "ffs" => "affs".to_string(),
+        "lfs" => "littlefs".to_string(),
         other => other.to_string(),
     }
 }
@@ -358,6 +367,31 @@ fn format_blank(fs_type: &str, dev: &mut MemoryBackend, options: &str) -> Result
             }
             bag.check_empty(&id)?;
             AnyFs::Affs(Box::new(Affs::format(dev, &opts)?))
+        }
+        "littlefs" => {
+            use crate::fs::littlefs::{LittleFs, LittleFsFormatOpts};
+            // Same knobs `spec::littlefs_format_opts` accepts.
+            let mut opts = LittleFsFormatOpts::default();
+            if let Some(b) = bag.take_u32("block_size")? {
+                opts.block_size = b;
+            }
+            if let Some(b) = bag.take_u32("block_count")? {
+                opts.block_count = Some(b);
+            }
+            if let Some(p) = bag.take_u32("prog_size")? {
+                opts.prog_size = p;
+            }
+            if let Some(v) = bag.take_str("version") {
+                opts.disk_version = crate::spec::parse_littlefs_version(&v)?;
+            }
+            if let Some(n) = bag.take_u32("name_max")? {
+                opts.name_max = n;
+            }
+            if let Some(n) = bag.take_u32("inline_max")? {
+                opts.inline_max = Some(n);
+            }
+            bag.check_empty(&id)?;
+            AnyFs::LittleFs(Box::new(LittleFs::format(dev, &opts)?))
         }
         "f2fs" => {
             use crate::fs::f2fs::{F2fs, FormatOpts};

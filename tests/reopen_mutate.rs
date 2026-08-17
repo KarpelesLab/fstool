@@ -306,6 +306,34 @@ fn exfat_reopen_mutate() {
 }
 
 // ----------------------------------------------------------------------
+// littlefs (every mutation is a metadata-pair commit; a reopened handle
+// is no different from a freshly formatted one)
+// ----------------------------------------------------------------------
+#[test]
+fn littlefs_reopen_mutate() {
+    use fstool::fs::littlefs::{LittleFs, LittleFsFormatOpts};
+    let tmp = NamedTempFile::new().unwrap();
+    {
+        let mut dev = FileBackend::create(tmp.path(), 4 * 1024 * 1024).unwrap();
+        let opts = LittleFsFormatOpts::default();
+        let mut fs: Box<dyn Filesystem> = Box::new(LittleFs::format(&mut dev, &opts).unwrap());
+        fs.create_file(
+            &mut dev,
+            Path::new("/seed.txt"),
+            src(SEED),
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+    reopen_add_then_verify(tmp.path());
+    anyfs_put_flush_survives(tmp.path());
+    // No `fsck.littlefs` exists; `tests/littlefs_external.rs` cross-checks
+    // against the reference C implementation instead.
+}
+
+// ----------------------------------------------------------------------
 // NTFS (DirBatch directory writes; AnyFs::flush must drain them)
 // ----------------------------------------------------------------------
 #[test]

@@ -31,7 +31,7 @@ fstool repack base.tar patch.tar flat.tar        # OCI-style layer merge with .w
 
 fstool also ships as a static, client-side web app. It builds images as well
 as reads them: format a blank filesystem (ext2/3/4, FAT12/16/32, exFAT, NTFS,
-XFS, HFS+, HFS, AFFS, F2FS, GRF), or lay out an MBR/GPT disk with a
+XFS, HFS+, HFS, AFFS, F2FS, littlefs, GRF), or lay out an MBR/GPT disk with a
 filesystem per partition, add files, and download the image — then keep
 editing and download again. Or upload any archive or disk
 image, browse what's inside, extract individual files, and convert the whole
@@ -74,6 +74,7 @@ See [web/README.md](web/README.md) for the build and local-dev steps.
 | APFS       | ✅    | ✅     | 🚧             | **Read**: multi-level omap + fs-tree, directory listings + file extents, embedded xattrs, snapshots (read-only, single-leaf snap-meta). **Write**: format + `create_dir`/`create_file`/`create_symlink` + `chmod`/`chown`/`set_times`/`rename`/`unlink`/`link` via fresh COW checkpoints (spaceman with IP ring + SFQ free-queues), round-tripped through a real macOS mount. **Gaps**: in-place edits are whole-file overwrite (no partial-extent COW); `UF_COMPRESSED`/decmpfs files read as empty; encryption, sealed-volume integrity, Fusion tiering, and dstream-backed xattrs are refused; not yet `fsck_apfs`-clean |
 | NTFS       | ✅    | ✅     | ✅              | MFT, attributes, $DATA + ADS, indexes; xattr map; multi-class `$Secure` ($SDS/$SDH/$SII); real `$LogFile` LFS records (Path A) |
 | F2FS       | ✅    | ✅     | —              | CP / NAT / dnodes / inline data + dentries; writer passes `fsck.f2fs`; **build-once** — the writer serializes the whole FS from memory at flush, so a re-opened image is read-only (reports `Immutable`) |
+| littlefs   | ✅    | ✅     | ✅              | The embedded-flash filesystem (`lfs2`, disk versions 2.0 + 2.1): metadata pairs with CRC-committed logs, CTZ skip-list files, inline small files, user attributes (surfaced as `user.littlefs.<type>` xattrs). Every mutation is a real littlefs commit, so `create` / `repack` / `add` / `rm` / `open_file_rw` all write images the reference C implementation mounts and keeps writing to — cross-validated both directions against `littlefs-python` (upstream `lfs.c`), including block-for-block agreement on which blocks are live. No symlinks, device nodes or POSIX metadata: the format has none |
 | SquashFS   | ✅    | ✅     | —              | gzip / xz / lz4 / zstd / lzo / lzma via Cargo features; writer round-trips via `unsquashfs`; repack-only           |
 | ISO 9660   | ✅    | ✅     | —              | PVD + Joliet (UCS-2) + Rock Ridge (PX/NM/SL/TF) + El Torito boot catalog; repack-only                              |
 | GRF        | ✅    | ✅     | ✅              | Gravity Ragnarok Online archive — v0x102 / v0x103 / v0x200; permutation cipher (`MIXCRYPT` / `DES`); CP949 filenames |
@@ -90,7 +91,7 @@ See [web/README.md](web/README.md) for the build and local-dev steps.
 
 `🚧` marks writers / mutation paths with known gaps (see Limitations).
 All writable filesystems — ext2/3/4, FAT12/16/32, exFAT, XFS, HFS+, NTFS,
-APFS, F2FS, SquashFS, ISO 9660, GRF — implement a single
+APFS, F2FS, littlefs, SquashFS, ISO 9660, GRF — implement a single
 `Filesystem` trait, so the CLI (`build`, `repack`, `add`, `rm`) and
 the TOML `[filesystem] type = "…"` spec dispatch through one
 codepath; pick a target FS by setting `--fs-type` on `repack` or
@@ -123,7 +124,7 @@ through xattrs under `user.ntfs.*` and `system.ntfs_security`.
 
 | Command       | What it does                                                            |
 |---------------|-------------------------------------------------------------------------|
-| `create`      | Build a bare image of any supported FS (`-t ext4` / `fat12` / `fat16` / `fat32` / `xfs` / `hfs+` / `ntfs` / `f2fs` / `squashfs` / `iso` / `apfs` / `exfat` / `grf` / `zip` / `cpio` / `ar`) from a host directory tree. FS-specific knobs go through `-O key=val,key=val`. |
+| `create`      | Build a bare image of any supported FS (`-t ext4` / `fat12` / `fat16` / `fat32` / `xfs` / `hfs+` / `ntfs` / `f2fs` / `littlefs` / `squashfs` / `iso` / `apfs` / `exfat` / `grf` / `zip` / `cpio` / `ar`) from a host directory tree. FS-specific knobs go through `-O key=val,key=val`. |
 | `build`       | Build from a TOML spec — bare FS or a partitioned disk image.           |
 | `info`        | Print partition table (whole-disk) or FS summary + root listing.        |
 | `ls`          | List a directory inside an image; `-R` walks subdirectories recursively. |

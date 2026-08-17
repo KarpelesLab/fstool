@@ -337,6 +337,16 @@ impl MemImage {
                     sz,
                 )
             }
+            "littlefs" | "lfs" => {
+                // littlefs reserves nothing up front, so a content-fit size
+                // from its own size plan is enough; keep a floor so tiny
+                // sources still leave room to edit the result afterwards.
+                let sz = self.geometry_size()?;
+                self.build_generic::<crate::fs::littlefs::LittleFs>(
+                    &crate::fs::littlefs::LittleFsFormatOpts::default(),
+                    sz,
+                )
+            }
             "apfs" => {
                 let sz = self.geometry_size()?;
                 self.build_generic::<crate::fs::apfs::Apfs>(
@@ -653,6 +663,12 @@ pub fn supported_targets() -> Vec<TargetInfo> {
             id: "affs",
             label: "Amiga FFS",
             ext: "adf",
+            streaming: false,
+        },
+        TargetInfo {
+            id: "littlefs",
+            label: "littlefs",
+            ext: "img",
             streaming: false,
         },
         TargetInfo {

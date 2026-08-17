@@ -344,6 +344,19 @@ pub fn plan_size(source: &Source, plan: &mut dyn FsSizePlan) -> Result<u64> {
     Ok(plan.total_size())
 }
 
+/// Content-fit sizing for an already-open filesystem — the [`plan_size`]
+/// counterpart `repack --shrink` uses, where the source is mounted rather
+/// than a path. Metadata only: file bodies are never read.
+pub fn plan_size_fs(
+    fs: &mut AnyFs,
+    dev: &mut dyn BlockDevice,
+    plan: &mut dyn FsSizePlan,
+) -> Result<u64> {
+    let mut sink = SizingSink { plan };
+    walk_anyfs(fs, dev, &mut sink)?;
+    Ok(plan.total_size())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

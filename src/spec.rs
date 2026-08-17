@@ -206,6 +206,11 @@ fn build_bare_fs(fs: &FilesystemSpec, output: &Path) -> Result<()> {
         "affs" | "ffs" | "ofs" => {
             build_bare_via_trait::<crate::fs::affs::Affs>(fs, output, affs_format_opts(fs)?)
         }
+        "littlefs" | "lfs" => build_bare_via_trait::<crate::fs::littlefs::LittleFs>(
+            fs,
+            output,
+            littlefs_format_opts(fs)?,
+        ),
         "ntfs" => build_bare_via_trait::<crate::fs::ntfs::Ntfs>(fs, output, ntfs_format_opts(fs)?),
         "f2fs" => build_bare_via_trait::<crate::fs::f2fs::F2fs>(fs, output, f2fs_format_opts(fs)?),
         "squashfs" => build_bare_via_trait::<crate::fs::squashfs::Squashfs>(
@@ -415,6 +420,48 @@ fn affs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::affs::AffsFormatOp
     }
     bag.check_empty("affs")?;
     Ok(opts)
+}
+
+/// `[filesystem.options]` for littlefs: `block_size`, `block_count`,
+/// `prog_size`, `version` (`2.0` / `2.1`), `name_max`, `inline_max`.
+fn littlefs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::littlefs::LittleFsFormatOpts> {
+    let mut bag = options_bag_for(fs)?;
+    let mut opts = crate::fs::littlefs::LittleFsFormatOpts::default();
+    // The generic `block_size` key doubles as littlefs's erase-block size.
+    if let Some(bs) = fs.block_size {
+        opts.block_size = bs;
+    }
+    if let Some(bs) = bag.take_u32("block_size")? {
+        opts.block_size = bs;
+    }
+    if let Some(bc) = bag.take_u32("block_count")? {
+        opts.block_count = Some(bc);
+    }
+    if let Some(p) = bag.take_u32("prog_size")? {
+        opts.prog_size = p;
+    }
+    if let Some(v) = bag.take_str("version") {
+        opts.disk_version = parse_littlefs_version(&v)?;
+    }
+    if let Some(n) = bag.take_u32("name_max")? {
+        opts.name_max = n;
+    }
+    if let Some(n) = bag.take_u32("inline_max")? {
+        opts.inline_max = Some(n);
+    }
+    bag.check_empty("littlefs")?;
+    Ok(opts)
+}
+
+/// Parse a littlefs on-disk version: `2.0` / `2.1` (or the raw `0x00020001`).
+pub(crate) fn parse_littlefs_version(v: &str) -> Result<u32> {
+    match v.trim() {
+        "2.0" | "20000" | "0x00020000" => Ok(crate::fs::littlefs::DISK_VERSION_2_0),
+        "2.1" | "20001" | "0x00020001" => Ok(crate::fs::littlefs::DISK_VERSION_2_1),
+        other => Err(crate::Error::InvalidArgument(format!(
+            "littlefs: unknown disk version {other:?} (use 2.0 or 2.1)"
+        ))),
+    }
 }
 
 fn hfs_plus_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::hfs_plus::FormatOpts> {
@@ -807,6 +854,13 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
                     &mut slice,
                     fs,
                     affs_format_opts(fs)?,
+                )?;
+            }
+            "littlefs" | "lfs" => {
+                format_in_partition_via_trait::<crate::fs::littlefs::LittleFs>(
+                    &mut slice,
+                    fs,
+                    littlefs_format_opts(fs)?,
                 )?;
             }
             "ntfs" => {

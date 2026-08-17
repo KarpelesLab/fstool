@@ -6,7 +6,7 @@ locally in WebAssembly memory:
 
 - **Inspect** — drop in an archive or disk image, browse what's inside,
   extract individual files, convert the whole thing to another format.
-- **Create** — format a blank filesystem (14 types) or lay out a partitioned
+- **Create** — format a blank filesystem (15 types) or lay out a partitioned
   disk (MBR/GPT, one filesystem per partition), add files and folders, and
   download the image at any point. You can keep editing and download again.
 
