@@ -271,8 +271,7 @@ impl BootSector {
         }
         // Derive the cluster count in u64 so a hostile FAT size can't wrap
         // the metadata sum before the bounds check below catches it.
-        let root_sectors =
-            (u32::from(root_entry_count) * 32).div_ceil(u32::from(bytes_per_sector));
+        let root_sectors = (u32::from(root_entry_count) * 32).div_ceil(u32::from(bytes_per_sector));
         let data_start = u64::from(reserved_sector_count)
             + u64::from(num_fats) * u64::from(fat_size)
             + u64::from(root_sectors);

@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(fat)* read + write FAT12 and FAT16 alongside FAT32. One backend serves
+  all three: `table::FatKind` owns the 12/16/32-bit entry width (including
+  FAT12's 1.5-byte packing) and `DirLayout` reduces both directory shapes —
+  a cluster chain and the FAT12/16 fixed root region — to a list of device
+  extents. A volume's flavour is derived from its data-cluster count per the
+  spec, so images that mislabel their `fs_type` string still open correctly,
+  and `detect_fs` probes the BPB rather than looking for a magic string
+  FAT12/16 don't have. Reachable as `create -t fat12|fat16`, as a `repack`
+  destination, and as a TOML spec `type`; `-O root_entries=` sizes the fixed
+  root, which cannot grow once formatted.
+
+### Changed
+
+- *(fat)* `FatFormatOpts` gained `kind` and `root_entries` — struct literals
+  need `..Default::default()`. `Fat32::geometry` now takes the flavour and a
+  root size and returns a `Geometry`. `table::{EOC, EOC_MIN, ENTRY_MASK}` are
+  replaced by width-aware `FatKind` methods. FAT32 geometry, error text and
+  on-disk output are unchanged.
+- *(deps)* bump `compcol` floor to 0.6.10.
+
 ## [0.4.20](https://github.com/KarpelesLab/fstool/compare/v0.4.19...v0.4.20) - 2026-07-12
 
 ### Fixed

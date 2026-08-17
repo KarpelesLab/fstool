@@ -63,9 +63,9 @@ enum Command {
     /// `FormatOpts::apply_options`; unknown keys are rejected with a
     /// clear error citing the FS type.
     Create {
-        /// Filesystem type to format: ext2 / ext3 / ext4 / fat32 / vfat /
-        /// exfat / hfs+ / hfsplus / ntfs / f2fs / squashfs / xfs / iso /
-        /// iso9660 / grf / apfs.
+        /// Filesystem type to format: ext2 / ext3 / ext4 / fat12 / fat16 /
+        /// fat32 / vfat / exfat / hfs+ / hfsplus / ntfs / f2fs / squashfs /
+        /// xfs / iso / iso9660 / grf / apfs.
         #[arg(short = 't', long = "type", value_name = "TYPE")]
         fs_type: String,
         /// Optional source directory on the host. Omit to create an
@@ -74,7 +74,7 @@ enum Command {
         src_dir: Option<PathBuf>,
         /// Output image file or block device. Block devices are formatted
         /// to their full capacity; regular files are auto-sized when the
-        /// FS supports it (ext / fat32 / iso / grf) or default to a
+        /// FS supports it (ext / fat / iso / grf) or default to a
         /// per-FS minimum otherwise. Explicit `--size` wins.
         #[arg(short = 'o', long = "output", value_name = "IMAGE")]
         output: PathBuf,
@@ -98,7 +98,7 @@ enum Command {
         cluster_size: String,
         /// FS-specific options as `key=val[,key=val]…`. Repeatable.
         /// Examples: `-O block_size=4096,sparse=true` (ext),
-        /// `-O volume_id=0xCAFEBABE` (fat32),
+        /// `-O volume_id=0xCAFEBABE,root_entries=512` (fat),
         /// `-O compression=zstd,block_size=128KiB` (squashfs).
         #[arg(short = 'O', long = "options", value_name = "KEY=VAL", action = clap::ArgAction::Append)]
         options: Vec<String>,
@@ -3578,7 +3578,17 @@ fn print_fat_info(fat: &fstool::fs::fat::Fat32) {
     println!("# of FATs:         {}", b.num_fats);
     println!("reserved sectors:  {}", b.reserved_sector_count);
     println!("data clusters:     {}", b.cluster_count());
-    println!("root cluster:      {}", b.root_cluster);
+    // FAT32 keeps the root as a cluster chain; FAT12/16 keep it in a fixed
+    // region, so each flavour has a different thing worth printing.
+    if b.kind == fstool::fs::fat::FatKind::Fat32 {
+        println!("root cluster:      {}", b.root_cluster);
+    } else {
+        println!(
+            "root entries:      {} ({} sectors, fixed)",
+            b.root_entry_count,
+            b.root_dir_sectors()
+        );
+    }
     println!("volume ID:         {:#010x}", b.volume_id);
     println!("volume label:      {label:?}");
 }

@@ -1341,7 +1341,7 @@ mod tests {
             total_sectors: 64 * 1024 * 1024 / 512,
             volume_id: 0xCAFE_F00D,
             volume_label: *b"DETECTVOL  ",
-        ..Default::default()
+            ..Default::default()
         };
         crate::fs::fat::Fat32::format(&mut dev, &opts).unwrap();
         assert_eq!(detect_fs(&mut dev).unwrap(), FsKind::Fat32);

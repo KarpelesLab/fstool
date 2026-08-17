@@ -377,8 +377,14 @@ impl Fat32 {
         // its error text) is unchanged from when this only spoke FAT32.
         if kind == FatKind::Fat32 {
             let spc = Self::pick_spc(total_sectors);
-            let (fat_size, clusters) =
-                Self::converge_fat_size(kind, total_sectors, spc, reserved, num_fats, root_sectors)?;
+            let (fat_size, clusters) = Self::converge_fat_size(
+                kind,
+                total_sectors,
+                spc,
+                reserved,
+                num_fats,
+                root_sectors,
+            )?;
             if clusters < MIN_FAT32_CLUSTERS {
                 return Err(crate::Error::InvalidArgument(format!(
                     "fat32: {clusters} clusters is below the FAT32 minimum of \
@@ -1640,7 +1646,7 @@ mod tests {
             total_sectors: 48 * 1024 * 1024 / 512,
             volume_id: 0xCAFE_F00D,
             volume_label: *b"OPENRWTEST ",
-        ..Default::default()
+            ..Default::default()
         };
         let fs = Fat32::format(&mut dev, &opts).unwrap();
         (dev, fs)
@@ -1682,7 +1688,7 @@ mod tests {
             total_sectors: 48 * 1024 * 1024 / 512,
             volume_id: 0xCAFE_F00D,
             volume_label: *b"TESTVOL    ",
-        ..Default::default()
+            ..Default::default()
         };
         let fs = Fat32::format(&mut dev, &opts).unwrap();
         // Boot sector round-trips.

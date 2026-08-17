@@ -309,7 +309,9 @@ impl Fat {
                 )));
             }
             if out.len() > cluster_count as usize {
-                return Err(crate::Error::InvalidImage("fat: cluster chain loops".into()));
+                return Err(crate::Error::InvalidImage(
+                    "fat: cluster chain loops".into(),
+                ));
             }
             out.push(cur);
             cur = self.get(cur);

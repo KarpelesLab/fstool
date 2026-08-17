@@ -167,15 +167,13 @@ impl FsSizePlan for FatSizePlan {
         let floor_clusters = u64::from(kind.min_clusters());
         let reserved = if kind == FatKind::Fat32 { 32u64 } else { 1u64 };
         let root_entries = self.root_entries();
-        let root_sectors = u64::from(root_entries.unwrap_or(0))
-            * ENTRY_SIZE as u64
-            / u64::from(SECTOR);
+        let root_sectors =
+            u64::from(root_entries.unwrap_or(0)) * ENTRY_SIZE as u64 / u64::from(SECTOR);
 
         let spc0 = 1u64;
         let need0 = self.clusters_at(spc0).max(floor_clusters);
         let fat0 = kind.fat_bytes(need0 + 2).div_ceil(u64::from(SECTOR));
-        let mut total =
-            reserved + u64::from(NUM_FATS) * fat0 + root_sectors + need0 * spc0;
+        let mut total = reserved + u64::from(NUM_FATS) * fat0 + root_sectors + need0 * spc0;
 
         for _ in 0..64 {
             let ts = u32::try_from(total).unwrap_or(u32::MAX);
@@ -193,12 +191,11 @@ impl FsSizePlan for FatSizePlan {
                 Err(_) => {
                     // Below the flavour's minimum: jump to a floor that
                     // geometry will accept, then let the loop refine.
-                    let fat_floor =
-                        kind.fat_bytes(floor_clusters + 2).div_ceil(u64::from(SECTOR));
-                    let floor = reserved
-                        + u64::from(NUM_FATS) * fat_floor
-                        + root_sectors
-                        + floor_clusters;
+                    let fat_floor = kind
+                        .fat_bytes(floor_clusters + 2)
+                        .div_ceil(u64::from(SECTOR));
+                    let floor =
+                        reserved + u64::from(NUM_FATS) * fat_floor + root_sectors + floor_clusters;
                     total = total.max(floor) + 1;
                 }
             }
@@ -276,7 +273,7 @@ mod tests {
             total_sectors: (bytes / 512) as u32,
             volume_id: 0,
             volume_label: *b"NO NAME    ",
-        ..Default::default()
+            ..Default::default()
         };
         let mut fat = Fat32::format(&mut dev, &opts).unwrap();
         populate_fat32_from_source(&mut dev, &mut fat, &src).expect("populate must fit");

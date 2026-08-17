@@ -225,7 +225,7 @@ fn fat32_reopen_mutate() {
             total_sectors,
             volume_id: 0xCAFE_F00D,
             volume_label: *b"FSTOOL     ",
-        ..Default::default()
+            ..Default::default()
         };
         let mut fs: Box<dyn Filesystem> = Box::new(Fat32::format(&mut dev, &opts).unwrap());
         fs.create_file(

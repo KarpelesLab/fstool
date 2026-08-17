@@ -60,7 +60,7 @@ See [web/README.md](web/README.md) for the build and local-dev steps.
 | ext2       | ✅    | ✅     | ✅              | byte-exact with `genext2fs` on the same input                                                                      |
 | ext3       | ✅    | ✅     | ✅              | + JBD2 journal — real transactions on `open_file_rw` (Path A)                                                      |
 | ext4       | ✅    | ✅     | ✅              | extents (read + write: any depth), FILETYPE, `metadata_csum`, xattrs, JBD2                                         |
-| FAT32      | ✅    | ✅     | ✅              | VFAT LFN entries, 8.3 short-name aliases                                                                           |
+| FAT12/16/32 | ✅    | ✅     | ✅              | one backend for all three widths; the flavour follows the data-cluster count, not the `fs_type` string. VFAT LFN entries, 8.3 short-name aliases. FAT12/16 use the fixed root region (sized by `-O root_entries=`, default 224 on floppy-sized media / 512 otherwise) and so cannot grow the root; validated against `fsck.vfat` + `mtools` both ways |
 | exFAT      | ✅    | ✅     | ✅              | format + create + remove + flush + `open_file_rw`                                                                  |
 | tar        | ✅    | ✅     | —              | ustar + PAX, `SCHILY.xattr.*` for xattrs; streaming-only                                                           |
 | XFS        | ✅    | ✅     | ✅              | shortform + block / leaf / node + multi-level B-tree dirs + BMBT; leaf-form xattrs; real XLOG transactions (Path A); passes `xfs_repair -n` single + multi-AG |
@@ -85,7 +85,7 @@ See [web/README.md](web/README.md) for the build and local-dev steps.
 | 7z         | ✅    | —     | —              | 7-Zip read-only: parses the container (incl. LZMA-packed headers + solid folders sliced per substream); single-coder **Copy / LZMA / BZip2 / Deflate** folders decode (cross-checked with `7z`). **LZMA2** (the default), BCJ filters, PPMd, encryption and multi-coder pipelines list but read as `Unsupported` pending raw-LZMA2 + branch-filter codecs in `compcol`. Creation unsupported |
 
 `🚧` marks writers / mutation paths with known gaps (see Limitations).
-All writable filesystems — ext2/3/4, FAT32, exFAT, XFS, HFS+, NTFS,
+All writable filesystems — ext2/3/4, FAT12/16/32, exFAT, XFS, HFS+, NTFS,
 APFS, F2FS, SquashFS, ISO 9660, GRF — implement a single
 `Filesystem` trait, so the CLI (`build`, `repack`, `add`, `rm`) and
 the TOML `[filesystem] type = "…"` spec dispatch through one
@@ -119,7 +119,7 @@ through xattrs under `user.ntfs.*` and `system.ntfs_security`.
 
 | Command       | What it does                                                            |
 |---------------|-------------------------------------------------------------------------|
-| `create`      | Build a bare image of any supported FS (`-t ext4` / `fat32` / `xfs` / `hfs+` / `ntfs` / `f2fs` / `squashfs` / `iso` / `apfs` / `exfat` / `grf` / `zip` / `cpio` / `ar`) from a host directory tree. FS-specific knobs go through `-O key=val,key=val`. |
+| `create`      | Build a bare image of any supported FS (`-t ext4` / `fat12` / `fat16` / `fat32` / `xfs` / `hfs+` / `ntfs` / `f2fs` / `squashfs` / `iso` / `apfs` / `exfat` / `grf` / `zip` / `cpio` / `ar`) from a host directory tree. FS-specific knobs go through `-O key=val,key=val`. |
 | `build`       | Build from a TOML spec — bare FS or a partitioned disk image.           |
 | `info`        | Print partition table (whole-disk) or FS summary + root listing.        |
 | `ls`          | List a directory inside an image; `-R` walks subdirectories recursively. |
@@ -262,7 +262,7 @@ Recognised tar extensions: `.tar`, `.tar.gz`, `.tgz`, `.tar.xz`, `.txz`,
 `.tar.zst`, `.tar.lz4`, `.tar.lzma`, `.tar.lzo` (codecs gated on the
 matching Cargo feature). For images, the `:N` suffix selects partition
 *N* (1-indexed); without it, the source is opened as a bare filesystem.
-The source FS may be any readable type — `ext{2,3,4}`, FAT32, exFAT,
+The source FS may be any readable type — `ext{2,3,4}`, FAT12/16/32, exFAT,
 XFS, HFS+, APFS, NTFS, F2FS, SquashFS, ISO 9660, tar, or GRF — and the
 destination is sized automatically to fit unless `size` is set
 explicitly.
@@ -374,10 +374,10 @@ synthesised from its DOS attributes, and carries its native metadata
 `user.ntfs.*` / `system.ntfs_security` xattrs.
 
 `fstool repack` writes any destination implementing the `Filesystem`
-trait — `ext2/3/4`, FAT32, exFAT, tar, XFS, HFS+, APFS, NTFS, F2FS,
+trait — `ext2/3/4`, FAT12/16/32, exFAT, tar, XFS, HFS+, APFS, NTFS, F2FS,
 SquashFS, ISO 9660, GRF. `add` / `rm` go through the same trait,
 which means they work on any FS whose writer can re-open an existing
-image; today that's all of the mutable backends — ext, FAT32, exFAT,
+image; today that's all of the mutable backends — ext, FAT12/16/32, exFAT,
 F2FS, XFS, HFS+, NTFS, APFS, and GRF. SquashFS, ISO 9660, and tar
 are repack-only (their `MutationCapability` is `Immutable` or
 `Streaming`, so `add` / `rm` fail fast with an actionable error and
