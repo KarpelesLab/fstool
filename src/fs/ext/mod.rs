@@ -3998,7 +3998,12 @@ impl Ext {
             let Some(entry) = dir::decode_entry(&bytes[off..], with_filetype) else {
                 break;
             };
-            if entry.inode == 0 && entry.name.is_empty() {
+            // A slot is free when its inode is 0 — and ext leaves the name
+            // bytes of a deleted entry in place, so an empty name is *not*
+            // the only marker. Requiring both (as `&&` would) sends a
+            // deleted-but-named slot into `read_inode(0)`, which is what
+            // every rename leaves behind in a large directory.
+            if entry.inode == 0 || entry.name.is_empty() {
                 if entry.rec_len == 0 {
                     break;
                 }
