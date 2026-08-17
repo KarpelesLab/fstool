@@ -8,14 +8,23 @@
 //! means rewriting the file from some offset onward leaves every earlier
 //! block untouched and still correctly pointed at.
 //!
+//! The first eight blocks of a file, with the pointers each one stores:
+//!
 //! ```text
-//! .--------.  .--------.  .--------.  .--------.  .--------.  .--------.
-//! | A      |<-| D      |<-| G      |<-| J      |<-| M      |<-| P      |
-//! | B      |<-| E      |--| H      |<-| K      |--| N      |  | Q      |
-//! | C      |<-| F      |--| I      |--| L      |--| O      |  |        |
-//! '--------'  '--------'  '--------'  '--------'  '--------'  '--------'
-//!   block 0     block 1     block 2     block 3     block 4     block 5
+//!   index   pointers stored at the start of the block
+//!   ----------------------------------------------------
+//!     0     (none — the whole block is data)
+//!     1     → 0
+//!     2     → 1, 0
+//!     3     → 2
+//!     4     → 3, 2, 0
+//!     5     → 4
+//!     6     → 5, 4
+//!     7     → 6
 //! ```
+//!
+//! Reaching index 0 from index 7 is then three hops (7 → 6 → 4 → 0)
+//! rather than seven.
 
 use std::io::Read;
 

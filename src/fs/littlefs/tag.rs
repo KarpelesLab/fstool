@@ -1,15 +1,14 @@
 //! littlefs metadata tags — the 32-bit words that describe every piece of
 //! metadata on disk, plus the CRC-32 variant commits are checksummed with.
 //!
-//! A tag packs four fields (see `SPEC.md`, "Metadata tags"):
+//! A tag packs four fields into its 32 bits (upstream's `SPEC.md`,
+//! "Metadata tags", is the reference for the layout):
 //!
 //! ```text
-//! [----            32             ----]
-//! [1|--  11   --|--  10  --|--  10  --]
-//!  ^      ^           ^          ^- length
-//!  |      |           '------------ id
-//!  |      '------------------------ type (type3 = type1<<8 | chunk)
-//!  '------------------------------- valid bit
+//!   bit  31     valid bit — clear on a real tag, set on unwritten storage
+//!   bits 30..20 type3: a 3-bit abstract type (type1) then an 8-bit chunk
+//!   bits 19..10 id: the file this tag belongs to (0x3ff = none)
+//!   bits  9..0  length of the tag's data (0x3ff = deleted, no data)
 //! ```
 //!
 //! Tags are the only thing littlefs stores big-endian (the valid bit has to
