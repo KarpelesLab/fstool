@@ -40,6 +40,10 @@ fn read_default_mke2fs_ext4_image() {
     std::fs::write(srcdir.path().join("etc/conf"), b"x=1\n").unwrap();
 
     let tmp = NamedTempFile::new().unwrap();
+    // Pin every knob that varies between mke2fs builds and platforms: without
+    // an explicit `-t ext4` the image inherits the local default, which is
+    // ext2 on some hosts, and the fixed label + UUID keep the image
+    // reproducible.
     let out = Command::new("mke2fs")
         .args([
             "-F",
@@ -91,6 +95,42 @@ fn read_default_mke2fs_ext4_image() {
     let mut body = Vec::new();
     reader.read_to_end(&mut body).unwrap();
     assert_eq!(body, b"x=1\n");
+}
+
+#[test]
+fn read_default_mke2fs_indexed_directory() {
+    let Some(_) = which("mke2fs") else {
+        eprintln!("skipping: mke2fs not installed");
+        return;
+    };
+
+    let srcdir = tempfile::tempdir().unwrap();
+    let indexed = srcdir.path().join("indexed");
+    std::fs::create_dir(&indexed).unwrap();
+    for index in 0..2_000 {
+        std::fs::write(indexed.join(format!("entry_{index:04}")), b"x").unwrap();
+    }
+
+    let tmp = NamedTempFile::new().unwrap();
+    let out = Command::new("mke2fs")
+        .args(["-F", "-t", "ext4", "-b", "4096", "-d"])
+        .arg(srcdir.path())
+        .arg(tmp.path())
+        .arg("32768")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "mke2fs failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let mut dev = FileBackend::open(tmp.path()).unwrap();
+    let ext = Ext::open(&mut dev).unwrap();
+    assert!(
+        ext.path_to_inode(&mut dev, "/indexed/entry_1999").is_ok(),
+        "path lookup must traverse a default mke2fs ext4 indexed directory"
+    );
 }
 
 /// A mostly-zero file written with `sparse` set should occupy far fewer
@@ -471,6 +511,21 @@ fn ext4_large_directory_spans_multiple_blocks() {
         n,
         "fstool ls miscounted: got {} expected {n}",
         names.len()
+    );
+
+    assert_eq!(
+        ext.path_to_inode(&mut dev, "/bigdir").unwrap(),
+        bigdir,
+        "path lookup must traverse a large directory"
+    );
+    assert_eq!(
+        ext.path_to_inode(&mut dev, "/bigdir/f0499").unwrap(),
+        *entries
+            .iter()
+            .find(|entry| entry.name == "f0499")
+            .map(|entry| &entry.inode)
+            .unwrap(),
+        "path lookup must ignore ext4 directory checksum tails"
     );
 
     drop(dev);
@@ -882,6 +937,10 @@ fn ext4_indexed_directory_passes_e2fsck() {
         got.len(),
         names.len(),
         "fstool ls miscounted on indexed dir"
+    );
+    assert!(
+        ext.path_to_inode(&mut dev, "/indexed/entry_0499").is_ok(),
+        "path lookup must traverse HTree leaf blocks"
     );
 
     drop(dev);

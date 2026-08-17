@@ -3992,6 +3992,9 @@ impl Ext {
         let n_blocks = (inode.size.div_ceil(bs) as u64).min(device_blocks) as u32;
         let mut out = Vec::new();
         let with_filetype = self.sb.feature_incompat & constants::feature::INCOMPAT_FILETYPE != 0;
+        let metadata_csum =
+            self.sb.feature_ro_compat & constants::feature::RO_COMPAT_METADATA_CSUM != 0;
+        let indexed = inode.flags & constants::EXT4_INDEX_FL != 0;
         let mut block_buf = vec![0u8; bs as usize];
         for n in 0..n_blocks {
             let blk = self.file_block(dev, &inode, n)?;
@@ -3999,33 +4002,69 @@ impl Ext {
                 continue;
             }
             self.read_block(dev, blk, &mut block_buf)?;
-            let mut off = 0usize;
-            while off < block_buf.len() {
-                let Some(entry) = dir::decode_entry(&block_buf[off..], with_filetype) else {
-                    break;
-                };
-                if entry.inode != 0 && !entry.name.is_empty() {
-                    let child = self.read_inode(dev, entry.inode)?;
-                    let kind = kind_from_mode(child.mode);
-                    let size = if matches!(kind, crate::fs::EntryKind::Regular) {
-                        u64::from(child.size)
-                    } else {
-                        0
-                    };
-                    out.push(crate::fs::DirEntry {
-                        name: String::from_utf8_lossy(entry.name).into_owned(),
-                        inode: entry.inode,
-                        kind,
-                        size,
-                    });
-                }
-                off += entry.rec_len;
+            if indexed && n == 0 {
+                self.decode_directory_entries(&block_buf[..24], with_filetype, dev, &mut out)?;
+                continue;
+            }
+            let data = if metadata_csum {
+                &block_buf[..block_buf.len() - dir::CSUM_TAIL_LEN]
+            } else {
+                &block_buf
+            };
+            self.decode_directory_entries(data, with_filetype, dev, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    fn decode_directory_entries(
+        &self,
+        bytes: &[u8],
+        with_filetype: bool,
+        dev: &mut dyn BlockDevice,
+        out: &mut Vec<crate::fs::DirEntry>,
+    ) -> Result<()> {
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let Some(entry) = dir::decode_entry(&bytes[off..], with_filetype) else {
+                break;
+            };
+            // A slot is free when its inode is 0 — and ext leaves the name
+            // bytes of a deleted entry in place, so an empty name is *not*
+            // the only marker. Requiring both (as `&&` would) sends a
+            // deleted-but-named slot into `read_inode(0)`, which is what
+            // every rename leaves behind in a large directory.
+            if entry.inode == 0 || entry.name.is_empty() {
                 if entry.rec_len == 0 {
                     break;
                 }
+                off += entry.rec_len;
+                continue;
             }
+            if entry.inode > self.sb.inodes_count {
+                return Err(crate::Error::InvalidImage(format!(
+                    "ext: directory entry references inode {} beyond inode count {}",
+                    entry.inode, self.sb.inodes_count
+                )));
+            }
+            let child = self.read_inode(dev, entry.inode)?;
+            let kind = kind_from_mode(child.mode);
+            let size = if matches!(kind, crate::fs::EntryKind::Regular) {
+                child.file_size()
+            } else {
+                0
+            };
+            out.push(crate::fs::DirEntry {
+                name: String::from_utf8_lossy(entry.name).into_owned(),
+                inode: entry.inode,
+                kind,
+                size,
+            });
+            if entry.rec_len == 0 {
+                break;
+            }
+            off += entry.rec_len;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Resolve an absolute path (must start with '/') to its inode number.
