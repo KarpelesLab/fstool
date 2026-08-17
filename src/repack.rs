@@ -1576,8 +1576,16 @@ pub(crate) fn host_meta_to_fs(meta: &std::fs::Metadata) -> crate::fs::FileMeta {
 
 /// Compute the minimum FAT32 byte capacity needed to fit `source`.
 /// Bumps to the FAT32 cluster-count minimum + rounds up to a 512-byte
-/// sector boundary.
+/// sector boundary. Shorthand for [`fat_min_bytes_for_source`] with
+/// `"fat32"`.
 pub fn fat32_min_bytes_for_source(source: &Source) -> Result<u64> {
+    fat_min_bytes_for_source(source, "fat32")
+}
+
+/// Compute the minimum byte capacity of FAT flavour `fs_type` (`"fat12"` /
+/// `"fat16"` / `"fat32"`) needed to fit `source`. Bumps to that flavour's
+/// cluster-count minimum + rounds up to a 512-byte sector boundary.
+pub fn fat_min_bytes_for_source(source: &Source, fs_type: &str) -> Result<u64> {
     let bytes = match source {
         Source::HostDir(p) => sum_host_dir_bytes(p)?,
         Source::TarArchive {
@@ -1586,7 +1594,7 @@ pub fn fat32_min_bytes_for_source(source: &Source) -> Result<u64> {
         } => {
             let spec = path.to_string_lossy().into_owned();
             let index = build_tar_stream_index(&spec, *algo)?;
-            let (sz, _, _, _, _, _) = size_from_tar_index(&index, "fat32")?;
+            let (sz, _, _, _, _, _) = size_from_tar_index(&index, fs_type)?;
             return Ok(sz);
         }
         Source::TarArchive { path, codec: None } => {
@@ -1617,7 +1625,7 @@ pub fn fat32_min_bytes_for_source(source: &Source) -> Result<u64> {
     };
     let needed = bytes
         .saturating_mul(2)
-        .max(crate::fs::fat::MIN_FAT32_CLUSTERS as u64 * 1024);
+        .max(crate::fs::fat::min_volume_bytes(fs_type));
     Ok(needed.div_ceil(512) * 512)
 }
 
@@ -1843,13 +1851,13 @@ pub(crate) fn size_from_tar_index(
             let raw = bytes + inodes * 4096 + 1024 * 1024;
             raw.max(8 * 1024 * 1024).div_ceil(4096) * 4096
         }
-        "fat32" | "vfat" => {
-            // FAT32 needs at least MIN_FAT32_CLUSTERS clusters of 1 KiB
-            // overhead per cluster. Double the byte total to leave room
-            // for cluster fragmentation + FAT tables + dir entries.
+        "fat12" | "fat16" | "fat32" | "vfat" => {
+            // Each FAT flavour has a floor cluster count; budget 1 KiB per
+            // cluster for it. Double the byte total to leave room for
+            // cluster fragmentation + FAT tables + dir entries.
             let needed = bytes
                 .saturating_mul(2)
-                .max(crate::fs::fat::MIN_FAT32_CLUSTERS as u64 * 1024);
+                .max(crate::fs::fat::min_volume_bytes(target_lower));
             needed.div_ceil(512) * 512
         }
         _ => bytes + 16 * 1024 * 1024,

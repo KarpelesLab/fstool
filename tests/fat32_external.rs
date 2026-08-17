@@ -33,6 +33,7 @@ fn format_empty(path: &Path, mib: u32) {
         total_sectors,
         volume_id: 0xCAFE_F00D,
         volume_label: *b"FSTOOL     ",
+        ..Default::default()
     };
     Fat32::format(&mut dev, &opts).expect("format fat32");
     use fstool::block::BlockDevice;

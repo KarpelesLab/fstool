@@ -28,7 +28,7 @@ use crate::repack::{RepackMeta, RepackSink, Source, walk_anyfs, walk_source_into
 /// formats to fit. Streamed / archive outputs (tar, zip, cpio, ar, grf,
 /// iso) grow-then-truncate and need no content-fit size, so they are
 /// deliberately absent.
-pub const SIZED_FS_TYPES: &[&str] = &["ext2", "ext3", "ext4", "fat32"];
+pub const SIZED_FS_TYPES: &[&str] = &["ext2", "ext3", "ext4", "fat12", "fat16", "fat32"];
 
 /// Aggregate result of walking a source. Counts are of directory
 /// entries: a hard link is counted under [`hardlinks`](Self::hardlinks),
@@ -67,8 +67,8 @@ impl Analysis {
     /// `None` when that destination doesn't take a content-fit size.
     ///
     /// `Some` only for the fixed-size block filesystems in
-    /// [`SIZED_FS_TYPES`]: `ext{2,3,4}` (from the [`BuildPlan`]) and
-    /// `fat32`/`vfat` (`2× file bytes`, floored at the FAT32 minimum,
+    /// [`SIZED_FS_TYPES`]: `ext{2,3,4}` (from the [`BuildPlan`]) and the
+    /// FAT flavours (`2× file bytes`, floored at that flavour's minimum,
     /// rounded to a sector). `None` for streamed / archive outputs
     /// (`tar`, `zip`, `cpio`, `ar`, `grf`, `iso`) and for self-sizing
     /// filesystems not wired into `--shrink`. These formulas mirror the
@@ -85,11 +85,9 @@ impl Analysis {
                 };
                 Some(p.blocks_count() as u64 * p.block_size as u64)
             }
-            "fat32" | "vfat" => {
-                let needed = self
-                    .total_file_bytes
-                    .saturating_mul(2)
-                    .max(crate::fs::fat::MIN_FAT32_CLUSTERS as u64 * 1024);
+            "fat12" | "fat16" | "fat32" | "vfat" => {
+                let floor = crate::fs::fat::min_volume_bytes(&lower);
+                let needed = self.total_file_bytes.saturating_mul(2).max(floor);
                 Some(needed.div_ceil(512) * 512)
             }
             _ => None,
@@ -322,6 +320,12 @@ impl RepackSink for SizingSink<'_> {
 /// `--size`.
 pub fn size_for_source(source: &Source, fs_type: &str) -> Result<Option<u64>> {
     let mut plan: Box<dyn FsSizePlan> = match fs_type.to_ascii_lowercase().as_str() {
+        "fat12" => Box::new(crate::fs::fat::FatSizePlan::for_kind(
+            crate::fs::fat::FatKind::Fat12,
+        )),
+        "fat16" => Box::new(crate::fs::fat::FatSizePlan::for_kind(
+            crate::fs::fat::FatKind::Fat16,
+        )),
         "fat32" | "vfat" => Box::new(crate::fs::fat::FatSizePlan::new()),
         _ => return Ok(None),
     };

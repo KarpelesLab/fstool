@@ -49,7 +49,9 @@ use crate::part::{Apm, Gpt, Mbr, Partition, PartitionTable, slice_partition};
 pub enum FsKind {
     /// ext2 / ext3 / ext4 — distinguished further by feature flags.
     Ext,
-    /// FAT32.
+    /// The FAT family — FAT12, FAT16 and FAT32. One backend
+    /// ([`crate::fs::fat::Fat32`]) drives all three; ask the opened
+    /// volume's `kind()` which flavour it actually is.
     Fat32,
     /// A tar archive treated as a read-only filesystem.
     Tar,
@@ -127,6 +129,16 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
     // NTFS: "NTFS    " at offset 3 of LBA 0.
     if &bs[3..11] == b"NTFS    " {
         return Ok(FsKind::Ntfs);
+    }
+
+    // FAT12 / FAT16 have no magic string at all — their flavour follows
+    // from the cluster count — so this probe validates the whole BPB plus
+    // the jump instruction and media byte. It runs after exFAT and NTFS
+    // because those carry a FAT-shaped sector 0 with their own signature,
+    // and before the remaining checks because those key off offsets a FAT
+    // boot sector doesn't use.
+    if crate::fs::fat::boot::probe(&bs).is_some() {
+        return Ok(FsKind::Fat32);
     }
 
     // XFS: "XFSB" at offset 0 of LBA 0.
@@ -990,7 +1002,7 @@ impl AnyFs {
                 crate::fs::ext::FsKind::Ext3 => "ext3",
                 crate::fs::ext::FsKind::Ext4 => "ext4",
             },
-            Self::Fat32(_) => "fat32",
+            Self::Fat32(fat) => fat.kind().as_str(),
             Self::Tar(_) => "tar",
             Self::Xfs(_) => "xfs",
             Self::Exfat(_) => "exfat",
@@ -1329,6 +1341,7 @@ mod tests {
             total_sectors: 64 * 1024 * 1024 / 512,
             volume_id: 0xCAFE_F00D,
             volume_label: *b"DETECTVOL  ",
+        ..Default::default()
         };
         crate::fs::fat::Fat32::format(&mut dev, &opts).unwrap();
         assert_eq!(detect_fs(&mut dev).unwrap(), FsKind::Fat32);

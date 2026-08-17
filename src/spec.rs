@@ -196,7 +196,7 @@ pub fn build(spec: &Spec, output: &Path) -> Result<()> {
 fn build_bare_fs(fs: &FilesystemSpec, output: &Path) -> Result<()> {
     match fs.fs_type.to_ascii_lowercase().as_str() {
         "ext2" | "ext3" | "ext4" => build_bare_ext(fs, output),
-        "fat32" | "vfat" => build_bare_fat32(fs, output),
+        "fat12" | "fat16" | "fat32" | "vfat" => build_bare_fat(fs, output),
         "hfsplus" | "hfs+" => build_bare_via_trait::<crate::fs::hfs_plus::HfsPlus>(
             fs,
             output,
@@ -476,37 +476,38 @@ fn build_bare_ext(fs: &FilesystemSpec, output: &Path) -> Result<()> {
     Ok(())
 }
 
-fn build_bare_fat32(fs: &FilesystemSpec, output: &Path) -> Result<()> {
+fn build_bare_fat(fs: &FilesystemSpec, output: &Path) -> Result<()> {
+    let lower = fs.fs_type.to_ascii_lowercase();
     // Sizing precedence: explicit `size` → use as-is. Otherwise size
-    // from the source (directory / tar archive / image walk). FAT32
-    // has a ~33 MiB minimum we have to honour; the sizing helper
-    // already floors at that.
+    // from the source (directory / tar archive / image walk). Each FAT
+    // flavour has a minimum volume size the sizing helper already floors
+    // at — ~33 MiB for FAT32.
     let bytes = match (fs.size.as_deref(), &fs.source) {
         (Some(s), _) => parse_size(s)?,
         (None, Some(src)) => {
             let source = source_from_spec(src)?;
-            crate::repack::fat32_min_bytes_for_source(&source)?
+            crate::repack::fat_min_bytes_for_source(&source, &lower)?
         }
         (None, None) => {
-            return Err(crate::Error::InvalidArgument(
-                "spec: FAT32 needs either `size` or `source` (no streaming auto-size; minimum ~33 MiB)".into(),
-            ));
+            return Err(crate::Error::InvalidArgument(format!(
+                "spec: {lower} needs either `size` or `source` (no streaming auto-size)"
+            )));
         }
     };
     let total_sectors: u32 = (bytes / SECTOR).try_into().map_err(|_| {
-        crate::Error::InvalidArgument(
-            "spec: FAT32 image size doesn't fit in a u32 sector count".into(),
-        )
+        crate::Error::InvalidArgument(format!(
+            "spec: {lower} image size doesn't fit in a u32 sector count"
+        ))
     })?;
     let label = fat32_volume_label(fs.volume_label.as_deref());
     let volume_id = fs.volume_id.unwrap_or(0);
     let mut dev = crate::block::create_image(output, bytes, &crate::block::CreateOpts::default())?;
-    format_fat32_into(dev.as_mut(), fs, total_sectors, volume_id, label)?;
+    format_fat_into(dev.as_mut(), fs, total_sectors, volume_id, label)?;
     dev.sync()?;
     Ok(())
 }
 
-fn format_fat32_into(
+fn format_fat_into(
     dev: &mut dyn BlockDevice,
     fs: &FilesystemSpec,
     total_sectors: u32,
@@ -514,11 +515,23 @@ fn format_fat32_into(
     label: [u8; 11],
 ) -> Result<()> {
     use crate::fs::fat::Fat32;
-    let opts = crate::fs::fat::FatFormatOpts {
+    let mut bag = options_bag_for(fs)?;
+    // The `type` line picks the flavour; `-O fat_type=` in `options` can
+    // still override it, and `-O root_entries=` sizes a FAT12/16 root.
+    let mut opts = crate::fs::fat::FatFormatOpts {
+        kind: crate::fs::fat::parse_fat_kind(&fs.fs_type)?,
         total_sectors,
         volume_id,
         volume_label: label,
+        ..Default::default()
     };
+    // `volume_label` is pre-loaded into the bag from the flat field and has
+    // already been applied above; drop it so `check_empty` stays quiet.
+    let _ = bag.take_str("volume_label");
+    opts.apply_options(&mut bag)?;
+    // `total_sectors` is owned by the caller (device / partition size).
+    opts.total_sectors = total_sectors;
+    bag.check_empty(&fs.fs_type.to_ascii_lowercase())?;
     let mut fat = Fat32::format(dev, &opts)?;
     if let Some(src) = &fs.source {
         let source = source_from_spec(src)?;
@@ -765,15 +778,15 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
                 let opts = ext_format_opts(fs, kind, block_size, Some(blocks))?;
                 format_ext_into(&mut slice, fs, &opts)?;
             }
-            "fat32" | "vfat" => {
+            "fat12" | "fat16" | "fat32" | "vfat" => {
                 let total_sectors: u32 = (part_bytes / SECTOR).try_into().map_err(|_| {
                     crate::Error::InvalidArgument(
-                        "spec: FAT32 partition size doesn't fit in a u32 sector count".into(),
+                        "spec: FAT partition size doesn't fit in a u32 sector count".into(),
                     )
                 })?;
                 let label = fat32_volume_label(fs.volume_label.as_deref());
                 let volume_id = fs.volume_id.unwrap_or(0);
-                format_fat32_into(&mut slice, fs, total_sectors, volume_id, label)?;
+                format_fat_into(&mut slice, fs, total_sectors, volume_id, label)?;
             }
             "hfsplus" | "hfs+" => {
                 format_in_partition_via_trait::<crate::fs::hfs_plus::HfsPlus>(
@@ -845,7 +858,7 @@ fn parse_partition_kind(s: &str) -> Result<crate::part::PartitionKind> {
         "linux" | "linux-filesystem" => PartitionKind::LinuxFilesystem,
         "linux-swap" | "swap" => PartitionKind::LinuxSwap,
         "bios-boot" | "bios" => PartitionKind::BiosBoot,
-        "fat" | "fat32" => PartitionKind::Fat32,
+        "fat" | "fat12" | "fat16" | "fat32" => PartitionKind::Fat32,
         "msdata" | "microsoft-basic-data" | "basic-data" => PartitionKind::MicrosoftBasicData,
         "empty" => PartitionKind::Empty,
         other => {

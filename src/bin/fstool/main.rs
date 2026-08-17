@@ -637,10 +637,12 @@ fn mount_cmd(
             let _ = ext.replay_pending_journal(dev.as_mut())?;
             (Box::new(ext), "ext")
         }
-        FsKind::Fat32 => (
-            Box::new(fstool::fs::fat::Fat32::open(dev.as_mut())?),
-            "fat32",
-        ),
+        FsKind::Fat32 => {
+            let fat = fstool::fs::fat::Fat32::open(dev.as_mut())?;
+            // FAT12 / FAT16 / FAT32 all land here; report the real one.
+            let name = fat.kind().as_str();
+            (Box::new(fat) as Box<dyn Filesystem + Send>, name)
+        }
         FsKind::Exfat => (
             Box::new(fstool::fs::exfat::Exfat::open(dev.as_mut())?),
             "exfat",
@@ -954,6 +956,8 @@ fn repack_cmd(
             "ext2"
                 | "ext3"
                 | "ext4"
+                | "fat12"
+                | "fat16"
                 | "fat32"
                 | "vfat"
                 | "xfs"
@@ -1051,7 +1055,7 @@ fn repack_cmd(
                 // Fixed-size block filesystems: the analyze API owns the
                 // content-fit sizing (ext via BuildPlan, fat32 via the
                 // byte heuristic).
-                "ext2" | "ext3" | "ext4" | "fat32" | "vfat" => {
+                "ext2" | "ext3" | "ext4" | "fat12" | "fat16" | "fat32" | "vfat" => {
                     fstool::analyze::analyze_fs(&mut src_fs, src_dev, block_size)?
                         .recommended_size(&lower)
                         .expect("block fs has a recommended size")
@@ -1194,16 +1198,18 @@ fn repack_cmd(
                 dst_ext.flush(dst_dev.as_mut())?;
                 None
             }
-            "fat32" | "vfat" => {
+            "fat12" | "fat16" | "fat32" | "vfat" => {
                 let total_sectors: u32 = (dst_size / 512).try_into().map_err(|_| {
                     fstool::Error::InvalidArgument(
-                        "repack: FAT32 size doesn't fit in a u32 sector count".into(),
+                        "repack: FAT size doesn't fit in a u32 sector count".into(),
                     )
                 })?;
                 let opts = fstool::fs::fat::FatFormatOpts {
+                    kind: fstool::fs::fat::parse_fat_kind(&lower)?,
                     total_sectors,
                     volume_id: 0,
                     volume_label: *b"REPACKED   ",
+                    ..Default::default()
                 };
                 let mut dst_fat = fstool::fs::fat::Fat32::format(dst_dev.as_mut(), &opts)?;
                 {
@@ -1540,16 +1546,18 @@ fn repack_layered_to_dst(
             dst.flush(dst_dev.as_mut())?;
             None
         }
-        "fat32" | "vfat" => {
+        "fat12" | "fat16" | "fat32" | "vfat" => {
             let total_sectors: u32 = (dst_size / 512).try_into().map_err(|_| {
                 fstool::Error::InvalidArgument(
-                    "repack: FAT32 size doesn't fit in a u32 sector count".into(),
+                    "repack: FAT size doesn't fit in a u32 sector count".into(),
                 )
             })?;
             let opts = fstool::fs::fat::FatFormatOpts {
+                kind: fstool::fs::fat::parse_fat_kind(&lower)?,
                 total_sectors,
                 volume_id: 0,
                 volume_label: *b"REPACKED   ",
+                ..Default::default()
             };
             let mut dst = fstool::fs::fat::Fat32::format(dst_dev.as_mut(), &opts)?;
             {
@@ -1786,16 +1794,18 @@ fn repack_tar_stream_to_fs(
             dst_ext.flush(dst_dev.as_mut())?;
             None
         }
-        "fat32" | "vfat" => {
+        "fat12" | "fat16" | "fat32" | "vfat" => {
             let total_sectors: u32 = (dst_size / 512).try_into().map_err(|_| {
                 fstool::Error::InvalidArgument(
-                    "repack: FAT32 size doesn't fit in a u32 sector count".into(),
+                    "repack: FAT size doesn't fit in a u32 sector count".into(),
                 )
             })?;
             let opts = fstool::fs::fat::FatFormatOpts {
+                kind: fstool::fs::fat::parse_fat_kind(lower)?,
                 total_sectors,
                 volume_id: 0,
                 volume_label: *b"REPACKED   ",
+                ..Default::default()
             };
             let mut dst_fat = fstool::fs::fat::Fat32::format(dst_dev.as_mut(), &opts)?;
             {
@@ -2472,7 +2482,8 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             is_device,
             qcow2_cluster_size,
         )?,
-        "fat32" | "vfat" => create_fat32(
+        "fat12" | "fat16" | "fat32" | "vfat" => create_fat(
+            &fs_type,
             source.as_ref(),
             args.output,
             args.size,
@@ -2786,10 +2797,12 @@ fn create_ext(
     Ok(())
 }
 
-/// FAT32 arm of `create`. The 65 525-cluster floor means even an empty
-/// image needs ~33 MiB, so the device capacity (or an explicit --size)
-/// is mandatory.
-fn create_fat32(
+/// FAT arm of `create` — `fat12`, `fat16`, `fat32` / `vfat`. FAT32's
+/// 65 525-cluster floor means even an empty image needs ~33 MiB, so the
+/// device capacity (or an explicit --size) is mandatory there; the
+/// narrower flavours have correspondingly smaller floors.
+fn create_fat(
+    fs_type: &str,
     source: Option<&fstool::repack::Source>,
     output: &std::path::Path,
     size_arg: Option<&str>,
@@ -2799,6 +2812,10 @@ fn create_fat32(
 ) -> fstool::Result<()> {
     use fstool::fs::fat::Fat32;
 
+    // `-t` picks the flavour; `-O fat_type=` can still override it below.
+    let kind = fstool::fs::fat::parse_fat_kind(fs_type)?;
+    let name = kind.as_str();
+
     // Defaults match the old `fat-build` behaviour: 11-byte ASCII
     // label, 0 volume id. Keep the upper-casing + non-printable
     // scrubbing so legacy CLI usage stays bit-identical.
@@ -2807,7 +2824,16 @@ fn create_fat32(
         .unwrap_or_else(|| "NO NAME".into());
     let label_bytes = fat32_label_bytes(&label_str);
     let volume_id = bag.take_u32("volume_id")?.unwrap_or(0);
-    bag.check_empty("fat32")?;
+    let mut fat_opts = fstool::fs::fat::FatFormatOpts {
+        kind,
+        volume_id,
+        volume_label: label_bytes,
+        ..Default::default()
+    };
+    fat_opts.apply_options(&mut bag)?;
+    bag.check_empty(name)?;
+    let kind = fat_opts.kind;
+    let name = kind.as_str();
 
     let bytes = if is_device {
         let dev = FileBackend::open(output)?;
@@ -2816,18 +2842,17 @@ fn create_fat32(
         fstool::spec::parse_size(s)?
     } else if let Some(src) = source {
         // No --size but a source: size the image to exactly fit the content.
-        fstool::analyze::size_for_source(src, "fat32")?.expect("fat32 has a content-fit size plan")
+        fstool::analyze::size_for_source(src, name)?.expect("fat has a content-fit size plan")
     } else {
-        return Err(fstool::Error::InvalidArgument(
-            "create: --size is required for an empty fat32 image on a regular file \
-             (FAT32 needs ≥ ~33 MiB); pass --size or a source directory"
-                .into(),
-        ));
+        return Err(fstool::Error::InvalidArgument(format!(
+            "create: --size is required for an empty {name} image on a regular file; \
+             pass --size or a source directory"
+        )));
     };
     let total_sectors: u32 = (bytes / 512).try_into().map_err(|_| {
-        fstool::Error::InvalidArgument(
-            "create: FAT32 device size doesn't fit in a u32 sector count".into(),
-        )
+        fstool::Error::InvalidArgument(format!(
+            "create: {name} device size doesn't fit in a u32 sector count"
+        ))
     })?;
     let mut dev = fstool::block::create_image(
         output,
@@ -2836,11 +2861,7 @@ fn create_fat32(
             cluster_size: qcow2_cluster_size,
         },
     )?;
-    let fat_opts = fstool::fs::fat::FatFormatOpts {
-        total_sectors,
-        volume_id,
-        volume_label: label_bytes,
-    };
+    fat_opts.total_sectors = total_sectors;
     let mut fat = Fat32::format(dev.as_mut(), &fat_opts)?;
     if let Some(src) = source {
         fstool::repack::populate_fat32_from_source(dev.as_mut(), &mut fat, src)?;
@@ -2848,7 +2869,7 @@ fn create_fat32(
     fat.flush(dev.as_mut())?;
     dev.sync()?;
     eprintln!(
-        "wrote {} ({} bytes, fat32{}, label {:?})",
+        "wrote {} ({} bytes, {name}{}, label {:?})",
         output.display(),
         bytes,
         if is_device { ", block device" } else { "" },

@@ -448,6 +448,7 @@ impl MemImage {
             total_sectors,
             volume_id: 0,
             volume_label: *b"FSTOOL     ",
+            ..Default::default()
         };
         let mut dst = MemoryBackend::new(dst_size);
         let mut fat = Fat32::format(&mut dst, &opts)?;

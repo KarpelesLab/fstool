@@ -1,4 +1,4 @@
-//! FAT32 in-place read/write file handle.
+//! FAT in-place read/write file handle.
 //!
 //! Backs [`crate::fs::Filesystem::open_file_rw`]. Every `Write::write` is
 //! eager: the relevant cluster(s) are read, patched, written back, and the
@@ -14,7 +14,7 @@
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
-use super::{Fat32, SECTOR, dir, table};
+use super::{DirLayout, Fat32, SECTOR, dir};
 use crate::Result;
 use crate::block::BlockDevice;
 use crate::fs::{FileHandle, FileReadHandle};
@@ -30,11 +30,11 @@ pub struct FatFileHandle<'a> {
     file_size: u64,
     /// Read/write cursor.
     pos: u64,
-    /// Cluster chain of the parent directory.
-    dir_chain: Vec<u32>,
-    /// Byte offset of the 8.3 directory entry within the parent's flat
-    /// directory buffer (= `cluster_index * cluster_bytes + in_cluster_off`).
-    entry_pos: usize,
+    /// Device byte offset of the 8.3 directory entry's 32-byte slot.
+    /// Resolved once at open time — the parent directory can't move or be
+    /// relaid while this handle holds the filesystem borrowed — so writing
+    /// the entry back needs no directory walk.
+    entry_off: u64,
     /// Attribute byte for the entry — preserved across rewrites.
     entry_attr: u8,
     /// Raw 8.3 name field — preserved across rewrites.
@@ -48,13 +48,14 @@ pub struct FatFileHandle<'a> {
 }
 
 impl<'a> FatFileHandle<'a> {
-    /// Build a handle for the file whose 8.3 entry lives in `parent_chain`
-    /// at byte offset `entry_pos`. Decodes the entry to recover the cluster
-    /// chain and length; subsequent writes go through `self`.
+    /// Build a handle for the file whose 8.3 entry lives at byte offset
+    /// `entry_pos` within the parent directory described by `parent`.
+    /// Decodes the entry to recover the cluster chain and length;
+    /// subsequent writes go through `self`.
     pub(super) fn open_existing(
         fs: &'a mut Fat32,
         dev: &'a mut dyn BlockDevice,
-        parent_chain: Vec<u32>,
+        parent: &DirLayout,
         entry_pos: usize,
         entry: dir::DirEntry,
     ) -> Result<Self> {
@@ -69,8 +70,7 @@ impl<'a> FatFileHandle<'a> {
             chain,
             file_size: u64::from(entry.file_size),
             pos: 0,
-            dir_chain: parent_chain,
-            entry_pos,
+            entry_off: parent.offset_of(entry_pos),
             entry_attr: entry.attr,
             entry_name_83: entry.name_83,
             entry_mtime: entry.mtime,
@@ -151,10 +151,11 @@ impl<'a> FatFileHandle<'a> {
         }
         let drained: Vec<u32> = self.chain.drain(keep as usize..).collect();
         for c in &drained {
-            self.fs.fat_mut().set(*c, table::FREE);
+            self.fs.fat_mut().set(*c, super::table::FREE);
         }
         if let Some(&last) = self.chain.last() {
-            self.fs.fat_mut().set(last, table::EOC);
+            let eoc = self.fs.fat().eoc();
+            self.fs.fat_mut().set(last, eoc);
         }
         // Allow the allocator to revisit these.
         if let Some(&first_freed) = drained.first() {
@@ -199,12 +200,7 @@ impl<'a> FatFileHandle<'a> {
             mtime: self.entry_mtime,
         };
         let enc = entry.encode();
-        let cb = self.cb() as usize;
-        let cluster_idx = self.entry_pos / cb;
-        let in_cluster = self.entry_pos % cb;
-        let cluster = self.dir_chain[cluster_idx];
-        let off = self.cluster_offset(cluster) + in_cluster as u64;
-        self.dev.write_at(off, &enc)?;
+        self.dev.write_at(self.entry_off, &enc)?;
         Ok(())
     }
 

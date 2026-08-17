@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use super::{Fat32, SECTOR, dir, table};
+use super::{DirLayout, Fat32, SECTOR, dir, table};
 use crate::Result;
 use crate::block::BlockDevice;
 
@@ -29,9 +29,9 @@ pub(super) struct PendingEntry {
 /// Result of [`Fat32::find_entry`] — a directory's loaded byte buffer plus
 /// the position of the named entry (and any preceding LFN run) within it.
 pub(super) struct FoundEntry {
-    /// The directory's cluster chain.
-    pub(super) chain: Vec<u32>,
-    /// Every cluster of the directory, concatenated.
+    /// Where the directory's slots live on the device.
+    pub(super) layout: DirLayout,
+    /// The whole directory, concatenated.
     pub(super) bytes: Vec<u8>,
     /// Byte offset of the first slot of the LFN run (== entry_pos if none).
     pub(super) run_start: usize,
@@ -76,7 +76,8 @@ impl Fat32 {
         for w in found.windows(2) {
             self.fat.set(w[0], w[1]);
         }
-        self.fat.set(*found.last().unwrap(), table::EOC);
+        let eoc = self.fat.eoc();
+        self.fat.set(*found.last().unwrap(), eoc);
         // Hint the next search past the last cluster we just took.
         self.next_free = found.last().unwrap().saturating_add(1);
         Ok(found)
@@ -96,51 +97,29 @@ impl Fat32 {
 
     // -- directory-entry insertion / deletion ----------------------------
 
-    /// Read the directory at `dir_cluster` as a flat byte buffer (every
-    /// cluster in its chain concatenated).
-    fn read_dir_with_chain(
+    /// Read the directory at `dir_cluster` as a flat byte buffer, together
+    /// with the layout that maps positions in it back onto the device.
+    fn read_dir_with_layout(
         &self,
         dev: &mut dyn BlockDevice,
         dir_cluster: u32,
-    ) -> Result<(Vec<u32>, Vec<u8>)> {
-        let chain = self.fat.chain(dir_cluster, self.boot.cluster_count())?;
-        let cb = self.cluster_bytes() as usize;
-        let mut buf = vec![0u8; chain.len() * cb];
-        for (i, &c) in chain.iter().enumerate() {
-            dev.read_at(self.cluster_offset(c), &mut buf[i * cb..(i + 1) * cb])?;
-        }
-        Ok((chain, buf))
-    }
-
-    /// Write back the byte range `[start, end)` of a directory's flat
-    /// buffer, cluster-aligned.
-    fn write_dir_range(
-        &self,
-        dev: &mut dyn BlockDevice,
-        chain: &[u32],
-        bytes: &[u8],
-        start: usize,
-        end: usize,
-    ) -> Result<()> {
-        let cb = self.cluster_bytes() as usize;
-        let first = start / cb;
-        let last = (end - 1) / cb;
-        for i in first..=last {
-            dev.write_at(self.cluster_offset(chain[i]), &bytes[i * cb..(i + 1) * cb])?;
-        }
-        Ok(())
+    ) -> Result<(DirLayout, Vec<u8>)> {
+        let layout = self.dir_layout(dir_cluster)?;
+        let bytes = layout.read_all(dev)?;
+        Ok((layout, bytes))
     }
 
     /// Insert `new_entries` (a run of 32-byte directory entries, ending
     /// with the 8.3 entry) into the directory at `dir_cluster`. Extends
-    /// the directory's cluster chain if necessary.
+    /// the directory's cluster chain if necessary — which the FAT12/16
+    /// fixed root cannot do, so overflowing it fails instead.
     fn append_dir_entries(
         &mut self,
         dev: &mut dyn BlockDevice,
         dir_cluster: u32,
         new_entries: &[u8],
     ) -> Result<()> {
-        let (chain, mut bytes) = self.read_dir_with_chain(dev, dir_cluster)?;
+        let (mut layout, mut bytes) = self.read_dir_with_layout(dev, dir_cluster)?;
         let cb = self.cluster_bytes() as usize;
         // Find the first end-of-directory slot (byte 0 == 0x00).
         let mut end_pos = bytes.len();
@@ -152,22 +131,16 @@ impl Fat32 {
         }
         let need = new_entries.len();
         let avail = bytes.len() - end_pos;
-        if avail >= need {
-            bytes[end_pos..end_pos + need].copy_from_slice(new_entries);
-            self.write_dir_range(dev, &chain, &bytes, end_pos, end_pos + need)?;
-        } else {
-            // Grow the chain.
+        if avail < need {
+            // Grow the chain by the shortfall; `grow_dir` rejects the
+            // fixed root, which has nowhere to grow into.
             let deficit = need - avail;
-            let extra_clusters = deficit.div_ceil(cb) as u32;
-            let extra = self.alloc_free_clusters(extra_clusters)?;
-            self.fat.set(*chain.last().unwrap(), extra[0]);
-            let mut full_chain = chain.to_vec();
-            full_chain.extend_from_slice(&extra);
+            self.grow_dir(&mut layout, deficit.div_ceil(cb) as u32)?;
             // Combined byte buffer: original + zero pad for new clusters.
-            bytes.resize(full_chain.len() * cb, 0);
-            bytes[end_pos..end_pos + need].copy_from_slice(new_entries);
-            self.write_dir_range(dev, &full_chain, &bytes, end_pos, end_pos + need)?;
+            bytes.resize(layout.len(), 0);
         }
+        bytes[end_pos..end_pos + need].copy_from_slice(new_entries);
+        layout.write_range(dev, &bytes, end_pos, end_pos + need)?;
         Ok(())
     }
 
@@ -182,7 +155,7 @@ impl Fat32 {
         dir_cluster: u32,
         name: &str,
     ) -> Result<Option<FoundEntry>> {
-        let (chain, bytes) = self.read_dir_with_chain(dev, dir_cluster)?;
+        let (layout, bytes) = self.read_dir_with_layout(dev, dir_cluster)?;
         let mut lfn_start: Option<usize> = None;
         let mut lfn_run: Vec<dir::LfnFragment> = Vec::new();
         let mut i = 0;
@@ -219,7 +192,7 @@ impl Fat32 {
                     if matches_short || matches_long {
                         let run_start = lfn_start.unwrap_or(i);
                         return Ok(Some(FoundEntry {
-                            chain,
+                            layout,
                             bytes,
                             run_start,
                             entry_pos: i,
@@ -240,7 +213,7 @@ impl Fat32 {
     fn mark_entries_deleted(
         &self,
         dev: &mut dyn BlockDevice,
-        chain: &[u32],
+        layout: &DirLayout,
         bytes: &mut [u8],
         start_pos: usize,
         end_pos: usize,
@@ -250,7 +223,7 @@ impl Fat32 {
             bytes[i] = 0xE5;
             i += dir::ENTRY_SIZE;
         }
-        self.write_dir_range(dev, chain, bytes, start_pos, end_pos + dir::ENTRY_SIZE)?;
+        layout.write_range(dev, bytes, start_pos, end_pos + dir::ENTRY_SIZE)?;
         Ok(())
     }
 
@@ -484,7 +457,7 @@ impl Fat32 {
         self.flush_dir_batches(dev)?;
         let (parent_cluster, leaf) = self.resolve_parent(dev, path)?;
         let Some(FoundEntry {
-            chain,
+            layout,
             mut bytes,
             run_start,
             entry_pos,
@@ -520,7 +493,7 @@ impl Fat32 {
         if entry.first_cluster >= 2 {
             self.free_chain(entry.first_cluster)?;
         }
-        self.mark_entries_deleted(dev, &chain, &mut bytes, run_start, entry_pos)?;
+        self.mark_entries_deleted(dev, &layout, &mut bytes, run_start, entry_pos)?;
         Ok(())
     }
 
@@ -542,7 +515,7 @@ impl Fat32 {
         self.flush_dir_batches(dev)?;
         let (parent_cluster, leaf) = self.resolve_parent(dev, path)?;
         let Some(FoundEntry {
-            chain,
+            layout,
             mut bytes,
             entry_pos,
             entry,
@@ -565,7 +538,7 @@ impl Fat32 {
         // Patch byte 11 (the attr field) of the 8.3 slot only, leaving the
         // write date/time and all other fields untouched.
         bytes[entry_pos + 11] = attr;
-        self.write_dir_range(dev, &chain, &bytes, entry_pos, entry_pos + dir::ENTRY_SIZE)?;
+        layout.write_range(dev, &bytes, entry_pos, entry_pos + dir::ENTRY_SIZE)?;
         Ok(())
     }
 

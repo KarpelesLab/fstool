@@ -1,11 +1,24 @@
-//! FAT32 filesystem writer.
+//! FAT filesystem reader / writer — FAT12, FAT16 and FAT32.
 //!
-//! Produces a FAT32 image from a host directory tree. FAT32 has no concept
-//! of symlinks, device nodes, or Unix ownership/permissions, so those are
-//! silently skipped when copying a tree.
+//! Produces a FAT image from a host directory tree, and reads or modifies
+//! one in place. FAT has no concept of symlinks, device nodes, or Unix
+//! ownership/permissions, so those are silently skipped when copying a
+//! tree. Long file names use VFAT LFN entries; short 8.3 names are
+//! generated where needed.
 //!
-//! v1 scope: write path only (`format` + `build_from_host_dir`). Long file
-//! names use VFAT LFN entries; short 8.3 names are generated where needed.
+//! The three flavours differ in exactly two places, both handled here so
+//! the rest of the module is width-agnostic:
+//!
+//! - **FAT entry width** — 12, 16 or 32 bits ([`table::FatKind`]). Which one
+//!   a volume uses is a function of its data-cluster count, never of the
+//!   `fs_type` string in the boot sector.
+//! - **The root directory** — FAT32 stores it as an ordinary cluster chain
+//!   starting at `root_cluster`; FAT12/FAT16 store it in a fixed region
+//!   between the last FAT and the data area, sized at format time and
+//!   unable to grow. [`DirLayout`] papers over the difference: a directory
+//!   is a list of `(device offset, length)` chunks either way, and the
+//!   FAT12/16 root is addressed by the cluster number `0` — the same value
+//!   those volumes already use in a `..` entry pointing at the root.
 //!
 //! Reference: the public Microsoft FAT specification.
 
@@ -18,6 +31,7 @@ pub mod size_plan;
 pub mod table;
 
 pub use size_plan::FatSizePlan;
+pub use table::FatKind;
 
 use std::io::Read;
 use std::path::Path;
@@ -34,40 +48,69 @@ use crate::fs::dir_batch::{DEFAULT_CAPACITY, DirBatch};
 /// FAT12/FAT16 volume, which fsck.vfat rejects as "not FAT32".
 pub const MIN_FAT32_CLUSTERS: u32 = 65525;
 
-/// Logical sector size. FAT32 supports others; genfs fixes it at 512.
+/// Logical sector size. FAT supports others; fstool fixes it at 512.
 pub const SECTOR: u32 = 512;
+
+/// Directory slots per 512-byte sector — the granularity `root_entries`
+/// must be a multiple of, since the fixed root region is sector-aligned.
+const ROOT_ENTRIES_PER_SECTOR: u16 = (SECTOR / dir::ENTRY_SIZE as u32) as u16;
+
+/// Root-directory slots for a floppy-sized FAT12/16 volume, matching the
+/// mkfs.fat convention for 1.44 MB media.
+const FLOPPY_ROOT_ENTRIES: u16 = 224;
+/// Root-directory slots for anything larger.
+const DEFAULT_ROOT_ENTRIES: u16 = 512;
+/// Volumes at or below this many sectors (2.88 MB) are treated as floppies
+/// when picking a default root-directory size.
+const FLOPPY_MAX_SECTORS: u32 = 5760;
 
 /// Options for [`Fat32::format`].
 #[derive(Debug, Clone)]
 pub struct FatFormatOpts {
+    /// Which FAT flavour to produce. Defaults to [`FatKind::Fat32`], so a
+    /// caller that says nothing keeps the historical behaviour.
+    pub kind: FatKind,
     /// Total volume size in 512-byte sectors.
     pub total_sectors: u32,
     /// Volume ID (serial number).
     pub volume_id: u32,
     /// Volume label — up to 11 bytes, space-padded.
     pub volume_label: [u8; 11],
+    /// Slots in the FAT12/FAT16 fixed root directory. `None` picks a
+    /// size-appropriate default (224 for floppy-sized media, 512
+    /// otherwise). Ignored on FAT32, whose root grows as a cluster chain.
+    pub root_entries: Option<u16>,
 }
 
 impl Default for FatFormatOpts {
     fn default() -> Self {
         Self {
+            kind: FatKind::Fat32,
             total_sectors: 0,
             volume_id: 0,
             volume_label: *b"NO NAME    ",
+            root_entries: None,
         }
     }
 }
 
 impl FatFormatOpts {
-    /// Pull FAT32-specific keys out of an
+    /// Pull FAT-specific keys out of an
     /// [`OptionMap`](crate::format_opts::OptionMap) and apply them on
     /// top of `self`. Recognised keys:
     ///
+    /// - `fat_type` (`fat12` / `12` / `fat16` / `16` / `fat32` / `32`)
     /// - `total_sectors` (u32) — 512-byte sectors. Usually set from
     ///   the device size by the caller, not by the user.
     /// - `volume_id` (u32, decimal or `0x…`)
     /// - `volume_label` (string, ≤ 11 ASCII bytes, space-padded)
+    /// - `root_entries` (u16, FAT12/16 only) — fixed root-directory slots;
+    ///   must be a non-zero multiple of 16 so the region stays
+    ///   sector-aligned.
     pub fn apply_options(&mut self, map: &mut crate::format_opts::OptionMap) -> crate::Result<()> {
+        if let Some(s) = map.take_str("fat_type") {
+            self.kind = parse_fat_kind(&s)?;
+        }
         if let Some(v) = map.take_u32("total_sectors")? {
             self.total_sectors = v;
         }
@@ -77,11 +120,156 @@ impl FatFormatOpts {
         if let Some(label) = map.take_label::<11>("volume_label", b' ')? {
             self.volume_label = label;
         }
+        if let Some(v) = map.take_u32("root_entries")? {
+            let v = u16::try_from(v).map_err(|_| {
+                crate::Error::InvalidArgument(format!("fat: root_entries={v} exceeds 65535"))
+            })?;
+            validate_root_entries(v)?;
+            self.root_entries = Some(v);
+        }
         Ok(())
     }
 }
 
-/// An under-construction FAT32 filesystem.
+/// Parse a FAT flavour name as accepted by `-t` and `-O fat_type=`.
+pub fn parse_fat_kind(s: &str) -> Result<FatKind> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "fat12" | "12" => Ok(FatKind::Fat12),
+        "fat16" | "16" => Ok(FatKind::Fat16),
+        "fat32" | "32" | "vfat" | "fat" => Ok(FatKind::Fat32),
+        other => Err(crate::Error::InvalidArgument(format!(
+            "fat: unknown FAT type {other:?} — expected fat12, fat16 or fat32"
+        ))),
+    }
+}
+
+/// A generous byte floor for a volume of FAT flavour `fs_type`, used by the
+/// `--shrink` / heuristic sizing paths that don't walk the tree precisely
+/// (the exact path is [`FatSizePlan`]). Budgets ~1 KiB per cluster at the
+/// flavour's minimum cluster count. Unknown names fall back to FAT32's
+/// floor, which is the largest of the three.
+pub fn min_volume_bytes(fs_type: &str) -> u64 {
+    let kind = parse_fat_kind(fs_type).unwrap_or(FatKind::Fat32);
+    match kind {
+        // 4084 clusters × 1 KiB would already exceed what a FAT12 volume
+        // usually is; a 1 MiB floor comfortably holds the metadata plus a
+        // real root directory.
+        FatKind::Fat12 => 1024 * 1024,
+        FatKind::Fat16 => u64::from(FatKind::Fat16.min_clusters()) * 1024,
+        FatKind::Fat32 => u64::from(MIN_FAT32_CLUSTERS) * 1024,
+    }
+}
+
+/// Reject a root-directory size the fixed region can't represent.
+fn validate_root_entries(v: u16) -> Result<()> {
+    if v == 0 || !v.is_multiple_of(ROOT_ENTRIES_PER_SECTOR) {
+        return Err(crate::Error::InvalidArgument(format!(
+            "fat: root_entries must be a non-zero multiple of {ROOT_ENTRIES_PER_SECTOR} \
+             (got {v})"
+        )));
+    }
+    Ok(())
+}
+
+/// The `(sectors_per_cluster, fat_size, …)` a volume of a given size
+/// resolves to. Produced by [`Fat32::geometry`] and consumed both by
+/// `format` and by the content-fit sizer in [`size_plan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Geometry {
+    pub(crate) spc: u8,
+    pub(crate) fat_size: u32,
+    pub(crate) reserved: u16,
+    pub(crate) root_entries: u16,
+    pub(crate) clusters: u32,
+}
+
+/// Where a directory's 32-byte slots live on the device.
+///
+/// Unifies the two shapes a FAT directory can take: a cluster chain (every
+/// directory on FAT32, every non-root directory on FAT12/16) and the
+/// FAT12/16 fixed root region. Callers address slots by byte position
+/// within the flattened directory and let [`DirLayout::offset_of`] map that
+/// onto the device.
+pub(super) struct DirLayout {
+    /// `(device offset, byte length)` per chunk, in order. Every chunk is
+    /// `chunk_bytes` long except possibly the last of a fixed root region.
+    chunks: Vec<(u64, usize)>,
+    /// Bytes per chunk — one cluster.
+    chunk_bytes: usize,
+    /// Clusters backing the directory, in order. Empty for the fixed root.
+    clusters: Vec<u32>,
+    /// The FAT12/16 fixed root region, which cannot be extended.
+    fixed_root: bool,
+}
+
+impl DirLayout {
+    /// Total addressable bytes of directory.
+    pub(super) fn len(&self) -> usize {
+        self.chunks.iter().map(|&(_, n)| n).sum()
+    }
+
+    /// Device offset of the byte at position `pos` within the directory.
+    /// Panics if `pos` is past the end — callers bound it by [`Self::len`].
+    pub(super) fn offset_of(&self, pos: usize) -> u64 {
+        let (base, _) = self.chunks[pos / self.chunk_bytes];
+        base + (pos % self.chunk_bytes) as u64
+    }
+
+    /// `true` for the FAT12/16 fixed root, which callers must not try to
+    /// grow.
+    pub(super) fn is_fixed_root(&self) -> bool {
+        self.fixed_root
+    }
+
+    /// Last cluster of the chain, or `None` for the fixed root.
+    pub(super) fn last_cluster(&self) -> Option<u32> {
+        self.clusters.last().copied()
+    }
+
+    /// Append `clusters` to the chain, extending the chunk list to match.
+    fn extend_with(&mut self, clusters: &[u32], offsets: impl Fn(u32) -> u64) {
+        for &c in clusters {
+            self.chunks.push((offsets(c), self.chunk_bytes));
+            self.clusters.push(c);
+        }
+    }
+
+    /// Write back the byte range `[start, end)` of the directory's flat
+    /// buffer. Whole chunks are written at a time, so `bytes` must be the
+    /// complete buffer, not a slice of it.
+    pub(super) fn write_range(
+        &self,
+        dev: &mut dyn BlockDevice,
+        bytes: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Result<()> {
+        let first = start / self.chunk_bytes;
+        let last = (end - 1) / self.chunk_bytes;
+        for i in first..=last {
+            let (off, n) = self.chunks[i];
+            let at = i * self.chunk_bytes;
+            dev.write_at(off, &bytes[at..at + n])?;
+        }
+        Ok(())
+    }
+
+    /// Read the whole directory into one flat buffer.
+    pub(super) fn read_all(&self, dev: &mut dyn BlockDevice) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; self.len()];
+        let mut at = 0usize;
+        for &(off, n) in &self.chunks {
+            dev.read_at(off, &mut buf[at..at + n])?;
+            at += n;
+        }
+        Ok(buf)
+    }
+}
+
+/// An open FAT12 / FAT16 / FAT32 filesystem.
+///
+/// The name predates FAT12/16 support; one type drives all three flavours,
+/// distinguished by [`Fat32::kind`].
 #[derive(Debug)]
 pub struct Fat32 {
     boot: BootSector,
@@ -116,101 +304,286 @@ impl Fat32 {
         }
     }
 
-    /// Compute `(sectors_per_cluster, fat_size_sectors, cluster_count)` for a
-    /// volume of `total_sectors`. Errors if the volume is too small to be a
-    /// valid FAT32. `pub(crate)` so the content-fit sizer ([`size_plan`])
-    /// searches against the authoritative geometry rather than re-deriving it.
-    pub(crate) fn geometry(total_sectors: u32) -> Result<(u8, u32, u32)> {
-        let spc = Self::pick_spc(total_sectors);
-        let reserved = 32u32;
-        let num_fats = 2u32;
-        let entries_per_fat_sector = SECTOR / 4; // 128
+    /// Default fixed root-directory size for a FAT12/16 volume of
+    /// `total_sectors`, following the mkfs.fat convention.
+    pub(crate) fn default_root_entries(total_sectors: u32) -> u16 {
+        if total_sectors <= FLOPPY_MAX_SECTORS {
+            FLOPPY_ROOT_ENTRIES
+        } else {
+            DEFAULT_ROOT_ENTRIES
+        }
+    }
 
-        // Converge fat_size upward until the FAT is big enough to map every
-        // data cluster it leaves room for.
+    /// Grow `fat_size` until the FAT is big enough to map every data
+    /// cluster it leaves room for, and report the cluster count it settles
+    /// on. The loop always terminates: `fat_size` strictly increases, so
+    /// the metadata eventually swallows the volume and the size check
+    /// fires.
+    fn converge_fat_size(
+        kind: FatKind,
+        total_sectors: u32,
+        spc: u8,
+        reserved: u32,
+        num_fats: u32,
+        root_sectors: u32,
+    ) -> Result<(u32, u32)> {
         let mut fat_size = 1u32;
         loop {
-            let meta = reserved + num_fats * fat_size;
+            let meta = reserved + num_fats * fat_size + root_sectors;
             if meta >= total_sectors {
-                return Err(crate::Error::InvalidArgument(
-                    "fat32: volume too small to hold the FAT metadata".into(),
-                ));
+                return Err(crate::Error::InvalidArgument(format!(
+                    "{}: volume too small to hold the FAT metadata",
+                    kind.as_str()
+                )));
             }
             let clusters = (total_sectors - meta) / spc as u32;
-            let needed = (clusters + 2).div_ceil(entries_per_fat_sector);
+            let needed = kind
+                .fat_bytes(u64::from(clusters) + 2)
+                .div_ceil(u64::from(SECTOR)) as u32;
             if needed <= fat_size {
-                if clusters < MIN_FAT32_CLUSTERS {
-                    return Err(crate::Error::InvalidArgument(format!(
-                        "fat32: {clusters} clusters is below the FAT32 minimum of \
-                         {MIN_FAT32_CLUSTERS} — use a volume of at least ~33 MiB"
-                    )));
-                }
-                return Ok((spc, fat_size, clusters));
+                return Ok((fat_size, clusters));
             }
             fat_size = needed;
         }
     }
 
-    /// Format a fresh, empty FAT32 onto `dev`. Writes the boot sector and
-    /// its backup, the FSInfo sector and its backup, both FAT copies, and
-    /// the (empty) root-directory cluster.
+    /// Resolve the on-disk geometry for a `kind` volume of `total_sectors`.
+    /// Errors if the volume can't be represented in that flavour.
+    ///
+    /// FAT32 keeps the conventional mkfs.vfat cluster-size thresholds
+    /// ([`Self::pick_spc`]). FAT12/16 instead search upward from one sector
+    /// per cluster for the smallest cluster size whose data-cluster count
+    /// falls inside the flavour's band — a FAT16 volume with too many
+    /// clusters isn't invalid, it just needs bigger clusters.
+    ///
+    /// `pub(crate)` so the content-fit sizer ([`size_plan`]) searches against
+    /// the authoritative geometry rather than re-deriving it.
+    pub(crate) fn geometry(
+        kind: FatKind,
+        total_sectors: u32,
+        root_entries: Option<u16>,
+    ) -> Result<Geometry> {
+        let num_fats = 2u32;
+        let (reserved, root_entries) = if kind == FatKind::Fat32 {
+            (32u32, 0u16)
+        } else {
+            let re = root_entries.unwrap_or_else(|| Self::default_root_entries(total_sectors));
+            validate_root_entries(re)?;
+            (1u32, re)
+        };
+        let root_sectors = (u32::from(root_entries) * dir::ENTRY_SIZE as u32).div_ceil(SECTOR);
+
+        // FAT32 has exactly one candidate cluster size, so its geometry (and
+        // its error text) is unchanged from when this only spoke FAT32.
+        if kind == FatKind::Fat32 {
+            let spc = Self::pick_spc(total_sectors);
+            let (fat_size, clusters) =
+                Self::converge_fat_size(kind, total_sectors, spc, reserved, num_fats, root_sectors)?;
+            if clusters < MIN_FAT32_CLUSTERS {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "fat32: {clusters} clusters is below the FAT32 minimum of \
+                     {MIN_FAT32_CLUSTERS} — use a volume of at least ~33 MiB"
+                )));
+            }
+            return Ok(Geometry {
+                spc,
+                fat_size,
+                reserved: reserved as u16,
+                root_entries,
+                clusters,
+            });
+        }
+
+        // Cluster sizes to try, smallest first — up to 32 KiB, the largest
+        // DOS/Windows accept on FAT12/16.
+        let mut smallest = None;
+        for &spc in &[1u8, 2, 4, 8, 16, 32, 64] {
+            // A failure here means the metadata already swallows the
+            // volume; a larger cluster size only makes that worse, so
+            // propagate rather than trying the next candidate.
+            let (fat_size, clusters) = Self::converge_fat_size(
+                kind,
+                total_sectors,
+                spc,
+                reserved,
+                num_fats,
+                root_sectors,
+            )?;
+            smallest.get_or_insert(clusters);
+            if clusters > kind.max_clusters() {
+                continue; // needs bigger clusters
+            }
+            if clusters < kind.min_clusters() {
+                break; // bigger clusters would only shrink the count further
+            }
+            return Ok(Geometry {
+                spc,
+                fat_size,
+                reserved: reserved as u16,
+                root_entries,
+                clusters,
+            });
+        }
+        let got = smallest.unwrap_or(0);
+        if got < kind.min_clusters() {
+            Err(crate::Error::InvalidArgument(format!(
+                "{}: {got} clusters is below the {} minimum of {} — use a larger volume \
+                 (or a smaller FAT type)",
+                kind.as_str(),
+                kind.as_str(),
+                kind.min_clusters()
+            )))
+        } else {
+            Err(crate::Error::InvalidArgument(format!(
+                "{}: a volume of {total_sectors} sectors needs more than {} clusters even at \
+                 the largest cluster size — use a wider FAT type",
+                kind.as_str(),
+                kind.max_clusters()
+            )))
+        }
+    }
+
+    /// Format a fresh, empty FAT volume onto `dev`. Writes the boot sector
+    /// (plus, on FAT32, its backup and the FSInfo sectors), both FAT
+    /// copies, and the empty root directory.
     pub fn format(dev: &mut dyn BlockDevice, opts: &FatFormatOpts) -> Result<Self> {
+        let kind = opts.kind;
         let total = opts.total_sectors;
         let need = total as u64 * SECTOR as u64;
         if dev.total_size() < need {
             return Err(crate::Error::InvalidArgument(format!(
-                "fat32: device has {} bytes, need {need}",
+                "{}: device has {} bytes, need {need}",
+                kind.as_str(),
                 dev.total_size()
             )));
         }
-        let (spc, fat_size, clusters) = Self::geometry(total)?;
+        let geom = Self::geometry(kind, total, opts.root_entries)?;
 
-        let mut boot = BootSector::fat32_default();
-        boot.sectors_per_cluster = spc;
+        let mut boot = BootSector::defaults_for(kind);
+        boot.sectors_per_cluster = geom.spc;
         boot.total_sectors = total;
-        boot.fat_size = fat_size;
+        boot.fat_size = geom.fat_size;
+        boot.reserved_sector_count = geom.reserved;
+        boot.root_entry_count = geom.root_entries;
         boot.volume_id = opts.volume_id;
         boot.volume_label = opts.volume_label;
 
-        // FAT has one entry per cluster (+ the 2 reserved); size the table
-        // to the full on-disk FAT so encode() produces exactly fat_size
-        // sectors.
-        let fat_entries = (fat_size * (SECTOR / 4)) as usize;
-        let mut fat = Fat::new(fat_entries, boot.media);
-        // Root directory occupies cluster 2, a one-cluster chain.
-        fat.set(boot.root_cluster, table::EOC);
+        // Size the in-memory table to the full on-disk FAT so encode()
+        // produces exactly `fat_size` sectors.
+        let fat_bytes = geom.fat_size as usize * SECTOR as usize;
+        let mut fat = Fat::new(kind, fat_bytes, boot.media);
+        if kind == FatKind::Fat32 {
+            // Root directory occupies cluster 2, a one-cluster chain.
+            fat.set(boot.root_cluster, fat.eoc());
+        }
 
         let mut fs = Self {
             boot,
             fat,
-            next_free: 3,
+            // FAT32 spends cluster 2 on the root directory; FAT12/16 keep
+            // the root out of the data area entirely, so cluster 2 is free.
+            next_free: if kind == FatKind::Fat32 { 3 } else { 2 },
             dir_batch: DirBatch::new(DEFAULT_CAPACITY),
             pending_names: std::collections::HashMap::new(),
         };
         // Zero only the metadata, not the whole device: the reserved
-        // sectors + both FAT copies (everything before the data region) and
-        // the empty root-directory cluster. Data-region clusters are marked
-        // free in the FAT and never read, so their prior contents are
-        // irrelevant — this keeps `format` O(metadata) instead of O(device),
-        // so formatting a large block device is near-instant rather than
+        // sectors + every FAT copy + (on FAT12/16) the fixed root region —
+        // everything before the data area — and, on FAT32, the root
+        // directory's one cluster. Data-region clusters are marked free in
+        // the FAT and never read, so their prior contents are irrelevant —
+        // this keeps `format` O(metadata) instead of O(device), so
+        // formatting a large block device is near-instant rather than
         // writing zeros across its whole capacity. `flush` writes the boot
         // sectors, FSInfo, and both full FATs into the cleared region.
         let meta_bytes = u64::from(fs.boot.data_start_sector()) * u64::from(SECTOR);
         dev.zero_range(0, meta_bytes)?;
-        let cluster_bytes = u64::from(spc) * u64::from(SECTOR);
-        dev.zero_range(fs.cluster_offset(fs.boot.root_cluster), cluster_bytes)?;
+        if kind == FatKind::Fat32 {
+            let cluster_bytes = u64::from(geom.spc) * u64::from(SECTOR);
+            dev.zero_range(fs.cluster_offset(fs.boot.root_cluster), cluster_bytes)?;
+        }
 
         // Mirror the boot-sector volume label as the first root-dir entry;
         // without this fsck.vfat treats the boot label as stale and would
         // "auto-remove" it (-n exit 1).
-        dev.write_at(
-            fs.cluster_offset(fs.boot.root_cluster),
-            &fs.volume_label_entry(),
-        )?;
+        let root_off = fs.root_dir_offset();
+        dev.write_at(root_off, &fs.volume_label_entry())?;
 
-        let _ = clusters;
         fs.flush(dev)?;
         Ok(fs)
+    }
+
+    /// Which FAT flavour this volume is.
+    pub fn kind(&self) -> FatKind {
+        self.boot.kind
+    }
+
+    /// Device byte offset where the root directory's first slot lives —
+    /// the fixed region on FAT12/16, cluster 2 (usually) on FAT32.
+    fn root_dir_offset(&self) -> u64 {
+        if self.boot.kind == FatKind::Fat32 {
+            self.cluster_offset(self.boot.root_cluster)
+        } else {
+            u64::from(self.boot.root_dir_start_sector()) * u64::from(SECTOR)
+        }
+    }
+
+    /// `true` when `dir_id` names the FAT12/16 fixed root directory. That
+    /// root has no cluster of its own, so it is addressed by the cluster
+    /// number `0` — which `boot.root_cluster` is set to on those volumes,
+    /// and which a `..` entry pointing at the root already stores.
+    fn is_fixed_root(&self, dir_id: u32) -> bool {
+        self.boot.kind != FatKind::Fat32 && dir_id == 0
+    }
+
+    /// Resolve a directory to the device chunks holding its 32-byte slots.
+    pub(super) fn dir_layout(&self, dir_id: u32) -> Result<DirLayout> {
+        let cb = self.cluster_bytes() as usize;
+        if self.is_fixed_root(dir_id) {
+            let total = usize::from(self.boot.root_entry_count) * dir::ENTRY_SIZE;
+            let base = self.root_dir_offset();
+            let mut chunks = Vec::with_capacity(total.div_ceil(cb));
+            let mut at = 0usize;
+            while at < total {
+                let n = cb.min(total - at);
+                chunks.push((base + at as u64, n));
+                at += n;
+            }
+            return Ok(DirLayout {
+                chunks,
+                chunk_bytes: cb,
+                clusters: Vec::new(),
+                fixed_root: true,
+            });
+        }
+        let clusters = self.fat.chain(dir_id, self.boot.cluster_count())?;
+        let chunks = clusters
+            .iter()
+            .map(|&c| (self.cluster_offset(c), cb))
+            .collect();
+        Ok(DirLayout {
+            chunks,
+            chunk_bytes: cb,
+            clusters,
+            fixed_root: false,
+        })
+    }
+
+    /// Grow `layout` by `n` clusters, linking them onto its chain. Errors
+    /// on the FAT12/16 fixed root, which has no way to grow.
+    pub(super) fn grow_dir(&mut self, layout: &mut DirLayout, n: u32) -> Result<()> {
+        if layout.is_fixed_root() {
+            return Err(self.fixed_root_full_err());
+        }
+        let extra = self.alloc_free_clusters(n)?;
+        if let Some(last) = layout.last_cluster() {
+            self.fat.set(last, extra[0]);
+        }
+        let data_start = u64::from(self.boot.data_start_sector()) * u64::from(SECTOR);
+        let spc = u64::from(self.boot.sectors_per_cluster);
+        layout.extend_with(&extra, |c| {
+            data_start + (u64::from(c) - 2) * spc * u64::from(SECTOR)
+        });
+        Ok(())
     }
 
     /// Encode the volume-label directory entry that mirrors the boot
@@ -247,8 +620,11 @@ impl Fat32 {
         let mut chain = Vec::with_capacity(n as usize);
         for _ in 0..n {
             let c = self.next_free;
-            if c as usize >= self.fat.capacity() {
-                return Err(crate::Error::Unsupported("fat32: out of clusters".into()));
+            if c as usize >= self.fat.capacity() || c >= self.boot.cluster_count() + 2 {
+                return Err(crate::Error::Unsupported(format!(
+                    "{}: out of clusters",
+                    self.boot.kind.as_str()
+                )));
             }
             chain.push(c);
             self.next_free += 1;
@@ -256,7 +632,8 @@ impl Fat32 {
         for w in chain.windows(2) {
             self.fat.set(w[0], w[1]);
         }
-        self.fat.set(*chain.last().unwrap(), table::EOC);
+        let eoc = self.fat.eoc();
+        self.fat.set(*chain.last().unwrap(), eoc);
         Ok(chain)
     }
 
@@ -275,41 +652,45 @@ impl Fat32 {
         Ok(())
     }
 
-    /// Persist the boot sector (+ backup), FSInfo (+ backup) and both FAT
-    /// copies. Free-cluster accounting is derived from the current FAT, so
-    /// this works for both fresh-format and modify-in-place flows.
+    /// Persist the boot sector and every FAT copy — plus, on FAT32, the
+    /// backup boot sector and both FSInfo sectors, neither of which
+    /// FAT12/FAT16 has. Free-cluster accounting is derived from the current
+    /// FAT, so this works for both fresh-format and modify-in-place flows.
     pub fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         // Serialize pending directory batches first — they may allocate
         // clusters, which the FAT written below must reflect.
         self.flush_dir_batches(dev)?;
         let boot_bytes = self.boot.encode();
         dev.write_at(0, &boot_bytes)?;
-        dev.write_at(
-            self.boot.backup_boot_sector as u64 * SECTOR as u64,
-            &boot_bytes,
-        )?;
 
-        let clusters = self.boot.cluster_count();
-        let free_count = self.count_free_clusters();
-        let next_hint = if self.next_free >= 2 && self.next_free < clusters + 2 {
-            self.next_free
-        } else {
-            2
-        };
-        let fsinfo = FsInfo {
-            free_count,
-            next_free: next_hint,
-        };
-        let fsinfo_bytes = fsinfo.encode();
-        dev.write_at(
-            self.boot.fs_info_sector as u64 * SECTOR as u64,
-            &fsinfo_bytes,
-        )?;
-        // The backup boot region also carries a backup FSInfo at +1.
-        dev.write_at(
-            (self.boot.backup_boot_sector as u64 + 1) * SECTOR as u64,
-            &fsinfo_bytes,
-        )?;
+        if self.boot.kind == FatKind::Fat32 {
+            dev.write_at(
+                self.boot.backup_boot_sector as u64 * SECTOR as u64,
+                &boot_bytes,
+            )?;
+
+            let clusters = self.boot.cluster_count();
+            let free_count = self.count_free_clusters();
+            let next_hint = if self.next_free >= 2 && self.next_free < clusters + 2 {
+                self.next_free
+            } else {
+                2
+            };
+            let fsinfo = FsInfo {
+                free_count,
+                next_free: next_hint,
+            };
+            let fsinfo_bytes = fsinfo.encode();
+            dev.write_at(
+                self.boot.fs_info_sector as u64 * SECTOR as u64,
+                &fsinfo_bytes,
+            )?;
+            // The backup boot region also carries a backup FSInfo at +1.
+            dev.write_at(
+                (self.boot.backup_boot_sector as u64 + 1) * SECTOR as u64,
+                &fsinfo_bytes,
+            )?;
+        }
 
         let fat_bytes = self.fat.encode();
         for i in 0..self.boot.num_fats as u32 {
@@ -348,6 +729,7 @@ impl Fat32 {
             total_sectors,
             volume_id,
             volume_label,
+            ..Default::default()
         };
         let mut fs = Self::format(dev, &opts)?;
         fs.populate_from_host_dir(dev, src)?;
@@ -506,6 +888,10 @@ impl Fat32 {
     /// Write a directory's assembled entry bytes into its cluster chain,
     /// extending the chain if the entries overflow `dir_cluster`'s single
     /// cluster.
+    ///
+    /// The FAT12/16 fixed root is written as one flat region instead: it
+    /// can't be extended, so entries that don't fit are an error rather
+    /// than a cluster allocation.
     fn write_dir_entries(
         &mut self,
         dev: &mut dyn BlockDevice,
@@ -513,6 +899,17 @@ impl Fat32 {
         entries: &[u8],
     ) -> Result<()> {
         let cb = self.cluster_bytes() as usize;
+        if self.is_fixed_root(dir_cluster) {
+            let capacity = usize::from(self.boot.root_entry_count) * dir::ENTRY_SIZE;
+            if entries.len() > capacity {
+                return Err(self.fixed_root_full_err());
+            }
+            // Pad to the whole region so stale slots read as end-of-directory.
+            let mut buf = entries.to_vec();
+            buf.resize(capacity, 0);
+            dev.write_at(self.root_dir_offset(), &buf)?;
+            return Ok(());
+        }
         let need_clusters = entries.len().div_ceil(cb).max(1) as u32;
         let mut chain = vec![dir_cluster];
         // Extend if more than one cluster of entries.
@@ -527,6 +924,18 @@ impl Fat32 {
         buf.resize(need_clusters as usize * cb, 0);
         self.write_chain(dev, &chain, &buf)?;
         Ok(())
+    }
+
+    /// The error a full FAT12/16 fixed root produces. Unlike every other
+    /// FAT directory it cannot be extended, so overflowing it is a hard
+    /// failure rather than a cluster allocation.
+    pub(super) fn fixed_root_full_err(&self) -> crate::Error {
+        crate::Error::Unsupported(format!(
+            "{}: the root directory is fixed at {} entries and is full — reformat with a \
+             larger `-O root_entries=`, nest the files in a subdirectory, or use fat32",
+            self.boot.kind.as_str(),
+            self.boot.root_entry_count
+        ))
     }
 
     /// Stream a host file's bytes into its cluster chain. The file is read
@@ -575,56 +984,45 @@ impl Fat32 {
 
     // -- read path --------------------------------------------------------
 
-    /// Open an existing FAT32 volume from `dev`: decode the boot sector,
-    /// validate the FAT32 fs_type signature, and load the primary FAT into
-    /// memory.
+    /// Open an existing FAT12 / FAT16 / FAT32 volume from `dev`: decode the
+    /// boot sector, derive the flavour from its cluster count, and load the
+    /// primary FAT into memory.
     pub fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
         let mut bs = [0u8; 512];
         dev.read_at(0, &mut bs)?;
+        // `decode` already rejects a BPB whose sector size, cluster size or
+        // FAT count would break the cluster arithmetic, so everything read
+        // back here is within its declared bounds.
         let boot = BootSector::decode(&bs)?;
+        let kind = boot.kind;
         if boot.bytes_per_sector as u32 != SECTOR {
             return Err(crate::Error::Unsupported(format!(
-                "fat32: only 512-byte sectors are supported (got {})",
+                "{}: only 512-byte sectors are supported (got {})",
+                kind.as_str(),
                 boot.bytes_per_sector
             )));
         }
-        // `sectors_per_cluster` is an untrusted u8 that divides into
-        // `cluster_count()` and scales `cluster_bytes()`. Per the FAT spec
-        // it must be a power of two in `1..=128`; zero would panic the
-        // `data_sectors / spc` division and a non-power-of-two breaks the
-        // cluster geometry. Reject both up front.
-        let spc = boot.sectors_per_cluster;
-        if spc == 0 || !spc.is_power_of_two() || spc > 128 {
-            return Err(crate::Error::InvalidImage(format!(
-                "fat32: sectors_per_cluster must be a power of two in 1..=128 (got {spc})"
-            )));
-        }
         // Validate the on-disk geometry before sizing any allocation from
-        // the untrusted `fat_size_32` field. The FAT(s) plus reserved
-        // sectors must fit inside the declared volume, and the volume must
-        // fit on the device.
+        // the untrusted FAT-size field. The FAT(s) plus reserved sectors and
+        // the fixed root region must fit inside the declared volume, and the
+        // volume must fit on the device.
         let total_sectors = boot.total_sectors as u64;
-        let volume_bytes = total_sectors
-            .checked_mul(SECTOR as u64)
-            .ok_or_else(|| crate::Error::InvalidImage("fat32: total_sectors overflow".into()))?;
+        let volume_bytes = total_sectors.checked_mul(SECTOR as u64).ok_or_else(|| {
+            crate::Error::InvalidImage(format!("{}: total_sectors overflow", kind.as_str()))
+        })?;
         if volume_bytes > dev.total_size() {
             return Err(crate::Error::InvalidImage(format!(
-                "fat32: volume of {volume_bytes} bytes exceeds device size {}",
+                "{}: volume of {volume_bytes} bytes exceeds device size {}",
+                kind.as_str(),
                 dev.total_size()
             )));
         }
-        let meta_sectors = (boot.reserved_sector_count as u64)
-            .checked_add(
-                (boot.num_fats as u64)
-                    .checked_mul(boot.fat_size as u64)
-                    .ok_or_else(|| {
-                        crate::Error::InvalidImage("fat32: FAT sector count overflow".into())
-                    })?,
-            )
-            .ok_or_else(|| crate::Error::InvalidImage("fat32: metadata sector overflow".into()))?;
+        let meta_sectors = u64::from(boot.data_start_sector());
         if meta_sectors > total_sectors {
             return Err(crate::Error::InvalidImage(format!(
-                "fat32: reserved + FATs ({meta_sectors} sectors) overruns volume of {total_sectors} sectors"
+                "{}: reserved + FATs + root ({meta_sectors} sectors) overruns volume of \
+                 {total_sectors} sectors",
+                kind.as_str()
             )));
         }
         // Read the first FAT copy. `fat_size` is now bounded by the volume,
@@ -633,7 +1031,7 @@ impl Fat32 {
         let mut fat_bytes = vec![0u8; fat_bytes_len as usize];
         let fat_off = boot.reserved_sector_count as u64 * SECTOR as u64;
         dev.read_at(fat_off, &mut fat_bytes)?;
-        let fat = Fat::decode(&fat_bytes);
+        let fat = Fat::decode(kind, &fat_bytes);
         // For an opened volume we don't track a free-pool cursor; set it
         // past the end so accidental allocation needs an explicit reset.
         let next_free = fat.capacity() as u32;
@@ -799,16 +1197,11 @@ impl Fat32 {
         Ok((found.1, cluster))
     }
 
-    /// Read every 32-byte slot of the directory at `dir_cluster`, walking
-    /// the cluster chain to the end. Returns the raw bytes concatenated.
+    /// Read every 32-byte slot of the directory at `dir_cluster` — walking
+    /// its cluster chain to the end, or spanning the fixed root region on
+    /// FAT12/16. Returns the raw bytes concatenated.
     fn read_dir_bytes(&self, dev: &mut dyn BlockDevice, dir_cluster: u32) -> Result<Vec<u8>> {
-        let chain = self.chain_of(dir_cluster)?;
-        let cb = self.cluster_bytes() as usize;
-        let mut buf = vec![0u8; chain.len() * cb];
-        for (i, &c) in chain.iter().enumerate() {
-            dev.read_at(self.cluster_offset(c), &mut buf[i * cb..(i + 1) * cb])?;
-        }
-        Ok(buf)
+        self.dir_layout(dir_cluster)?.read_all(dev)
     }
 
     /// Walk a directory's slots, reassembling LFN runs into long names.
@@ -1146,12 +1539,12 @@ impl crate::fs::Filesystem for Fat32 {
             )));
         }
         let mutate::FoundEntry {
-            chain: dir_chain,
+            layout,
             entry_pos,
             entry,
             ..
         } = found;
-        let inner = handle::FatFileHandle::open_existing(self, dev, dir_chain, entry_pos, entry)?;
+        let inner = handle::FatFileHandle::open_existing(self, dev, &layout, entry_pos, entry)?;
         Ok(Box::new(handle::ReadOnlyFatHandle::new(inner)))
     }
 
@@ -1207,13 +1600,13 @@ impl crate::fs::Filesystem for Fat32 {
             }
         };
         let mutate::FoundEntry {
-            chain: dir_chain,
+            layout,
             entry_pos,
             entry,
             ..
         } = found;
         let mut handle =
-            handle::FatFileHandle::open_existing(self, dev, dir_chain, entry_pos, entry)?;
+            handle::FatFileHandle::open_existing(self, dev, &layout, entry_pos, entry)?;
         if flags.truncate {
             crate::fs::FileHandle::set_len(&mut handle, 0)?;
         }
@@ -1247,6 +1640,7 @@ mod tests {
             total_sectors: 48 * 1024 * 1024 / 512,
             volume_id: 0xCAFE_F00D,
             volume_label: *b"OPENRWTEST ",
+        ..Default::default()
         };
         let fs = Fat32::format(&mut dev, &opts).unwrap();
         (dev, fs)
@@ -1265,20 +1659,20 @@ mod tests {
     #[test]
     fn geometry_small_volume() {
         // 64 MiB volume = 131072 sectors.
-        let (spc, fat_size, clusters) = Fat32::geometry(131072).unwrap();
-        assert_eq!(spc, 1);
-        assert!(fat_size > 0);
-        assert!(clusters >= MIN_FAT32_CLUSTERS);
+        let g = Fat32::geometry(FatKind::Fat32, 131072, None).unwrap();
+        assert_eq!(g.spc, 1);
+        assert!(g.fat_size > 0);
+        assert!(g.clusters >= MIN_FAT32_CLUSTERS);
         // Consistency: reserved + 2*fat + clusters*spc <= total.
-        assert!(32 + 2 * fat_size + clusters * spc as u32 <= 131072);
+        assert!(32 + 2 * g.fat_size + g.clusters * g.spc as u32 <= 131072);
         // The FAT must map every cluster.
-        assert!(fat_size * (SECTOR / 4) >= clusters + 2);
+        assert!(g.fat_size * (SECTOR / 4) >= g.clusters + 2);
     }
 
     #[test]
     fn geometry_rejects_tiny_volume() {
         // 4 MiB is far below the FAT32 minimum.
-        assert!(Fat32::geometry(8192).is_err());
+        assert!(Fat32::geometry(FatKind::Fat32, 8192, None).is_err());
     }
 
     #[test]
@@ -1288,6 +1682,7 @@ mod tests {
             total_sectors: 48 * 1024 * 1024 / 512,
             volume_id: 0xCAFE_F00D,
             volume_label: *b"TESTVOL    ",
+        ..Default::default()
         };
         let fs = Fat32::format(&mut dev, &opts).unwrap();
         // Boot sector round-trips.
@@ -1302,7 +1697,7 @@ mod tests {
         dev.read_at(6 * 512, &mut backup).unwrap();
         assert_eq!(bs, backup);
         // Root cluster's FAT entry is an end-of-chain marker.
-        assert!(Fat::is_eoc(fs.fat.get(2)));
+        assert!(fs.fat.is_eoc(fs.fat.get(2)));
     }
 
     #[test]
