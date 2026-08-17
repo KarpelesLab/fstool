@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.22](https://github.com/KarpelesLab/fstool/compare/v0.4.21...v0.4.22) - 2026-08-17
+
+### Added
+
+- *(littlefs)* read, write and in-place edits for lfs2 images
+- *(web)* create, edit and download images in the browser
+- *(memedit)* in-memory authoring — blank filesystems, partitioned disks
+
+### Fixed
+
+- *(ext)* honour journal revoke records across transactions
+- *(ext)* decode HTree directory roots and honour journal revoke blocks ([#32](https://github.com/KarpelesLab/fstool/pull/32))
+
+### Other
+
+- *(littlefs)* redraw the tag and skip-list diagrams in our own form
+
 ### Added
 
 - *(littlefs)* new backend for the embedded-flash filesystem (`lfs2`, disk
