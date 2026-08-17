@@ -2,10 +2,15 @@
 import { ref, reactive, computed, provide } from 'vue'
 import { Fstool, humanSize, baseName, download, sortEntries } from './fstool.js'
 import TreeNode from './components/TreeNode.vue'
+import Builder from './components/Builder.vue'
 
 const fstool = new Fstool()
 
 const phase = ref('empty') // 'empty' | 'loaded' | 'opened'
+// 'inspect' is the original drop-a-file flow; 'build' is the authoring pane.
+const mode = ref('inspect')
+// Set when the user drops a file and picks "Edit" — Builder adopts it.
+const adopt = ref(false)
 const status = ref('') // non-empty while a blocking op is running
 const error = ref('')
 const dragover = ref(false)
@@ -116,6 +121,22 @@ function reset() {
   report.value = null
 }
 
+function startBuilder() {
+  adopt.value = false
+  mode.value = 'build'
+}
+
+// Hand the already-loaded file to the builder instead of the viewer.
+function editLoaded() {
+  adopt.value = true
+  mode.value = 'build'
+}
+
+function leaveBuilder() {
+  mode.value = 'inspect'
+  adopt.value = false
+}
+
 // Drag & drop / file input --------------------------------------------------
 const fileInput = ref(null)
 function onPick() {
@@ -151,16 +172,32 @@ function onDrop(e) {
     @drop.prevent="onDrop"
   >
     <section class="hero">
-      <h1>Inspect &amp; convert disk images and archives</h1>
+      <h1>Build, inspect &amp; convert disk images</h1>
       <p class="sub">
-        Drop in a <code>tar</code>, <code>zip</code>, <code>ext4</code>,
-        <code>squashfs</code>, <code>iso</code>, and more — browse what's inside, pull out
-        individual files, and convert the whole thing to another format.
-        Everything runs <strong>in your browser</strong>; nothing is uploaded.
+        Create a blank filesystem or a partitioned disk, fill it, and download
+        the image — or drop in a <code>tar</code>, <code>zip</code>,
+        <code>ext4</code>, <code>squashfs</code>, <code>iso</code> and browse
+        what's inside. Everything runs <strong>in your browser</strong>;
+        nothing is uploaded.
       </p>
+      <div v-if="mode === 'inspect' && phase === 'empty'" class="hero-actions">
+        <button class="primary-btn" type="button" @click="startBuilder">
+          Create a new image
+        </button>
+        <span class="or">or drop an existing one below</span>
+      </div>
     </section>
 
+    <Builder
+      v-if="mode === 'build'"
+      :fstool="fstool"
+      :adopt="adopt"
+      :adopt-name="file.name"
+      @close="leaveBuilder"
+    />
+
     <section
+      v-if="mode === 'inspect'"
       class="dropzone"
       :class="{ dragover }"
       tabindex="0"
@@ -178,18 +215,19 @@ function onDrop(e) {
       </div>
     </section>
 
-    <section v-if="status" class="status">
+    <section v-if="mode === 'inspect' && status" class="status">
       <span class="spinner" aria-hidden="true"></span>
       <span>{{ status }}</span>
     </section>
 
-    <section v-if="error" class="error">{{ error }}</section>
+    <section v-if="mode === 'inspect' && error" class="error">{{ error }}</section>
 
-    <section v-if="phase !== 'empty'" class="workspace">
+    <section v-if="mode === 'inspect' && phase !== 'empty'" class="workspace">
       <div class="panel meta-panel">
         <div class="file-line">
           <span class="file-name">{{ file.name }}</span>
           <span class="file-size">{{ humanSize(file.size) }}</span>
+          <button class="ghost-btn" type="button" @click="editLoaded">Edit</button>
           <button class="ghost-btn" type="button" @click="reset">Clear</button>
         </div>
         <div v-if="badges.length" class="badges">

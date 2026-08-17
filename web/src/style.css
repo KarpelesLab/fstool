@@ -153,3 +153,190 @@ select {
 .convert-note.bad { color: var(--danger); }
 
 .foot { border-top: 1px solid var(--border); padding: 1rem 1.4rem; color: var(--muted); font-size: 0.82rem; text-align: center; }
+
+/* ---------------------------------------------------------------------- *
+ * Authoring pane (Builder.vue)
+ * ---------------------------------------------------------------------- */
+
+.hero-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  flex-wrap: wrap;
+  margin-top: 1.1rem;
+}
+.hero-actions .or {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.build-tabs {
+  display: flex;
+  gap: 0.4rem;
+  margin-bottom: 1rem;
+}
+.build-tabs button {
+  flex: 1;
+  padding: 0.55rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+.build-tabs button.on {
+  border-color: var(--accent);
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 14%, var(--panel-2));
+}
+
+/* Label / control pairs. Collapses to one column on narrow screens. */
+.form-grid {
+  display: grid;
+  grid-template-columns: 8.5rem minmax(0, 1fr);
+  gap: 0.6rem 0.8rem;
+  align-items: center;
+}
+.form-grid > label {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+.form-grid input,
+.form-grid select {
+  width: 100%;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel-2);
+  color: var(--text);
+  font: inherit;
+}
+.form-grid input:disabled {
+  opacity: 0.5;
+}
+.form-grid .form-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+.form-grid .form-hint code {
+  font-family: var(--mono);
+  font-size: 0.85em;
+}
+.form-grid button {
+  justify-self: start;
+}
+.add-part {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}
+.row-inline {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  flex-wrap: wrap;
+}
+.row-inline input[type='text'],
+.row-inline input:not([type]) {
+  flex: 1 1 8rem;
+}
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+.check input {
+  width: auto;
+}
+
+.part-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+}
+.part-table th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--muted);
+  font-size: 0.82rem;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+.part-table td {
+  padding: 0.4rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+.part-table tr:last-child td {
+  border-bottom: none;
+}
+.part-table tr.on {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.part-table .ent-size {
+  color: var(--muted);
+  white-space: nowrap;
+  text-align: right;
+  font-family: var(--mono);
+  font-size: 0.85em;
+}
+.part-table .ent-actions {
+  text-align: right;
+  white-space: nowrap;
+}
+.part-table .ent-actions button + button {
+  margin-left: 0.35rem;
+}
+.ghost-btn.danger {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
+}
+
+.crumbs {
+  display: flex;
+  align-items: center;
+  gap: 0.2rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.7rem;
+  font-family: var(--mono);
+  font-size: 0.88rem;
+}
+.crumbs .sep {
+  color: var(--muted);
+}
+.crumbs .up {
+  margin-left: auto;
+}
+.crumb {
+  background: none;
+  border: none;
+  padding: 0.1rem 0.2rem;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.crumb:hover {
+  text-decoration: underline;
+}
+
+.edit-bar {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.8rem;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 640px) {
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+  .form-grid > label {
+    margin-bottom: -0.35rem;
+  }
+}

@@ -44,6 +44,56 @@ export class Fstool {
   convert(target) {
     return this.#call('convert', { target })
   }
+
+  // Authoring — build an image instead of reading one. Every workspace
+  // call that changes the layout resolves with the fresh `info()`, so the
+  // caller never has to follow up with a separate query.
+  fsTypes() {
+    return this.#call('fsTypes')
+  }
+  newFilesystem(fsType, size, options = '') {
+    return this.#call('newFilesystem', { fsType, size, options })
+  }
+  newDisk(size, table) {
+    return this.#call('newDisk', { size, table })
+  }
+  editLoaded() {
+    return this.#call('editLoaded')
+  }
+  addPartition({ size = 0, kind, name = '', fsType = '', fsOptions = '' }) {
+    return this.#call('addPartition', { size, kind, name, fsType, fsOptions })
+  }
+  formatPartition(index, fsType, fsOptions = '') {
+    return this.#call('formatPartition', { index, fsType, fsOptions })
+  }
+  openPartition(index) {
+    return this.#call('openPartition', { index })
+  }
+  wsInfo() {
+    return this.#call('wsInfo')
+  }
+  wsList(path) {
+    return this.#call('wsList', { path })
+  }
+  wsRead(path) {
+    return this.#call('wsRead', { path })
+  }
+  // `bytes` is an ArrayBuffer; it is transferred, not copied.
+  wsAddFile(path, bytes) {
+    return this.#call('wsAddFile', { path, bytes }, [bytes])
+  }
+  wsMkdir(path) {
+    return this.#call('wsMkdir', { path })
+  }
+  wsRemove(path) {
+    return this.#call('wsRemove', { path })
+  }
+  wsExport() {
+    return this.#call('wsExport')
+  }
+  wsClose() {
+    return this.#call('wsClose')
+  }
 }
 
 // Shared UI helpers -------------------------------------------------------
@@ -76,6 +126,21 @@ export function baseName(name) {
   return name
     .replace(/\.(gz|xz|zst|zstd|lz4|lzma|lzo|bz2)$/i, '')
     .replace(/\.[^.]+$/, '')
+}
+
+// Parse a size the user typed: a bare byte count, or a number with a
+// KiB/MiB/GiB suffix (`M`, `MB` and `MiB` all mean the same here — binary
+// units, matching the CLI's `--size`). Returns null when unparseable.
+export function parseSize(text) {
+  const m = String(text)
+    .trim()
+    .match(/^(\d+(?:\.\d+)?)\s*([kmgt]?)(?:i?b)?$/i)
+  if (!m) return null
+  const mult = { '': 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3, t: 1024 ** 4 }[
+    m[2].toLowerCase()
+  ]
+  const n = Math.round(parseFloat(m[1]) * mult)
+  return Number.isFinite(n) && n > 0 ? n : null
 }
 
 export function download(bytes, filename) {

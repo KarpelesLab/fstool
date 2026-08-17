@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(memedit)* new in-memory authoring surface: `Workspace` formats a blank
+  filesystem or lays out a partitioned disk (MBR/GPT), takes files and
+  directories, and hands back the image bytes at any point.
+  `creatable_filesystems()` advertises 14 types with their real minimum sizes.
+- *(wasm)* `Workspace` and `creatable_filesystems()` bindings, so the browser
+  build can author images as well as read them.
+- *(web)* "Create a new image" mode: pick a filesystem and size, or build a
+  partitioned disk with a filesystem per partition, then add files, delete
+  them, browse directories, and download the image — repeatedly, while
+  continuing to edit. An uploaded image can also be switched into edit mode.
+
 ### Fixed
 
 - *(ext)* journal recovery now honours revoke records across transactions.

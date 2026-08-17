@@ -29,7 +29,11 @@ fstool repack base.tar patch.tar flat.tar        # OCI-style layer merge with .w
 
 **▶ Live demo: <https://karpeleslab.github.io/fstool/>**
 
-fstool also ships as a static, client-side web app: upload any archive or disk
+fstool also ships as a static, client-side web app. It builds images as well
+as reads them: format a blank filesystem (ext2/3/4, FAT12/16/32, exFAT, NTFS,
+XFS, HFS+, HFS, AFFS, F2FS, GRF), or lay out an MBR/GPT disk with a
+filesystem per partition, add files, and download the image — then keep
+editing and download again. Or upload any archive or disk
 image, browse what's inside, extract individual files, and convert the whole
 thing to another format — **entirely in the browser**, with nothing uploaded.
 It's fstool compiled to WebAssembly, driving the same readers/writers as the
