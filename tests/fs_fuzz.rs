@@ -821,6 +821,27 @@ fn fuzz_f2fs() {
 }
 
 #[test]
+fn fuzz_littlefs() {
+    use fstool::fs::littlefs::{LittleFs, LittleFsFormatOpts};
+    // 4 MiB of 4 KiB blocks. Every mutation rewrites a metadata pair
+    // and (for outlined files) the tail of a CTZ skip-list, so this run
+    // leans hard on the block allocator: a single leaked or
+    // double-allocated block shows up as corruption within a few
+    // iterations.
+    const SIZE: u64 = 4 * 1024 * 1024;
+    let mut dev = MemoryBackend::new(SIZE);
+    let opts = LittleFsFormatOpts::default();
+    let mut fs = LittleFs::format(&mut dev, &opts).expect("format littlefs");
+    fuzz_filesystem(
+        &mut fs,
+        &mut dev,
+        0x11F5_2222_C0DE,
+        FUZZ_ITERS,
+        &Caps::mutable_small(),
+    );
+}
+
+#[test]
 fn fuzz_xfs() {
     use fstool::fs::xfs::{self, FormatOpts};
     // 256 MiB clears xfs::format's minimum AG-size thresholds at all

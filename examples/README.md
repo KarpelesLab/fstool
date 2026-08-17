@@ -15,6 +15,7 @@ point `source` at your own tree to populate the filesystems.
 |------|--------|
 | [`bare-ext4.toml`](bare-ext4.toml) | A single ext4 filesystem, no partition table (the `genext2fs` replacement). |
 | [`bare-fat32.toml`](bare-fat32.toml) | A single FAT32 filesystem, no partition table. |
+| [`bare-littlefs.toml`](bare-littlefs.toml) | A single littlefs image for embedded flash (block / program size tuned to the target part). |
 | [`raspberry-pi.toml`](raspberry-pi.toml) | Raspberry Pi SD card — MBR with a FAT32 boot partition + ext4 root. |
 | [`efi-disk.toml`](efi-disk.toml) | UEFI-bootable GPT disk (also a UEFI USB image) — ESP (FAT32) + ext4 root. |
 | [`bios-legacy-disk.toml`](bios-legacy-disk.toml) | Legacy-BIOS MBR disk — ext2 `/boot` + ext4 root. |

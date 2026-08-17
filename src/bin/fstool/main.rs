@@ -1063,6 +1063,15 @@ fn repack_cmd(
                 // Tar output streams to a file; no pre-sized device, so
                 // the destination size is unused.
                 "tar" => 0,
+                "littlefs" | "lfs" => {
+                    // littlefs reserves nothing up front, so its own size
+                    // plan gives an exact content fit.
+                    let opts = fstool::fs::littlefs::LittleFsFormatOpts::default();
+                    let mut plan = <fstool::fs::littlefs::LittleFs as fstool::fs::FilesystemFactory>
+                        ::size_plan(&opts)
+                        .expect("littlefs has a size plan");
+                    fstool::analyze::plan_size_fs(&mut src_fs, src_dev, plan.as_mut())?
+                }
                 "iso" | "iso9660" => {
                     // ISO writer needs ~32 MiB headroom for a small tree.
                     // Real sizing happens during flush; we just want enough
@@ -1113,6 +1122,12 @@ fn repack_cmd(
                 "zip" | "cpio" | "ar" => {
                     let bytes = sum_source_file_bytes(src_dev, &mut src_fs).unwrap_or(0);
                     bytes.saturating_mul(2).saturating_add(16 * 1024 * 1024)
+                }
+                "littlefs" | "lfs" => {
+                    // File data rounded up to whole blocks, plus room for
+                    // metadata pairs and later edits.
+                    let bytes = sum_source_file_bytes(src_dev, &mut src_fs).unwrap_or(0);
+                    bytes.saturating_mul(2).saturating_add(1024 * 1024)
                 }
                 _ => src_total,
             },
@@ -1240,6 +1255,16 @@ fn repack_cmd(
                 &mut src_fs,
                 src_dev,
                 false,
+            )?,
+            // littlefs has neither symlinks nor device nodes, so the sink
+            // runs lossy: those entries are skipped instead of failing the
+            // whole repack.
+            "littlefs" | "lfs" => repack_via_trait::<fstool::fs::littlefs::LittleFs>(
+                dst_dev.as_mut(),
+                &fstool::fs::littlefs::LittleFsFormatOpts::default(),
+                &mut src_fs,
+                src_dev,
+                true,
             )?,
             "squashfs" => repack_via_trait::<fstool::fs::squashfs::Squashfs>(
                 dst_dev.as_mut(),
@@ -1602,6 +1627,13 @@ fn repack_layered_to_dst(
             &layers,
             false,
         )?,
+        "littlefs" | "lfs" => repack_layered_via_trait::<fstool::fs::littlefs::LittleFs>(
+            dst_dev.as_mut(),
+            &fstool::fs::littlefs::LittleFsFormatOpts::default(),
+            &model,
+            &layers,
+            true,
+        )?,
         "iso" | "iso9660" => {
             let opts = fstool::fs::iso9660::FormatOpts {
                 volume_id: "FSTOOL".into(),
@@ -1844,6 +1876,14 @@ fn repack_tar_stream_to_fs(
             tar_path,
             codec,
             false,
+        )?,
+        // Lossy: littlefs stores neither symlinks nor device nodes.
+        "littlefs" | "lfs" => repack_stream_via_trait::<fstool::fs::littlefs::LittleFs>(
+            dst_dev.as_mut(),
+            &fstool::fs::littlefs::LittleFsFormatOpts::default(),
+            tar_path,
+            codec,
+            true,
         )?,
         "squashfs" => repack_stream_via_trait::<fstool::fs::squashfs::Squashfs>(
             dst_dev.as_mut(),
@@ -2570,6 +2610,46 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             },
             DEFAULT_MIN_SIZE,
         )?,
+        "littlefs" | "lfs" => create_via_factory::<fstool::fs::littlefs::LittleFs>(
+            "littlefs",
+            source.as_ref(),
+            args.output,
+            args.size,
+            opts,
+            is_device,
+            qcow2_cluster_size,
+            fstool::fs::littlefs::LittleFsFormatOpts::default(),
+            |o: &mut fstool::fs::littlefs::LittleFsFormatOpts, m| {
+                if let Some(b) = m.take_u32("block_size")? {
+                    o.block_size = b;
+                }
+                if let Some(b) = m.take_u32("block_count")? {
+                    o.block_count = Some(b);
+                }
+                if let Some(p) = m.take_u32("prog_size")? {
+                    o.prog_size = p;
+                }
+                if let Some(v) = m.take_str("version") {
+                    o.disk_version = match v.trim() {
+                        "2.0" => fstool::fs::littlefs::DISK_VERSION_2_0,
+                        "2.1" => fstool::fs::littlefs::DISK_VERSION_2_1,
+                        other => {
+                            return Err(fstool::Error::InvalidArgument(format!(
+                                "littlefs: unknown disk version {other:?} (use 2.0 or 2.1)"
+                            )));
+                        }
+                    };
+                }
+                if let Some(n) = m.take_u32("name_max")? {
+                    o.name_max = n;
+                }
+                if let Some(n) = m.take_u32("inline_max")? {
+                    o.inline_max = Some(n);
+                }
+                Ok(())
+            },
+            DEFAULT_MIN_SIZE,
+        )?,
         "ntfs" => create_via_factory::<fstool::fs::ntfs::Ntfs>(
             "ntfs",
             source.as_ref(),
@@ -2695,7 +2775,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
         other => {
             return Err(fstool::Error::InvalidArgument(format!(
                 "create: unknown --type {other:?} (try ext4, fat32, exfat, hfs+, ntfs, \
-                 f2fs, squashfs, xfs, iso, grf, apfs, zip, cpio, ar)"
+                 f2fs, littlefs, squashfs, xfs, iso, grf, apfs, zip, cpio, ar)"
             )));
         }
     }
@@ -3480,6 +3560,7 @@ fn print_fs_info(dev: &mut dyn fstool::block::BlockDevice, fs: &mut fstool::insp
         fstool::inspect::AnyFs::HfsPlus(hfs) => print_hfs_plus_info(hfs),
         fstool::inspect::AnyFs::Hfs(hfs) => print_hfs_info(hfs),
         fstool::inspect::AnyFs::Affs(affs) => print_affs_info(affs),
+        fstool::inspect::AnyFs::LittleFs(lfs) => print_littlefs_info(dev, lfs),
         fstool::inspect::AnyFs::Apfs(apfs) => print_apfs_info(apfs),
         fstool::inspect::AnyFs::Ntfs(ntfs) => print_ntfs_info(ntfs),
         fstool::inspect::AnyFs::F2fs(f2) => print_f2fs_info(f2),
@@ -3628,6 +3709,22 @@ fn print_affs_info(affs: &fstool::fs::affs::Affs) {
         if v.intl { "+INTL" } else { "" },
         if v.dircache { "+DC" } else { "" },
     );
+}
+
+fn print_littlefs_info(
+    dev: &mut dyn fstool::block::BlockDevice,
+    lfs: &mut fstool::fs::littlefs::LittleFs,
+) {
+    let (block_size, block_count) = lfs.geometry();
+    let (major, minor) = lfs.version();
+    println!("disk version:      {major}.{minor}");
+    println!("block size:        {block_size}");
+    println!("block count:       {block_count}");
+    println!("inline max:        {}", lfs.inline_max());
+    match lfs.used_blocks(dev) {
+        Ok(used) => println!("blocks used:       {used} / {block_count}"),
+        Err(e) => println!("blocks used:       <unavailable: {e}>"),
+    }
 }
 
 fn print_apfs_info(apfs: &fstool::fs::apfs::Apfs) {

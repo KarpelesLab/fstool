@@ -9,10 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(littlefs)* new backend for the embedded-flash filesystem (`lfs2`, disk
+  versions 2.0 and 2.1): read, write, and in-place edits. Metadata pairs are
+  replayed from their CRC-committed logs (tags, splices, tails, global-state
+  deltas, lfs2.1 forward-CRCs) and written back as compactions; files live
+  inline in metadata or in CTZ skip-lists, which are rebuilt only from the
+  first changed block onwards so a partial write leaves earlier blocks
+  untouched. Block allocation reconstructs the in-use map by traversing the
+  volume, as littlefs itself does. Wired into `create -t littlefs`, the TOML
+  spec (`type = "littlefs"`, with `block_size` / `block_count` / `prog_size` /
+  `version` / `name_max` / `inline_max` options), `repack --fs-type littlefs`,
+  `info`, `add`/`rm`, the in-memory authoring surface, and the browser build.
+  littlefs user attributes surface as `user.littlefs.<type>` extended
+  attributes; the format has no symlinks, device nodes or POSIX metadata, so
+  those are refused rather than faked. Cross-validated in both directions
+  against the reference C implementation via `littlefs-python`, including
+  handing an image back and forth mid-edit.
+
 - *(memedit)* new in-memory authoring surface: `Workspace` formats a blank
   filesystem or lays out a partitioned disk (MBR/GPT), takes files and
   directories, and hands back the image bytes at any point.
-  `creatable_filesystems()` advertises 14 types with their real minimum sizes.
+  `creatable_filesystems()` advertises 15 types with their real minimum sizes.
 - *(wasm)* `Workspace` and `creatable_filesystems()` bindings, so the browser
   build can author images as well as read them.
 - *(web)* "Create a new image" mode: pick a filesystem and size, or build a

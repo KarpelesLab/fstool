@@ -30,6 +30,7 @@ use crate::fs::f2fs::F2fs;
 use crate::fs::fat::Fat32;
 use crate::fs::hfs::Hfs;
 use crate::fs::hfs_plus::HfsPlus;
+use crate::fs::littlefs::LittleFs;
 use crate::fs::ntfs::Ntfs;
 use crate::fs::ramfs::Ramfs;
 use crate::fs::squashfs::Squashfs;
@@ -65,6 +66,8 @@ pub enum FsKind {
     Hfs,
     /// Amiga OFS/FFS (AFFS) — read-only (write lands in later phases).
     Affs,
+    /// littlefs — read + write, including in-place edits.
+    LittleFs,
     /// APFS — read-only, single-leaf-tree case only.
     Apfs,
     /// NTFS — read + write (MFT, attributes, `$DATA` + ADS, indexes,
@@ -154,6 +157,12 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
     // GRF: "Master of Magic\0" at offset 0 (16-byte magic header).
     if &bs[0..16] == b"Master of Magic\0" {
         return Ok(FsKind::Grf);
+    }
+
+    // littlefs: the superblock entry is always the first tag of block 0's
+    // first commit, which puts the magic string at exactly offset 8.
+    if &bs[8..16] == b"littlefs" {
+        return Ok(FsKind::LittleFs);
     }
 
     // Amiga OFS/FFS: boot block "DOS" + a flag byte 0..=7 at offset 0.
@@ -296,6 +305,8 @@ pub enum AnyFs {
     Hfs(Box<Hfs>),
     /// Amiga OFS/FFS (AFFS) — read-only.
     Affs(Box<Affs>),
+    /// littlefs — read + write (metadata pairs + CTZ skip-lists).
+    LittleFs(Box<LittleFs>),
     /// APFS — read-only; single-leaf trees only.
     Apfs(Box<Apfs>),
     /// NTFS — read + write (MFT, attributes, `$DATA` + ADS, indexes).
@@ -351,6 +362,7 @@ impl AnyFs {
             FsKind::HfsPlus => Ok(Self::HfsPlus(Box::new(HfsPlus::open(dev)?))),
             FsKind::Hfs => Ok(Self::Hfs(Box::new(Hfs::open(dev)?))),
             FsKind::Affs => Ok(Self::Affs(Box::new(Affs::open(dev)?))),
+            FsKind::LittleFs => Ok(Self::LittleFs(Box::new(LittleFs::open(dev)?))),
             FsKind::Apfs => Ok(Self::Apfs(Box::new(Apfs::open(dev)?))),
             FsKind::Ntfs => Ok(Self::Ntfs(Box::new(Ntfs::open(dev)?))),
             FsKind::F2fs => Ok(Self::F2fs(Box::new(F2fs::open(dev)?))),
@@ -447,6 +459,7 @@ impl AnyFs {
             Self::HfsPlus(_) => FsKind::HfsPlus,
             Self::Hfs(_) => FsKind::Hfs,
             Self::Affs(_) => FsKind::Affs,
+            Self::LittleFs(_) => FsKind::LittleFs,
             Self::Apfs(_) => FsKind::Apfs,
             Self::Ntfs(_) => FsKind::Ntfs,
             Self::F2fs(_) => FsKind::F2fs,
@@ -474,6 +487,10 @@ impl AnyFs {
             Self::HfsPlus(hfs) => hfs.list_path(dev, path),
             Self::Hfs(hfs) => hfs.list_path(path),
             Self::Affs(affs) => affs.list_path(path),
+            Self::LittleFs(lfs) => {
+                use crate::fs::Filesystem;
+                lfs.list(dev, std::path::Path::new(path))
+            }
             Self::Apfs(apfs) => apfs.list_path(dev, path),
             Self::Ntfs(ntfs) => ntfs.list_path(dev, path),
             Self::F2fs(f2) => f2.list_path(dev, path),
@@ -580,6 +597,11 @@ impl AnyFs {
                 let mut r = affs.open_file_reader(dev, path)?;
                 pump(&mut r, out, &mut buf)
             }
+            Self::LittleFs(lfs) => {
+                use crate::fs::Filesystem;
+                let mut r = lfs.read_file(dev, std::path::Path::new(path))?;
+                pump(&mut r, out, &mut buf)
+            }
             Self::HfsPlus(hfs) => {
                 let mut r = hfs.open_file_reader(dev, path)?;
                 pump(&mut r, out, &mut buf)
@@ -653,6 +675,10 @@ impl AnyFs {
             Self::HfsPlus(hfs) => Ok(Box::new(hfs.open_file_reader(dev, path)?)),
             Self::Hfs(hfs) => Ok(Box::new(hfs.open_file_reader(dev, path)?)),
             Self::Affs(affs) => Ok(Box::new(affs.open_file_reader(dev, path)?)),
+            Self::LittleFs(lfs) => {
+                use crate::fs::Filesystem;
+                lfs.read_file(dev, std::path::Path::new(path))
+            }
             Self::Apfs(apfs) => Ok(Box::new(apfs.open_file_reader(dev, path)?)),
             Self::Ntfs(ntfs) => Ok(Box::new(ntfs.open_file_reader(dev, path)?)),
             Self::F2fs(f2) => Ok(Box::new(f2.open_file_reader(dev, path)?)),
@@ -793,6 +819,7 @@ impl AnyFs {
             Self::HfsPlus(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
             Self::Hfs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
             Self::Affs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            Self::LittleFs(l) => crate::fs::Filesystem::access_mode(l.as_ref()),
             Self::Ntfs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
             Self::F2fs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
             Self::Squashfs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
@@ -814,6 +841,7 @@ impl AnyFs {
             Self::HfsPlus(h) => crate::fs::Filesystem::mutation_capability(h.as_ref()),
             Self::Hfs(h) => crate::fs::Filesystem::mutation_capability(h.as_ref()),
             Self::Affs(a) => crate::fs::Filesystem::mutation_capability(a.as_ref()),
+            Self::LittleFs(l) => crate::fs::Filesystem::mutation_capability(l.as_ref()),
             Self::Ntfs(n) => crate::fs::Filesystem::mutation_capability(n.as_ref()),
             Self::F2fs(fs2) => crate::fs::Filesystem::mutation_capability(fs2.as_ref()),
             Self::Squashfs(sq) => crate::fs::Filesystem::mutation_capability(sq.as_ref()),
@@ -842,6 +870,7 @@ impl AnyFs {
             Self::HfsPlus(h) => crate::fs::Filesystem::clone_capability(h.as_ref()),
             Self::Hfs(h) => crate::fs::Filesystem::clone_capability(h.as_ref()),
             Self::Affs(a) => crate::fs::Filesystem::clone_capability(a.as_ref()),
+            Self::LittleFs(l) => crate::fs::Filesystem::clone_capability(l.as_ref()),
             Self::Ntfs(n) => crate::fs::Filesystem::clone_capability(n.as_ref()),
             Self::F2fs(fs2) => crate::fs::Filesystem::clone_capability(fs2.as_ref()),
             Self::Squashfs(sq) => crate::fs::Filesystem::clone_capability(sq.as_ref()),
@@ -924,6 +953,7 @@ impl AnyFs {
             Self::HfsPlus(h) => f(h.as_mut()),
             Self::Hfs(h) => f(h.as_mut()),
             Self::Affs(a) => f(a.as_mut()),
+            Self::LittleFs(l) => f(l.as_mut()),
             Self::Ntfs(n) => f(n.as_mut()),
             Self::F2fs(fs2) => f(fs2.as_mut()),
             Self::Squashfs(sq) => f(sq.as_mut()),
@@ -1009,6 +1039,7 @@ impl AnyFs {
             Self::HfsPlus(_) => "hfs+",
             Self::Hfs(_) => "hfs",
             Self::Affs(_) => "affs",
+            Self::LittleFs(_) => "littlefs",
             Self::Apfs(_) => "apfs",
             Self::Ntfs(_) => "ntfs",
             Self::F2fs(_) => "f2fs",
@@ -1105,6 +1136,7 @@ impl AnyFs {
             Self::HfsPlus(b) => b,
             Self::Hfs(b) => b,
             Self::Affs(b) => b,
+            Self::LittleFs(b) => b,
             Self::Apfs(b) => b,
             Self::Ntfs(b) => b,
             Self::F2fs(b) => b,

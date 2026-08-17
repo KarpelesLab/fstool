@@ -63,6 +63,16 @@ jobs:
             fi
           done
 
+      # littlefs has no packaged fsck; the reference C implementation is
+      # reached through its Python binding instead (tests/littlefs_external.rs
+      # skips itself when the module is missing).
+      - name: Install littlefs reference implementation
+        run: |
+          python3 -m pip install --user --break-system-packages littlefs-python \
+            || python3 -m pip install --user littlefs-python \
+            || echo "littlefs-python unavailable (littlefs cross-checks will skip)"
+          python3 -c "import littlefs; print('littlefs-python ok')" || true
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
