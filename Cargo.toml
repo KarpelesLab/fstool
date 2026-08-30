@@ -40,7 +40,7 @@ path = "src/bin/fstool/main.rs"
 # per-format feature (`cab`, `amiga-lzx`, `lha`, `arc`, `sit`, `sevenz`,
 # `rar`); each enables only the compcol codecs it can use today and returns a
 # clean `Unsupported` for methods whose codec hasn't landed in compcol yet.
-default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "cab", "amiga-lzx", "lha", "arc", "sit", "sevenz", "rar", "dmg-bzip2", "dmg-lzfse", "dmg-encrypted", "readline"]
+default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "cab", "amiga-lzx", "lha", "arc", "sit", "sevenz", "rar", "dmg-bzip2", "dmg-lzfse", "dmg-encrypted", "luks", "qcow2-crypto", "readline"]
 # Line editing + command history for the interactive `fstool shell` (↑/↓
 # history, Ctrl-A/E, etc.) via `rustyline`. On by default; disable it
 # (`default-features = false`) to drop the dependency — the shell then falls
@@ -99,6 +99,17 @@ dmg-lzfse = ["dep:compcol", "compcol/lzfse"]
 # `purecrypto` crate (AES-CBC, 3DES-EDE3-CBC via Cbc64, HMAC-SHA1, SHA-1,
 # PBKDF2) — pure-Rust, no foreign code. Gated so a slim build can drop it.
 dmg-encrypted = ["dep:purecrypto"]
+# LUKS1 / LUKS2 containers: unlock an existing volume with a passphrase,
+# read and write it in place, and format a fresh one. Served by
+# `purecrypto` (AES/Camellia/ARIA/SM4 in XTS/CBC/CTR/ECB, PBKDF2,
+# Argon2i/id, SHA-1/2, RIPEMD-160, Whirlpool) — pure-Rust, no foreign
+# code. Gated so a slim build can drop it.
+luks = ["dep:purecrypto"]
+# qcow2 encryption — both `crypt_method` values: 1 (the legacy AES-CBC
+# scheme qemu now reads but no longer creates) and 2 (LUKS, whose header
+# is embedded in the image via the crypto-header extension). Builds on
+# the `luks` engine for the sector cipher and keyslot unwrap.
+qcow2-crypto = ["luks"]
 # FUSE adapter: enables the `fstool mount` subcommand which exposes an
 # ext{2,3,4} image as a userspace filesystem via libfuse (Linux) or
 # macFUSE (macOS). Off by default so the core build doesn't need a C
@@ -140,11 +151,13 @@ compcol = { version = "0.6.10", optional = true, default-features = false, featu
 # the `readline` feature; the bin enables it by default. Pure-Rust line editor.
 rustyline = { version = "15", optional = true }
 
-# Encrypted DMG (encrcdsa v2) crypto — `purecrypto`, a pure-Rust no_std
-# toolkit (KarpelesLab, MIT). Opt-in via the `dmg-encrypted` feature; we
-# pull only the symmetric/hash/kdf modules (`kdf` re-enables `hash` +
-# `cipher`), not its TLS/PQC/RSA surface.
-purecrypto = { version = "0.6.14", optional = true, default-features = false, features = ["std", "cipher", "hash", "kdf"] }
+# Crypto for encrypted DMG (encrcdsa v2), LUKS1/LUKS2 and qcow2
+# encryption — `purecrypto`, a pure-Rust no_std toolkit (KarpelesLab,
+# MIT). Opt-in via the `dmg-encrypted` / `luks` / `qcow2-crypto`
+# features; we pull only the symmetric/hash/kdf/rng modules (`kdf`
+# re-enables `hash` + `cipher`), not its TLS/PQC/RSA surface.
+# LUKS formatting draws its salts and master key from `rng` (OsRng).
+purecrypto = { version = "0.6.29", optional = true, default-features = false, features = ["std", "cipher", "hash", "kdf", "rng"] }
 
 # FUSE adapter — Linux uses libfuse, macOS uses macFUSE. Off by default
 # (see the `fuse` feature). `fuser` is the maintained successor to

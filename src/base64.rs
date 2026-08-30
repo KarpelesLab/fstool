@@ -63,7 +63,9 @@ pub fn decode(input: &str) -> Result<Vec<u8>> {
                 }
                 let v = lookup[c as usize];
                 if v == 0xFF {
-                    return Err(crate::Error::InvalidImage(format!("base64: invalid byte {c:#x}")));
+                    return Err(crate::Error::InvalidImage(format!(
+                        "base64: invalid byte {c:#x}"
+                    )));
                 }
                 acc = (acc << 6) | (v as u32);
                 groups += 1;

@@ -34,6 +34,8 @@ pub mod crash_inject;
 pub mod diskcopy;
 pub mod dmg;
 pub mod file;
+#[cfg(feature = "luks")]
+pub mod luks;
 pub mod memory;
 pub mod qcow2;
 pub mod sliced;
@@ -42,6 +44,8 @@ pub use crash_inject::{CrashInject, FailAfter};
 pub use diskcopy::DiskCopy42Backend;
 pub use dmg::DmgBackend;
 pub use file::FileBackend;
+#[cfg(feature = "luks")]
+pub use luks::LuksBackend;
 pub use memory::MemoryBackend;
 pub use qcow2::Qcow2Backend;
 pub use sliced::SlicedBackend;
@@ -266,5 +270,38 @@ pub trait BlockDevice: Read + Write + Seek + Send {
         self.seek(std::io::SeekFrom::Start(offset))?;
         self.write_all(buf)?;
         Ok(())
+    }
+}
+
+/// Forward every method to the boxed device.
+///
+/// `Read`/`Write`/`Seek` already forward through `Box` via the standard
+/// library's blanket impls, but `BlockDevice` is ours, so it needs this
+/// one. It is what lets a wrapper that takes ownership of its parent —
+/// [`luks::LuksBackend`], a qcow2 backing chain — be built over the
+/// `Box<dyn BlockDevice>` that [`open_image`] hands back.
+impl<B: BlockDevice + ?Sized> BlockDevice for Box<B> {
+    fn block_size(&self) -> u32 {
+        (**self).block_size()
+    }
+
+    fn total_size(&self) -> u64 {
+        (**self).total_size()
+    }
+
+    fn zero_range(&mut self, offset: u64, len: u64) -> Result<()> {
+        (**self).zero_range(offset, len)
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        (**self).sync()
+    }
+
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        (**self).read_at(offset, buf)
+    }
+
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
+        (**self).write_at(offset, buf)
     }
 }
