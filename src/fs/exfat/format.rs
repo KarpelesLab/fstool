@@ -300,8 +300,8 @@ pub fn boot_checksum(sectors_0_to_10: &[u8], sector_size: usize) -> u32 {
 /// Fill sector 11 with `checksum` repeated bytes_per_sector/4 times in LE.
 pub fn make_checksum_sector(checksum: u32, sector_size: usize) -> Vec<u8> {
     let mut out = vec![0u8; sector_size];
-    for chunk in out.chunks_exact_mut(4) {
-        chunk.copy_from_slice(&checksum.to_le_bytes());
+    for chunk in out.as_chunks_mut::<4>().0 {
+        *chunk = checksum.to_le_bytes();
     }
     out
 }

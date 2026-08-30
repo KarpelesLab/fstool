@@ -62,8 +62,10 @@ impl Fat {
     /// Decode a byte image of one FAT copy.
     pub fn decode(bytes: &[u8]) -> Self {
         let entries = bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| u32::from_le_bytes(c))
             .collect();
         Self { entries }
     }

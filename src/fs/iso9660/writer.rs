@@ -942,9 +942,8 @@ fn write_padded_ucs2(buf: &mut [u8], ucs: &[u8]) {
     let n = ucs.len().min(buf.len() / 2 * 2);
     buf[..n].copy_from_slice(&ucs[..n]);
     // Pad with 0x00 0x20 (space) in UCS-2 BE.
-    for chunk in buf[n..].chunks_exact_mut(2) {
-        chunk[0] = 0x00;
-        chunk[1] = 0x20;
+    for chunk in buf[n..].as_chunks_mut::<2>().0 {
+        *chunk = [0x00, 0x20];
     }
 }
 

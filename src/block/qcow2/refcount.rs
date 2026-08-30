@@ -89,8 +89,10 @@ impl Refcount {
         file.seek(SeekFrom::Start(header.refcount_table_offset))?;
         file.read_exact(&mut raw)?;
         let table: Vec<u64> = raw
-            .chunks_exact(8)
-            .map(|c| u64::from_be_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|&c| u64::from_be_bytes(c))
             .collect();
         Ok(Self {
             cluster_size,
@@ -168,8 +170,10 @@ impl Refcount {
             let mut raw = vec![0u8; self.cluster_size as usize];
             file.read_exact(&mut raw)?;
             let entries: Vec<u16> = raw
-                .chunks_exact(2)
-                .map(|c| u16::from_be_bytes(c.try_into().unwrap()))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| u16::from_be_bytes(c))
                 .collect();
             // Drop a non-dirty cache entry if we're at the cap.
             if self.block_cache.len() >= self.block_cache_cap

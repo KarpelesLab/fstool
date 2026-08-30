@@ -117,8 +117,8 @@ impl L1L2 {
         let mut raw = vec![0u8; l1_bytes];
         file.read_exact(&mut raw)?;
         let mut l1 = Vec::with_capacity(header.l1_size as usize);
-        for chunk in raw.chunks_exact(8) {
-            l1.push(u64::from_be_bytes(chunk.try_into().unwrap()));
+        for &chunk in raw.as_chunks::<8>().0 {
+            l1.push(u64::from_be_bytes(chunk));
         }
         Ok(Self {
             cluster_size,
@@ -207,8 +207,10 @@ impl L1L2 {
             let mut raw = vec![0u8; self.cluster_size as usize];
             file.read_exact(&mut raw)?;
             let entries: Vec<u64> = raw
-                .chunks_exact(8)
-                .map(|c| u64::from_be_bytes(c.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|&c| u64::from_be_bytes(c))
                 .collect();
             if self.l2_cache.len() >= self.l2_cache_cap {
                 // Drop one entry — pick the first non-dirty to evict.

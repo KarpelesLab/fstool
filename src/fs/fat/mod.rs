@@ -1221,8 +1221,7 @@ impl Fat32 {
         let bytes = self.read_dir_bytes(dev, dir_cluster)?;
         let mut out = Vec::new();
         let mut lfn_run: Vec<dir::LfnFragment> = Vec::new();
-        for chunk in bytes.chunks_exact(dir::ENTRY_SIZE) {
-            let slot: &[u8; dir::ENTRY_SIZE] = chunk.try_into().unwrap();
+        for slot in bytes.as_chunks::<{ dir::ENTRY_SIZE }>().0 {
             match dir::classify_slot(slot) {
                 dir::RawSlot::End => break,
                 dir::RawSlot::Deleted => {

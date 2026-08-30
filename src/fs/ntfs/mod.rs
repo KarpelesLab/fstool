@@ -1555,9 +1555,7 @@ impl<'a> CompressedReader<'a> {
         let real_clusters = self.count_real_clusters_in_cu(base_vcn)?;
         if real_clusters == 0 {
             // All-sparse CU → all zero.
-            for b in &mut self.out_buf {
-                *b = 0;
-            }
+            self.out_buf.fill(0);
         } else if real_clusters == self.cu_clusters {
             // Stored verbatim — concatenate every cluster's bytes.
             for k in 0..self.cu_clusters {

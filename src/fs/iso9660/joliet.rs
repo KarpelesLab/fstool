@@ -11,8 +11,10 @@
 /// Joliet identifiers is also stripped.
 pub fn ucs2_be_to_string(buf: &[u8]) -> String {
     let mut units: Vec<u16> = buf
-        .chunks_exact(2)
-        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&c| u16::from_be_bytes(c))
         .collect();
     // Strip trailing padding (0x0000 or 0x0020 — Joliet uses spaces for
     // volume identifier padding, NULs for name padding).

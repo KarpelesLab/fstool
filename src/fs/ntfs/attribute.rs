@@ -284,8 +284,10 @@ impl<'a> Iterator for AttributeIter<'a> {
 /// unpaired surrogates with U+FFFD.
 pub fn decode_utf16le(b: &[u8]) -> String {
     let units: Vec<u16> = b
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&c| u16::from_le_bytes(c))
         .collect();
     char::decode_utf16(units.iter().copied())
         .map(|r| r.unwrap_or('\u{FFFD}'))
