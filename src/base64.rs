@@ -1,23 +1,19 @@
-//! Minimal base64 decoder used to recover the mish-block payloads
-//! embedded under each `<key>blkx</key>` `<data>` element in the
-//! UDIF resource-fork plist.
+//! Standard-alphabet base64 (RFC 4648) encode + decode.
 //!
-//! Scope is intentionally narrow — DMG plists are produced by
-//! Apple's `hdiutil` and always use the standard alphabet (RFC 4648,
-//! `'+'` / `'/'` / `'='` padding). We accept whitespace anywhere
-//! (CR / LF / TAB / SP) because the plist pretty-prints the base64
-//! payload across many lines, and we reject any other byte.
+//! Two callers today: the UDIF resource-fork plist (`<data>` elements
+//! holding mish blocks) and the LUKS2 JSON metadata (salts, digests and
+//! master-key material are base64 strings). Both use the standard
+//! alphabet with `'='` padding, so one 60-line helper serves them and
+//! pulling in the `base64` crate would be gratuitous.
 //!
-//! Pulling in the `base64` crate just for this hot-path would be
-//! gratuitous: the decoder is ~40 lines of straight-line code and
-//! has no cross-cutting requirements with the rest of the crate.
-//! If we later need base64 elsewhere (qcow2 backing-file URIs, etc.)
-//! this will graduate to a shared helper.
+//! [`decode`] tolerates whitespace anywhere in the input because the
+//! plist serialiser splits long payloads across many indented lines;
+//! anything else outside the alphabet is a hard error. [`encode`] emits
+//! a single unbroken line.
 //!
-//! Cross-check: the `decodes_known_vectors` test below pins us to
-//! the RFC 4648 reference vectors so any drift in alphabet or
-//! padding handling is caught locally — no need to round-trip
-//! through a real DMG fixture for unit-level confidence.
+//! Cross-check: the tests below pin both directions to the RFC 4648 §10
+//! reference vectors, so any drift in alphabet or padding handling is
+//! caught locally.
 
 use crate::Result;
 
@@ -50,7 +46,7 @@ pub fn decode(input: &str) -> Result<Vec<u8>> {
                 pad += 1;
                 if pad > 2 {
                     return Err(crate::Error::InvalidImage(
-                        "dmg: base64 has more than two '=' padding bytes".into(),
+                        "base64: more than two '=' padding bytes".into(),
                     ));
                 }
                 // Padding still contributes a (zero) sextet to the
@@ -62,14 +58,12 @@ pub fn decode(input: &str) -> Result<Vec<u8>> {
             _ => {
                 if pad > 0 {
                     return Err(crate::Error::InvalidImage(
-                        "dmg: base64 has non-padding bytes after '='".into(),
+                        "base64: non-padding bytes after '='".into(),
                     ));
                 }
                 let v = lookup[c as usize];
                 if v == 0xFF {
-                    return Err(crate::Error::InvalidImage(format!(
-                        "dmg: base64 contains invalid byte {c:#x}"
-                    )));
+                    return Err(crate::Error::InvalidImage(format!("base64: invalid byte {c:#x}")));
                 }
                 acc = (acc << 6) | (v as u32);
                 groups += 1;
@@ -86,7 +80,7 @@ pub fn decode(input: &str) -> Result<Vec<u8>> {
 
     if groups != 0 {
         return Err(crate::Error::InvalidImage(
-            "dmg: base64 input length not a multiple of 4 after stripping whitespace".into(),
+            "base64: input length not a multiple of 4 after stripping whitespace".into(),
         ));
     }
 
@@ -96,6 +90,33 @@ pub fn decode(input: &str) -> Result<Vec<u8>> {
         out.pop();
     }
     Ok(out)
+}
+
+/// Encode `bytes` as standard-alphabet base64 with `=` padding, on one
+/// unbroken line. The inverse of [`decode`].
+pub fn encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let (b0, b1, b2) = (
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        );
+        let v = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+        out.push(ALPHABET[((v >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((v >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() >= 2 {
+            ALPHABET[((v >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() == 3 {
+            ALPHABET[(v & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -125,5 +146,26 @@ mod tests {
         assert!(decode("Zm9v!").is_err());
         assert!(decode("Zm===").is_err()); // 3 padding bytes
         assert!(decode("Zm9vA").is_err()); // wrong length
+    }
+
+    #[test]
+    fn encodes_known_vectors() {
+        // Same RFC 4648 §10 vectors, the other way round.
+        assert_eq!(encode(b""), "");
+        assert_eq!(encode(b"f"), "Zg==");
+        assert_eq!(encode(b"fo"), "Zm8=");
+        assert_eq!(encode(b"foo"), "Zm9v");
+        assert_eq!(encode(b"foob"), "Zm9vYg==");
+        assert_eq!(encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn round_trips_every_byte_value() {
+        let all: Vec<u8> = (0..=255u8).collect();
+        for cut in [0usize, 1, 2, 3, 17, 128, 255, 256] {
+            let src = &all[..cut];
+            assert_eq!(decode(&encode(src)).unwrap(), src, "cut={cut}");
+        }
     }
 }

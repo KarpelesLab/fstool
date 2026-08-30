@@ -39,7 +39,6 @@
 //! All offsets and field meanings are public spec; no Apple
 //! source / SDK was consulted.
 
-mod base64;
 mod codec;
 pub mod encrypted;
 mod mish;
@@ -50,6 +49,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::Result;
+use crate::base64;
 use crate::block::BlockDevice;
 
 pub use encrypted::{

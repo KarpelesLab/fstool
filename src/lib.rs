@@ -15,6 +15,7 @@
 //! between formats, and [`memconv`] / [`memedit`] do both in memory.
 
 pub mod analyze;
+pub mod base64;
 pub mod block;
 pub mod compression;
 pub mod concurrent;
