@@ -653,7 +653,7 @@ impl Qcow2Backend {
             refcount_table_cluster * cs,
             refcount_block_cluster * cs,
             &initial,
-        );
+        )?;
         refcount.flush(&mut file)?;
         l1l2.flush(&mut file)?;
 
@@ -1286,10 +1286,11 @@ impl BlockDevice for Qcow2Backend {
         // the FS formatter prefaces format with a full-device zero.
         //
         // Over a backing file that shortcut is wrong: an unallocated
-        // cluster reads *through*, so it has to be marked zero instead.
-        // A whole cluster gets the ZERO flag (no data cluster needed);
-        // a partial one has to be copied up and zeroed in place, since
-        // the flag covers the whole cluster or nothing.
+        // cluster reads *through*, so it has to be shadowed. A whole
+        // cluster takes the v3 ZERO flag, which costs an L2 entry and no
+        // data cluster; a partial one has to be copied up from the base
+        // and zeroed in place, because the flag covers a whole cluster or
+        // nothing.
         let cs = self.cluster_size;
         let zero = [0u8; 4096];
         let mut cur = offset;
@@ -1297,24 +1298,19 @@ impl BlockDevice for Qcow2Backend {
             let in_cluster = cur & (cs - 1);
             let take = (cs - in_cluster).min(end - cur);
             let cluster_start = cur - in_cluster;
-            let whole_cluster = in_cluster == 0 && take == cs;
             let mapping = self.l1l2.map(&mut self.file, cluster_start)?;
-            if whole_cluster {
-                // Flagging beats writing a cluster of zeros whether or not
-                // there is a backing file, and it releases a compressed
-                // cluster's host range on the way through.
-                if !matches!(mapping, Mapping::Zero { .. }) {
-                    self.mark_zero_cluster(cluster_start)?;
-                }
-                cur += take;
-                continue;
-            }
             let phys = match mapping {
+                // Already reads as zeros — the flag says so.
                 Mapping::Zero { .. } => None,
-                Mapping::Unallocated if self.backing.is_some() => {
-                    Some(self.cow_from_backing(cluster_start)?)
+                // No backing file: an unallocated cluster already reads as
+                // zeros, so there is nothing to do and nothing to allocate.
+                Mapping::Unallocated if self.backing.is_none() => None,
+                // Over a backing file it has to be shadowed.
+                Mapping::Unallocated if in_cluster == 0 && take == cs => {
+                    self.mark_zero_cluster(cluster_start)?;
+                    None
                 }
-                Mapping::Unallocated => None,
+                Mapping::Unallocated => Some(self.cow_from_backing(cluster_start)?),
                 Mapping::Normal(phys) => Some(phys),
                 // A compressed cluster carries real data; copy it out to a
                 // plain cluster so we can zero the requested sub-range in place.

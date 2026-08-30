@@ -717,7 +717,7 @@ impl<B: BlockDevice> BlockDevice for LuksBackend<B> {
             return Ok(());
         }
         self.bounds(offset, len)?;
-        let zero = vec![0u8; CHUNK_BYTES as usize];
+        let zero = vec![0u8; len.min(CHUNK_BYTES) as usize];
         let mut written = 0u64;
         while written < len {
             let n = (len - written).min(CHUNK_BYTES) as usize;

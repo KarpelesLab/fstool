@@ -1303,3 +1303,47 @@ fn hosts_a_filesystem_inside_an_encrypted_image() {
     }
     assert_eq!(got, body);
 }
+
+/// Zeroing an *allocated* cluster of an image with no backing file must
+/// really overwrite it on disk, not just flag it — a caller reaching for
+/// `zero_range` on a plain image expects the old bytes gone.
+#[test]
+fn zero_range_overwrites_allocated_clusters_on_disk() {
+    let tmp = NamedTempFile::new().unwrap();
+    {
+        let mut back = Qcow2Backend::create(tmp.path(), 4 * 1024 * 1024, 65536).unwrap();
+        back.write_at(0, b"SENSITIVE-PAYLOAD").unwrap();
+        back.write_at(65536, b"SECOND-CLUSTER").unwrap();
+        back.zero_range(0, 2 * 65536).unwrap();
+        back.sync().unwrap();
+    }
+    let raw = std::fs::read(tmp.path()).unwrap();
+    assert!(
+        !raw.windows(17).any(|w| w == b"SENSITIVE-PAYLOAD"),
+        "zeroed bytes are still on disk"
+    );
+    assert!(
+        !raw.windows(14).any(|w| w == b"SECOND-CLUSTER"),
+        "zeroed bytes are still on disk"
+    );
+}
+
+/// …and zeroing a range that was never allocated must stay sparse: no L2
+/// table, no data cluster, no growth.
+#[test]
+fn zero_range_over_unallocated_clusters_allocates_nothing() {
+    let tmp = NamedTempFile::new().unwrap();
+    let before;
+    {
+        let mut back = Qcow2Backend::create(tmp.path(), 1024 * 1024 * 1024, 65536).unwrap();
+        back.sync().unwrap();
+        before = std::fs::metadata(tmp.path()).unwrap().len();
+        back.zero_range(0, 1024 * 1024 * 1024).unwrap();
+        back.sync().unwrap();
+    }
+    let after = std::fs::metadata(tmp.path()).unwrap().len();
+    assert_eq!(
+        after, before,
+        "zeroing an all-unallocated 1 GiB image grew the file from {before} to {after}"
+    );
+}

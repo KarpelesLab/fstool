@@ -111,18 +111,31 @@ impl Refcount {
     /// `initial_clusters` is the set of physical cluster indices that
     /// should start with refcount=1 — i.e. the header / refcount table /
     /// refcount block / L1 clusters that the new image's layout uses.
+    /// The freshly-created image seeds exactly one refcount block, so the
+    /// whole initial layout has to fit inside it — `cluster_size / 2`
+    /// clusters. Later growth allocates further blocks on demand
+    /// ([`alloc_cluster`](Self::alloc_cluster)), so this bound binds only
+    /// at creation. A layout that overflows it is an error rather than
+    /// an out-of-bounds write.
     pub fn new_fresh(
         cluster_size: u64,
         table_offset: u64,
         first_refcount_block_offset: u64,
         initial_clusters: &[u64],
-    ) -> Self {
+    ) -> Result<Self> {
         let table_capacity = cluster_size / 8;
         let mut table = vec![0u64; table_capacity as usize];
         table[0] = first_refcount_block_offset;
         let entries_per_block = cluster_size / REFCOUNT_ENTRY_BYTES;
         let mut entries = vec![0u16; entries_per_block as usize];
         for &c in initial_clusters {
+            if c >= entries_per_block {
+                return Err(crate::Error::Unsupported(format!(
+                    "qcow2: the image's fixed layout reaches cluster {c}, past the \
+                     {entries_per_block} one refcount block covers at cluster_size \
+                     {cluster_size} — use a larger cluster size"
+                )));
+            }
             entries[c as usize] = 1;
         }
         let mut block_cache = HashMap::new();
@@ -133,7 +146,7 @@ impl Refcount {
                 dirty: true,
             },
         );
-        Self {
+        Ok(Self {
             cluster_size,
             table_offset,
             table_clusters: 1,
@@ -142,7 +155,7 @@ impl Refcount {
             block_cache_cap: 32,
             next_free_hint: initial_clusters.iter().copied().max().unwrap_or(0) + 1,
             table_dirty: true,
-        }
+        })
     }
 
     fn load_block<F: Read + Seek>(
@@ -357,7 +370,7 @@ mod tests {
     fn fresh_state_marks_initial_clusters() {
         // Pretend cluster_size=512 to keep the test tiny; we just check
         // the bookkeeping. Initial clusters [0,1,2,3] are reserved.
-        let r = Refcount::new_fresh(512, 512, 1024, &[0, 1, 2, 3]);
+        let r = Refcount::new_fresh(512, 512, 1024, &[0, 1, 2, 3]).unwrap();
         assert_eq!(r.table[0], 1024);
         let block = r.block_cache.get(&1024).unwrap();
         assert_eq!(block.entries[0], 1);
@@ -370,7 +383,7 @@ mod tests {
 
     #[test]
     fn alloc_picks_first_free_in_existing_block() {
-        let mut r = Refcount::new_fresh(512, 512, 1024, &[0, 1, 2, 3]);
+        let mut r = Refcount::new_fresh(512, 512, 1024, &[0, 1, 2, 3]).unwrap();
         let mut file_len = 4 * 512;
         // No real I/O needed since the block is already in cache.
         let mut buf: Vec<u8> = Vec::new();
@@ -379,5 +392,17 @@ mod tests {
         assert_eq!(c, 4);
         let block = r.block_cache.get(&1024).unwrap();
         assert_eq!(block.entries[4], 1);
+    }
+
+    /// A layout reaching past the single seeded refcount block must be a
+    /// clean error, not an out-of-bounds write.
+    #[test]
+    fn rejects_a_layout_past_the_first_refcount_block() {
+        // cluster_size 512 → one refcount block covers 256 clusters.
+        assert!(Refcount::new_fresh(512, 512, 1024, &[0, 1, 255]).is_ok());
+        let Err(err) = Refcount::new_fresh(512, 512, 1024, &[0, 1, 256]) else {
+            panic!("a layout past the first refcount block should be refused");
+        };
+        assert!(matches!(err, crate::Error::Unsupported(_)), "{err}");
     }
 }
