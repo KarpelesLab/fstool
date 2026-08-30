@@ -73,6 +73,15 @@ pub enum Version {
     V2,
 }
 
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Version::V1 => "LUKS1",
+            Version::V2 => "LUKS2",
+        })
+    }
+}
+
 /// The decoded header, whichever version it turned out to be.
 #[derive(Debug, Clone)]
 pub enum Header {
@@ -898,6 +907,12 @@ mod tests {
         assert!(buf[..512].iter().all(|&b| b == 0xff));
         assert!(buf[512..4608].iter().all(|&b| b == 0));
         assert!(buf[4608..].iter().all(|&b| b == 0xff));
+    }
+
+    #[test]
+    fn version_displays_as_the_format_name() {
+        assert_eq!(Version::V1.to_string(), "LUKS1");
+        assert_eq!(Version::V2.to_string(), "LUKS2");
     }
 
     #[test]

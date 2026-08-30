@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(luks)* new `block::luks` backend for LUKS1 and LUKS2 volumes: unlock with
+  a passphrase (or a master key), read and write the payload in place, and
+  format a fresh volume. Ciphers follow dm-crypt's `cipher-mode-ivgen`
+  spelling — `aes` / `camellia` / `aria` / `sm4` in `xts` / `cbc` / `ctr` /
+  `ecb`, with the `plain`, `plain64`, `plain64be`, `benbi`, `null` and
+  `essiv:<hash>` IV generators — and keyslots derive through Argon2id /
+  Argon2i or PBKDF2. All of it on `purecrypto`, behind the `luks` feature.
+  Volumes we cannot read faithfully (`--integrity`, unmet
+  `config.requirements`, an interrupted online re-encryption) are refused
+  rather than misread. Cross-validated against `cryptsetup` and `qemu-io`.
+- *(qcow2)* backing files: an overlay reads through to its base for every
+  cluster it has not allocated, writes copy the cluster up first, and
+  `create_with_backing` produces overlays `qemu-img check` accepts. The v3
+  ZERO flag is now honoured, so a zeroed range shadows the base instead of
+  letting it show through. Chains nest, and a cycle is refused.
+- *(qcow2)* encryption, both `crypt_method` values: LUKS (a header embedded
+  in the image, which `create_encrypted` also writes) and the legacy AES
+  scheme, which can be opened and rewritten but — as in qemu since 2.9 — not
+  created. Behind the `qcow2-crypto` feature.
+- *(cli)* `--password` / `--password-file` on every command, for LUKS volumes
+  and encrypted qcow2 images; `--encrypt` (with `--encrypt-cipher`,
+  `--encrypt-format`, `--encrypt-key-bytes`, `--encrypt-kdf-iterations`,
+  `--encrypt-kdf-memory`) on the commands that create an image; `--backing`
+  / `--backing-format` for a qcow2 overlay. `fstool info` now leads with what
+  the container is — qcow2 version, cluster size, backing file, encryption
+  method; or the LUKS header's own summary.
+
+### Changed
+
+- *(block)* `open_image` and friends now refuse an encrypted container
+  instead of returning ciphertext a filesystem probe would misreport; the
+  `*_with_password` variants open it. `CreateOpts` grew `encrypt` and
+  `backing` fields (and is no longer `Copy`).
+- *(base64)* the DMG plist decoder graduated to `crate::base64` and grew an
+  `encode` counterpart, for LUKS2's JSON metadata.
+
 ## [0.4.22](https://github.com/KarpelesLab/fstool/compare/v0.4.21...v0.4.22) - 2026-08-17
 
 ### Added

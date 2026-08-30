@@ -101,16 +101,18 @@ means an already-flushed image can be re-opened for `add` / `rm` /
 through a real transaction so a crash mid-write leaves an image the
 host's `fsck` can replay.
 
-`qcow2` and `dmg` are **not** in the table above: they aren't
+`qcow2`, `LUKS` and `dmg` are **not** in the table above: they aren't
 filesystems but *disk-image containers*. They live one layer down, as
 `BlockDevice` backends (see the architecture diagram and "Partitions,
-block devices, qcow2"), presenting a flat byte-addressable device that
+block devices, qcow2, LUKS"), presenting a flat byte-addressable device that
 any of the filesystems above is then laid down *inside* — fstool reads
 and writes through them transparently. qcow2 is read/write (v2 + v3,
 allocate-on-write), including **compressed** clusters — reads zlib and zstd
-transparently (writing to a compressed cluster copies it out to a plain one);
-dmg is read-only (UDIF v4 mish chunks: zero / raw / zlib / ADC / bzip2 /
-LZFSE / LZMA, plus encrypted v2 `encrcdsa`).
+transparently (writing to a compressed cluster copies it out to a plain one)
+— plus **backing files** and **encryption**; LUKS1 / LUKS2 volumes are
+read/write and can be created; dmg is read-only (UDIF v4 mish chunks:
+zero / raw / zlib / ADC / bzip2 / LZFSE / LZMA, plus encrypted v2
+`encrcdsa`).
 
 The reader for each FS streams: file contents are never fully resident in
 memory regardless of size. The writers do the same, two-pass: scan to size
@@ -138,7 +140,13 @@ through xattrs under `user.ntfs.*` and `system.ntfs_security`.
 | `dd`          | Resilient raw block copy (file/device → file/device), `ddrescue`-style: reads in 1 MiB blocks that halve on error down to the source sector and skip unreadable spots. Threaded reader/writer pipeline with a live progress bar (%, ETA, separate read/write speed, buffer occupancy, current block, bytes skipped). Ctrl-C cancels cleanly. |
 
 All commands accept partition-aware `disk.img:N` targets (1-indexed) — see
-"Partitions, block devices, qcow2" below.
+"Partitions, block devices, qcow2, LUKS" below.
+
+Encrypted images — a LUKS volume, or a qcow2 with either `crypt_method` —
+open with `--password` / `--password-file` on any command; commands that
+*create* an image take `--encrypt` to make an encrypted one, and a qcow2
+destination takes `--backing` to make it a thin overlay. See "Encryption"
+and "Backing files" below.
 
 All inspection / modification commands accept a `disk.img:N` (1-indexed)
 target to walk into a partition of a GPT, MBR, or Apple Partition Map disk
@@ -189,7 +197,7 @@ Each backend's `apply_options` validates keys; unknown keys are rejected
 with a clear error citing the FS type. The same options are available
 through the TOML spec — see "[filesystem.options]" below.
 
-## Partitions, block devices, qcow2
+## Partitions, block devices, qcow2, LUKS
 
 - **Partition tables** — MBR (4 primaries) and GPT (128-entry, CRC32 on
   header + entry array, primary + backup, protective MBR). Cross-checked
@@ -211,6 +219,79 @@ through the TOML spec — see "[filesystem.options]" below.
   factories (`block::open_image`, `block::create_image`) auto-dispatch by qcow2
   magic or file extension, so `fstool create -t ext4 src -o out.qcow2` Just
   Works.
+- **LUKS** — `LuksBackend` unlocks a LUKS1 or LUKS2 volume with a passphrase
+  and presents the decrypted payload as an ordinary device, so any filesystem
+  above can live inside one. Read/write in place, and `luks::format` (or
+  `fstool create --encrypt`) writes a fresh volume that `cryptsetup` opens.
+  See "Encryption".
+
+### Backing files
+
+A qcow2 image may name a **backing file**: a base image supplying every
+cluster the overlay has not allocated. `fstool` reads an overlay `qemu-img
+create -b` produced, and creates its own:
+
+```sh
+# A thin ext2 overlay over an existing base; the overlay holds only its deltas.
+fstool create -t ext2 --size 32M -o overlay.qcow2 \
+       --backing base.qcow2 --backing-format qcow2
+```
+
+A relative `--backing` path is resolved against the *overlay's* directory
+when the overlay is opened, so the pair stays movable together. Recording
+`--backing-format` is what stops a raw base that happens to start with
+qcow2 magic from being read as qcow2; without it the format is probed.
+Writes copy the whole cluster up from the base first — a qcow2 cluster
+shadows the base all-or-nothing — and zeroing a range over a base sets the
+v3 ZERO flag rather than leaving the base showing through. Chains nest
+(`MAX_BACKING_DEPTH` = 32) and a cycle is refused rather than followed.
+Cross-checked against `qemu-img check` and `qemu-io` in both directions.
+
+### Encryption
+
+Three encrypted containers are supported, all served by
+[`purecrypto`](https://github.com/KarpelesLab/purecrypto) — pure Rust, no
+foreign code:
+
+| Container | Read | Write | Create |
+|-----------|------|-------|--------|
+| **LUKS1 / LUKS2** | ✅ | ✅ | ✅ |
+| **qcow2 `crypt_method = 2`** (embedded LUKS) | ✅ | ✅ | ✅ |
+| **qcow2 `crypt_method = 1`** (legacy AES) | ✅ | ✅ | ❌ by design |
+| **DMG `encrcdsa` v2** | ✅ | — | — |
+
+```sh
+# Put ext4 inside a fresh LUKS2 volume that `cryptsetup open` will unlock.
+fstool create -t ext4 --size 1G -o secret.img tree/ --encrypt --password-file pw
+
+# …or inside an encrypted qcow2 (a LUKS header embedded in the image, as
+# `qemu-img create -o encrypt.format=luks` produces).
+fstool create -t ext4 --size 1G -o secret.qcow2 tree/ --encrypt --password-file pw
+
+# Every read/inspect/mutate command takes the same passphrase.
+fstool ls   secret.img / --password-file pw
+fstool info secret.img   --password-file pw
+fstool add  secret.img ./new-file /new-file --password-file pw
+```
+
+Ciphers follow dm-crypt's `cipher-mode-ivgen` spelling: `aes`, `camellia`,
+`aria` and `sm4` in `xts` / `cbc` / `ctr` / `ecb`, with the `plain`,
+`plain64`, `plain64be`, `benbi`, `null` and `essiv:<hash>` IV generators.
+`serpent` and `twofish` are recognised only well enough to refuse cleanly.
+Keyslots derive through Argon2id / Argon2i (LUKS2) or PBKDF2 (either);
+`--encrypt-kdf-iterations` and `--encrypt-kdf-memory` tune the cost, which
+is the whole thing standing between a passphrase and a wordlist.
+
+Two limits worth stating plainly. None of these modes **authenticate** —
+a tampered sector decrypts to garbage rather than failing, exactly as
+under dm-crypt — and LUKS `--integrity` volumes, which add a
+`dm-integrity` layer, are refused rather than misread. And an encrypted
+image opened without a passphrase is an error, not a device full of
+ciphertext that a filesystem probe would misreport.
+
+Cross-validated against `cryptsetup` (it recovers the same master key from
+volumes each side wrote) and `qemu-io` / `qemu-img` (plaintext written by
+one implementation reads back through the other).
 
 ## TOML spec
 
@@ -534,6 +615,17 @@ its own Cargo feature flag so you can trim the binary down:
 | lz4   | `lz4`   | SquashFS, `.tar.lz4` |
 | zstd  | `zstd`  | SquashFS, `.tar.zst` |
 | lzo   | `lzo`   | SquashFS, `.tar.lzo` |
+
+Crypto is feature-gated the same way, all three served by `purecrypto`:
+
+| Feature | What it enables |
+|---------|-----------------|
+| `luks` | LUKS1 / LUKS2 volumes: unlock, read/write, format |
+| `qcow2-crypto` | qcow2 encryption, both `crypt_method` values (implies `luks`) |
+| `dmg-encrypted` | Password-protected DMG (`encrcdsa` v2), read-only |
+
+A build without them refuses encrypted containers rather than silently
+handing back ciphertext.
 
 Compressed tar input / output is detected by filename extension (or by
 magic for inputs without a recognisable extension): `fstool ls

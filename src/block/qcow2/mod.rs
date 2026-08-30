@@ -523,7 +523,7 @@ impl Qcow2Backend {
             None => None,
         };
         #[cfg(not(feature = "qcow2-crypto"))]
-        let built_crypto: Option<()> = encrypt;
+        let _built_crypto: Option<()> = encrypt;
 
         #[cfg(feature = "qcow2-crypto")]
         let crypto_clusters = built_crypto
@@ -1044,6 +1044,10 @@ impl Qcow2Backend {
         in_cluster: u64,
         out: &mut [u8],
     ) -> Result<()> {
+        // Only the encrypted path needs to know where the cluster sits in
+        // the guest — the IV generator does.
+        #[cfg(not(feature = "qcow2-crypto"))]
+        let _ = cluster_start;
         #[cfg(feature = "qcow2-crypto")]
         if let Some(crypt) = &self.crypt {
             let ss = crypt.sector_size() as u64;
@@ -1082,6 +1086,8 @@ impl Qcow2Backend {
         in_cluster: u64,
         data: &[u8],
     ) -> Result<()> {
+        #[cfg(not(feature = "qcow2-crypto"))]
+        let _ = cluster_start;
         #[cfg(feature = "qcow2-crypto")]
         if let Some(crypt) = &self.crypt {
             let ss = crypt.sector_size() as u64;

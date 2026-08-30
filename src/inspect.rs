@@ -1160,6 +1160,10 @@ pub struct Target {
     pub path: PathBuf,
     /// `None` → whole disk; `Some(i)` → partition with zero-based index `i`.
     pub partition: Option<usize>,
+    /// Passphrase for an encrypted container (a LUKS volume, an encrypted
+    /// qcow2). Ignored when the image turns out not to be encrypted, so a
+    /// caller holding one may attach it unconditionally.
+    pub password: Option<String>,
 }
 
 impl Target {
@@ -1175,12 +1179,20 @@ impl Target {
             return Self {
                 path: PathBuf::from(head),
                 partition: Some(n - 1),
+                password: None,
             };
         }
         Self {
             path: PathBuf::from(s),
             partition: None,
+            password: None,
         }
+    }
+
+    /// Attach a passphrase for an encrypted container.
+    pub fn with_password(mut self, password: Option<String>) -> Self {
+        self.password = password;
+        self
     }
 }
 
@@ -1304,7 +1316,10 @@ pub fn with_target_device<F, R>(target: &Target, op: F) -> Result<R>
 where
     F: FnOnce(&mut dyn BlockDevice) -> Result<R>,
 {
-    let mut disk = crate::block::open_image_maybe_compressed(&target.path)?;
+    let mut disk = crate::block::open_image_maybe_compressed_with_password(
+        &target.path,
+        target.password.as_deref(),
+    )?;
     match target.partition {
         None => op(disk.as_mut()),
         Some(idx) => {
@@ -1335,7 +1350,10 @@ pub fn with_target_device_read_only<F, R>(target: &Target, op: F) -> Result<R>
 where
     F: FnOnce(&mut dyn BlockDevice) -> Result<R>,
 {
-    let mut disk = crate::block::open_image_maybe_compressed_read_only(&target.path)?;
+    let mut disk = crate::block::open_image_maybe_compressed_read_only_with_password(
+        &target.path,
+        target.password.as_deref(),
+    )?;
     match target.partition {
         None => op(disk.as_mut()),
         Some(idx) => {

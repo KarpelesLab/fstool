@@ -3,8 +3,10 @@
 //! The crate is organised as a stack of three trait-based layers:
 //!
 //! - [`block`] — `BlockDevice`: raw seekable byte storage. Backends include
-//!   on-disk files, in-memory buffers (for tests), and sub-range slices used to
-//!   give each partition an isolated view.
+//!   on-disk files, in-memory buffers (for tests), sub-range slices used to
+//!   give each partition an isolated view, and the disk-image *containers*:
+//!   qcow2 (with backing files and encryption), LUKS1/LUKS2 volumes, and
+//!   read-only DMG.
 //! - [`part`] — `PartitionTable`: MBR, GPT and APM.
 //! - [`fs`] — `Filesystem`: one trait over every backend — ext2/3/4,
 //!   FAT12/16/32, exFAT, XFS, HFS+, HFS, AFFS, APFS, NTFS, F2FS, littlefs,

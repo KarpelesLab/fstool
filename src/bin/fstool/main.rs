@@ -48,6 +48,93 @@ struct Cli {
     )]
     path_style: fstool::path_style::PathStyle,
 
+    /// Passphrase for an encrypted image — a LUKS1/LUKS2 volume, or a
+    /// qcow2 encrypted with either `crypt_method`. Ignored when the
+    /// image is not encrypted.
+    ///
+    /// A passphrase on the command line is visible in `ps` output and in
+    /// your shell history; prefer `--password-file`.
+    #[arg(long = "password", global = true, value_name = "PASSPHRASE")]
+    password: Option<String>,
+
+    /// Read the passphrase from FILE (one line; the trailing newline is
+    /// stripped). `-` reads it from stdin.
+    #[arg(
+        long = "password-file",
+        global = true,
+        value_name = "FILE",
+        conflicts_with = "password"
+    )]
+    password_file: Option<PathBuf>,
+
+    /// Encrypt the image being created. A `.qcow2` destination gets
+    /// qcow2's own LUKS encryption (`crypt_method = 2`); anything else
+    /// becomes a LUKS container with the filesystem inside it, which
+    /// `cryptsetup open` will unlock. Needs a passphrase.
+    #[arg(long = "encrypt", global = true)]
+    encrypt: bool,
+
+    /// Cipher for `--encrypt`, as dm-crypt spells it. Default
+    /// `aes-xts-plain64`.
+    #[arg(
+        long = "encrypt-cipher",
+        global = true,
+        value_name = "SPEC",
+        default_value = "aes-xts-plain64"
+    )]
+    encrypt_cipher: String,
+
+    /// Master-key length in bytes for `--encrypt`. XTS counts both
+    /// halves, so 64 is AES-256 and 32 is AES-128. Default 64.
+    #[arg(long = "encrypt-key-bytes", global = true, value_name = "N")]
+    encrypt_key_bytes: Option<usize>,
+
+    /// LUKS format for `--encrypt` on a non-qcow2 destination: `luks2`
+    /// (default) or `luks1`. A qcow2 destination is always LUKS1 —
+    /// that is the header qemu embeds.
+    #[arg(
+        long = "encrypt-format",
+        global = true,
+        value_name = "FMT",
+        default_value = "luks2"
+    )]
+    encrypt_format: String,
+
+    /// KDF work factor for `--encrypt`: Argon2 passes (LUKS2, default 4)
+    /// or PBKDF2 rounds (LUKS1, default 2000000).
+    ///
+    /// This is what makes guessing the passphrase expensive. Lower it
+    /// only for throwaway images — a fixture, a test — and expect the
+    /// result to be brute-forceable.
+    #[arg(long = "encrypt-kdf-iterations", global = true, value_name = "N")]
+    encrypt_kdf_iterations: Option<u32>,
+
+    /// Argon2 memory cost for `--encrypt`, in MiB. Default 512. Ignored
+    /// for LUKS1, whose PBKDF2 has no memory parameter.
+    ///
+    /// Memory hardness is what Argon2 buys over PBKDF2; it is the
+    /// parameter that makes GPU cracking expensive.
+    #[arg(long = "encrypt-kdf-memory", global = true, value_name = "MIB")]
+    encrypt_kdf_memory: Option<u32>,
+
+    /// Make a new `.qcow2` an overlay that reads through to FILE for
+    /// every cluster it does not hold itself. A relative FILE is
+    /// resolved against the new image's directory when it is opened, so
+    /// the pair stays movable together.
+    #[arg(long = "backing", global = true, value_name = "FILE")]
+    backing: Option<PathBuf>,
+
+    /// Format of `--backing` (`qcow2`, `raw`, …). Recording it is what
+    /// stops a raw base that happens to start with qcow2 magic from
+    /// being read as qcow2; without it the format is probed.
+    #[arg(
+        long = "backing-format",
+        global = true,
+        value_name = "FMT",
+        requires = "backing"
+    )]
+    backing_format: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -395,6 +482,126 @@ enum Command {
     },
 }
 
+/// Settle the passphrase from `--password` / `--password-file`.
+///
+/// `--password-file -` reads stdin. A trailing newline is stripped (a
+/// file written by `echo` or an editor has one); anything else is taken
+/// verbatim, so a passphrase may contain spaces.
+fn resolve_password(
+    inline: Option<&str>,
+    file: Option<&std::path::Path>,
+) -> fstool::Result<Option<String>> {
+    if let Some(p) = inline {
+        return Ok(Some(p.to_owned()));
+    }
+    let Some(file) = file else {
+        return Ok(None);
+    };
+    let raw = if file == std::path::Path::new("-") {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut buf)?;
+        buf
+    } else {
+        std::fs::read_to_string(file)?
+    };
+    Ok(Some(
+        raw.strip_suffix('\n')
+            .map(|s| s.strip_suffix('\r').unwrap_or(s))
+            .unwrap_or(&raw)
+            .to_owned(),
+    ))
+}
+
+/// Turn `--encrypt` and friends into the options `create_image` wants.
+#[cfg(feature = "luks")]
+fn resolve_encrypt(
+    cli: &Cli,
+    password: Option<&str>,
+) -> fstool::Result<Option<fstool::block::EncryptOpts>> {
+    use fstool::block::luks::{FormatOpts, KdfChoice, Version};
+
+    if !cli.encrypt {
+        return Ok(None);
+    }
+    let Some(password) = password else {
+        return Err(fstool::Error::InvalidArgument(
+            "--encrypt needs a passphrase: pass --password or --password-file".into(),
+        ));
+    };
+    let version = match cli.encrypt_format.to_ascii_lowercase().as_str() {
+        "luks2" | "2" => Version::V2,
+        "luks1" | "1" => Version::V1,
+        other => {
+            return Err(fstool::Error::InvalidArgument(format!(
+                "--encrypt-format {other}: expected `luks1` or `luks2`"
+            )));
+        }
+    };
+    // qcow2 embeds a LUKS1 header, so that destination overrides the
+    // choice rather than failing on a default the user never typed.
+    let version = if fstool::block::is_qcow2_path(output_path_of(&cli.command)) {
+        Version::V1
+    } else {
+        version
+    };
+    let mut luks = FormatOpts {
+        version,
+        cipher: cli.encrypt_cipher.clone(),
+        key_bytes: cli.encrypt_key_bytes.unwrap_or(64),
+        ..FormatOpts::default()
+    };
+    luks.kdf = match version {
+        // LUKS1 has no Argon2 keyslots. 2 000 000 rounds of PBKDF2 lands
+        // in the range cryptsetup's own benchmark picks on current
+        // hardware (~1 s); we cannot benchmark, so it is fixed.
+        Version::V1 => KdfChoice::Pbkdf2 {
+            iterations: cli.encrypt_kdf_iterations.unwrap_or(2_000_000),
+        },
+        Version::V2 => KdfChoice::Argon2id {
+            time: cli.encrypt_kdf_iterations.unwrap_or(4),
+            memory_kib: cli
+                .encrypt_kdf_memory
+                .unwrap_or(512)
+                .saturating_mul(1024)
+                .max(8),
+            cpus: 4,
+        },
+    };
+    Ok(Some(fstool::block::EncryptOpts {
+        password: password.to_owned(),
+        luks,
+    }))
+}
+
+#[cfg(not(feature = "luks"))]
+fn resolve_encrypt(
+    cli: &Cli,
+    _password: Option<&str>,
+) -> fstool::Result<Option<fstool::block::EncryptOpts>> {
+    if cli.encrypt {
+        return Err(fstool::Error::Unsupported(
+            "--encrypt needs fstool built with the `luks` feature".into(),
+        ));
+    }
+    Ok(None)
+}
+
+/// The destination path of a command that creates an image, so
+/// `--encrypt` can tell a qcow2 destination from a raw one. Commands
+/// that create nothing return an empty path, which is not a qcow2.
+#[cfg(feature = "luks")]
+fn output_path_of(cmd: &Command) -> &std::path::Path {
+    match cmd {
+        Command::Create { output, .. } | Command::Build { output, .. } => output,
+        Command::Convert { dst, .. } => dst,
+        Command::Repack { paths, .. } => paths
+            .last()
+            .map(std::path::Path::new)
+            .unwrap_or(std::path::Path::new("")),
+        _ => std::path::Path::new(""),
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli) {
@@ -407,6 +614,9 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> fstool::Result<()> {
+    let password = resolve_password(cli.password.as_deref(), cli.password_file.as_deref())?;
+    let encrypt = resolve_encrypt(&cli, password.as_deref())?;
+    let backing = cli.backing.clone().map(|p| (p, cli.backing_format.clone()));
     match cli.command {
         Command::Create {
             fs_type,
@@ -420,6 +630,11 @@ fn run(cli: Cli) -> fstool::Result<()> {
             compress,
         } => {
             let comp = parse_compress(compress.as_deref())?;
+            let create_opts = fstool::block::CreateOpts {
+                cluster_size: parse_cluster_size(&cluster_size)?,
+                encrypt: encrypt.clone(),
+                backing: backing.clone(),
+            };
             create_cmd(CreateArgs {
                 fs_type: &fs_type,
                 src_dir: src_dir.as_deref(),
@@ -427,7 +642,7 @@ fn run(cli: Cli) -> fstool::Result<()> {
                 size: size.as_deref(),
                 label: label.as_deref(),
                 force,
-                cluster_size: &cluster_size,
+                create_opts: &create_opts,
                 options: &options,
             })?;
             if let Some((ctype, level)) = comp {
@@ -439,14 +654,28 @@ fn run(cli: Cli) -> fstool::Result<()> {
             image,
             path,
             recursive,
-        } => ls(&image, &path, recursive, cli.path_style),
-        Command::Cat { image, path, rsrc } => cat(&image, &path, rsrc, cli.path_style),
+        } => ls(
+            &image,
+            &path,
+            recursive,
+            cli.path_style,
+            password.as_deref(),
+        ),
+        Command::Cat { image, path, rsrc } => {
+            cat(&image, &path, rsrc, cli.path_style, password.as_deref())
+        }
         Command::Resources {
             image,
             path,
             extract,
-        } => resources_cmd(&image, &path, extract.as_deref(), cli.path_style),
-        Command::Info { image } => info(&image),
+        } => resources_cmd(
+            &image,
+            &path,
+            extract.as_deref(),
+            cli.path_style,
+            password.as_deref(),
+        ),
+        Command::Info { image } => info(&image, password.as_deref()),
         Command::Analyze {
             source,
             fs_type,
@@ -469,8 +698,14 @@ fn run(cli: Cli) -> fstool::Result<()> {
             image,
             host_src,
             fs_dest,
-        } => add(&image, &host_src, &fs_dest, cli.path_style),
-        Command::Rm { image, fs_path } => rm(&image, &fs_path, cli.path_style),
+        } => add(
+            &image,
+            &host_src,
+            &fs_dest,
+            cli.path_style,
+            password.as_deref(),
+        ),
+        Command::Rm { image, fs_path } => rm(&image, &fs_path, cli.path_style, password.as_deref()),
         Command::Shell {
             image,
             ro,
@@ -484,6 +719,7 @@ fn run(cli: Cli) -> fstool::Result<()> {
             new_ramfs,
             from.as_deref(),
             cli.path_style,
+            password.as_deref(),
         ),
         Command::Convert {
             src,
@@ -493,7 +729,15 @@ fn run(cli: Cli) -> fstool::Result<()> {
             compress,
         } => {
             let comp = parse_compress(compress.as_deref())?;
-            convert_cmd(&src, &dst, size.as_deref(), &cluster_size)?;
+            convert_cmd(
+                &src,
+                &dst,
+                size.as_deref(),
+                &cluster_size,
+                password.as_deref(),
+                encrypt.as_ref(),
+                backing.as_ref(),
+            )?;
             if let Some((ctype, level)) = comp {
                 finalize_compress_qcow2(&dst, ctype, level)?;
             }
@@ -524,6 +768,9 @@ fn run(cli: Cli) -> fstool::Result<()> {
                 fs_type.as_deref(),
                 block_size,
                 &cluster_size,
+                password.as_deref(),
+                encrypt.as_ref(),
+                backing.as_ref(),
             );
             fstool::repack::leave();
             res?;
@@ -820,9 +1067,16 @@ fn convert_cmd(
     dst: &std::path::Path,
     size_arg: Option<&str>,
     cluster_size: &str,
+    password: Option<&str>,
+    encrypt: Option<&fstool::block::EncryptOpts>,
+    backing: Option<&(PathBuf, Option<String>)>,
 ) -> fstool::Result<()> {
-    let cluster_size = parse_cluster_size(cluster_size)?;
-    let mut src_dev = fstool::block::open_image(src)?;
+    let create_opts = fstool::block::CreateOpts {
+        cluster_size: parse_cluster_size(cluster_size)?,
+        encrypt: encrypt.cloned(),
+        backing: backing.cloned(),
+    };
+    let mut src_dev = fstool::block::open_image_with_password(src, password)?;
     let src_size = src_dev.total_size();
     let dst_size = match size_arg {
         None => src_size,
@@ -836,8 +1090,7 @@ fn convert_cmd(
             want
         }
     };
-    let mut dst_dev =
-        fstool::block::create_image(dst, dst_size, &fstool::block::CreateOpts { cluster_size })?;
+    let mut dst_dev = fstool::block::create_image(dst, dst_size, &create_opts)?;
     // 1 MiB copy buffer. Reads from sparse regions return zeros; on the
     // qcow2 side those become unallocated clusters (no on-disk cost).
     let mut buf = vec![0u8; 1024 * 1024];
@@ -870,9 +1123,16 @@ fn repack_cmd(
     fs_type_override: Option<&str>,
     block_size: u32,
     cluster_size: &str,
+    password: Option<&str>,
+    encrypt: Option<&fstool::block::EncryptOpts>,
+    backing: Option<&(PathBuf, Option<String>)>,
 ) -> fstool::Result<()> {
     use fstool::repack::RepackSink;
-    let qcow2_cluster_size = parse_cluster_size(cluster_size)?;
+    let create_opts = &fstool::block::CreateOpts {
+        cluster_size: parse_cluster_size(cluster_size)?,
+        encrypt: encrypt.cloned(),
+        backing: backing.cloned(),
+    };
 
     if srcs.is_empty() {
         return Err(fstool::Error::InvalidArgument(
@@ -888,7 +1148,7 @@ fn repack_cmd(
     if srcs.len() > 1 {
         let layers: Vec<fstool::repack::Source> = srcs
             .iter()
-            .map(|s| fstool::repack::Source::detect(s))
+            .map(|s| Ok(fstool::repack::Source::detect(s)?.with_password(password)))
             .collect::<fstool::Result<_>>()?;
         return repack_layered_to_dst(
             layers,
@@ -897,7 +1157,7 @@ fn repack_cmd(
             shrink,
             fs_type_override,
             block_size,
-            qcow2_cluster_size,
+            create_opts,
         );
     }
 
@@ -980,7 +1240,7 @@ fn repack_cmd(
                 size_arg,
                 shrink,
                 block_size,
-                qcow2_cluster_size,
+                create_opts,
             );
         }
         // All streamable destinations are handled above; nothing falls
@@ -1001,7 +1261,7 @@ fn repack_cmd(
             .unwrap_or(raw);
         fstool::repack::phase(&format!("decompressing {name} ({}) …", algo.name()));
     }
-    let src_target = fstool::inspect::Target::parse(src);
+    let src_target = fstool::inspect::Target::parse(src).with_password(password.map(str::to_owned));
 
     // Open the source once and walk it; the source FS stays open across
     // the destination build so we stream each file straight through
@@ -1170,13 +1430,7 @@ fn repack_cmd(
             "formatting {target_fs_str} destination ({}) …",
             human_size(dst_size)
         ));
-        let mut dst_dev = fstool::block::create_image(
-            dst,
-            dst_size,
-            &fstool::block::CreateOpts {
-                cluster_size: qcow2_cluster_size,
-            },
-        )?;
+        let mut dst_dev = fstool::block::create_image(dst, dst_size, create_opts)?;
         // `Some(len)` for archive writers (zip/cpio/ar) so we truncate
         // the over-provisioned file; `None` for fixed-size FS images.
         let archive_len: Option<u64> = match lower.as_str() {
@@ -1455,7 +1709,7 @@ fn repack_layered_to_dst(
     shrink: bool,
     fs_type_override: Option<&str>,
     block_size: u32,
-    qcow2_cluster_size: u32,
+    create_opts: &fstool::block::CreateOpts,
 ) -> fstool::Result<()> {
     use fstool::merge::MergeModel;
     use fstool::repack::{FsSink, RepackSink, TarStreamSink};
@@ -1535,13 +1789,7 @@ fn repack_layered_to_dst(
     // Totals from the merge model power the copy-phase progress bar.
     let total_entries = analysis.files + analysis.dirs + analysis.symlinks + analysis.devices;
     fstool::repack::set_total(total_entries, analysis.total_file_bytes);
-    let mut dst_dev = fstool::block::create_image(
-        dst,
-        dst_size,
-        &fstool::block::CreateOpts {
-            cluster_size: qcow2_cluster_size,
-        },
-    )?;
+    let mut dst_dev = fstool::block::create_image(dst, dst_size, create_opts)?;
 
     let archive_len: Option<u64> = match lower.as_str() {
         "ext2" | "ext3" | "ext4" => {
@@ -1726,7 +1974,7 @@ fn repack_tar_stream_to_fs(
     size_arg: Option<&str>,
     shrink: bool,
     block_size: u32,
-    qcow2_cluster_size: u32,
+    create_opts: &fstool::block::CreateOpts,
 ) -> fstool::Result<()> {
     use fstool::fs::ext::{Ext, FsKind};
     let _ = shrink; // sizing always uses a pass when no explicit size
@@ -1802,13 +2050,7 @@ fn repack_tar_stream_to_fs(
     // copy phase renders a bar instead of a filename ticker.
     let total_entries = analysis.files + analysis.dirs + analysis.symlinks + analysis.devices;
     fstool::repack::set_total(total_entries, analysis.total_file_bytes);
-    let mut dst_dev = fstool::block::create_image(
-        dst,
-        dst_size,
-        &fstool::block::CreateOpts {
-            cluster_size: qcow2_cluster_size,
-        },
-    )?;
+    let mut dst_dev = fstool::block::create_image(dst, dst_size, create_opts)?;
 
     // `Some(len)` for the deferred archive formats (squashfs/iso/grf) so
     // the over-provisioned backing file is truncated to its real length;
@@ -2307,6 +2549,7 @@ fn shell_cmd(
     new_ramfs: bool,
     from: Option<&str>,
     style: PathStyle,
+    password: Option<&str>,
 ) -> fstool::Result<()> {
     if new_ramfs {
         // An in-memory ramfs: no backing file. Build it (optionally from a
@@ -2331,7 +2574,7 @@ fn shell_cmd(
             "shell: an IMAGE is required (or pass --new-ramfs for an empty in-memory tree)".into(),
         )
     })?;
-    let target = fstool::inspect::Target::parse(image);
+    let target = fstool::inspect::Target::parse(image).with_password(password.map(str::to_owned));
     if ro {
         // Read-only shell: open the underlying file O_RDONLY (any
         // write through the BlockDevice fails with PermissionDenied),
@@ -2414,8 +2657,8 @@ fn run_shell(
     sh.run(dev, stdin.lock(), stdout.lock())
 }
 
-fn rm(image: &str, fs_path: &str, style: PathStyle) -> fstool::Result<()> {
-    let target = fstool::inspect::Target::parse(image);
+fn rm(image: &str, fs_path: &str, style: PathStyle, password: Option<&str>) -> fstool::Result<()> {
+    let target = fstool::inspect::Target::parse(image).with_password(password.map(str::to_owned));
     fstool::inspect::reject_compressed_for_mutation(&target)?;
     fstool::inspect::with_target_device(&target, |dev| {
         let mut fs = fstool::inspect::AnyFs::open_writable(dev)?;
@@ -2433,9 +2676,10 @@ fn add(
     host_src: &std::path::Path,
     fs_dest: &str,
     style: PathStyle,
+    password: Option<&str>,
 ) -> fstool::Result<()> {
     let meta = std::fs::symlink_metadata(host_src)?;
-    let target = fstool::inspect::Target::parse(image);
+    let target = fstool::inspect::Target::parse(image).with_password(password.map(str::to_owned));
     fstool::inspect::reject_compressed_for_mutation(&target)?;
     fstool::inspect::with_target_device(&target, |dev| {
         let mut fs = fstool::inspect::AnyFs::open_writable(dev)?;
@@ -2475,7 +2719,9 @@ struct CreateArgs<'a> {
     size: Option<&'a str>,
     label: Option<&'a str>,
     force: bool,
-    cluster_size: &'a str,
+    /// How to make the destination container: cluster size, and any
+    /// encryption or backing file the caller asked for.
+    create_opts: &'a fstool::block::CreateOpts,
     options: &'a [String],
 }
 
@@ -2489,7 +2735,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
     let fs_type = args.fs_type.to_ascii_lowercase();
     let is_device = is_block_device(args.output);
     require_force_for_device(args.output, is_device, args.force)?;
-    let qcow2_cluster_size = parse_cluster_size(args.cluster_size)?;
+    let create_opts = args.create_opts;
 
     // Build the option bag. `--label` is a shortcut for the standard
     // `volume_label` key so the same flag works for every FS that
@@ -2520,7 +2766,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             args.size,
             opts,
             is_device,
-            qcow2_cluster_size,
+            create_opts,
         )?,
         "fat12" | "fat16" | "fat32" | "vfat" => create_fat(
             &fs_type,
@@ -2529,7 +2775,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             args.size,
             opts,
             is_device,
-            qcow2_cluster_size,
+            create_opts,
         )?,
         "exfat" => create_exfat(
             source.as_ref(),
@@ -2537,7 +2783,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             args.size,
             opts,
             is_device,
-            qcow2_cluster_size,
+            create_opts,
         )?,
         "hfs+" | "hfsplus" => create_via_factory::<fstool::fs::hfs_plus::HfsPlus>(
             "hfs+",
@@ -2546,7 +2792,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             args.size,
             opts,
             is_device,
-            qcow2_cluster_size,
+            create_opts,
             fstool::fs::hfs_plus::FormatOpts::default(),
             |o, m| o.apply_options(m),
             DEFAULT_MIN_SIZE,
@@ -2558,7 +2804,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             args.size,
             opts,
             is_device,
-            qcow2_cluster_size,
+            create_opts,
             fstool::fs::hfs::HfsFormatOpts::default(),
             |o: &mut fstool::fs::hfs::HfsFormatOpts, m| {
                 if let Some(s) = m.take_str("volume_label") {
@@ -2578,7 +2824,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             args.size,
             opts,
             is_device,
-            qcow2_cluster_size,
+            create_opts,
             {
                 let mut o = fstool::fs::affs::AffsFormatOpts::default();
                 match fs_type.to_ascii_lowercase().as_str() {
@@ -2617,7 +2863,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             args.size,
             opts,
             is_device,
-            qcow2_cluster_size,
+            create_opts,
             fstool::fs::littlefs::LittleFsFormatOpts::default(),
             |o: &mut fstool::fs::littlefs::LittleFsFormatOpts, m| {
                 if let Some(b) = m.take_u32("block_size")? {
@@ -2657,7 +2903,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             args.size,
             opts,
             is_device,
-            qcow2_cluster_size,
+            create_opts,
             fstool::fs::ntfs::format::FormatOpts::default(),
             |o, m| o.apply_options(m),
             4 * 1024 * 1024,
@@ -2669,7 +2915,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             args.size,
             opts,
             is_device,
-            qcow2_cluster_size,
+            create_opts,
             fstool::fs::f2fs::FormatOpts::default(),
             |o, m| o.apply_options(m),
             // The analytic size plan enforces F2FS's real 6-main-segment floor
@@ -2683,7 +2929,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             args.size,
             opts,
             is_device,
-            qcow2_cluster_size,
+            create_opts,
             fstool::fs::squashfs::FormatOpts::default(),
             |o, m| o.apply_options(m),
             DEFAULT_MIN_SIZE,
@@ -2695,7 +2941,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             args.size,
             opts,
             is_device,
-            qcow2_cluster_size,
+            create_opts,
             fstool::fs::xfs::format::FormatOpts::default(),
             |o, m| o.apply_options(m),
             16 * 1024 * 1024,
@@ -2707,7 +2953,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             args.size,
             opts,
             is_device,
-            qcow2_cluster_size,
+            create_opts,
             fstool::fs::iso9660::FormatOpts::default(),
             |o, m| o.apply_options(m),
             DEFAULT_MIN_SIZE,
@@ -2719,7 +2965,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             args.size,
             opts,
             is_device,
-            qcow2_cluster_size,
+            create_opts,
             fstool::fs::grf::FormatOpts::default(),
             |o, m| o.apply_options(m),
             DEFAULT_MIN_SIZE,
@@ -2731,7 +2977,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             args.size,
             opts,
             is_device,
-            qcow2_cluster_size,
+            create_opts,
             fstool::fs::apfs::ApfsFormatOpts::default(),
             |o, m| o.apply_options(m),
             DEFAULT_MIN_SIZE,
@@ -2743,7 +2989,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             args.size,
             opts,
             is_device,
-            qcow2_cluster_size,
+            create_opts,
             fstool::fs::archive::zip::ZipFormatOpts::default(),
             |o, m| o.apply_options(m),
             DEFAULT_MIN_SIZE,
@@ -2755,7 +3001,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             args.size,
             opts,
             is_device,
-            qcow2_cluster_size,
+            create_opts,
             fstool::fs::archive::cpio::CpioFormatOpts,
             |o, m| o.apply_options(m),
             DEFAULT_MIN_SIZE,
@@ -2767,7 +3013,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             args.size,
             opts,
             is_device,
-            qcow2_cluster_size,
+            create_opts,
             fstool::fs::archive::ar::ArFormatOpts,
             |o, m| o.apply_options(m),
             DEFAULT_MIN_SIZE,
@@ -2797,7 +3043,7 @@ fn create_ext(
     size_arg: Option<&str>,
     mut bag: OptionMap,
     is_device: bool,
-    qcow2_cluster_size: u32,
+    create_opts: &fstool::block::CreateOpts,
 ) -> fstool::Result<()> {
     use fstool::fs::ext::BuildPlan;
 
@@ -2834,13 +3080,7 @@ fn create_ext(
         Some(s) => fstool::spec::parse_size(s)?,
         None => plan_size,
     };
-    let mut dev = fstool::block::create_image(
-        output,
-        want_size,
-        &fstool::block::CreateOpts {
-            cluster_size: qcow2_cluster_size,
-        },
-    )?;
+    let mut dev = fstool::block::create_image(output, want_size, create_opts)?;
     let actual_size = dev.total_size();
     if actual_size > plan_size {
         // Grow the FS to fill the device (block-device or larger
@@ -2888,7 +3128,7 @@ fn create_fat(
     size_arg: Option<&str>,
     mut bag: OptionMap,
     is_device: bool,
-    qcow2_cluster_size: u32,
+    create_opts: &fstool::block::CreateOpts,
 ) -> fstool::Result<()> {
     use fstool::fs::fat::Fat32;
 
@@ -2934,13 +3174,7 @@ fn create_fat(
             "create: {name} device size doesn't fit in a u32 sector count"
         ))
     })?;
-    let mut dev = fstool::block::create_image(
-        output,
-        bytes,
-        &fstool::block::CreateOpts {
-            cluster_size: qcow2_cluster_size,
-        },
-    )?;
+    let mut dev = fstool::block::create_image(output, bytes, create_opts)?;
     fat_opts.total_sectors = total_sectors;
     let mut fat = Fat32::format(dev.as_mut(), &fat_opts)?;
     if let Some(src) = source {
@@ -2966,7 +3200,7 @@ fn create_exfat(
     size_arg: Option<&str>,
     mut bag: OptionMap,
     is_device: bool,
-    qcow2_cluster_size: u32,
+    create_opts: &fstool::block::CreateOpts,
 ) -> fstool::Result<()> {
     use fstool::fs::exfat::{Exfat, FormatOpts as ExFormat};
 
@@ -2975,13 +3209,7 @@ fn create_exfat(
     bag.check_empty("exfat")?;
 
     let bytes = resolve_size_for_dev(output, size_arg, is_device, 16 * 1024 * 1024)?;
-    let mut dev = fstool::block::create_image(
-        output,
-        bytes,
-        &fstool::block::CreateOpts {
-            cluster_size: qcow2_cluster_size,
-        },
-    )?;
+    let mut dev = fstool::block::create_image(output, bytes, create_opts)?;
     let mut exfat = Exfat::format(dev.as_mut(), &format_opts)?;
     if let Some(src) = source {
         fstool::repack::populate_fs_from_source_dyn(dev.as_mut(), &mut exfat, src)?;
@@ -3008,7 +3236,7 @@ fn create_via_factory<F>(
     size_arg: Option<&str>,
     mut bag: OptionMap,
     is_device: bool,
-    qcow2_cluster_size: u32,
+    create_opts: &fstool::block::CreateOpts,
     mut format_opts: F::FormatOpts,
     apply: impl FnOnce(&mut F::FormatOpts, &mut OptionMap) -> fstool::Result<()>,
     default_min_size: u64,
@@ -3061,13 +3289,7 @@ where
         Some(b) => b,
         None => resolve_size_for_dev(output, size_arg, is_device, default_min_size)?,
     };
-    let mut dev = fstool::block::create_image(
-        output,
-        bytes,
-        &fstool::block::CreateOpts {
-            cluster_size: qcow2_cluster_size,
-        },
-    )?;
+    let mut dev = fstool::block::create_image(output, bytes, create_opts)?;
     let mut fs = F::format(dev.as_mut(), &format_opts)?;
     if let Some(src) = source {
         fstool::repack::populate_fs_from_source(dev.as_mut(), &mut fs, src)?;
@@ -3182,14 +3404,20 @@ fn require_force_for_device(
     Ok(())
 }
 
-fn ls(image: &str, path: &str, recursive: bool, style: PathStyle) -> fstool::Result<()> {
+fn ls(
+    image: &str,
+    path: &str,
+    recursive: bool,
+    style: PathStyle,
+    password: Option<&str>,
+) -> fstool::Result<()> {
     // Compressed-tar archives stream-walk per invocation; bypass the
     // tempfile-spooling BlockDevice path entirely. Tar's separator is `/`, so
     // path-style is a no-op there — pass the path through unchanged.
     if let Some(algo) = tar_input_codec(image) {
         return ls_tar_stream(image, path, Some(algo), recursive);
     }
-    let target = fstool::inspect::Target::parse(image);
+    let target = fstool::inspect::Target::parse(image).with_password(password.map(str::to_owned));
     fstool::inspect::with_target_device(&target, |dev| {
         let mut fs = fstool::inspect::AnyFs::open(dev)?;
         let kind = fs.kind();
@@ -3274,7 +3502,13 @@ fn join_image_path(dir: &str, name: &str) -> String {
     }
 }
 
-fn cat(image: &str, path: &str, rsrc: bool, style: PathStyle) -> fstool::Result<()> {
+fn cat(
+    image: &str,
+    path: &str,
+    rsrc: bool,
+    style: PathStyle,
+    password: Option<&str>,
+) -> fstool::Result<()> {
     if let Some(algo) = tar_input_codec(image) {
         if rsrc {
             return Err(fstool::Error::Unsupported(
@@ -3283,7 +3517,7 @@ fn cat(image: &str, path: &str, rsrc: bool, style: PathStyle) -> fstool::Result<
         }
         return cat_tar_stream(image, path, Some(algo));
     }
-    let target = fstool::inspect::Target::parse(image);
+    let target = fstool::inspect::Target::parse(image).with_password(password.map(str::to_owned));
     fstool::inspect::with_target_device(&target, |dev| {
         let mut fs = fstool::inspect::AnyFs::open(dev)?;
         let cpath = path_style::to_canonical(path, fs.kind(), style);
@@ -3305,9 +3539,10 @@ fn resources_cmd(
     path: &str,
     extract: Option<&str>,
     style: PathStyle,
+    password: Option<&str>,
 ) -> fstool::Result<()> {
     use fstool::resfork::ResourceFork;
-    let target = fstool::inspect::Target::parse(image);
+    let target = fstool::inspect::Target::parse(image).with_password(password.map(str::to_owned));
     fstool::inspect::with_target_device(&target, |dev| {
         let mut fs = fstool::inspect::AnyFs::open(dev)?;
         let cpath = path_style::to_canonical(path, fs.kind(), style);
@@ -3434,16 +3669,17 @@ fn analyze_cmd(
     Ok(())
 }
 
-fn info(image: &str) -> fstool::Result<()> {
+fn info(image: &str, password: Option<&str>) -> fstool::Result<()> {
     if let Some(algo) = tar_input_codec(image) {
         return info_tar_stream(image, Some(algo));
     }
-    let target = fstool::inspect::Target::parse(image);
+    let target = fstool::inspect::Target::parse(image).with_password(password.map(str::to_owned));
+    print_container_info(&target.path, password);
     // If the user gave a bare `disk.img` and it carries a partition
     // table, print the table instead of trying to open it as a single
     // filesystem (which would fail).
     if target.partition.is_none() {
-        let mut disk = fstool::block::open_image(&target.path)?;
+        let mut disk = fstool::block::open_image_with_password(&target.path, password)?;
         if let Some(table) = fstool::inspect::detect_partition_table(disk.as_mut())? {
             print_partition_table(&target.path, disk.total_size(), &table);
             return Ok(());
@@ -3459,6 +3695,71 @@ fn info(image: &str) -> fstool::Result<()> {
         print_fs_info(dev, &mut fs);
         Ok(())
     })
+}
+
+/// Print what the *container* is, before anything about the filesystem
+/// inside it: the qcow2 facts `qemu-img info` would show, or the LUKS
+/// header's own summary. Silent for a plain raw image, and never fatal —
+/// this is a courtesy line, so a container we cannot describe just
+/// doesn't get one and the filesystem summary carries on.
+fn print_container_info(path: &std::path::Path, password: Option<&str>) {
+    if fstool::block::Qcow2Backend::probe(path).unwrap_or(false) {
+        let opened = match password {
+            #[cfg(feature = "qcow2-crypto")]
+            Some(pw) => fstool::block::Qcow2Backend::open_encrypted_read_only(path, pw),
+            #[cfg(not(feature = "qcow2-crypto"))]
+            Some(_) => fstool::block::Qcow2Backend::open_read_only(path),
+            None => fstool::block::Qcow2Backend::open_read_only(path),
+        };
+        let Ok(q) = opened else { return };
+        let h = q.header();
+        println!("container:         qcow2 v{}", h.version);
+        println!("virtual size:      {} bytes", h.size);
+        println!("cluster size:      {} bytes", h.cluster_size());
+        if let Some(name) = q.backing_file() {
+            match q.backing_format() {
+                Some(fmt) => println!("backing file:      {name} (format {fmt})"),
+                None => println!("backing file:      {name}"),
+            }
+        }
+        match h.crypt_method {
+            0 => {}
+            1 => println!("encryption:        AES (legacy; the key is the passphrase)"),
+            2 => println!("encryption:        LUKS"),
+            other => println!("encryption:        unknown method {other}"),
+        }
+        println!();
+        return;
+    }
+
+    #[cfg(feature = "luks")]
+    {
+        let Ok(mut file) = fstool::block::FileBackend::open_read_only(path) else {
+            return;
+        };
+        let Some(version) = fstool::block::luks::probe(&mut file) else {
+            return;
+        };
+        println!("container:         {version}");
+        let Some(pw) = password else {
+            println!("                   (pass --password to see inside)");
+            println!();
+            return;
+        };
+        match fstool::block::luks::LuksBackend::open_read_only(file, pw) {
+            Ok(vol) => {
+                println!("uuid:              {}", vol.header().uuid());
+                if let Ok(c) = vol.header().cipher_spec_string() {
+                    println!("cipher:            {c}");
+                }
+                println!("payload offset:    {} bytes", vol.payload_offset());
+                println!("payload size:      {} bytes", vol.total_size());
+                println!("sector size:       {} bytes", vol.block_size());
+            }
+            Err(e) => println!("                   (locked: {e})"),
+        }
+        println!();
+    }
 }
 
 fn print_partition_table(

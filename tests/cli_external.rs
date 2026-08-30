@@ -2207,3 +2207,268 @@ fn cli_shell_chmod_across_backends() {
         assert_eq!(mode_of(img.path()), "644", "{ty}: chmod 644 not reflected");
     }
 }
+
+// ------------------------------------- encrypted images and overlays
+
+/// Run `fstool` with `args`, asserting it succeeded.
+fn fstool(args: &[&str]) -> String {
+    let out = Command::new(FSTOOL)
+        .args(args)
+        .output()
+        .expect("spawning fstool");
+    assert!(
+        out.status.success(),
+        "fstool {args:?} failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A tiny source tree for the create commands below.
+fn fixture_tree() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("hello.txt"), b"hello encrypted world\n").unwrap();
+    std::fs::write(dir.path().join("sub/nested.txt"), b"nested\n").unwrap();
+    dir
+}
+
+/// `--encrypt-kdf-*` at the floor, so the tests don't spend seconds in a
+/// KDF that is deliberately expensive in real use.
+const CHEAP_KDF: [&str; 4] = ["--encrypt-kdf-iterations", "1", "--encrypt-kdf-memory", "8"];
+
+/// `create --encrypt` on a raw destination makes a LUKS volume that
+/// cryptsetup recognises and that fstool itself can walk back.
+#[test]
+#[cfg(feature = "luks")]
+fn cli_creates_a_luks_volume() {
+    let tree = fixture_tree();
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("secret.img");
+    let img_s = img.to_str().unwrap();
+
+    let mut args = vec![
+        "create",
+        "-t",
+        "ext4",
+        "--size",
+        "16M",
+        "-o",
+        img_s,
+        tree.path().to_str().unwrap(),
+        "--encrypt",
+        "--password",
+        "hunter2",
+    ];
+    args.extend_from_slice(&CHEAP_KDF);
+    fstool(&args);
+
+    // Without a passphrase, opening must fail — and say why.
+    let out = Command::new(FSTOOL)
+        .args(["ls", img_s, "/"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("LUKS"), "unhelpful error: {err}");
+
+    // With one, the filesystem is right there.
+    let listing = fstool(&["ls", img_s, "/", "--password", "hunter2"]);
+    assert!(listing.contains("hello.txt"), "{listing}");
+    let body = fstool(&["cat", img_s, "/hello.txt", "--password", "hunter2"]);
+    assert_eq!(body, "hello encrypted world\n");
+
+    // `info` leads with the container.
+    let info = fstool(&["info", img_s, "--password", "hunter2"]);
+    assert!(info.contains("LUKS2"), "{info}");
+    assert!(info.contains("aes-xts-plain64"), "{info}");
+
+    if which("cryptsetup") {
+        let dump = Command::new("cryptsetup")
+            .arg("luksDump")
+            .arg(&img)
+            .output()
+            .unwrap();
+        assert!(
+            dump.status.success(),
+            "cryptsetup rejected the header we wrote: {}",
+            String::from_utf8_lossy(&dump.stderr)
+        );
+    }
+}
+
+/// The same, but the destination is a qcow2 — which gets qcow2's own
+/// embedded-LUKS encryption instead.
+#[test]
+#[cfg(feature = "qcow2-crypto")]
+fn cli_creates_an_encrypted_qcow2() {
+    let tree = fixture_tree();
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("secret.qcow2");
+    let img_s = img.to_str().unwrap();
+
+    let mut args = vec![
+        "create",
+        "-t",
+        "ext4",
+        "--size",
+        "16M",
+        "-o",
+        img_s,
+        tree.path().to_str().unwrap(),
+        "--encrypt",
+        "--password",
+        "hunter2",
+    ];
+    args.extend_from_slice(&CHEAP_KDF);
+    fstool(&args);
+
+    let info = fstool(&["info", img_s, "--password", "hunter2"]);
+    assert!(info.contains("qcow2"), "{info}");
+    assert!(info.contains("encryption:"), "{info}");
+    let body = fstool(&["cat", img_s, "/hello.txt", "--password", "hunter2"]);
+    assert_eq!(body, "hello encrypted world\n");
+
+    if which("qemu-img") {
+        let check = Command::new("qemu-img")
+            .arg("check")
+            .arg("--object")
+            .arg("secret,id=sec0,data=hunter2")
+            .arg("--image-opts")
+            .arg(format!(
+                "driver=qcow2,file.filename={},encrypt.key-secret=sec0",
+                img.display()
+            ))
+            .output()
+            .unwrap();
+        assert!(
+            check.status.success(),
+            "qemu-img check failed: {}{}",
+            String::from_utf8_lossy(&check.stdout),
+            String::from_utf8_lossy(&check.stderr)
+        );
+    }
+}
+
+/// `--password-file` is the form that keeps the passphrase out of `ps`.
+#[test]
+#[cfg(feature = "luks")]
+fn cli_reads_the_passphrase_from_a_file() {
+    let tree = fixture_tree();
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("pwfile.img");
+    let img_s = img.to_str().unwrap();
+    let pw = dir.path().join("pw.txt");
+    // With a trailing newline, as `echo` would leave it.
+    std::fs::write(&pw, b"from a file\n").unwrap();
+    let pw_s = pw.to_str().unwrap();
+
+    let mut args = vec![
+        "create",
+        "-t",
+        "ext4",
+        "--size",
+        "16M",
+        "-o",
+        img_s,
+        tree.path().to_str().unwrap(),
+        "--encrypt",
+        "--password-file",
+        pw_s,
+    ];
+    args.extend_from_slice(&CHEAP_KDF);
+    fstool(&args);
+
+    // The newline must have been stripped: the inline form has to match.
+    let listing = fstool(&["ls", img_s, "/", "--password", "from a file"]);
+    assert!(listing.contains("hello.txt"), "{listing}");
+    let listing = fstool(&["ls", img_s, "/", "--password-file", pw_s]);
+    assert!(listing.contains("hello.txt"), "{listing}");
+}
+
+/// `create --backing` makes a qcow2 overlay: `info` reports the base, and
+/// the overlay is far smaller than the image it reads through to.
+#[test]
+fn cli_creates_a_qcow2_overlay() {
+    let tree = fixture_tree();
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.qcow2");
+    let overlay = dir.path().join("overlay.qcow2");
+
+    fstool(&[
+        "create",
+        "-t",
+        "ext4",
+        "--size",
+        "32M",
+        "-o",
+        base.to_str().unwrap(),
+        tree.path().to_str().unwrap(),
+    ]);
+    fstool(&[
+        "create",
+        "-t",
+        "ext2",
+        "--size",
+        "32M",
+        "-o",
+        overlay.to_str().unwrap(),
+        "--backing",
+        "base.qcow2",
+        "--backing-format",
+        "qcow2",
+    ]);
+
+    let info = fstool(&["info", overlay.to_str().unwrap()]);
+    assert!(
+        info.contains("backing file:      base.qcow2 (format qcow2)"),
+        "{info}"
+    );
+    // The overlay carries only its own filesystem, not the base's data.
+    let overlay_len = std::fs::metadata(&overlay).unwrap().len();
+    assert!(
+        overlay_len < 4 * 1024 * 1024,
+        "overlay is {overlay_len} bytes — it should hold only its deltas"
+    );
+
+    if which("qemu-img") {
+        let check = Command::new("qemu-img")
+            .arg("check")
+            .arg(&overlay)
+            .output()
+            .unwrap();
+        assert!(
+            check.status.success(),
+            "qemu-img check rejected our overlay: {}{}",
+            String::from_utf8_lossy(&check.stdout),
+            String::from_utf8_lossy(&check.stderr)
+        );
+    }
+}
+
+/// `--encrypt` with no passphrase must be refused up front, not part-way
+/// through writing an image.
+#[test]
+#[cfg(feature = "luks")]
+fn cli_refuses_encrypt_without_a_passphrase() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("nope.img");
+    let out = Command::new(FSTOOL)
+        .args([
+            "create",
+            "-t",
+            "ext4",
+            "--size",
+            "16M",
+            "-o",
+            img.to_str().unwrap(),
+            "--encrypt",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("passphrase"), "unhelpful error: {err}");
+    assert!(!img.exists(), "a rejected create left an image behind");
+}

@@ -197,6 +197,18 @@ impl FormatOpts {
         Ok(())
     }
 
+    /// Byte offset at which [`format`] will place the payload.
+    ///
+    /// A caller sizing a container from the outside — "I need `n` usable
+    /// bytes, how big must the file be?" — adds this to `n`.
+    pub fn payload_offset(&self) -> u64 {
+        let header = match self.version {
+            Version::V1 => v1::KEYSLOT_ALIGN,
+            Version::V2 => 2 * v2::DEFAULT_HDR_BYTES,
+        };
+        self.align_data(header + self.slot_area_bytes() * v1::NUM_KEYS as u64)
+    }
+
     /// Size of one keyslot's material area, rounded to the 4096-byte
     /// keyslot alignment.
     fn slot_area_bytes(&self) -> u64 {
@@ -609,6 +621,24 @@ fn format_v2<B: BlockDevice>(
 mod tests {
     use super::*;
     use crate::block::MemoryBackend;
+
+    /// `payload_offset` must predict exactly where `format` puts the
+    /// payload — a caller sizes its container from that number.
+    #[test]
+    fn payload_offset_predicts_the_real_one() {
+        for version in [Version::V1, Version::V2] {
+            for alignment in [4096u64, 1024 * 1024] {
+                let opts = FormatOpts {
+                    version,
+                    data_alignment: alignment,
+                    ..FormatOpts::fast_for_tests()
+                };
+                let predicted = opts.payload_offset();
+                let vol = format(MemoryBackend::new(predicted + (1 << 20)), "pw", &opts).unwrap();
+                assert_eq!(vol.payload_offset(), predicted, "{version:?} @ {alignment}");
+            }
+        }
+    }
 
     #[test]
     fn refuses_argon2_for_luks1() {

@@ -497,6 +497,21 @@ impl Source {
         }
         Ok(Self::Image(crate::inspect::Target::parse(spec)))
     }
+
+    /// Attach a passphrase to every image this source resolves to, so an
+    /// encrypted container can be repacked. Non-image sources ignore it.
+    pub fn with_password(self, password: Option<&str>) -> Self {
+        match self {
+            Self::Image(t) => Self::Image(t.with_password(password.map(str::to_owned))),
+            Self::Layered(parts) => Self::Layered(
+                parts
+                    .into_iter()
+                    .map(|p| p.with_password(password))
+                    .collect(),
+            ),
+            other => other,
+        }
+    }
 }
 
 fn has_plain_tar_extension(path: &Path) -> bool {
