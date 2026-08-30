@@ -1042,3 +1042,264 @@ fn missing_backing_file_is_reported_clearly() {
     let msg = err.to_string();
     assert!(msg.contains("nope.qcow2"), "unhelpful error: {msg}");
 }
+
+// ------------------------------------------------------------ encryption
+
+/// Run qemu-io against an encrypted qcow2 through qemu's own crypto layer.
+#[cfg(feature = "qcow2-crypto")]
+fn qemu_io_encrypted(
+    path: &std::path::Path,
+    password: &str,
+    cmds: &[&str],
+) -> std::process::Output {
+    let mut cmd = Command::new("qemu-io");
+    cmd.arg("--object")
+        .arg(format!("secret,id=sec0,data={password}"))
+        .arg("--image-opts")
+        .arg(format!(
+            "driver=qcow2,file.filename={},encrypt.key-secret=sec0",
+            path.display()
+        ));
+    for c in cmds {
+        cmd.arg("-c").arg(c);
+    }
+    cmd.output().expect("spawning qemu-io")
+}
+
+/// An image `qemu-img create -o encrypt.format=luks` produced must open
+/// with its passphrase and hand back the plaintext qemu wrote.
+#[test]
+#[cfg(feature = "qcow2-crypto")]
+fn opens_a_qemu_encrypted_luks_image() {
+    if !which("qemu-img") || !which("qemu-io") {
+        eprintln!("skipping: qemu-img / qemu-io not installed");
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let img = dir.path().join("enc.qcow2");
+    let out = Command::new("qemu-img")
+        .arg("create")
+        .arg("--object")
+        .arg("secret,id=sec0,data=hunter2")
+        .args([
+            "-f",
+            "qcow2",
+            "-o",
+            "encrypt.format=luks,encrypt.key-secret=sec0,encrypt.iter-time=10",
+        ])
+        .arg(&img)
+        .arg("16M")
+        .output()
+        .unwrap();
+    if !out.status.success() {
+        eprintln!(
+            "skipping: this qemu-img cannot create encrypted qcow2: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+    let w = qemu_io_encrypted(
+        &img,
+        "hunter2",
+        &["write -P 0x77 0 65536", "write -P 0x88 1048576 4096"],
+    );
+    assert!(
+        w.status.success(),
+        "qemu-io write failed: {}",
+        String::from_utf8_lossy(&w.stderr)
+    );
+
+    let mut back = Qcow2Backend::open_encrypted(&img, "hunter2").unwrap();
+    assert_eq!(back.total_size(), 16 * 1024 * 1024);
+    let mut buf = [0u8; 32];
+    back.read_at(0, &mut buf).unwrap();
+    assert!(buf.iter().all(|&b| b == 0x77), "first pattern wrong");
+    // Mid-cluster, to exercise the sector-aligned widening.
+    back.read_at(32768 + 7, &mut buf).unwrap();
+    assert!(buf.iter().all(|&b| b == 0x77), "unaligned read wrong");
+    back.read_at(1024 * 1024, &mut buf).unwrap();
+    assert!(buf.iter().all(|&b| b == 0x88), "second pattern wrong");
+    // Never-written clusters are unallocated: plaintext zeros.
+    back.read_at(8 * 1024 * 1024, &mut buf).unwrap();
+    assert!(buf.iter().all(|&b| b == 0));
+
+    // A wrong passphrase must be refused, not silently yield garbage.
+    let err = Qcow2Backend::open_encrypted(&img, "wrong").unwrap_err();
+    assert!(matches!(err, fstool::Error::InvalidArgument(_)), "{err}");
+
+    // …and so must opening it with no passphrase at all.
+    let err = Qcow2Backend::open(&img).unwrap_err();
+    assert!(matches!(err, fstool::Error::InvalidArgument(_)), "{err}");
+}
+
+/// An encrypted image *we* create must satisfy `qemu-img check` and read
+/// back correctly through qemu's crypto layer — including an unaligned
+/// write, which exercises the read-modify-write path on a 512-byte unit.
+#[test]
+#[cfg(feature = "qcow2-crypto")]
+fn qemu_reads_an_encrypted_image_we_created() {
+    use fstool::block::luks::{FormatOpts, Version};
+
+    if !which("qemu-img") || !which("qemu-io") {
+        eprintln!("skipping: qemu-img / qemu-io not installed");
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let img = dir.path().join("ours-enc.qcow2");
+    let opts = FormatOpts {
+        version: Version::V1,
+        ..FormatOpts::fast_for_tests()
+    };
+    {
+        let mut back =
+            Qcow2Backend::create_encrypted(&img, 16 * 1024 * 1024, 65536, "s3cret", &opts).unwrap();
+        back.write_at(0, &[0x99u8; 65536]).unwrap();
+        back.write_at(1024 * 1024, &[0xAAu8; 4096]).unwrap();
+        back.write_at(1024 * 1024 + 100, b"unaligned!").unwrap();
+        back.sync().unwrap();
+    }
+
+    let check = Command::new("qemu-img")
+        .arg("check")
+        .arg("--object")
+        .arg("secret,id=sec0,data=s3cret")
+        .arg("--image-opts")
+        .arg(format!(
+            "driver=qcow2,file.filename={},encrypt.key-secret=sec0",
+            img.display()
+        ))
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "qemu-img check failed: {}{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    let r = qemu_io_encrypted(
+        &img,
+        "s3cret",
+        &[
+            "read -P 0x99 0 65536",
+            "read -P 0xAA 1048576 100",
+            "read -v 1048676 10",
+            "read -P 0xAA 1048686 100",
+            "read -P 0x00 8388608 4096",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&r.stdout);
+    assert!(
+        r.status.success(),
+        "qemu-io disagreed with our encrypted image: {stdout}{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    // Match the hex column: qemu-io's ASCII column renders some
+    // printable bytes as `.`, so it is not a reliable needle.
+    assert!(
+        stdout.contains("75 6e 61 6c 69 67 6e 65 64 21"),
+        "the unaligned write did not survive:\n{stdout}"
+    );
+}
+
+/// The legacy `crypt_method = 1` scheme. qemu has refused to *create*
+/// these since 2.9, so the image is built here — a plain image with the
+/// method byte flipped, then written through the AES engine — and qemu
+/// only has to read it.
+#[test]
+#[cfg(feature = "qcow2-crypto")]
+fn qemu_reads_a_legacy_aes_image() {
+    if !which("qemu-io") {
+        eprintln!("skipping: qemu-io not installed");
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let img = dir.path().join("aes.qcow2");
+    Qcow2Backend::create(&img, 16 * 1024 * 1024, 65536).unwrap();
+    {
+        // crypt_method lives at byte 32 of the header.
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        let mut f = std::fs::OpenOptions::new().write(true).open(&img).unwrap();
+        f.seek(SeekFrom::Start(32)).unwrap();
+        f.write_all(&1u32.to_be_bytes()).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    {
+        let mut back = Qcow2Backend::open_encrypted(&img, "hunter2").unwrap();
+        assert_eq!(back.header().crypt_method, 1);
+        back.write_at(0, &[0x5eu8; 65536]).unwrap();
+        back.write_at(1024 * 1024, b"legacy aes payload").unwrap();
+        back.sync().unwrap();
+        // Round-trips through our own reader too.
+        let mut buf = [0u8; 18];
+        back.read_at(1024 * 1024, &mut buf).unwrap();
+        assert_eq!(&buf, b"legacy aes payload");
+    }
+
+    let r = qemu_io_encrypted(
+        &img,
+        "hunter2",
+        &["read -P 0x5e 0 65536", "read -v 1048576 16"],
+    );
+    let stdout = String::from_utf8_lossy(&r.stdout);
+    assert!(
+        r.status.success(),
+        "qemu-io could not read our legacy-AES image: {stdout}{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    assert!(
+        stdout.contains("6c 65 67 61 63 79 20 61 65 73 20 70 61 79 6c 6f"),
+        "qemu did not see our bytes:\n{stdout}"
+    );
+}
+
+/// A filesystem inside an encrypted image, reopened from scratch.
+#[test]
+#[cfg(feature = "qcow2-crypto")]
+fn hosts_a_filesystem_inside_an_encrypted_image() {
+    use fstool::block::luks::{FormatOpts as LuksOpts, Version};
+    use fstool::fs::ext::{Ext, FormatOpts as ExtOpts};
+    use fstool::fs::{FileMeta, FileSource, Filesystem};
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let img = dir.path().join("fs-enc.qcow2");
+    let luks = LuksOpts {
+        version: Version::V1,
+        ..LuksOpts::fast_for_tests()
+    };
+    let body = b"secret payload\n";
+    {
+        let mut dev =
+            Qcow2Backend::create_encrypted(&img, 16 * 1024 * 1024, 65536, "pw", &luks).unwrap();
+        let ext_opts = ExtOpts {
+            blocks_count: (dev.total_size() / 1024) as u32,
+            ..ExtOpts::default()
+        };
+        let mut fs = Ext::format_with(&mut dev, &ext_opts).unwrap();
+        fs.create_file(
+            &mut dev,
+            std::path::Path::new("/secret.txt"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(body.to_vec())),
+                len: body.len() as u64,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+
+    let mut dev = Qcow2Backend::open_encrypted(&img, "pw").unwrap();
+    let mut fs = Ext::open(&mut dev).unwrap();
+    let mut got = Vec::new();
+    {
+        use std::io::Read as _;
+        let mut r = fs
+            .read_file(&mut dev, std::path::Path::new("/secret.txt"))
+            .unwrap();
+        r.read_to_end(&mut got).unwrap();
+    }
+    assert_eq!(got, body);
+}

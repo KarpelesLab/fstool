@@ -307,23 +307,34 @@ pub fn format<B: BlockDevice>(
     }
 }
 
-fn format_v1<B: BlockDevice>(
-    mut dev: B,
+/// A LUKS1 header region built in memory: the phdr, the eight keyslot
+/// areas, and the master key that unlocks it.
+///
+/// [`format_v1`] writes this at offset 0 of a device. qcow2's
+/// `crypt_method = 2` embeds the very same bytes somewhere inside the
+/// image file instead — see [`crate::block::qcow2::crypto`].
+pub struct Luks1Image {
+    /// The whole header region: `4096 + 8 × slot_area` bytes.
+    pub bytes: Vec<u8>,
+    /// The volume's master key.
+    pub master_key: Vec<u8>,
+    /// Value written into the phdr's `payload-offset` field, in sectors.
+    pub payload_offset_sectors: u32,
+}
+
+/// Build a LUKS1 header region protected by `passphrase`.
+///
+/// `payload_offset` is the byte offset the phdr should advertise for the
+/// payload. A standalone volume passes where its payload really starts;
+/// an embedded header (qcow2) passes the region's own length, since the
+/// payload is not laid out after the header at all.
+pub fn build_luks1(
     passphrase: &str,
     opts: &FormatOpts,
+    payload_offset: u64,
     master_key: &[u8],
-) -> Result<LuksBackend<B>> {
+) -> Result<Luks1Image> {
     let slot_area = opts.slot_area_bytes();
-    let keyslots_end = v1::KEYSLOT_ALIGN + slot_area * v1::NUM_KEYS as u64;
-    let payload_offset = opts.align_data(keyslots_end);
-    if payload_offset >= dev.total_size() {
-        return Err(crate::Error::InvalidArgument(format!(
-            "luks1: the header and eight keyslots need {payload_offset} bytes, \
-             but the device is only {} — use a bigger device, fewer stripes, \
-             or a smaller data alignment",
-            dev.total_size()
-        )));
-    }
 
     // Split "aes-xts-plain64" back into the two fields LUKS1 stores.
     let (cipher_name, cipher_mode) = opts.cipher.split_once('-').ok_or_else(|| {
@@ -334,7 +345,11 @@ fn format_v1<B: BlockDevice>(
     })?;
 
     let KdfChoice::Pbkdf2 { iterations } = opts.kdf else {
-        unreachable!("validate() rejects Argon2 for LUKS1");
+        return Err(crate::Error::InvalidArgument(
+            "luks1: the format has no Argon2 keyslots — pick KdfChoice::Pbkdf2, \
+             or format LUKS2"
+                .into(),
+        ));
     };
     // cryptsetup spends a fraction of the keyslot budget on the master-key
     // digest; a tenth, floored at the format's 1000-round minimum.
@@ -372,11 +387,12 @@ fn format_v1<B: BlockDevice>(
     slots[0].iterations = iterations;
     slots[0].salt = slot_salt;
 
+    let payload_offset_sectors = (payload_offset / 512) as u32;
     let header = v1::Header {
         cipher_name: cipher_name.to_string(),
         cipher_mode: cipher_mode.to_string(),
         hash_spec: opts.hash.clone(),
-        payload_offset: (payload_offset / 512) as u32,
+        payload_offset: payload_offset_sectors,
         key_bytes: opts.key_bytes as u32,
         mk_digest,
         mk_digest_salt,
@@ -390,12 +406,39 @@ fn format_v1<B: BlockDevice>(
 
     let material = build_slot_material(opts, passphrase.as_bytes(), &slot_salt, master_key)?;
 
-    // The phdr sits inside the first 4096 bytes; zero the rest of that
-    // block so no stale bytes masquerade as header fields.
-    let mut block = vec![0u8; v1::KEYSLOT_ALIGN as usize];
-    block[..v1::PHDR_BYTES].copy_from_slice(&header.encode());
-    dev.write_at(0, &block)?;
-    dev.write_at(v1::KEYSLOT_ALIGN, &material)?;
+    let mut bytes = vec![0u8; (v1::KEYSLOT_ALIGN + slot_area * v1::NUM_KEYS as u64) as usize];
+    bytes[..v1::PHDR_BYTES].copy_from_slice(&header.encode());
+    let slot0 = v1::KEYSLOT_ALIGN as usize;
+    bytes[slot0..slot0 + material.len()].copy_from_slice(&material);
+    Ok(Luks1Image {
+        bytes,
+        master_key: master_key.to_vec(),
+        payload_offset_sectors,
+    })
+}
+
+fn format_v1<B: BlockDevice>(
+    mut dev: B,
+    passphrase: &str,
+    opts: &FormatOpts,
+    master_key: &[u8],
+) -> Result<LuksBackend<B>> {
+    let slot_area = opts.slot_area_bytes();
+    let keyslots_end = v1::KEYSLOT_ALIGN + slot_area * v1::NUM_KEYS as u64;
+    let payload_offset = opts.align_data(keyslots_end);
+    if payload_offset >= dev.total_size() {
+        return Err(crate::Error::InvalidArgument(format!(
+            "luks1: the header and eight keyslots need {payload_offset} bytes, \
+             but the device is only {} — use a bigger device, fewer stripes, \
+             or a smaller data alignment",
+            dev.total_size()
+        )));
+    }
+
+    let image = build_luks1(passphrase, opts, payload_offset, master_key)?;
+    // Writing the whole region (not just the phdr and slot 0) also clears
+    // any stale keyslot material left by whatever was on the device.
+    dev.write_at(0, &image.bytes)?;
     dev.sync()?;
 
     LuksBackend::open(dev, passphrase)

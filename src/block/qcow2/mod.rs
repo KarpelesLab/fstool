@@ -45,6 +45,8 @@
 //! to not have another writer pointed at the same file.
 
 pub mod compress;
+#[cfg(feature = "qcow2-crypto")]
+pub mod crypto;
 pub mod header;
 pub mod l1l2;
 pub mod refcount;
@@ -97,6 +99,10 @@ pub struct Qcow2Backend {
     /// The backing file's format, from the `BACKING_FORMAT` header
     /// extension. `None` means the header didn't say and we probed.
     backing_format: Option<String>,
+    /// The keyed cipher, for an encrypted image. Cluster data is
+    /// encrypted; metadata never is.
+    #[cfg(feature = "qcow2-crypto")]
+    crypt: Option<crypto::Qcow2Crypt>,
 }
 
 impl std::fmt::Debug for Qcow2Backend {
@@ -118,7 +124,24 @@ impl Qcow2Backend {
     /// A backing file named in the header is resolved relative to this
     /// image's directory and opened read-only.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::open_inner(path.as_ref(), false, 0)
+        Self::open_inner(path.as_ref(), false, 0, None)
+    }
+
+    /// Open an encrypted qcow2 image with `password`.
+    ///
+    /// Works for both `crypt_method` values: the legacy AES scheme
+    /// (`1`), where the password *is* the key, and LUKS (`2`), where it
+    /// unlocks a keyslot in the header embedded in the image. Opening an
+    /// unencrypted image this way is fine — the password is ignored.
+    #[cfg(feature = "qcow2-crypto")]
+    pub fn open_encrypted<P: AsRef<Path>>(path: P, password: &str) -> Result<Self> {
+        Self::open_inner(path.as_ref(), false, 0, Some(password))
+    }
+
+    /// [`open_encrypted`](Self::open_encrypted), read-only.
+    #[cfg(feature = "qcow2-crypto")]
+    pub fn open_encrypted_read_only<P: AsRef<Path>>(path: P, password: &str) -> Result<Self> {
+        Self::open_inner(path.as_ref(), true, 0, Some(password))
     }
 
     /// Open an existing qcow2 file read-only. The backing `File` is
@@ -126,10 +149,15 @@ impl Qcow2Backend {
     /// API would fail at the syscall. The qcow2 read paths
     /// (L1/L2/refcount load, cluster reads) work unchanged.
     pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::open_inner(path.as_ref(), true, 0)
+        Self::open_inner(path.as_ref(), true, 0, None)
     }
 
-    fn open_inner(path: &Path, read_only: bool, depth: usize) -> Result<Self> {
+    fn open_inner(
+        path: &Path,
+        read_only: bool,
+        depth: usize,
+        password: Option<&str>,
+    ) -> Result<Self> {
         if depth > MAX_BACKING_DEPTH {
             return Err(crate::Error::InvalidImage(format!(
                 "qcow2: backing chain deeper than {MAX_BACKING_DEPTH} images \
@@ -162,6 +190,15 @@ impl Qcow2Backend {
             None => None,
         };
 
+        let crypt = Self::key_cipher(&mut file, &header, password)?;
+        if crypt.is_some() && header.compression_type != 0 {
+            return Err(crate::Error::Unsupported(
+                "qcow2: compression and encryption together are not supported \
+                 (qemu refuses to produce that combination either)"
+                    .into(),
+            ));
+        }
+
         let l1l2 = L1L2::load(&mut file, &header)?;
         let refcount = Refcount::load(&mut file, &header)?;
         let file_len = file.metadata()?.len();
@@ -178,7 +215,67 @@ impl Qcow2Backend {
             backing,
             backing_file,
             backing_format,
+            #[cfg(feature = "qcow2-crypto")]
+            crypt,
         })
+    }
+
+    /// Set up the cipher for an encrypted image, or confirm there is
+    /// nothing to set up.
+    ///
+    /// Refusing an encrypted image with no password here — rather than
+    /// handing back a device whose reads are ciphertext — is the point:
+    /// a caller that forgot the password gets a clear error, not garbage
+    /// that a filesystem probe would then misreport.
+    #[cfg(feature = "qcow2-crypto")]
+    fn key_cipher(
+        file: &mut File,
+        header: &Header,
+        password: Option<&str>,
+    ) -> Result<Option<crypto::Qcow2Crypt>> {
+        if header.crypt_method == header::crypt::NONE {
+            return Ok(None);
+        }
+        let Some(password) = password else {
+            return Err(crate::Error::InvalidArgument(format!(
+                "qcow2: image is encrypted (crypt_method {}) — open it with a password",
+                header.crypt_method
+            )));
+        };
+        match header.crypt_method {
+            header::crypt::AES => Ok(Some(crypto::Qcow2Crypt::open_aes(password)?)),
+            header::crypt::LUKS => {
+                let extent = crypto::crypto_header_extent(header)?.ok_or_else(|| {
+                    crate::Error::InvalidImage(
+                        "qcow2: crypt_method says LUKS but no crypto-header extension \
+                         says where the header is"
+                            .into(),
+                    )
+                })?;
+                Ok(Some(crypto::Qcow2Crypt::open_luks(file, extent, password)?))
+            }
+            other => Err(crate::Error::Unsupported(format!(
+                "qcow2: unknown crypt_method {other}"
+            ))),
+        }
+    }
+
+    /// Without the `qcow2-crypto` feature an encrypted image is simply
+    /// refused, rather than opened as if it were plaintext.
+    #[cfg(not(feature = "qcow2-crypto"))]
+    fn key_cipher(
+        _file: &mut File,
+        header: &Header,
+        _password: Option<&str>,
+    ) -> Result<Option<()>> {
+        if header.crypt_method != header::crypt::NONE {
+            return Err(crate::Error::Unsupported(format!(
+                "qcow2: image is encrypted (crypt_method {}) — rebuild fstool with \
+                 the `qcow2-crypto` feature to open it",
+                header.crypt_method
+            )));
+        }
+        Ok(None)
     }
 
     /// Read and decode the header, together with the bytes of the first
@@ -266,7 +363,10 @@ impl Qcow2Backend {
             // An explicit format is authoritative — that is the whole
             // reason the extension exists. A raw backing file that happens
             // to start with qcow2 magic must still be read as raw.
-            Some("qcow2") => Ok(Box::new(Self::open_inner(&path, true, depth + 1)?)),
+            // No password is threaded down the chain: an encrypted
+            // backing file needs its own, and qemu likewise takes a
+            // separate secret per image. It errors clearly if it is one.
+            Some("qcow2") => Ok(Box::new(Self::open_inner(&path, true, depth + 1, None)?)),
             Some("raw") => Ok(Box::new(super::FileBackend::open_read_only(&path)?)),
             Some(other) => Err(crate::Error::Unsupported(format!(
                 "qcow2: backing file `{name}` declares format `{other}`, \
@@ -274,7 +374,9 @@ impl Qcow2Backend {
             ))),
             // No declared format: probe, exactly as qemu does when the
             // extension is absent.
-            None if Self::probe(&path)? => Ok(Box::new(Self::open_inner(&path, true, depth + 1)?)),
+            None if Self::probe(&path)? => {
+                Ok(Box::new(Self::open_inner(&path, true, depth + 1, None)?))
+            }
             None => Ok(super::open_image_read_only(&path)?),
         }
     }
@@ -294,7 +396,7 @@ impl Qcow2Backend {
     /// empty refcount table + refcount block, and an L1 table. All
     /// data clusters are allocate-on-write.
     pub fn create<P: AsRef<Path>>(path: P, virtual_size: u64, cluster_size: u32) -> Result<Self> {
-        Self::create_with_backing(path, virtual_size, cluster_size, None)
+        Self::create_full(path.as_ref(), virtual_size, cluster_size, None, None)
     }
 
     /// Format a fresh qcow2 v3 image that reads through to `backing`.
@@ -316,7 +418,47 @@ impl Qcow2Backend {
         cluster_size: u32,
         backing: Option<(&Path, Option<&str>)>,
     ) -> Result<Self> {
-        let path = path.as_ref();
+        Self::create_full(path.as_ref(), virtual_size, cluster_size, backing, None)
+    }
+
+    /// Format a fresh **encrypted** qcow2 v3 image (`crypt_method = 2`).
+    ///
+    /// A LUKS1 header protecting a fresh random master key with
+    /// `password` is embedded in the image and pointed at by the
+    /// crypto-header extension, and every cluster written from here on is
+    /// encrypted. `opts` tunes the LUKS side — cipher, key length, KDF
+    /// cost; its `version` must be `V1`, which is what qemu embeds.
+    ///
+    /// The legacy AES scheme (`crypt_method = 1`) is deliberately not
+    /// offered: its key is the passphrase itself. Existing images can be
+    /// opened with [`open_encrypted`](Self::open_encrypted); new ones
+    /// should not be made.
+    #[cfg(feature = "qcow2-crypto")]
+    pub fn create_encrypted<P: AsRef<Path>>(
+        path: P,
+        virtual_size: u64,
+        cluster_size: u32,
+        password: &str,
+        opts: &crate::block::luks::FormatOpts,
+    ) -> Result<Self> {
+        Self::create_full(
+            path.as_ref(),
+            virtual_size,
+            cluster_size,
+            None,
+            Some((password, opts)),
+        )
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn create_full(
+        path: &Path,
+        virtual_size: u64,
+        cluster_size: u32,
+        backing: Option<(&Path, Option<&str>)>,
+        #[cfg(feature = "qcow2-crypto")] encrypt: Option<(&str, &crate::block::luks::FormatOpts)>,
+        #[cfg(not(feature = "qcow2-crypto"))] encrypt: Option<()>,
+    ) -> Result<Self> {
         // Resolve the backing file first: it settles the virtual size when
         // the caller left that to us, and a broken reference should fail
         // before we truncate anything.
@@ -371,6 +513,27 @@ impl Qcow2Backend {
         let refcount_block_cluster = 2u64;
         let l1_first_cluster = 3u64;
         let next_free_cluster = l1_first_cluster + l1_clusters as u64;
+
+        // An encrypted image reserves whole clusters for its embedded
+        // LUKS header, right after the L1 table — the same place qemu
+        // puts it.
+        #[cfg(feature = "qcow2-crypto")]
+        let built_crypto = match encrypt {
+            Some((password, opts)) => Some(crypto::create_luks_header(password, opts)?),
+            None => None,
+        };
+        #[cfg(not(feature = "qcow2-crypto"))]
+        let built_crypto: Option<()> = encrypt;
+
+        #[cfg(feature = "qcow2-crypto")]
+        let crypto_clusters = built_crypto
+            .as_ref()
+            .map(|c| (c.bytes.len() as u64).div_ceil(cs))
+            .unwrap_or(0);
+        #[cfg(not(feature = "qcow2-crypto"))]
+        let crypto_clusters = 0u64;
+        let crypto_first_cluster = next_free_cluster;
+        let next_free_cluster = next_free_cluster + crypto_clusters;
         let file_len = next_free_cluster * cs;
 
         // The clusters we just laid out must all have refcount=1.
@@ -382,19 +545,32 @@ impl Qcow2Backend {
             for i in 0..l1_clusters as u64 {
                 v.push(l1_first_cluster + i);
             }
+            for i in 0..crypto_clusters {
+                v.push(crypto_first_cluster + i);
+            }
             v
         };
 
         // Lay out the header cluster: fixed header, then the extension
         // chain, then the backing filename right after it (where every
         // qcow2 writer puts it).
-        let extensions: Vec<header::Extension> = match &backing_info {
-            Some((_, Some(fmt), _)) => vec![header::Extension {
+        let mut extensions: Vec<header::Extension> = Vec::new();
+        #[cfg(feature = "qcow2-crypto")]
+        if let Some(built) = &built_crypto {
+            extensions.push(header::Extension {
+                kind: header::ext_type::CRYPTO_HEADER,
+                data: crypto::crypto_header_ext_data(crypto::CryptoHeaderExtent {
+                    offset: crypto_first_cluster * cs,
+                    length: built.bytes.len() as u64,
+                }),
+            });
+        }
+        if let Some((_, Some(fmt), _)) = &backing_info {
+            extensions.push(header::Extension {
                 kind: header::ext_type::BACKING_FORMAT,
                 data: fmt.as_bytes().to_vec(),
-            }],
-            _ => Vec::new(),
-        };
+            });
+        }
         let ext_bytes = header::encode_extensions(&extensions);
         let name_offset = header::V3_HEADER_LEN + ext_bytes.len();
         let (backing_file_offset, backing_file_size) = match &backing_info {
@@ -418,7 +594,11 @@ impl Qcow2Backend {
             backing_file_size,
             cluster_bits,
             size: virtual_size,
-            crypt_method: 0,
+            crypt_method: if crypto_clusters > 0 {
+                header::crypt::LUKS
+            } else {
+                header::crypt::NONE
+            },
             l1_size,
             l1_table_offset: l1_first_cluster * cs,
             refcount_table_offset: refcount_table_cluster * cs,
@@ -476,6 +656,19 @@ impl Qcow2Backend {
         );
         refcount.flush(&mut file)?;
         l1l2.flush(&mut file)?;
+
+        #[cfg(feature = "qcow2-crypto")]
+        let crypt = match &built_crypto {
+            Some(built) => {
+                file.seek(SeekFrom::Start(crypto_first_cluster * cs))?;
+                file.write_all(&built.bytes)?;
+                Some(crypto::Qcow2Crypt::from_luks_master_key(
+                    built.cipher_spec.clone(),
+                    &built.master_key,
+                )?)
+            }
+            None => None,
+        };
         file.sync_data()?;
 
         let (backing_file, backing_format, backing) = match backing_info {
@@ -495,6 +688,8 @@ impl Qcow2Backend {
             backing,
             backing_file,
             backing_format,
+            #[cfg(feature = "qcow2-crypto")]
+            crypt,
         })
     }
 
@@ -589,8 +784,7 @@ impl Qcow2Backend {
                 Mapping::Zero { .. } => self.materialise_zero_cluster(cluster_start)?,
                 _ => self.ensure_mapping(cluster_start)?,
             };
-            self.file.seek(SeekFrom::Start(phys + in_cluster))?;
-            self.file.write_all(chunk)?;
+            self.write_cluster_bytes(phys, cluster_start, in_cluster, chunk)?;
             offset += take as u64;
             buf = rest;
         }
@@ -614,8 +808,7 @@ impl Qcow2Backend {
             }
         }
         let phys = self.ensure_mapping(cluster_start)?;
-        self.file.seek(SeekFrom::Start(phys))?;
-        self.file.write_all(&cluster)?;
+        self.write_cluster_bytes(phys, cluster_start, 0, &cluster)?;
         Ok(phys)
     }
 
@@ -734,8 +927,7 @@ impl Qcow2Backend {
             self.file_len = new_end;
         }
         self.file.set_len(self.file_len)?;
-        self.file.seek(SeekFrom::Start(new_off))?;
-        self.file.write_all(&content)?;
+        self.write_cluster_bytes(new_off, cluster_start, 0, &content)?;
 
         // Repoint the L2 entry at the new plain cluster.
         let (l1_idx, l2_idx, _) = self.l1l2.split_addr(cluster_start);
@@ -818,6 +1010,15 @@ impl Qcow2Backend {
         if self.decomp_cache.as_ref().map(|(k, _)| *k) == Some(cluster_start) {
             return Ok(());
         }
+        // qemu refuses to combine the two, so no real image has both; an
+        // image claiming it would need a decrypt-then-inflate order we
+        // have no way to confirm, and guessing would hand back garbage.
+        #[cfg(feature = "qcow2-crypto")]
+        if self.crypt.is_some() {
+            return Err(crate::Error::Unsupported(
+                "qcow2: this image has a compressed cluster and is encrypted;                  the two are not supported together".into(),
+            ));
+        }
         let mut comp = vec![0u8; byte_len as usize];
         self.file.seek(SeekFrom::Start(host_offset))?;
         self.file.read_exact(&mut comp)?;
@@ -825,6 +1026,87 @@ impl Qcow2Backend {
         let mut plain = compress::decompress_cluster(self.header.compression_type, &comp, cs)?;
         plain.resize(cs, 0); // qcow2 compresses full clusters; pad short output
         self.decomp_cache = Some((cluster_start, plain));
+        Ok(())
+    }
+
+    /// Read `out.len()` bytes from `in_cluster` within the plain cluster
+    /// at physical `phys`, decrypting if the image is encrypted.
+    ///
+    /// Encryption works in 512-byte units, so a request that starts or
+    /// ends mid-unit is widened to unit bounds and the surplus discarded.
+    /// The widening always stays inside the cluster: a cluster is a whole
+    /// number of 512-byte units, and `in_cluster + out.len()` never
+    /// exceeds it.
+    fn read_cluster_bytes(
+        &mut self,
+        phys: u64,
+        cluster_start: u64,
+        in_cluster: u64,
+        out: &mut [u8],
+    ) -> Result<()> {
+        #[cfg(feature = "qcow2-crypto")]
+        if let Some(crypt) = &self.crypt {
+            let ss = crypt.sector_size() as u64;
+            let lo = in_cluster / ss * ss;
+            let hi = (in_cluster + out.len() as u64).div_ceil(ss) * ss;
+            let mut scratch = vec![0u8; (hi - lo) as usize];
+            self.file.seek(SeekFrom::Start(phys + lo))?;
+            self.file.read_exact(&mut scratch)?;
+            // LUKS keys the IV off where the cluster physically sits;
+            // the legacy AES scheme off where it sits in the guest.
+            let iv_base = if crypt.uses_host_offset() {
+                phys
+            } else {
+                cluster_start
+            };
+            crypt.decrypt(iv_base + lo, &mut scratch)?;
+            let from = (in_cluster - lo) as usize;
+            out.copy_from_slice(&scratch[from..from + out.len()]);
+            return Ok(());
+        }
+        self.file.seek(SeekFrom::Start(phys + in_cluster))?;
+        self.file.read_exact(out)?;
+        Ok(())
+    }
+
+    /// Write `data` at `in_cluster` within the plain cluster at physical
+    /// `phys`, encrypting if the image is encrypted.
+    ///
+    /// A write that does not fill whole 512-byte units reads the covering
+    /// units back and decrypts them first, so the bytes it does not touch
+    /// survive re-encryption.
+    fn write_cluster_bytes(
+        &mut self,
+        phys: u64,
+        cluster_start: u64,
+        in_cluster: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        #[cfg(feature = "qcow2-crypto")]
+        if let Some(crypt) = &self.crypt {
+            let ss = crypt.sector_size() as u64;
+            let lo = in_cluster / ss * ss;
+            let hi = (in_cluster + data.len() as u64).div_ceil(ss) * ss;
+            let iv_base = if crypt.uses_host_offset() {
+                phys
+            } else {
+                cluster_start
+            };
+            let mut scratch = vec![0u8; (hi - lo) as usize];
+            if lo != in_cluster || hi != in_cluster + data.len() as u64 {
+                self.file.seek(SeekFrom::Start(phys + lo))?;
+                self.file.read_exact(&mut scratch)?;
+                crypt.decrypt(iv_base + lo, &mut scratch)?;
+            }
+            let from = (in_cluster - lo) as usize;
+            scratch[from..from + data.len()].copy_from_slice(data);
+            crypt.encrypt(iv_base + lo, &mut scratch)?;
+            self.file.seek(SeekFrom::Start(phys + lo))?;
+            self.file.write_all(&scratch)?;
+            return Ok(());
+        }
+        self.file.seek(SeekFrom::Start(phys + in_cluster))?;
+        self.file.write_all(data)?;
         Ok(())
     }
 
@@ -857,8 +1139,7 @@ impl Qcow2Backend {
             let cluster_start = offset - in_cluster;
             match self.l1l2.map(&mut self.file, cluster_start)? {
                 Mapping::Normal(phys) => {
-                    self.file.seek(SeekFrom::Start(phys + in_cluster))?;
-                    self.file.read_exact(chunk)?;
+                    self.read_cluster_bytes(phys, cluster_start, in_cluster, chunk)?;
                 }
                 // The ZERO flag says "genuinely zero here", which is
                 // exactly what distinguishes it from Unallocated: it does
@@ -1037,12 +1318,16 @@ impl BlockDevice for Qcow2Backend {
                 } => Some(self.cow_compressed_cluster(cluster_start, host_offset, byte_len)?),
             };
             if let Some(phys) = phys {
-                self.file.seek(SeekFrom::Start(phys + in_cluster))?;
-                let mut remaining = take;
-                while remaining > 0 {
-                    let n = remaining.min(zero.len() as u64) as usize;
-                    self.file.write_all(&zero[..n])?;
-                    remaining -= n as u64;
+                let mut written = 0u64;
+                while written < take {
+                    let n = (take - written).min(zero.len() as u64) as usize;
+                    self.write_cluster_bytes(
+                        phys,
+                        cluster_start,
+                        in_cluster + written,
+                        &zero[..n],
+                    )?;
+                    written += n as u64;
                 }
             }
             cur += take;
