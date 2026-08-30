@@ -1,6 +1,6 @@
 //! Formatting a fresh LUKS volume.
 //!
-//! [`format`] is the `cryptsetup luksFormat` of this crate: it draws a
+//! [`format()`] is the `cryptsetup luksFormat` of this crate: it draws a
 //! random master key, wraps it under one passphrase in keyslot 0, writes
 //! the header, and hands back the volume already unlocked so the caller
 //! can go straight on to putting a partition table or filesystem inside
@@ -76,7 +76,7 @@ pub enum KdfChoice {
     },
 }
 
-/// Knobs for [`format`].
+/// Knobs for [`format()`].
 #[derive(Debug, Clone)]
 pub struct FormatOpts {
     /// On-disk format to write.
@@ -197,7 +197,7 @@ impl FormatOpts {
         Ok(())
     }
 
-    /// Byte offset at which [`format`] will place the payload.
+    /// Byte offset at which [`format()`] will place the payload.
     ///
     /// A caller sizing a container from the outside — "I need `n` usable
     /// bytes, how big must the file be?" — adds this to `n`.
@@ -322,7 +322,7 @@ pub fn format<B: BlockDevice>(
 /// A LUKS1 header region built in memory: the phdr, the eight keyslot
 /// areas, and the master key that unlocks it.
 ///
-/// [`format_v1`] writes this at offset 0 of a device. qcow2's
+/// [`format()`] writes this at offset 0 of a device. qcow2's
 /// `crypt_method = 2` embeds the very same bytes somewhere inside the
 /// image file instead — see [`crate::block::qcow2::crypto`].
 pub struct Luks1Image {

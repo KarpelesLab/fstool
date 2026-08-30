@@ -134,7 +134,7 @@ pub mod crypt {
     /// to create them since 2.9.
     pub const AES: u32 = 1;
     /// LUKS, with the header embedded in the image and located by the
-    /// [`ext_type::CRYPTO_HEADER`] extension.
+    /// [`CRYPTO_HEADER`](super::ext_type::CRYPTO_HEADER) extension.
     pub const LUKS: u32 = 2;
 }
 

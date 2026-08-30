@@ -88,7 +88,7 @@ pub fn merge(alg: HashAlgorithm, src: &[u8], block_size: usize, stripes: u32) ->
 /// `random` supplies the `stripes - 1` leading stripes; it must be exactly
 /// `key.len() * (stripes - 1)` bytes of *cryptographically random* data —
 /// the anti-forensic property rests entirely on it. The caller draws it
-/// (see [`super::format`], which uses `purecrypto`'s `OsRng`) rather than
+/// (see [`super::format()`], which uses `purecrypto`'s `OsRng`) rather than
 /// this module, so the transform stays deterministic and testable.
 pub fn split(alg: HashAlgorithm, key: &[u8], stripes: u32, random: &[u8]) -> Result<Vec<u8>> {
     if stripes == 0 || key.is_empty() {

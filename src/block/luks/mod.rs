@@ -28,14 +28,14 @@
 //! - **Read and write in place.** Writes stay within the existing payload
 //!   and never touch the header, so a volume opened here can still be
 //!   opened by `cryptsetup`.
-//! - **Format** a fresh volume — see [`format`].
+//! - **Format** a fresh volume — see [`format()`].
 //! - Ciphers, modes and IV generators as far as [`crypt`] implements them
 //!   (AES/Camellia/ARIA/SM4 in XTS/CBC/CTR/ECB).
 //!
 //! ## What is not
 //!
 //! - **Keyslot management** — adding, changing or killing a passphrase on
-//!   an existing volume. [`format`] writes a single slot 0.
+//!   an existing volume. [`format()`] writes a single slot 0.
 //! - **`--integrity` volumes**, which put a `dm-integrity` layer under the
 //!   crypt layer, and volumes mid online-re-encryption. Both are refused
 //!   on open rather than misread.
@@ -238,7 +238,7 @@ impl<B: BlockDevice> LuksBackend<B> {
 
     /// Unlock with a master key taken from elsewhere — a key file, a
     /// `cryptsetup luksDump --dump-master-key`, or the caller's own
-    /// [`format`] run. The key is still checked against the header's
+    /// [`format()`] run. The key is still checked against the header's
     /// digest, so a wrong key is rejected rather than silently producing
     /// garbage.
     pub fn open_with_master_key(dev: B, master_key: &[u8]) -> Result<Self> {
