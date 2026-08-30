@@ -8,11 +8,11 @@
 //! ```text
 //!     0   4  magic                       "QFI\xfb"
 //!     4   4  version                     2 or 3
-//!     8   8  backing_file_offset         0 (we don't support backing files)
-//!    16   4  backing_file_size           0
+//!     8   8  backing_file_offset         byte offset of the backing filename
+//!    16   4  backing_file_size           its length in bytes (no NUL)
 //!    20   4  cluster_bits                e.g. 16 → 64 KiB clusters
 //!    24   8  size                        virtual size in bytes
-//!    32   4  crypt_method                0 (we only support unencrypted)
+//!    32   4  crypt_method                0 none / 1 legacy AES / 2 LUKS
 //!    36   4  l1_size                     entries in the L1 table
 //!    40   8  l1_table_offset             byte offset of the L1 table
 //!    48   8  refcount_table_offset       byte offset of the refcount table
@@ -26,6 +26,17 @@
 //!    96   4  refcount_order              we only support 4 (16-bit refcounts)
 //!   100   4  header_length               ≥ 104 for v3
 //! ```
+//!
+//! ## Header extensions
+//!
+//! Everything between `header_length` and the end of the first cluster is
+//! a chain of optional extensions, each `u32` type + `u32` length + data
+//! padded to a multiple of 8. A type-0 record ends the chain. The two that
+//! matter here are `0xE2792ACA` (the backing file's *format* name, so a
+//! raw backing file is not mistaken for a qcow2) and `0x0537BE77` (where
+//! the embedded LUKS header lives, for `crypt_method = 2`). Unknown
+//! extensions are carried through untouched — the spec requires readers to
+//! ignore what they do not recognise.
 
 use std::io::Read;
 
@@ -36,6 +47,96 @@ pub const VERSION_V2: u32 = 2;
 pub const VERSION_V3: u32 = 3;
 pub const V2_HEADER_LEN: usize = 72;
 pub const V3_HEADER_LEN: usize = 104;
+
+/// Header-extension type tags (qcow2 spec §"Header extensions").
+pub mod ext_type {
+    /// Terminates the extension chain.
+    pub const END: u32 = 0x0000_0000;
+    /// Backing file format name, e.g. `"raw"` or `"qcow2"`.
+    pub const BACKING_FORMAT: u32 = 0xE279_2ACA;
+    /// Human-readable names for the feature bits.
+    pub const FEATURE_NAME_TABLE: u32 = 0x6803_F857;
+    /// Bitmaps directory.
+    pub const BITMAPS: u32 = 0x2385_2875;
+    /// Full-disk-encryption header pointer: two big-endian u64s, the
+    /// offset and length of the embedded LUKS header.
+    pub const CRYPTO_HEADER: u32 = 0x0537_BE77;
+    /// External data file name.
+    pub const EXTERNAL_DATA_FILE: u32 = 0x4441_5441;
+}
+
+/// One header extension, kept verbatim so extensions we do not interpret
+/// survive a rewrite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Extension {
+    pub kind: u32,
+    pub data: Vec<u8>,
+}
+
+impl Extension {
+    /// The payload as a UTF-8 string, for the name-carrying extensions.
+    pub fn as_str(&self) -> Option<&str> {
+        std::str::from_utf8(&self.data).ok()
+    }
+}
+
+/// Parse the extension chain that starts at `start` and may run to `end`.
+///
+/// Stops at the first `END` record, at `end`, or at the first malformed
+/// record — a truncated tail is treated as "no more extensions" rather
+/// than an error, because qemu itself tolerates trailing junk in the
+/// header cluster.
+pub fn parse_extensions(buf: &[u8], start: usize, end: usize) -> Vec<Extension> {
+    let mut out = Vec::new();
+    let mut pos = start;
+    let end = end.min(buf.len());
+    while pos + 8 <= end {
+        let kind = u32_be(buf, pos);
+        let len = u32_be(buf, pos + 4) as usize;
+        if kind == ext_type::END {
+            break;
+        }
+        let body = pos + 8;
+        // Each record's payload is padded out to a multiple of 8.
+        let padded = len.next_multiple_of(8);
+        if body + len > end || body.checked_add(padded).is_none() {
+            break;
+        }
+        out.push(Extension {
+            kind,
+            data: buf[body..body + len].to_vec(),
+        });
+        pos = body + padded;
+    }
+    out
+}
+
+/// Serialise an extension chain, terminated by an `END` record.
+pub fn encode_extensions(exts: &[Extension]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for e in exts {
+        out.extend_from_slice(&e.kind.to_be_bytes());
+        out.extend_from_slice(&(e.data.len() as u32).to_be_bytes());
+        out.extend_from_slice(&e.data);
+        // Pad the payload to an 8-byte boundary.
+        out.resize(out.len().next_multiple_of(8), 0);
+    }
+    out.extend_from_slice(&ext_type::END.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out
+}
+
+/// `crypt_method` values.
+pub mod crypt {
+    /// Plaintext image.
+    pub const NONE: u32 = 0;
+    /// The legacy AES-CBC scheme. qemu still reads these but has refused
+    /// to create them since 2.9.
+    pub const AES: u32 = 1;
+    /// LUKS, with the header embedded in the image and located by the
+    /// [`ext_type::CRYPTO_HEADER`] extension.
+    pub const LUKS: u32 = 2;
+}
 
 /// v3 incompatible-feature bits that we DON'T implement. If any are set
 /// in an opened image, we error with `Unsupported`.
@@ -73,6 +174,9 @@ pub struct Header {
     /// Only meaningful when some cluster is compressed; the
     /// `COMPRESSION_TYPE` incompatible bit is set iff this is non-zero.
     pub compression_type: u8,
+    /// Header extensions, in the order they appeared. Kept verbatim so a
+    /// rewrite preserves the ones we do not interpret.
+    pub extensions: Vec<Extension>,
 }
 
 impl Header {
@@ -132,6 +236,7 @@ impl Header {
             refcount_order: 4, // v2 implicit
             header_length: V2_HEADER_LEN as u32,
             compression_type: 0,
+            extensions: Vec::new(),
         };
         if version == VERSION_V3 {
             if buf.len() < V3_HEADER_LEN {
@@ -157,21 +262,29 @@ impl Header {
                 h.compression_type = buf[V3_HEADER_LEN];
             }
         }
+        // Extensions follow the fixed header. They end at the backing
+        // filename when there is one (it is placed right after the chain),
+        // otherwise at the end of whatever the caller read.
+        let ext_start = h.header_length as usize;
+        let ext_end = if h.backing_file_offset > 0 {
+            (h.backing_file_offset as usize).min(buf.len())
+        } else {
+            buf.len()
+        };
+        if ext_start < ext_end {
+            h.extensions = parse_extensions(buf, ext_start, ext_end);
+        }
         h.validate()?;
         Ok(h)
     }
 
     /// Validate fields against fstool's supported subset.
     fn validate(&self) -> Result<()> {
-        if self.backing_file_offset != 0 {
-            return Err(crate::Error::Unsupported(
-                "qcow2: backing files are not supported".into(),
-            ));
-        }
-        if self.crypt_method != 0 {
-            return Err(crate::Error::Unsupported(
-                "qcow2: encrypted images are not supported".into(),
-            ));
+        if self.crypt_method > crypt::LUKS {
+            return Err(crate::Error::Unsupported(format!(
+                "qcow2: unknown crypt_method {}",
+                self.crypt_method
+            )));
         }
         if self.refcount_order != 4 {
             return Err(crate::Error::Unsupported(format!(
@@ -289,6 +402,7 @@ mod tests {
             refcount_order: 4,
             header_length: V3_HEADER_LEN as u32,
             compression_type: 0,
+            extensions: Vec::new(),
         }
     }
 

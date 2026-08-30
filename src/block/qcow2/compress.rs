@@ -405,6 +405,7 @@ pub fn write_compressed_image(
         refcount_order: 4,
         header_length: if ctype != CTYPE_ZLIB { 112 } else { 104 },
         compression_type: ctype,
+        extensions: Vec::new(),
     };
 
     // Write it all.

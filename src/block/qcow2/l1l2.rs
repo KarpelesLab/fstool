@@ -17,10 +17,17 @@
 //!
 //! ```text
 //!   63       COPIED   refcount == 1, no COW needed
-//!   62       COMPRESSED (L2 only; we reject)
+//!   62       COMPRESSED (L2 only)
 //!   9..55    cluster offset
+//!   0        ZERO (L2 only, v3+): the cluster reads as zeros
 //!   else     reserved (must be 0)
 //! ```
+//!
+//! The ZERO bit matters most with a backing file: it is how an image says
+//! "this range is genuinely zero" as opposed to "I have nothing here, ask
+//! the backing file". An unallocated cluster falls through to the backing
+//! file; a zero cluster does not. qcow2 v2 has no such bit, so a v2 image
+//! over a backing file must allocate and write real zeros instead.
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -32,10 +39,15 @@ use super::header::Header;
 /// Where the cluster backing a virtual address physically lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mapping {
-    /// No physical cluster — reads return zeros.
+    /// No physical cluster. Reads return zeros — or, when the image has a
+    /// backing file, whatever the backing file holds there.
     Unallocated,
     /// Plain cluster at this physical byte offset (cluster-aligned).
     Normal(u64),
+    /// The ZERO flag is set: the cluster reads as zeros regardless of any
+    /// backing file. `host_offset` is the preallocated cluster the flag
+    /// rides on, or 0 when the entry carries no allocation.
+    Zero { host_offset: u64 },
     /// Compressed cluster: `byte_len` compressed bytes start at
     /// `host_offset` (byte-granular, may straddle clusters).
     Compressed { host_offset: u64, byte_len: u64 },
@@ -43,8 +55,10 @@ pub enum Mapping {
 
 /// Set when refcount == 1 — we own the cluster outright.
 pub const COPIED: u64 = 1u64 << 63;
-/// L2-only: compressed cluster. We reject these.
+/// L2-only: compressed cluster.
 pub const COMPRESSED: u64 = 1u64 << 62;
+/// L2-only, qcow2 v3 and later: the cluster reads as all zeros.
+pub const ZERO: u64 = 1u64 << 0;
 /// Mask isolating the cluster-aligned physical byte offset.
 pub const OFFSET_MASK: u64 = 0x00FF_FFFF_FFFF_FE00;
 
@@ -64,6 +78,9 @@ pub struct L1L2 {
     /// are dropped on insert. Set high enough that linear-scan workloads
     /// don't thrash.
     pub l2_cache_cap: usize,
+    /// True for qcow2 v3+, where L2 bit 0 marks a zero cluster. On a v2
+    /// image that bit is reserved and must be ignored.
+    pub zero_flag: bool,
 }
 
 pub struct L2Entry {
@@ -111,6 +128,7 @@ impl L1L2 {
             l1_table_offset: header.l1_table_offset,
             l2_cache: HashMap::new(),
             l2_cache_cap: 32,
+            zero_flag: header.version >= 3,
         })
     }
 
@@ -131,7 +149,7 @@ impl L1L2 {
     /// compression use this; readers use [`Self::map`].
     pub fn lookup<F: Read + Seek>(&mut self, file: &mut F, vaddr: u64) -> Result<Option<u64>> {
         match self.map(file, vaddr)? {
-            Mapping::Unallocated => Ok(None),
+            Mapping::Unallocated | Mapping::Zero { .. } => Ok(None),
             Mapping::Normal(phys) => Ok(Some(phys)),
             Mapping::Compressed { .. } => Err(crate::Error::Unsupported(
                 "qcow2: compressed clusters are not supported".into(),
@@ -171,6 +189,12 @@ impl L1L2 {
             });
         }
         let phys = l2_entry & OFFSET_MASK;
+        if self.zero_flag && l2_entry & ZERO != 0 {
+            // Reads as zeros whether or not a cluster is preallocated
+            // behind the flag, and — crucially — without consulting a
+            // backing file.
+            return Ok(Mapping::Zero { host_offset: phys });
+        }
         if phys == 0 {
             return Ok(Mapping::Unallocated);
         }
@@ -315,6 +339,7 @@ mod tests {
             l1_table_offset: 0,
             l2_cache: HashMap::new(),
             l2_cache_cap: 32,
+            zero_flag: true,
         };
         // Cluster 0 → L1[0], L2[0], offset 0.
         assert_eq!(l.split_addr(0), (0, 0, 0));

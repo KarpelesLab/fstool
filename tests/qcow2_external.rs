@@ -654,3 +654,391 @@ fn open_image_dispatches_to_qcow2() {
     dev.read_at(0, &mut buf).unwrap();
     assert!(buf.iter().all(|&b| b == 0));
 }
+
+// ------------------------------------------------------- backing files
+
+/// Run `qemu-io` over a qcow2 image, returning the process output.
+fn qemu_io(path: &std::path::Path, cmds: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new("qemu-io");
+    cmd.args(["-f", "qcow2"]);
+    for c in cmds {
+        cmd.arg("-c").arg(c);
+    }
+    cmd.arg(path).output().expect("spawning qemu-io")
+}
+
+/// Build `base.qcow2` with two known patterns in a temp dir, via qemu-img
+/// and qemu-io. Returns the directory (kept alive by the caller).
+fn build_base(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let base = dir.path().join("base.qcow2");
+    let out = Command::new("qemu-img")
+        .args(["create", "-q", "-f", "qcow2"])
+        .arg(&base)
+        .arg("16M")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let w = qemu_io(
+        &base,
+        &["write -P 0x11 0 1M", "write -P 0x22 4194304 65536"],
+    );
+    assert!(
+        w.status.success(),
+        "qemu-io write failed: {}",
+        String::from_utf8_lossy(&w.stderr)
+    );
+    base
+}
+
+/// An overlay made by `qemu-img create -b` must read through to its base
+/// everywhere it has not allocated a cluster of its own.
+#[test]
+fn reads_through_a_qemu_made_backing_file() {
+    if !which("qemu-img") || !which("qemu-io") {
+        eprintln!("skipping: qemu-img / qemu-io not installed");
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    build_base(&dir);
+    let overlay = dir.path().join("overlay.qcow2");
+    let out = Command::new("qemu-img")
+        .args([
+            "create",
+            "-q",
+            "-f",
+            "qcow2",
+            "-b",
+            "base.qcow2",
+            "-F",
+            "qcow2",
+        ])
+        .arg(&overlay)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "qemu-img create -b failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Give the overlay one cluster of its own.
+    let w = qemu_io(&overlay, &["write -P 0x33 65536 4096"]);
+    assert!(w.status.success());
+
+    let mut back = Qcow2Backend::open_read_only(&overlay).unwrap();
+    assert_eq!(back.backing_file(), Some("base.qcow2"));
+    assert_eq!(back.backing_format(), Some("qcow2"));
+    assert_eq!(back.total_size(), 16 * 1024 * 1024);
+
+    let mut buf = [0u8; 16];
+    // From the base.
+    back.read_at(0, &mut buf).unwrap();
+    assert!(
+        buf.iter().all(|&b| b == 0x11),
+        "base pattern not read through"
+    );
+    back.read_at(4 * 1024 * 1024, &mut buf).unwrap();
+    assert!(
+        buf.iter().all(|&b| b == 0x22),
+        "second base pattern missing"
+    );
+    // The overlay's own cluster.
+    back.read_at(65536, &mut buf).unwrap();
+    assert!(buf.iter().all(|&b| b == 0x33), "overlay pattern missing");
+    // The rest of that cluster was copied up from the base by qemu.
+    back.read_at(65536 + 4096, &mut buf).unwrap();
+    assert!(
+        buf.iter().all(|&b| b == 0x11),
+        "COW tail lost the base bytes"
+    );
+    // Past everything either image wrote.
+    back.read_at(8 * 1024 * 1024, &mut buf).unwrap();
+    assert!(buf.iter().all(|&b| b == 0));
+}
+
+/// An overlay *we* create must satisfy qemu: `qemu-img check` has to pass,
+/// `qemu-img info` has to report the backing file, and qemu's own reader
+/// has to see both the base's bytes and ours.
+#[test]
+fn qemu_reads_an_overlay_we_created() {
+    if !which("qemu-img") || !which("qemu-io") {
+        eprintln!("skipping: qemu-img / qemu-io not installed");
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    build_base(&dir);
+    let overlay = dir.path().join("overlay.qcow2");
+
+    {
+        // Virtual size 0 → inherit the base's, as `qemu-img create -b` does.
+        let mut back = Qcow2Backend::create_with_backing(
+            &overlay,
+            0,
+            65536,
+            Some((std::path::Path::new("base.qcow2"), Some("qcow2"))),
+        )
+        .unwrap();
+        assert_eq!(back.total_size(), 16 * 1024 * 1024);
+        // A sub-cluster write: the rest of the cluster must be copied up
+        // from the base, or qemu will read our zeros over its 0x11s.
+        back.write_at(4096, &[0x44u8; 4096]).unwrap();
+        back.sync().unwrap();
+    }
+
+    let info = Command::new("qemu-img")
+        .args(["info", "--output=json"])
+        .arg(&overlay)
+        .output()
+        .unwrap();
+    let info = String::from_utf8_lossy(&info.stdout);
+    assert!(
+        info.contains("base.qcow2"),
+        "qemu-img info lost the backing file:\n{info}"
+    );
+
+    let check = Command::new("qemu-img")
+        .arg("check")
+        .arg(&overlay)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "qemu-img check failed: {}{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    // qemu must see our write, the copied-up head of that cluster, and
+    // the base beyond it.
+    let r = qemu_io(
+        &overlay,
+        &[
+            "read -P 0x11 0 4096",
+            "read -P 0x44 4096 4096",
+            "read -P 0x11 8192 4096",
+            "read -P 0x22 4194304 65536",
+        ],
+    );
+    assert!(
+        r.status.success(),
+        "qemu-io disagreed with our overlay: {}{}",
+        String::from_utf8_lossy(&r.stdout),
+        String::from_utf8_lossy(&r.stderr)
+    );
+}
+
+/// `zero_range` over a backing file must actually shadow it — the ZERO
+/// flag, not the "unallocated already reads zero" shortcut.
+#[test]
+fn zeroing_over_a_backing_file_shadows_it() {
+    if !which("qemu-img") || !which("qemu-io") {
+        eprintln!("skipping: qemu-img / qemu-io not installed");
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    build_base(&dir);
+    let overlay = dir.path().join("overlay.qcow2");
+
+    {
+        let mut back = Qcow2Backend::create_with_backing(
+            &overlay,
+            0,
+            65536,
+            Some((std::path::Path::new("base.qcow2"), Some("qcow2"))),
+        )
+        .unwrap();
+        // A whole cluster (takes the ZERO-flag path) and a partial range
+        // (takes the copy-up path).
+        back.zero_range(0, 65536).unwrap();
+        back.zero_range(65536, 4096).unwrap();
+        // Writing zeros through the normal write path must shadow too.
+        back.write_at(131072, &[0u8; 4096]).unwrap();
+        back.sync().unwrap();
+
+        let mut buf = [0xffu8; 16];
+        back.read_at(0, &mut buf).unwrap();
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "whole-cluster zero did not stick"
+        );
+        back.read_at(65536, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0), "partial zero did not stick");
+        back.read_at(131072, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0), "zero write did not stick");
+        // …and the rest of the partially-zeroed cluster still shows the base.
+        back.read_at(65536 + 4096, &mut buf).unwrap();
+        assert!(
+            buf.iter().all(|&b| b == 0x11),
+            "copy-up lost the base bytes"
+        );
+    }
+
+    let r = qemu_io(
+        &overlay,
+        &[
+            "read -P 0x00 0 65536",
+            "read -P 0x00 65536 4096",
+            "read -P 0x11 69632 4096",
+            "read -P 0x00 131072 4096",
+        ],
+    );
+    assert!(
+        r.status.success(),
+        "qemu-io disagreed about the zeroed ranges: {}{}",
+        String::from_utf8_lossy(&r.stdout),
+        String::from_utf8_lossy(&r.stderr)
+    );
+}
+
+/// A raw backing file, declared as such, must be opened as raw.
+#[test]
+fn supports_a_raw_backing_file() {
+    if !which("qemu-img") || !which("qemu-io") {
+        eprintln!("skipping: qemu-img / qemu-io not installed");
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let base = dir.path().join("base.raw");
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&base).unwrap();
+        f.set_len(8 * 1024 * 1024).unwrap();
+        f.write_all(&[0x55u8; 4096]).unwrap();
+        f.sync_all().unwrap();
+    }
+    let overlay = dir.path().join("overlay.qcow2");
+    {
+        let mut back = Qcow2Backend::create_with_backing(
+            &overlay,
+            0,
+            65536,
+            Some((std::path::Path::new("base.raw"), Some("raw"))),
+        )
+        .unwrap();
+        assert_eq!(back.total_size(), 8 * 1024 * 1024);
+        let mut buf = [0u8; 16];
+        back.read_at(0, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0x55));
+        back.write_at(0, &[0x66u8; 512]).unwrap();
+        back.sync().unwrap();
+    }
+
+    let r = qemu_io(
+        &overlay,
+        &[
+            "read -P 0x66 0 512",
+            "read -P 0x55 512 3584",
+            "read -P 0x00 4096 4096",
+        ],
+    );
+    assert!(
+        r.status.success(),
+        "qemu-io disagreed about the raw-backed overlay: {}{}",
+        String::from_utf8_lossy(&r.stdout),
+        String::from_utf8_lossy(&r.stderr)
+    );
+}
+
+/// A backing chain three images deep must resolve, and a self-referential
+/// one must be refused rather than recursing forever.
+#[test]
+fn follows_a_chain_and_refuses_a_loop() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let a = dir.path().join("a.qcow2");
+    let b = dir.path().join("b.qcow2");
+    let c = dir.path().join("c.qcow2");
+
+    {
+        let mut base = Qcow2Backend::create(&a, 4 * 1024 * 1024, 65536).unwrap();
+        base.write_at(0, &[0xA1u8; 4096]).unwrap();
+        base.write_at(1024 * 1024, &[0xA2u8; 4096]).unwrap();
+        base.sync().unwrap();
+    }
+    {
+        let mut mid = Qcow2Backend::create_with_backing(
+            &b,
+            0,
+            65536,
+            Some((std::path::Path::new("a.qcow2"), Some("qcow2"))),
+        )
+        .unwrap();
+        mid.write_at(1024 * 1024, &[0xB2u8; 4096]).unwrap();
+        mid.sync().unwrap();
+    }
+    {
+        let mut top = Qcow2Backend::create_with_backing(
+            &c,
+            0,
+            65536,
+            Some((std::path::Path::new("b.qcow2"), Some("qcow2"))),
+        )
+        .unwrap();
+        top.write_at(2 * 1024 * 1024, &[0xC3u8; 4096]).unwrap();
+        top.sync().unwrap();
+    }
+
+    let mut top = Qcow2Backend::open_read_only(&c).unwrap();
+    let mut buf = [0u8; 16];
+    top.read_at(0, &mut buf).unwrap();
+    assert!(
+        buf.iter().all(|&x| x == 0xA1),
+        "bottom of the chain missing"
+    );
+    top.read_at(1024 * 1024, &mut buf).unwrap();
+    assert!(
+        buf.iter().all(|&x| x == 0xB2),
+        "middle should shadow the base"
+    );
+    top.read_at(2 * 1024 * 1024, &mut buf).unwrap();
+    assert!(buf.iter().all(|&x| x == 0xC3), "top's own cluster missing");
+    drop(top);
+
+    // Point an image at itself; opening must fail rather than recurse.
+    let loop_img = dir.path().join("loop.qcow2");
+    Qcow2Backend::create_with_backing(
+        &loop_img,
+        4 * 1024 * 1024,
+        65536,
+        Some((std::path::Path::new("a.qcow2"), Some("qcow2"))),
+    )
+    .unwrap();
+    // Rewrite the backing name in place to point at itself.
+    {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&loop_img)
+            .unwrap();
+        let mut head = vec![0u8; 65536];
+        f.read_exact(&mut head).unwrap();
+        let off = u64::from_be_bytes(head[8..16].try_into().unwrap()) as usize;
+        let name = b"loop.qcow2";
+        head[off..off + name.len()].copy_from_slice(name);
+        head[16..20].copy_from_slice(&(name.len() as u32).to_be_bytes());
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(&head).unwrap();
+        f.sync_all().unwrap();
+    }
+    let err = Qcow2Backend::open_read_only(&loop_img).unwrap_err();
+    assert!(
+        matches!(err, fstool::Error::InvalidImage(_)),
+        "a backing loop should be refused, got: {err}"
+    );
+}
+
+/// A missing backing file is a clear error naming the path we looked at,
+/// not a confusing I/O failure deep in a read.
+#[test]
+fn missing_backing_file_is_reported_clearly() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let overlay = dir.path().join("overlay.qcow2");
+    let err = Qcow2Backend::create_with_backing(
+        &overlay,
+        4 * 1024 * 1024,
+        65536,
+        Some((std::path::Path::new("nope.qcow2"), Some("qcow2"))),
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("nope.qcow2"), "unhelpful error: {msg}");
+}
