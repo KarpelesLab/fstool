@@ -273,7 +273,7 @@ pub fn open_image_maybe_compressed_read_only_with_password(
 }
 
 /// Options for [`create_image`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CreateOpts {
     /// qcow2 cluster size in bytes (power of two, ≥ 512). Default 64 KiB,
     /// matching qemu-img. Ignored when creating a raw image.
@@ -304,6 +304,16 @@ pub struct EncryptOpts {
     /// qemu embeds and reads.
     #[cfg(feature = "luks")]
     pub luks: luks::FormatOpts,
+}
+
+impl Default for CreateOpts {
+    fn default() -> Self {
+        Self {
+            cluster_size: 65_536,
+            encrypt: None,
+            backing: None,
+        }
+    }
 }
 
 impl CreateOpts {
