@@ -222,10 +222,23 @@ impl Header {
                     "luks1: keyslot {i} is enabled but has 0 PBKDF2 iterations"
                 )));
             }
-            if s.stripes == 0 || s.stripes > 100_000 {
+            if s.stripes == 0 {
                 return Err(crate::Error::InvalidImage(format!(
-                    "luks1: keyslot {i} has an implausible stripe count {}",
-                    s.stripes
+                    "luks1: keyslot {i} is enabled but has 0 anti-forensic stripes"
+                )));
+            }
+            // The material is buffered whole before anything validates
+            // it, so an unbounded `stripes × key_bytes` is an
+            // out-of-memory in one header field. Real slots use 4000
+            // stripes of 64 bytes = 250 KiB.
+            let material = s.stripes as u64 * self.key_bytes as u64;
+            if material > super::v2::MAX_AF_MATERIAL_BYTES {
+                return Err(crate::Error::InvalidImage(format!(
+                    "luks1: keyslot {i} declares {} stripes of {} bytes = {material}, \
+                     over the {} a keyslot may hold",
+                    s.stripes,
+                    self.key_bytes,
+                    super::v2::MAX_AF_MATERIAL_BYTES
                 )));
             }
         }
@@ -450,6 +463,23 @@ mod tests {
         let mut bytes = sample().encode();
         bytes[104..108].copy_from_slice(&0u32.to_be_bytes()); // payload at 0
         assert!(Header::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn refuses_an_absurd_stripe_count() {
+        let mut h = sample();
+        h.slots[0] = KeySlot {
+            active: SLOT_ENABLED,
+            iterations: 1000,
+            salt: [0u8; SALT_BYTES],
+            key_material_offset: 8,
+            stripes: u32::MAX,
+        };
+        let bytes = h.encode();
+        assert!(matches!(
+            Header::decode(&bytes),
+            Err(crate::Error::InvalidImage(_))
+        ));
     }
 
     #[test]

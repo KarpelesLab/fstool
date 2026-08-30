@@ -85,6 +85,14 @@ pub const DEFAULT_HDR_BYTES: u64 = 16384;
 /// the default `hdr_size`.
 pub const DEFAULT_KEYSLOTS_OFFSET: u64 = 2 * DEFAULT_HDR_BYTES;
 
+/// Upper bound on a keyslot's anti-forensic material, in bytes.
+///
+/// `stripes × key_size` both come out of the JSON, and the material is
+/// buffered whole before anything validates it — so without a cap a
+/// hostile header is a one-line out-of-memory. 64 MiB is ~250× what a
+/// real keyslot uses (4000 stripes × 64 bytes = 250 KiB).
+pub const MAX_AF_MATERIAL_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Upper bound on the Argon2 memory cost we will honour, in KiB (4 GiB).
 ///
 /// `memory` comes straight out of an attacker-supplied header and
@@ -455,7 +463,19 @@ impl Segment {
                 "luks2: segment uses dm-integrity ({integ}), which fstool does not implement"
             )));
         }
+        self.validate()?;
         CipherSpec::parse(&self.encryption, key_bytes)
+    }
+
+    /// Validate the fields a caller divides by or allocates from.
+    pub fn validate(&self) -> Result<()> {
+        if !(512..=1024 * 1024).contains(&self.sector_size) || !self.sector_size.is_power_of_two() {
+            return Err(crate::Error::InvalidImage(format!(
+                "luks2: segment sector_size {} is not a power of two in 512..=1048576",
+                self.sector_size
+            )));
+        }
+        Ok(())
     }
 
     /// Payload length in bytes, or `None` for `"dynamic"` (runs to the end
@@ -538,6 +558,12 @@ impl KeySlot {
         let exact = (self.key_size as u64)
             .checked_mul(self.af.stripes as u64)
             .ok_or_else(|| crate::Error::InvalidImage("luks2: AF material overflows".into()))?;
+        if exact == 0 || exact > MAX_AF_MATERIAL_BYTES {
+            return Err(crate::Error::InvalidImage(format!(
+                "luks2: keyslot declares {} stripes of {} bytes = {exact}, outside                  the 1..={MAX_AF_MATERIAL_BYTES} bytes a keyslot may hold",
+                self.af.stripes, self.key_size
+            )));
+        }
         let rounded = exact.div_ceil(512) * 512;
         if rounded > self.area.size {
             return Err(crate::Error::InvalidImage(format!(
@@ -795,6 +821,28 @@ mod tests {
             kdf.derive(b"pw", &mut out),
             Err(crate::Error::InvalidImage(_))
         ));
+    }
+
+    #[test]
+    fn refuses_an_absurd_keyslot_size() {
+        let mut m = Metadata::parse(SAMPLE_JSON).unwrap();
+        let slot = m.keyslots.get_mut("0").unwrap();
+        slot.af.stripes = u32::MAX;
+        assert!(matches!(
+            slot.material_extent(),
+            Err(crate::Error::InvalidImage(_))
+        ));
+    }
+
+    #[test]
+    fn refuses_a_nonsense_sector_size() {
+        for bad in [0u32, 3, 300, 2 * 1024 * 1024] {
+            let json =
+                SAMPLE_JSON.replace(r#""sector_size": 512"#, &format!(r#""sector_size": {bad}"#));
+            let m = Metadata::parse(&json).unwrap();
+            let (_, seg) = m.data_segment().unwrap();
+            assert!(seg.validate().is_err(), "sector_size {bad} was accepted");
+        }
     }
 
     #[test]

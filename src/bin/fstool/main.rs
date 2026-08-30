@@ -760,18 +760,18 @@ fn run(cli: Cli) -> fstool::Result<()> {
             // it emits a refreshing status line in TTY mode and stays
             // quiet for pipes/logs.
             fstool::repack::enter(fstool::repack::Progress::auto());
-            let res = repack_cmd(
-                &srcs,
-                &dst,
-                size.as_deref(),
+            let res = repack_cmd(RepackArgs {
+                srcs: &srcs,
+                dst: &dst,
+                size_arg: size.as_deref(),
                 shrink,
-                fs_type.as_deref(),
+                fs_type_override: fs_type.as_deref(),
                 block_size,
-                &cluster_size,
-                password.as_deref(),
-                encrypt.as_ref(),
-                backing.as_ref(),
-            );
+                cluster_size: &cluster_size,
+                password: password.as_deref(),
+                encrypt: encrypt.as_ref(),
+                backing: backing.as_ref(),
+            });
             fstool::repack::leave();
             res?;
             if let Some((ctype, level)) = comp {
@@ -1115,18 +1115,37 @@ fn convert_cmd(
     Ok(())
 }
 
-fn repack_cmd(
-    srcs: &[String],
-    dst: &std::path::Path,
-    size_arg: Option<&str>,
+/// Everything `fstool repack` was told, gathered so the entry point
+/// keeps a readable signature.
+struct RepackArgs<'a> {
+    srcs: &'a [String],
+    dst: &'a std::path::Path,
+    size_arg: Option<&'a str>,
     shrink: bool,
-    fs_type_override: Option<&str>,
+    fs_type_override: Option<&'a str>,
     block_size: u32,
-    cluster_size: &str,
-    password: Option<&str>,
-    encrypt: Option<&fstool::block::EncryptOpts>,
-    backing: Option<&(PathBuf, Option<String>)>,
-) -> fstool::Result<()> {
+    cluster_size: &'a str,
+    /// Passphrase for encrypted *sources*.
+    password: Option<&'a str>,
+    /// Encryption for the *destination*, if `--encrypt` was given.
+    encrypt: Option<&'a fstool::block::EncryptOpts>,
+    /// Backing file for a qcow2 destination.
+    backing: Option<&'a (PathBuf, Option<String>)>,
+}
+
+fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
+    let RepackArgs {
+        srcs,
+        dst,
+        size_arg,
+        shrink,
+        fs_type_override,
+        block_size,
+        cluster_size,
+        password,
+        encrypt,
+        backing,
+    } = args;
     use fstool::repack::RepackSink;
     let create_opts = &fstool::block::CreateOpts {
         cluster_size: parse_cluster_size(cluster_size)?,

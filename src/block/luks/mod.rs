@@ -131,13 +131,26 @@ pub fn detect(buf: &[u8]) -> Option<Version> {
     }
 }
 
-/// Read the first sector of `dev` and report which LUKS version it holds.
+/// Read the head of `dev` and report which LUKS version it holds.
+///
 /// Any I/O failure or short device reads as "not LUKS" so callers can fall
 /// through to other backends.
+///
+/// When offset 0 carries no magic the LUKS2 spare header's own offset is
+/// checked too: a volume whose primary header was destroyed is still a
+/// LUKS volume, and refusing to recognise it would mean the spare — whose
+/// entire purpose is to survive that — never got consulted.
 pub fn probe<B: BlockDevice + ?Sized>(dev: &mut B) -> Option<Version> {
     let mut head = [0u8; 8];
-    dev.read_at(0, &mut head).ok()?;
-    detect(&head)
+    if dev.read_at(0, &mut head).is_ok()
+        && let Some(v) = detect(&head)
+    {
+        return Some(v);
+    }
+    let mut spare = [0u8; 8];
+    dev.read_at(v2::DEFAULT_HDR_BYTES, &mut spare).ok()?;
+    (spare[0..6] == v2::MAGIC_2ND && u16::from_be_bytes([spare[6], spare[7]]) == 2)
+        .then_some(Version::V2)
 }
 
 /// Master key material that is wiped when it goes out of scope.
@@ -251,10 +264,8 @@ impl<B: BlockDevice> LuksBackend<B> {
         master_key: Option<&[u8]>,
         read_only: bool,
     ) -> Result<Self> {
-        let mut head = [0u8; 8];
-        dev.read_at(0, &mut head)?;
         let (header, mk, payload_offset, payload_size, iv_tweak, cipher_spec, sector_size) =
-            match detect(&head) {
+            match probe(&mut dev) {
                 Some(Version::V1) => Self::unlock_v1(&mut dev, passphrase, master_key)?,
                 Some(Version::V2) => Self::unlock_v2(&mut dev, passphrase, master_key)?,
                 None => {
@@ -408,6 +419,9 @@ impl<B: BlockDevice> LuksBackend<B> {
                 "luks2: segment declares {declared} bytes but only {avail} are on the device"
             )));
         }
+        // Validated before use: `sector_size` is a divisor below, and a
+        // header claiming 0 would panic rather than fail.
+        seg.validate()?;
         let sector_size = seg.sector_size;
         let payload_size = declared / sector_size as u64 * sector_size as u64;
         let spec = seg.cipher_spec(mk.len())?;
@@ -434,12 +448,17 @@ impl<B: BlockDevice> LuksBackend<B> {
         let mut best: Option<(v2::BinHeader, v2::Metadata)> = None;
         let mut first_error: Option<crate::Error> = None;
 
-        // The primary copy is at 0; the secondary follows it, so its offset
-        // is the primary's own hdr_size.
-        let mut offsets = vec![0u64];
+        // The primary copy is at 0; the secondary follows it, so its
+        // offset is the primary's own hdr_size. When the primary's binary
+        // header is itself unreadable that number is lost, so the default
+        // 16 KiB is always tried too — otherwise a damaged primary would
+        // take the spare down with it, which is the one thing the spare
+        // exists to prevent.
+        let mut offsets = vec![0u64, v2::DEFAULT_HDR_BYTES];
         let mut primary_head = [0u8; v2::BIN_HDR_BYTES];
         if dev.read_at(0, &mut primary_head).is_ok()
             && let Ok(h) = v2::BinHeader::decode(&primary_head)
+            && !offsets.contains(&h.hdr_size)
         {
             offsets.push(h.hdr_size);
         }
@@ -907,6 +926,20 @@ mod tests {
         assert!(buf[..512].iter().all(|&b| b == 0xff));
         assert!(buf[512..4608].iter().all(|&b| b == 0));
         assert!(buf[4608..].iter().all(|&b| b == 0xff));
+    }
+
+    /// A LUKS2 volume must still open when the *primary* binary header is
+    /// destroyed outright — that is what the spare copy is for.
+    #[test]
+    fn opens_from_the_spare_when_the_primary_header_is_destroyed() {
+        let opts = FormatOpts::fast_for_tests();
+        let vol = format(MemoryBackend::new(8 * 1024 * 1024), "pw", &opts).unwrap();
+        let mut dev = vol.into_inner();
+        // Wipe the whole primary binary header, magic included.
+        dev.write_at(0, &vec![0u8; v2::BIN_HDR_BYTES]).unwrap();
+
+        let vol = LuksBackend::open(dev, "pw").unwrap();
+        assert_eq!(vol.version(), Version::V2);
     }
 
     #[test]
