@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.23](https://github.com/KarpelesLab/fstool/compare/v0.4.22...v0.4.23) - 2026-08-30
+
+### Added
+
+- *(cli)* open, create and inspect encrypted images and qcow2 overlays
+- *(qcow2)* read and write encrypted images, and create LUKS ones
+- *(qcow2)* follow backing files, and create overlays over them
+- *(luks)* read, write and format LUKS1 and LUKS2 volumes
+
+### Fixed
+
+- *(block)* keep CreateOpts::default()'s 64 KiB cluster size
+- *(luks)* bound header-controlled allocations, and use the spare copy
+- *(qcow2)* keep zero_range sparse, and bound the fresh refcount block
+
+### Other
+
+- adopt as_chunks for the fixed-width decoders clippy now flags
+- cover LUKS, qcow2 backing files and encryption
+- *(base64)* graduate the DMG decoder into a shared crate module
+
 ### Added
 
 - *(luks)* new `block::luks` backend for LUKS1 and LUKS2 volumes: unlock with
