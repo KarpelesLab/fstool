@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.24](https://github.com/KarpelesLab/fstool/compare/v0.4.23...v0.4.24) - 2026-09-01
+
+### Other
+
+- keep the CLI's dependencies out of library consumers
+
 ### Changed
 
 - *(cargo)* the CLI's dependencies no longer reach library consumers. `clap`
