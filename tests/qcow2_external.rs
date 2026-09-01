@@ -401,6 +401,7 @@ fn create_then_qemu_img_check() {
 /// `fstool create -t ext4 src -o out.qcow2` produces a valid qcow2
 /// carrying an ext4 image. Verified with qemu-img check + (after
 /// convert-to-raw) e2fsck.
+#[cfg(feature = "cli")]
 #[test]
 fn ext_build_into_qcow2() {
     if !which("qemu-img") || !which("e2fsck") {
@@ -486,6 +487,7 @@ fn ext_build_into_qcow2() {
 /// `fstool build spec -o disk.qcow2` produces a GPT-partitioned qcow2
 /// with two filesystems. The partition target syntax (`disk.qcow2:N`)
 /// walks each partition cleanly.
+#[cfg(feature = "cli")]
 #[test]
 fn build_partitioned_qcow2() {
     if !which("qemu-img") {

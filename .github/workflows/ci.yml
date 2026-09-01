@@ -96,6 +96,23 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
 
+      # A library consumer must not pay for the binary. `clap` and
+      # `rustyline` are the CLI's alone; if either shows up in the
+      # library-only resolve, something lost its `cli` / `readline` gate.
+      # The test run is part of the guarantee: it catches a CLI-driven
+      # test that forgot its `#[cfg(feature = "cli")]` and would other-
+      # wise fail on the binary this configuration does not build.
+      - name: library-only build carries no CLI dependencies
+        run: |
+          set -euo pipefail
+          if cargo tree -e normal --no-default-features \
+               --features codecs,containers --prefix none \
+               | grep -Ew 'clap|rustyline'; then
+            echo "::error::a CLI dependency leaked into the library-only build"
+            exit 1
+          fi
+          cargo test --no-default-features --features codecs,containers
+
   # macOS proves the lib + CLI compile and unit-test cleanly on a
   # non-Linux Unix. `qemu-img` is available via Homebrew so the qcow2
   # round-trip suite runs here too; sgdisk / e2fsck / mke2fs / mtools

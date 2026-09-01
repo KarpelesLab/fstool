@@ -123,13 +123,15 @@ jobs:
       # but it yields a static, libc-free x86_64-unknown-linux-fullrust binary
       # (no C toolchain, no glibc — runs on any Linux kernel with nothing else).
       # `readline` is dropped (rustyline's terminal layer is unix-only); every
-      # codec stays. `libc` is a cfg(unix) dep, so it's simply absent here.
+      # codec and container stays, and `cli` is listed explicitly because the
+      # binary's `required-features` gate it. `libc` is a cfg(unix) dep, so
+      # it's simply absent here.
       - name: Build static libc-free binary (fullrust)
         uses: KarpelesLab/fullrust@master
         with:
           args: >-
             --release --bin fstool --no-default-features
-            --features gzip,xz,lzma,lz4,zstd,lzo,cab,amiga-lzx,lha,arc,sit,sevenz,rar,dmg-bzip2,dmg-lzfse,dmg-encrypted
+            --features codecs,containers,cli
 
       - name: Stage archive contents
         run: |

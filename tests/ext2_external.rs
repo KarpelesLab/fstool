@@ -942,6 +942,7 @@ fn prezeroed_skips_full_device_zero_and_stays_sparse() {
 /// the `RO_COMPAT_LARGE_FILE` size-high handling. The image must
 /// validate clean with e2fsck and our own reader must produce the same
 /// bytes back.
+#[cfg(feature = "cli")]
 #[test]
 fn large_file_round_trips_through_triple_indirect() {
     let Some(_) = which("e2fsck") else {

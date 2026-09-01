@@ -979,6 +979,7 @@ fn ext4_indexed_directory_passes_e2fsck() {
 /// the hardlink relationship (multiple names sharing one inode with
 /// `links_count > 1`) instead of materialising each link as a
 /// duplicated file body.
+#[cfg(feature = "cli")]
 #[test]
 fn ext4_repack_preserves_hardlinks() {
     let Some(_) = which("mke2fs") else {
@@ -1119,6 +1120,7 @@ fn ext4_repack_preserves_hardlinks() {
 /// real data, then a 240 KiB hole, then another 4 KiB of real data),
 /// run `fstool repack --shrink`, and confirm the destination keeps
 /// the hole instead of inflating the file to its full dense size.
+#[cfg(feature = "cli")]
 #[test]
 fn ext4_repack_preserves_sparse_files() {
     use std::io::Read;
@@ -1231,6 +1233,7 @@ fn ext4_repack_preserves_sparse_files() {
 /// the journal looks dirty, and confirm `fstool repack` applies the
 /// pending transaction (destination's marker.txt reads "NEW") instead
 /// of taking the stale on-disk state.
+#[cfg(feature = "cli")]
 #[test]
 fn ext4_repack_replays_pending_journal() {
     let Some(_) = which("e2fsck") else {

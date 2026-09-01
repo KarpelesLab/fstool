@@ -4,7 +4,7 @@
 //! symlink trees and shell out to Linux-only tools (`mke2fs`, `e2fsck`,
 //! `debugfs`, `truncate`, etc.) for cross-validation.
 
-#![cfg(unix)]
+#![cfg(all(unix, feature = "cli"))]
 
 use std::process::Command;
 

@@ -1272,6 +1272,7 @@ fn apfs_xp_desc_ring_buffer_survives_many_checkpoints() {
 /// methods all returned Unsupported, so `fstool add disk.apfs …`
 /// erred with "apfs is a write-once format" even though the
 /// inherent Write-state API worked fine.
+#[cfg(feature = "cli")]
 #[test]
 fn cli_add_rm_reach_apfs_write_state() {
     if !cfg!(target_os = "macos") && !cfg!(target_os = "linux") {

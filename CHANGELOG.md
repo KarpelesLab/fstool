@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- *(cargo)* the CLI's dependencies no longer reach library consumers. `clap`
+  is optional behind a new `cli` feature, the binary carries
+  `required-features = ["cli"]`, and `PathStyle`'s `ValueEnum` derive is
+  `cfg_attr`-gated on the same flag. New `codecs` and `containers` umbrella
+  features make the library-only line short —
+  `default-features = false, features = ["codecs", "containers"]` keeps every
+  format while dropping `clap` and `rustyline` (60 → 34 crates). Defaults are
+  unchanged, so `cargo install fstool` still yields a working command; CI
+  asserts the library-only resolve contains neither.
+
 ## [0.4.23](https://github.com/KarpelesLab/fstool/compare/v0.4.22...v0.4.23) - 2026-08-30
 
 ### Added

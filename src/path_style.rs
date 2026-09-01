@@ -26,7 +26,12 @@
 use crate::inspect::FsKind;
 
 /// How paths are spelled on the command line and in the shell.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, clap::ValueEnum)]
+///
+/// The `ValueEnum` derive — the only thing in the library that touches
+/// `clap` — rides the `cli` feature, so a library-only build carries no
+/// argument-parsing dependency.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 pub enum PathStyle {
     /// `/` separator everywhere; HFS/HFS+ literal `/` shown as `:`.
     #[default]

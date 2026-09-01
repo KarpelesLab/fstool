@@ -28,6 +28,9 @@ path = "src/lib.rs"
 [[bin]]
 name = "fstool"
 path = "src/bin/fstool/main.rs"
+# Gate the binary on the feature carrying its dependencies, so a library
+# consumer that turns `cli` off doesn't build (or resolve) any of them.
+required-features = ["cli"]
 
 [features]
 # Compression codecs for SquashFS reads and `.tar.<algo>` streaming I/O.
@@ -40,11 +43,31 @@ path = "src/bin/fstool/main.rs"
 # per-format feature (`cab`, `amiga-lzx`, `lha`, `arc`, `sit`, `sevenz`,
 # `rar`); each enables only the compcol codecs it can use today and returns a
 # clean `Unsupported` for methods whose codec hasn't landed in compcol yet.
-default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "cab", "amiga-lzx", "lha", "arc", "sit", "sevenz", "rar", "dmg-bzip2", "dmg-lzfse", "dmg-encrypted", "luks", "qcow2-crypto", "readline"]
+default = ["codecs", "containers", "cli", "readline"]
+
+# Everything the library reads and writes, with no command-line surface.
+# This is the set a library consumer wants:
+#
+#     fstool = { version = "0.4", default-features = false,
+#                features = ["codecs", "containers"] }
+#
+# which drops `clap` and `rustyline` (and their ~30 transitive crates)
+# while keeping every format.
+codecs = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "cab", "amiga-lzx", "lha", "arc", "sit", "sevenz", "rar", "dmg-bzip2", "dmg-lzfse"]
+# The encrypted disk-image containers.
+containers = ["dmg-encrypted", "luks", "qcow2-crypto"]
+
+# The `fstool` binary's argument parsing. On by default so `cargo install
+# fstool` produces a working command; a library consumer turns it off with
+# `default-features = false`. Deliberately does NOT imply `readline`: the
+# static libc-free release build wants the CLI without rustyline's
+# unix-only terminal layer.
+cli = ["dep:clap"]
 # Line editing + command history for the interactive `fstool shell` (↑/↓
-# history, Ctrl-A/E, etc.) via `rustyline`. On by default; disable it
-# (`default-features = false`) to drop the dependency — the shell then falls
-# back to a plain line-buffered reader. No effect on piped/non-TTY input.
+# history, Ctrl-A/E, etc.) via `rustyline`. Implied by `cli`; drop it with
+# `--features cli` and no `readline` to lose the dependency — the shell
+# then falls back to a plain line-buffered reader. No effect on
+# piped/non-TTY input, and nothing in the library uses it.
 readline = ["dep:rustyline"]
 # WebAssembly bindings (src/wasm.rs) for the browser UI. Pulls in
 # `wasm-bindgen`; build with `--no-default-features --features
@@ -121,7 +144,10 @@ thiserror = "2"
 log = "0.4"
 uuid = { version = "1", features = ["v4"] }
 crc32fast = "1"
-clap = { version = "4", features = ["derive"] }
+# Argument parsing for the `fstool` binary — see the `cli` feature. The
+# library itself needs clap only to derive `ValueEnum` on `PathStyle`,
+# which is `cfg_attr`-gated on the same feature.
+clap = { version = "4", features = ["derive"], optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"
 toml = "1.1.2"

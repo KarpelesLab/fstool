@@ -9,8 +9,10 @@
 
 use std::process::Command;
 
+#[cfg(feature = "cli")]
 use tempfile::NamedTempFile;
 
+#[cfg(feature = "cli")]
 const FSTOOL: &str = env!("CARGO_BIN_EXE_fstool");
 
 fn which(tool: &str) -> bool {
@@ -21,6 +23,7 @@ fn which(tool: &str) -> bool {
         .is_some_and(|o| o.status.success())
 }
 
+#[cfg(feature = "cli")]
 #[test]
 fn repack_into_tar_gz_then_inspect() {
     if !which("mke2fs") {
@@ -109,6 +112,7 @@ fn repack_into_tar_gz_then_inspect() {
 /// Repack an ext2 image into a `.tar.lz4` and confirm the canonical LZ4
 /// Frame (compcol) is both readable by the system `lz4` CLI and round-trips
 /// back through fstool — exercising the `compcol::lz4::frame` path.
+#[cfg(feature = "cli")]
 #[test]
 fn repack_into_tar_lz4_interops_with_lz4_cli() {
     if !which("mke2fs") {

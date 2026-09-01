@@ -3,6 +3,10 @@
 //! combinations that the old specialized copiers could not handle, plus
 //! metadata fidelity surfaced through a non-ext source's `getattr`.
 
+// Every test here drives the `fstool` binary, which only exists when
+// the `cli` feature builds it (see `[[bin]] required-features`).
+#![cfg(feature = "cli")]
+
 use std::process::Command;
 
 const FSTOOL: &str = env!("CARGO_BIN_EXE_fstool");

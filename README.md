@@ -602,6 +602,30 @@ codec. Archive-to-`ext`/`fat`/`tar` repack uses the specialised FS-to-FS
 copiers and isn't wired yet (same limitation as XFS/HFS+ sources) — convert
 between archives, or to `iso`/`grf`, via the generic trait path.
 
+## Using fstool as a library
+
+The crate is a library first and a command second. The binary's
+dependencies — `clap`, and `rustyline` for the shell's line editing — sit
+behind the `cli` and `readline` features, and `[[bin]] required-features`
+keeps the binary itself out of a library build. Depend on it like this:
+
+```toml
+[dependencies]
+fstool = { version = "0.4", default-features = false,
+           features = ["codecs", "containers"] }
+```
+
+`codecs` is every compression codec, `containers` every encrypted
+container (LUKS, qcow2 encryption, encrypted DMG) — so that line keeps
+each supported format while dropping the CLI and its ~26 transitive
+crates. Take neither, or hand-pick individual features from the tables
+below, to trim further.
+
+The default feature set adds `cli` + `readline` on top, so `cargo install
+fstool` and `cargo build` still produce a working command with no extra
+flags. CI asserts the library-only resolve contains neither `clap` nor
+`rustyline`.
+
 ## Compression
 
 `fstool` ships with six compression codecs enabled by default. Each has

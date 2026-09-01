@@ -9,6 +9,10 @@
 //! writer, including the post-flush truncation to the true archive
 //! length.
 
+// Every test here drives the `fstool` binary, which only exists when
+// the `cli` feature builds it (see `[[bin]] required-features`).
+#![cfg(feature = "cli")]
+
 use std::path::Path;
 use std::process::Command;
 
