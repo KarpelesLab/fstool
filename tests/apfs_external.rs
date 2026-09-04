@@ -1679,6 +1679,27 @@ fn apfs_drec_hash_known_vectors() {
         h_precomposed & !0x3FF,
         "NFD should fuse the two café spellings"
     );
+
+    // Full case folding is not `to_lowercase`, and that difference is the
+    // reason this crate depends on `caseless` at all. Under Unicode
+    // default case folding ß folds to "ss" and the ﬁ ligature to "fi";
+    // `to_lowercase` leaves both alone. macOS's kernel folds, so a
+    // `to_lowercase` "simplification" here would sort these drecs into
+    // the wrong B-tree bucket and the files would vanish on mount.
+    for (a, b) in [("stra\u{00DF}e", "STRASSE"), ("\u{FB01}le", "file")] {
+        assert_eq!(
+            apfs_drec_name_len_and_hash(a, true) & !0x3FF,
+            apfs_drec_name_len_and_hash(b, true) & !0x3FF,
+            "{a:?} and {b:?} must fold to the same hash"
+        );
+        // Sanity that the pair is a real fold case, not accidentally equal
+        // before folding.
+        assert_ne!(
+            apfs_drec_name_len_and_hash(a, false) & !0x3FF,
+            apfs_drec_name_len_and_hash(b, false) & !0x3FF,
+            "{a:?} and {b:?} should differ without case-fold"
+        );
+    }
 }
 
 /// Sibling of `apfs_writer_passes_fsck_apfs` — validates the
