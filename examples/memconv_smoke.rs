@@ -12,7 +12,12 @@ fn main() -> fstool::Result<()> {
     println!("input: {path} ({} bytes)", bytes.len());
 
     let report = fstool::memconv::probe(&bytes)?;
+    // The report serialises only when the `json` feature is on; without
+    // it, fall back to the Debug rendering so the example still runs.
+    #[cfg(feature = "json")]
     println!("probe: {}", serde_json::to_string_pretty(&report).unwrap());
+    #[cfg(not(feature = "json"))]
+    println!("probe: {report:?}");
 
     let mut img = fstool::memconv::MemImage::open(bytes)?;
     println!("opened as: {}", img.kind());

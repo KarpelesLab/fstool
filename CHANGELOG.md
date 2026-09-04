@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- *(deps)* four more capabilities are feature-gated, all on by default:
+  `spec` (the TOML engine → `toml` + `serde`), `json` (`Serialize`, the
+  `--json` output, the wasm bridge, and LUKS2 → `serde` + `serde_json`),
+  `log` (the facade → `log`), and `unix-host` (block-device ioctls,
+  `O_EXCL`, terminal width, Ctrl-C → `libc`). Defaults are unchanged, so
+  nothing moves for existing users; `--features codecs` alone is now a
+  7-crate build whose only third-party dependency is `uuid`. CI checks
+  that floor builds, lints and passes its tests.
+
 ## [0.4.25](https://github.com/KarpelesLab/fstool/compare/v0.4.24...v0.4.25) - 2026-09-04
 
 ### Fixed

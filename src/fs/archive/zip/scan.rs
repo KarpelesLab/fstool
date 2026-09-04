@@ -253,7 +253,8 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
 
     if eocd.total_entries != 0 && seen != eocd.total_entries {
         // Not fatal — some tools miscount — but worth surfacing in logs.
-        log::debug!(
+        crate::fstool_log!(
+            debug,
             "zip: EOCD declared {} entries, walked {seen}",
             eocd.total_entries
         );

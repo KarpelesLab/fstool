@@ -23,16 +23,24 @@
 //! Sizes accept a human suffix: `512`, `4KiB`, `256MiB`, `1GiB`, `2GB`
 //! (decimal `KB/MB/GB` and binary `KiB/MiB/GiB`; bare numbers are bytes).
 
+#[cfg(feature = "spec")]
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "spec")]
 use serde::Deserialize;
 
 use crate::Result;
+#[cfg(feature = "spec")]
 use crate::block::BlockDevice;
-use crate::fs::ext::{Ext, FsKind};
+#[cfg(feature = "spec")]
+use crate::fs::ext::Ext;
+#[cfg(feature = "spec")]
+use crate::fs::ext::FsKind;
+#[cfg(feature = "spec")]
 use crate::fs::rootdevs::RootDevs;
 
 /// Top-level parsed spec. Exactly one of `filesystem` / `image` must be set.
+#[cfg(feature = "spec")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Spec {
@@ -46,6 +54,7 @@ pub struct Spec {
 }
 
 /// Disk-level options for a partitioned image.
+#[cfg(feature = "spec")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImageSpec {
@@ -71,6 +80,7 @@ pub struct ImageSpec {
 /// type = "ext4"
 /// source = "./rootfs"
 /// ```
+#[cfg(feature = "spec")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartitionSpec {
@@ -96,6 +106,7 @@ pub struct PartitionSpec {
 /// route. External crates should construct `FilesystemSpec` only through
 /// `toml::from_str` (or one of the [`Spec`] parse helpers), not via a
 /// struct literal.
+#[cfg(feature = "spec")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
@@ -137,6 +148,7 @@ pub struct FilesystemSpec {
     pub options: Option<toml::Table>,
 }
 
+#[cfg(feature = "spec")]
 impl Spec {
     /// Parse a spec from TOML text.
     pub fn parse(toml_text: &str) -> Result<Self> {
@@ -182,6 +194,7 @@ impl Spec {
 }
 
 /// Build the image described by `spec` into the file at `output`.
+#[cfg(feature = "spec")]
 pub fn build(spec: &Spec, output: &Path) -> Result<()> {
     if let Some(fs) = &spec.filesystem {
         build_bare_fs(fs, output)
@@ -193,6 +206,7 @@ pub fn build(spec: &Spec, output: &Path) -> Result<()> {
     }
 }
 
+#[cfg(feature = "spec")]
 fn build_bare_fs(fs: &FilesystemSpec, output: &Path) -> Result<()> {
     match fs.fs_type.to_ascii_lowercase().as_str() {
         "ext2" | "ext3" | "ext4" => build_bare_ext(fs, output),
@@ -242,6 +256,7 @@ fn build_bare_fs(fs: &FilesystemSpec, output: &Path) -> Result<()> {
     }
 }
 
+#[cfg(feature = "spec")]
 fn zip_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::archive::zip::ZipFormatOpts> {
     let mut bag = options_bag_for(fs)?;
     // `volume_label` is meaningless for archives; drop it so check_empty
@@ -253,6 +268,7 @@ fn zip_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::archive::zip::ZipFo
     Ok(opts)
 }
 
+#[cfg(feature = "spec")]
 fn cpio_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::archive::cpio::CpioFormatOpts> {
     let mut bag = options_bag_for(fs)?;
     let _ = bag.take_str("volume_label");
@@ -262,6 +278,7 @@ fn cpio_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::archive::cpio::Cpi
     Ok(opts)
 }
 
+#[cfg(feature = "spec")]
 fn ar_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::archive::ar::ArFormatOpts> {
     let mut bag = options_bag_for(fs)?;
     let _ = bag.take_str("volume_label");
@@ -277,6 +294,7 @@ fn ar_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::archive::ar::ArForma
 /// respective helpers), then merges the optional `[filesystem.options]`
 /// table on top. Caller is responsible for `check_empty` after taking
 /// the keys it recognises.
+#[cfg(feature = "spec")]
 fn options_bag_for(fs: &FilesystemSpec) -> Result<crate::format_opts::OptionMap> {
     let mut bag = crate::format_opts::OptionMap::new();
     if let Some(label) = &fs.volume_label {
@@ -288,6 +306,7 @@ fn options_bag_for(fs: &FilesystemSpec) -> Result<crate::format_opts::OptionMap>
     Ok(bag)
 }
 
+#[cfg(feature = "spec")]
 fn grf_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::grf::FormatOpts> {
     let mut bag = options_bag_for(fs)?;
     let mut opts = crate::fs::grf::FormatOpts::default();
@@ -296,6 +315,7 @@ fn grf_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::grf::FormatOpts> {
     Ok(opts)
 }
 
+#[cfg(feature = "spec")]
 fn iso9660_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::iso9660::FormatOpts> {
     let mut bag = options_bag_for(fs)?;
     let mut opts = crate::fs::iso9660::FormatOpts {
@@ -312,6 +332,7 @@ fn iso9660_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::iso9660::Format
 /// `source`, flush" pipeline. Used for every writable FS whose
 /// destination size doesn't have to be derived from the source tree
 /// (we accept an explicit `size` in TOML, defaulting to 256 MiB).
+#[cfg(feature = "spec")]
 fn build_bare_via_trait<F: crate::fs::FilesystemFactory>(
     fs: &FilesystemSpec,
     output: &Path,
@@ -343,6 +364,7 @@ fn build_bare_via_trait<F: crate::fs::FilesystemFactory>(
 
 /// Shrink an over-provisioned archive output file to its true length.
 /// No-op for block devices and qcow2 containers.
+#[cfg(feature = "spec")]
 fn truncate_archive_file(output: &Path, len: u64) -> Result<()> {
     if crate::block::file::is_block_device(output)
         || output
@@ -360,6 +382,7 @@ fn truncate_archive_file(output: &Path, len: u64) -> Result<()> {
 /// In-partition variant of [`build_bare_via_trait`]: takes an already
 /// pre-sliced `dev` (just one partition's view) and formats `F` into
 /// it, optionally populating from `source`.
+#[cfg(feature = "spec")]
 fn format_in_partition_via_trait<F: crate::fs::FilesystemFactory>(
     dev: &mut dyn BlockDevice,
     fs: &FilesystemSpec,
@@ -374,6 +397,7 @@ fn format_in_partition_via_trait<F: crate::fs::FilesystemFactory>(
     Ok(())
 }
 
+#[cfg(feature = "spec")]
 fn hfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::hfs::HfsFormatOpts> {
     // Classic HFS has no `[filesystem.options]` knobs yet; the volume name and
     // allocation-block size come from the flat fields.
@@ -391,6 +415,7 @@ fn hfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::hfs::HfsFormatOpts>
     })
 }
 
+#[cfg(feature = "spec")]
 fn affs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::affs::AffsFormatOpts> {
     let mut bag = options_bag_for(fs)?;
     let mut opts = crate::fs::affs::AffsFormatOpts::default();
@@ -424,6 +449,7 @@ fn affs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::affs::AffsFormatOp
 
 /// `[filesystem.options]` for littlefs: `block_size`, `block_count`,
 /// `prog_size`, `version` (`2.0` / `2.1`), `name_max`, `inline_max`.
+#[cfg(feature = "spec")]
 fn littlefs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::littlefs::LittleFsFormatOpts> {
     let mut bag = options_bag_for(fs)?;
     let mut opts = crate::fs::littlefs::LittleFsFormatOpts::default();
@@ -464,6 +490,7 @@ pub(crate) fn parse_littlefs_version(v: &str) -> Result<u32> {
     }
 }
 
+#[cfg(feature = "spec")]
 fn hfs_plus_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::hfs_plus::FormatOpts> {
     let mut bag = options_bag_for(fs)?;
     let mut opts = crate::fs::hfs_plus::FormatOpts {
@@ -475,6 +502,7 @@ fn hfs_plus_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::hfs_plus::Form
     Ok(opts)
 }
 
+#[cfg(feature = "spec")]
 fn ntfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::ntfs::format::FormatOpts> {
     let mut bag = options_bag_for(fs)?;
     let mut opts = crate::fs::ntfs::format::FormatOpts::default();
@@ -483,6 +511,7 @@ fn ntfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::ntfs::format::Form
     Ok(opts)
 }
 
+#[cfg(feature = "spec")]
 fn f2fs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::f2fs::FormatOpts> {
     let mut bag = options_bag_for(fs)?;
     let mut opts = crate::fs::f2fs::FormatOpts::default();
@@ -491,6 +520,7 @@ fn f2fs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::f2fs::FormatOpts> 
     Ok(opts)
 }
 
+#[cfg(feature = "spec")]
 fn squashfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::squashfs::FormatOpts> {
     let mut bag = options_bag_for(fs)?;
     let mut opts = crate::fs::squashfs::FormatOpts {
@@ -504,6 +534,7 @@ fn squashfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::squashfs::Form
     Ok(opts)
 }
 
+#[cfg(feature = "spec")]
 fn xfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::xfs::format::FormatOpts> {
     let mut bag = options_bag_for(fs)?;
     let mut opts = crate::fs::xfs::format::FormatOpts::default();
@@ -512,6 +543,7 @@ fn xfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::xfs::format::Format
     Ok(opts)
 }
 
+#[cfg(feature = "spec")]
 fn build_bare_ext(fs: &FilesystemSpec, output: &Path) -> Result<()> {
     let kind = parse_fs_kind(&fs.fs_type)?;
     let block_size = fs.block_size.unwrap_or(1024);
@@ -523,6 +555,7 @@ fn build_bare_ext(fs: &FilesystemSpec, output: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "spec")]
 fn build_bare_fat(fs: &FilesystemSpec, output: &Path) -> Result<()> {
     let lower = fs.fs_type.to_ascii_lowercase();
     // Sizing precedence: explicit `size` → use as-is. Otherwise size
@@ -554,6 +587,7 @@ fn build_bare_fat(fs: &FilesystemSpec, output: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "spec")]
 fn format_fat_into(
     dev: &mut dyn BlockDevice,
     fs: &FilesystemSpec,
@@ -594,6 +628,7 @@ fn format_fat_into(
 /// archive (by extension) becomes `TarArchive`, and any other string
 /// — including the `disk.img:N` partition selector — falls through
 /// to `Image`.
+#[cfg(feature = "spec")]
 fn source_from_spec(src: &Path) -> Result<crate::repack::Source> {
     let s = src.to_str().ok_or_else(|| {
         crate::Error::InvalidArgument(format!("spec: source path {src:?} is not valid UTF-8"))
@@ -604,6 +639,7 @@ fn source_from_spec(src: &Path) -> Result<crate::repack::Source> {
 /// Space-pad and truncate `label` to exactly 11 bytes for FAT32. ASCII only;
 /// non-ASCII bytes are replaced with `_` (FAT32 short labels are OEM-encoded;
 /// we don't try to translate code pages).
+#[cfg(feature = "spec")]
 fn fat32_volume_label(label: Option<&str>) -> [u8; 11] {
     let mut out = [b' '; 11];
     let Some(s) = label else {
@@ -625,6 +661,7 @@ fn fat32_volume_label(label: Option<&str>) -> [u8; 11] {
 /// `blocks_count_override` forces a specific block count (used to make a
 /// partition's filesystem fill the partition exactly); `None` auto-sizes
 /// from the source tree.
+#[cfg(feature = "spec")]
 fn ext_format_opts(
     fs: &FilesystemSpec,
     kind: FsKind,
@@ -678,6 +715,7 @@ fn ext_format_opts(
 }
 
 /// Format + populate an ext filesystem into `dev` from `fs`.
+#[cfg(feature = "spec")]
 fn format_ext_into(
     dev: &mut dyn BlockDevice,
     fs: &FilesystemSpec,
@@ -705,10 +743,13 @@ fn format_ext_into(
 
 /// Logical sector size for partition-table geometry. Both MBR and our v1
 /// GPT writer assume 512-byte sectors.
+#[cfg(feature = "spec")]
 const SECTOR: u64 = 512;
 /// Partition-start alignment: 1 MiB, the modern convention.
+#[cfg(feature = "spec")]
 const ALIGN_LBA: u64 = 2048;
 
+#[cfg(feature = "spec")]
 fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &Path) -> Result<()> {
     use crate::part::{Gpt, Mbr, Partition, PartitionTable, slice_partition};
 
@@ -938,6 +979,7 @@ pub fn parse_partition_kind(s: &str) -> Result<crate::part::PartitionKind> {
     })
 }
 
+#[cfg(feature = "spec")]
 fn parse_fs_kind(s: &str) -> Result<FsKind> {
     match s.to_ascii_lowercase().as_str() {
         "ext2" => Ok(FsKind::Ext2),
@@ -949,6 +991,7 @@ fn parse_fs_kind(s: &str) -> Result<FsKind> {
     }
 }
 
+#[cfg(feature = "spec")]
 fn parse_rootdevs(s: Option<&str>) -> Result<RootDevs> {
     match s.map(|x| x.to_ascii_lowercase()) {
         None => Ok(RootDevs::None),
@@ -963,6 +1006,7 @@ fn parse_rootdevs(s: Option<&str>) -> Result<RootDevs> {
     }
 }
 
+#[cfg(feature = "spec")]
 fn rootdevs_entry_count(kind: RootDevs) -> usize {
     crate::fs::rootdevs::device_table(kind).len()
 }
@@ -998,7 +1042,7 @@ pub fn parse_size(s: &str) -> Result<u64> {
         .ok_or_else(|| crate::Error::InvalidArgument(format!("spec: size {s:?} overflows u64")))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "spec"))]
 mod tests {
     use super::*;
 

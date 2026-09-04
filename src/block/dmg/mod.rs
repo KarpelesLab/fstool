@@ -342,7 +342,8 @@ impl DmgBackend {
         for w in chunks.windows(2) {
             let prev_end = w[0].virtual_sector_start.saturating_add(w[0].sector_count);
             if w[1].virtual_sector_start < prev_end {
-                log::warn!(
+                crate::fstool_log!(
+                    warn,
                     "dmg: chunk overlap detected: chunk ending at sector {} > next chunk start {}",
                     prev_end,
                     w[1].virtual_sector_start

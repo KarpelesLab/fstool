@@ -20,8 +20,6 @@
 
 use std::io::Read;
 
-use serde::Serialize;
-
 use crate::block::{BlockDevice, MemoryBackend};
 use crate::compression::{self, Algo};
 use crate::fs::{EntryKind, Filesystem, FilesystemFactory};
@@ -38,7 +36,8 @@ const PLAN_BLOCK_SIZE: u32 = 4096;
 
 /// What a first pass over a blob revealed. Serializable so the wasm layer
 /// can hand it to JavaScript as JSON.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "json", derive(serde::Serialize))]
 pub struct ProbeReport {
     /// Outer compression codec, if the blob is a single compressed stream
     /// (`"gzip"`, `"zstd"`, …). The inner content is what everything else
@@ -53,14 +52,16 @@ pub struct ProbeReport {
     pub content_size: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "json", derive(serde::Serialize))]
 pub struct PartitionTableReport {
     /// `"gpt"`, `"mbr"`, or `"apm"`.
     pub label: String,
     pub partitions: Vec<PartitionReport>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "json", derive(serde::Serialize))]
 pub struct PartitionReport {
     /// 1-indexed partition number, matching `disk.img:N` and `sgdisk -p`.
     pub index: usize,
@@ -528,7 +529,8 @@ impl MemImage {
 }
 
 /// One entry in a directory listing.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "json", derive(serde::Serialize))]
 pub struct EntryInfo {
     pub name: String,
     /// `"file"`, `"dir"`, `"symlink"`, `"char"`, `"block"`, `"fifo"`,
@@ -542,7 +544,8 @@ pub struct EntryInfo {
 // ======================================================================
 
 /// A conversion target offered to the UI.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "json", derive(serde::Serialize))]
 pub struct TargetInfo {
     /// Format id passed to [`MemImage::convert`].
     pub id: &'static str,

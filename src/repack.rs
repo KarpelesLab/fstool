@@ -258,8 +258,9 @@ impl Progress {
 /// via the `TIOCGWINSZ` ioctl. Returns `None` when stderr isn't a TTY,
 /// the ioctl fails, or the width comes back zero (which some terminals
 /// report transiently during resizes). Unix-only; on other platforms
-/// we just don't truncate.
-#[cfg(unix)]
+/// we just don't truncate — and likewise without the `libc` feature,
+/// which is what the ioctl needs.
+#[cfg(all(unix, feature = "unix-host"))]
 fn term_cols() -> Option<usize> {
     use std::os::fd::AsRawFd;
     let fd = std::io::stderr().as_raw_fd();
@@ -274,7 +275,7 @@ fn term_cols() -> Option<usize> {
     Some(ws.ws_col as usize)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(all(unix, feature = "unix-host")))]
 fn term_cols() -> Option<usize> {
     None
 }

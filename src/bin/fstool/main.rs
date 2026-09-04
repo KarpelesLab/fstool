@@ -3722,64 +3722,82 @@ fn info(image: &str, password: Option<&str>) -> fstool::Result<()> {
 /// this is a courtesy line, so a container we cannot describe just
 /// doesn't get one and the filesystem summary carries on.
 fn print_container_info(path: &std::path::Path, password: Option<&str>) {
-    if fstool::block::Qcow2Backend::probe(path).unwrap_or(false) {
-        let opened = match password {
-            #[cfg(feature = "qcow2-crypto")]
-            Some(pw) => fstool::block::Qcow2Backend::open_encrypted_read_only(path, pw),
-            #[cfg(not(feature = "qcow2-crypto"))]
-            Some(_) => fstool::block::Qcow2Backend::open_read_only(path),
-            None => fstool::block::Qcow2Backend::open_read_only(path),
-        };
-        let Ok(q) = opened else { return };
-        let h = q.header();
-        println!("container:         qcow2 v{}", h.version);
-        println!("virtual size:      {} bytes", h.size);
-        println!("cluster size:      {} bytes", h.cluster_size());
-        if let Some(name) = q.backing_file() {
-            match q.backing_format() {
-                Some(fmt) => println!("backing file:      {name} (format {fmt})"),
-                None => println!("backing file:      {name}"),
-            }
-        }
-        match h.crypt_method {
-            0 => {}
-            1 => println!("encryption:        AES (legacy; the key is the passphrase)"),
-            2 => println!("encryption:        LUKS"),
-            other => println!("encryption:        unknown method {other}"),
-        }
-        println!();
+    if print_qcow2_container_info(path, password) {
         return;
     }
-
-    #[cfg(feature = "luks")]
-    {
-        let Ok(mut file) = fstool::block::FileBackend::open_read_only(path) else {
-            return;
-        };
-        let Some(version) = fstool::block::luks::probe(&mut file) else {
-            return;
-        };
-        println!("container:         {version}");
-        let Some(pw) = password else {
-            println!("                   (pass --password to see inside)");
-            println!();
-            return;
-        };
-        match fstool::block::luks::LuksBackend::open_read_only(file, pw) {
-            Ok(vol) => {
-                println!("uuid:              {}", vol.header().uuid());
-                if let Ok(c) = vol.header().cipher_spec_string() {
-                    println!("cipher:            {c}");
-                }
-                println!("payload offset:    {} bytes", vol.payload_offset());
-                println!("payload size:      {} bytes", vol.total_size());
-                println!("sector size:       {} bytes", vol.block_size());
-            }
-            Err(e) => println!("                   (locked: {e})"),
-        }
-        println!();
-    }
+    print_luks_container_info(path, password);
 }
+
+/// The qcow2 half. Returns true when it printed, so the caller stops.
+fn print_qcow2_container_info(path: &std::path::Path, password: Option<&str>) -> bool {
+    if !fstool::block::Qcow2Backend::probe(path).unwrap_or(false) {
+        return false;
+    }
+    let opened = match password {
+        #[cfg(feature = "qcow2-crypto")]
+        Some(pw) => fstool::block::Qcow2Backend::open_encrypted_read_only(path, pw),
+        #[cfg(not(feature = "qcow2-crypto"))]
+        Some(_) => fstool::block::Qcow2Backend::open_read_only(path),
+        None => fstool::block::Qcow2Backend::open_read_only(path),
+    };
+    let Ok(q) = opened else {
+        // It is a qcow2 — we just can't describe it (encrypted, no
+        // password). Claiming it isn't one would be worse.
+        return true;
+    };
+    let h = q.header();
+    println!("container:         qcow2 v{}", h.version);
+    println!("virtual size:      {} bytes", h.size);
+    println!("cluster size:      {} bytes", h.cluster_size());
+    if let Some(name) = q.backing_file() {
+        match q.backing_format() {
+            Some(fmt) => println!("backing file:      {name} (format {fmt})"),
+            None => println!("backing file:      {name}"),
+        }
+    }
+    match h.crypt_method {
+        0 => {}
+        1 => println!("encryption:        AES (legacy; the key is the passphrase)"),
+        2 => println!("encryption:        LUKS"),
+        other => println!("encryption:        unknown method {other}"),
+    }
+    println!();
+    true
+}
+
+/// The LUKS half — a no-op in a build without the `luks` feature, which
+/// keeps the caller free of a `cfg` around the call.
+#[cfg(feature = "luks")]
+fn print_luks_container_info(path: &std::path::Path, password: Option<&str>) {
+    let Ok(mut file) = fstool::block::FileBackend::open_read_only(path) else {
+        return;
+    };
+    let Some(version) = fstool::block::luks::probe(&mut file) else {
+        return;
+    };
+    println!("container:         {version}");
+    let Some(pw) = password else {
+        println!("                   (pass --password to see inside)");
+        println!();
+        return;
+    };
+    match fstool::block::luks::LuksBackend::open_read_only(file, pw) {
+        Ok(vol) => {
+            println!("uuid:              {}", vol.header().uuid());
+            if let Ok(c) = vol.header().cipher_spec_string() {
+                println!("cipher:            {c}");
+            }
+            println!("payload offset:    {} bytes", vol.payload_offset());
+            println!("payload size:      {} bytes", vol.total_size());
+            println!("sector size:       {} bytes", vol.block_size());
+        }
+        Err(e) => println!("                   (locked: {e})"),
+    }
+    println!();
+}
+
+#[cfg(not(feature = "luks"))]
+fn print_luks_container_info(_path: &std::path::Path, _password: Option<&str>) {}
 
 fn print_partition_table(
     path: &std::path::Path,

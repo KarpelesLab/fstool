@@ -479,7 +479,10 @@ impl Drop for FileWriter<'_> {
         if self.dirty.is_some()
             && let Err(e) = self.apply()
         {
-            log::warn!("littlefs: dropping a file handle lost pending writes: {e}");
+            crate::fstool_log!(
+                warn,
+                "littlefs: dropping a file handle lost pending writes: {e}"
+            );
         }
     }
 }

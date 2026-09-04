@@ -621,11 +621,34 @@ each supported format while dropping the CLI and its ~26 transitive
 crates. Take neither, or hand-pick individual features from the tables
 below, to trim further.
 
-What remains is 31 crates, and the two non-trivial ones are ours:
-[`purecrypto`](https://github.com/KarpelesLab/purecrypto) for every
-cipher, hash and KDF, and [`intl`](https://github.com/KarpelesLab/intlrs)
-for the Unicode normalization and case folding the APFS directory-record
-hash needs. Both are pure Rust with no foreign code.
+Four more features carve up what is left, all on by default:
+
+| Feature | Enables | Pulls |
+|---------|---------|-------|
+| `spec` | the TOML spec engine — `spec::Spec`, `spec::build`, `-O` from a file | `toml`, `serde` |
+| `json` | `Serialize` on the report types, `--json` output, the wasm bridge, and LUKS2 (whose metadata *is* JSON) | `serde`, `serde_json` |
+| `log` | the `log` facade — four call sites, all reporting something recovered from | `log` |
+| `unix-host` | block-device capacity ioctls, `O_EXCL` on a mounted disk, terminal width, the CLI's Ctrl-C | `libc` |
+
+Dropping one costs only what it names: without `spec` the library is
+driven through its Rust API (`spec::parse_size` and the other pure
+helpers stay), without `json` there is no `--json` and no LUKS2, without
+`log` those four sites compile to nothing, and without `unix-host` a
+block device is refused the same way it already is on Windows. Image
+*files* work in every configuration.
+
+That makes the floor `--features codecs` — **7 crates**, of which the
+three that matter are ours:
+[`compcol`](https://github.com/KarpelesLab/compcol) for every codec,
+[`charcode`](https://github.com/KarpelesLab/charcode) for legacy
+character encodings, and
+[`intl`](https://github.com/KarpelesLab/intlrs) for the Unicode
+normalization and case folding the APFS directory-record hash needs.
+Add `containers` and
+[`purecrypto`](https://github.com/KarpelesLab/purecrypto) joins them for
+every cipher, hash and KDF. All four are pure Rust with no foreign code.
+The only third-party crate left in that floor is `uuid` (with
+`getrandom` and `libc` behind it). CI asserts the floor stays there.
 
 The default feature set adds `cli` + `readline` on top, so `cargo install
 fstool` and `cargo build` still produce a working command with no extra

@@ -38,8 +38,9 @@ pub fn is_block_device(path: &Path) -> bool {
 }
 
 /// Total byte size of an opened block device. Errors on platforms without
-/// an ioctl implementation (currently anything other than Linux/macOS).
-#[cfg(unix)]
+/// an ioctl implementation (anything other than Linux/macOS), and in a
+/// build without the `libc` feature, which is what the ioctls need.
+#[cfg(all(unix, feature = "unix-host"))]
 fn block_device_size(file: &File) -> io::Result<u64> {
     use std::os::unix::io::AsRawFd;
     let fd = file.as_raw_fd();
@@ -85,7 +86,7 @@ fn block_device_size(file: &File) -> io::Result<u64> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(all(unix, feature = "unix-host")))]
 fn block_device_size(_file: &File) -> io::Result<u64> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -245,12 +246,12 @@ impl FileBackend {
 fn open_existing_for_write(path: &Path, exclusive: bool) -> io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.read(true).write(true);
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "unix-host"))]
     if exclusive {
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(libc::O_EXCL);
     }
-    #[cfg(not(unix))]
+    #[cfg(not(all(unix, feature = "unix-host")))]
     {
         let _ = exclusive;
     }

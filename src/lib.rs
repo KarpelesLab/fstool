@@ -42,4 +42,26 @@ pub mod spec;
 #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 pub mod wasm;
 
+/// `log::warn!` / `log::debug!` when the `log` feature is on, and
+/// nothing at all when it is off.
+///
+/// Every call site reports something the code *recovered* from — a
+/// dropped handle, an odd field — never a failure, so compiling them
+/// away costs no diagnosis of anything fatal. The arguments are still
+/// type-checked in both configurations: the no-op arm feeds them to
+/// `format_args!` and discards it, so a stale `{}` placeholder is a
+/// compile error either way rather than only in the logging build.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! fstool_log {
+    ($level:ident, $($arg:tt)*) => {{
+        #[cfg(feature = "log")]
+        ::log::$level!($($arg)*);
+        #[cfg(not(feature = "log"))]
+        {
+            let _ = ::core::format_args!($($arg)*);
+        }
+    }};
+}
+
 pub use error::{Error, Result};

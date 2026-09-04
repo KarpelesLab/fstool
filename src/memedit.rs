@@ -35,8 +35,6 @@
 //! # Ok::<(), fstool::Error>(())
 //! ```
 
-use serde::Serialize;
-
 use crate::block::{BlockDevice, MemoryBackend};
 use crate::format_opts::OptionMap;
 use crate::fs::{FileMeta, FileSource, FilesystemFactory, MutationCapability};
@@ -57,7 +55,8 @@ const GPT_TAIL_LBA: u64 = 34;
 // ======================================================================
 
 /// A filesystem type [`Workspace::new_filesystem`] can format from scratch.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "json", derive(serde::Serialize))]
 pub struct FsTypeInfo {
     /// Id accepted by [`Workspace::new_filesystem`] and `add_partition`.
     pub id: &'static str,
@@ -432,7 +431,8 @@ struct OpenFs {
 }
 
 /// Description of a workspace, for a UI to render. Serializable.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "json", derive(serde::Serialize))]
 pub struct WorkspaceInfo {
     /// `"gpt"` / `"mbr"` for a disk workspace, `None` for a bare filesystem.
     pub table: Option<String>,
@@ -451,7 +451,8 @@ pub struct WorkspaceInfo {
 }
 
 /// One partition of a disk workspace.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "json", derive(serde::Serialize))]
 pub struct PartitionInfo {
     /// 1-indexed, matching `disk.img:N`.
     pub index: usize,

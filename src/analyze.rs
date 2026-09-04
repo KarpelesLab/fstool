@@ -128,7 +128,8 @@ impl Analysis {
 
 /// Flat, serialisable view of an [`Analysis`] — what `fstool analyze
 /// --json` emits and the human formatter consumes.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "json", derive(serde::Serialize))]
 pub struct AnalysisReport {
     pub files: u64,
     pub dirs: u64,

@@ -1,5 +1,8 @@
 //! End-to-end validation of the TOML spec `build` path.
 
+// Every test here drives the TOML spec engine.
+#![cfg(feature = "spec")]
+
 use std::process::Command;
 
 use tempfile::NamedTempFile;

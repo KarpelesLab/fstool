@@ -43,7 +43,7 @@ required-features = ["cli"]
 # per-format feature (`cab`, `amiga-lzx`, `lha`, `arc`, `sit`, `sevenz`,
 # `rar`); each enables only the compcol codecs it can use today and returns a
 # clean `Unsupported` for methods whose codec hasn't landed in compcol yet.
-default = ["codecs", "containers", "cli", "readline"]
+default = ["codecs", "containers", "spec", "json", "log", "unix-host", "cli", "readline"]
 
 # Everything the library reads and writes, with no command-line surface.
 # This is the set a library consumer wants:
@@ -57,12 +57,37 @@ codecs = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "cab", "amiga-lzx", "lha",
 # The encrypted disk-image containers.
 containers = ["dmg-encrypted", "luks", "qcow2-crypto"]
 
+# The TOML spec engine: `spec::Spec`, `spec::build`, and
+# `OptionMap::merge_toml` — everything that turns a `.toml` file into an
+# image. Pulls `toml` (and `serde`, which it is built on). Off, the
+# library is driven through its Rust API instead; `spec::parse_size` and
+# the other pure helpers stay either way.
+spec = ["dep:toml", "dep:serde"]
+
+# Speaking JSON: `Serialize` on the report types, the `--json` output of
+# `analyze`, the wasm bridge's return values — and LUKS2, whose on-disk
+# metadata *is* a JSON document, which is why `luks` requires this.
+json = ["dep:serde", "dep:serde_json"]
+
+# The `log` facade. Four call sites, all of them reporting something
+# recovered from rather than failed on. Off, they compile to nothing.
+log = ["dep:log"]
+
+# Unix host integration: querying a real block device's capacity
+# (`BLKGETSIZE64` / `DKIOCGETBLOCK*`), opening one `O_EXCL` so the kernel
+# refuses a mounted disk, terminal width for the progress line, and the
+# CLI's Ctrl-C handler. Off, these degrade the way they already do on
+# non-Unix: a block device reports no size and is refused, the progress
+# line assumes 80 columns, and Ctrl-C is the default kill. Image *files*
+# are untouched either way.
+unix-host = ["dep:libc"]
+
 # The `fstool` binary's argument parsing. On by default so `cargo install
 # fstool` produces a working command; a library consumer turns it off with
 # `default-features = false`. Deliberately does NOT imply `readline`: the
 # static libc-free release build wants the CLI without rustyline's
 # unix-only terminal layer.
-cli = ["dep:clap"]
+cli = ["dep:clap", "spec", "json", "log", "unix-host"]
 # Line editing + command history for the interactive `fstool shell` (↑/↓
 # history, Ctrl-A/E, etc.) via `rustyline`. Implied by `cli`; drop it with
 # `--features cli` and no `readline` to lose the dependency — the shell
@@ -73,7 +98,7 @@ readline = ["dep:rustyline"]
 # `wasm-bindgen`; build with `--no-default-features --features
 # wasm,<codecs…> --target wasm32-unknown-unknown`, then run `wasm-bindgen`.
 # Off by default so native library/CLI builds don't carry the dependency.
-wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook"]
+wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook", "json"]
 # Every codec is served by `compcol` (one uniform crate): gzip/zlib/deflate/
 # xz/lzma/zstd/lz4/lzo, plus the CAB + Amiga-LZX archive codecs and the DMG
 # bzip2/lzfse decoders. The `gzip` feature also covers zip DEFLATE, DMG zlib,
@@ -127,7 +152,7 @@ dmg-encrypted = ["dep:purecrypto"]
 # `purecrypto` (AES/Camellia/ARIA/SM4 in XTS/CBC/CTR/ECB, PBKDF2,
 # Argon2i/id, SHA-1/2, RIPEMD-160, Whirlpool) — pure-Rust, no foreign
 # code. Gated so a slim build can drop it.
-luks = ["dep:purecrypto"]
+luks = ["dep:purecrypto", "json"]
 # qcow2 encryption — both `crypt_method` values: 1 (the legacy AES-CBC
 # scheme qemu now reads but no longer creates) and 2 (LUKS, whose header
 # is embedded in the image via the crypto-header extension). Builds on
@@ -137,18 +162,20 @@ qcow2-crypto = ["luks"]
 # ext{2,3,4} image as a userspace filesystem via libfuse (Linux) or
 # macFUSE (macOS). Off by default so the core build doesn't need a C
 # FUSE library on the host; opt in with `--features fuse`.
-fuse = ["dep:fuser"]
+fuse = ["dep:fuser", "unix-host"]
 
 [dependencies]
-log = "0.4"
+log = { version = "0.4", optional = true }
 uuid = { version = "1", features = ["v4"] }
 # Argument parsing for the `fstool` binary — see the `cli` feature. The
 # library itself needs clap only to derive `ValueEnum` on `PathStyle`,
 # which is `cfg_attr`-gated on the same feature.
 clap = { version = "4", features = ["derive"], optional = true }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1"
-toml = "1.1.2"
+# Serialization, behind the `serde` feature. `toml` is here because it is
+# built on serde and cannot exist without it; the three travel together.
+serde = { version = "1.0.228", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+toml = { version = "1.1.2", optional = true }
 # Unicode NFD + full case folding for the APFS drec hash function.
 # Volumes formatted with APFS_INCOMPAT_NORMALIZATION_INSENSITIVE (the
 # macOS default for user data volumes) store drec keys with a 22-bit
@@ -209,7 +236,7 @@ fuser = { version = "0.16", optional = true, features = ["libfuse"] }
 # query the size of a block device, plus the O_EXCL open flag that refuses
 # devices with a mounted partition.
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

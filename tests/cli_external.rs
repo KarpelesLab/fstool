@@ -2236,6 +2236,7 @@ fn fixture_tree() -> tempfile::TempDir {
 
 /// `--encrypt-kdf-*` at the floor, so the tests don't spend seconds in a
 /// KDF that is deliberately expensive in real use.
+#[cfg(feature = "luks")]
 const CHEAP_KDF: [&str; 4] = ["--encrypt-kdf-iterations", "1", "--encrypt-kdf-memory", "8"];
 
 /// `create --encrypt` on a raw destination makes a LUKS volume that

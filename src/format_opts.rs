@@ -87,6 +87,7 @@ impl OptionMap {
     /// to its conventional string form: booleans → `"true"`/`"false"`,
     /// integers / floats → decimal, strings → their raw text. Nested
     /// arrays / tables aren't accepted — pass scalar values only.
+    #[cfg(feature = "spec")]
     pub fn merge_toml(&mut self, table: &toml::Table) -> Result<()> {
         for (k, v) in table.iter() {
             let s = match v {
@@ -294,6 +295,7 @@ mod tests {
         assert!(msg.contains("journal_blocks"), "msg: {msg}");
     }
 
+    #[cfg(feature = "spec")]
     #[test]
     fn toml_table_round_trips() {
         let table: toml::Table = toml::from_str(
