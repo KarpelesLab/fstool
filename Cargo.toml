@@ -152,22 +152,25 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"
 toml = "1.1.2"
 crc32c = "0.6.8"
-# Unicode NFD + default case folding for the APFS drec hash function.
+# Unicode NFD + full case folding for the APFS drec hash function.
 # Volumes formatted with APFS_INCOMPAT_NORMALIZATION_INSENSITIVE (the
 # macOS default for user data volumes) store drec keys with a 22-bit
 # CRC32C of the NFD-normalised (optionally case-folded) name; our writer
-# computes it via these crates. Both are maintained under unicode-rs and
-# MIT/Apache.
+# computes it via `intl`.
 #
-# `caseless` is one file of generated case-folding tables and costs
-# exactly one crate: its only dependency is `unicode-normalization`,
-# which we take directly anyway. It is not interchangeable with
-# `str::to_lowercase` — full folding maps ß to "ss" and ﬁ to "fi" where
-# lowercasing leaves them alone, and the macOS kernel folds, so getting
-# it wrong files a drec in the wrong B-tree bucket (see the
-# `apfs_drec_hash_known_vectors` test).
-unicode-normalization = "0.1"
-caseless = "0.2"
+# `intl` (KarpelesLab) is a pure-Rust, no_std ICU analog with zero
+# mandatory dependencies. We take the two modules that hash needs —
+# UAX #15 normalization and UTS-conformant case folding — over the whole
+# codepoint range (`full`), and none of its CLDR / collation / datetime /
+# timezone surface.
+#
+# Folding is not `str::to_lowercase`: full folding maps ß to "ss" and ﬁ
+# to "fi" where lowercasing leaves them alone, and the macOS kernel
+# folds, so getting it wrong files a drec in a bucket the kernel never
+# looks up (see the `apfs_drec_hash_known_vectors` test, which pins the
+# exact hashes).
+intl = { version = "0.6.1", default-features = false, features = ["case", "full"] }
+
 # CP949 (Korean) ↔ UTF-8 for the GRF backend (Gravity Ragnarok archives
 # store filenames in CP949). encoding_rs's `EUC_KR` label is the WHATWG
 # alias that covers CP949 — the spec mapping is identical in practice.

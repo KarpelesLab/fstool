@@ -621,6 +621,12 @@ each supported format while dropping the CLI and its ~26 transitive
 crates. Take neither, or hand-pick individual features from the tables
 below, to trim further.
 
+What remains is 31 crates, and the two non-trivial ones are ours:
+[`purecrypto`](https://github.com/KarpelesLab/purecrypto) for every
+cipher, hash and KDF, and [`intl`](https://github.com/KarpelesLab/intlrs)
+for the Unicode normalization and case folding the APFS directory-record
+hash needs. Both are pure Rust with no foreign code.
+
 The default feature set adds `cli` + `readline` on top, so `cargo install
 fstool` and `cargo build` still produce a working command with no extra
 flags. CI asserts the library-only resolve contains neither `clap` nor

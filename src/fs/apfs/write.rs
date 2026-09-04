@@ -355,12 +355,15 @@ pub(crate) fn build_drec_record(
 /// bucket and the kernel won't find it on the next mount — same
 /// failure mode as an off-by-one in our impl.
 pub fn apfs_drec_name_len_and_hash(name: &str, case_fold: bool) -> u32 {
-    use caseless::Caseless;
-    use unicode_normalization::UnicodeNormalization;
+    use intl::unicode::{case, normalize};
+    // NFD first, then fold — the order the kernel's hash uses. Both are
+    // iterator adapters, so nothing intermediate is allocated.
     let chars: Vec<u32> = if case_fold {
-        name.nfd().default_case_fold().map(|c| c as u32).collect()
+        case::fold(normalize::nfd(name.chars()))
+            .map(|c| c as u32)
+            .collect()
     } else {
-        name.nfd().map(|c| c as u32).collect()
+        normalize::nfd(name.chars()).map(|c| c as u32).collect()
     };
     let bytes: Vec<u8> = chars.iter().flat_map(|c| c.to_le_bytes()).collect();
     let crc = crc32c::crc32c(&bytes);

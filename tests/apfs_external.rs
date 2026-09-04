@@ -1680,12 +1680,12 @@ fn apfs_drec_hash_known_vectors() {
         "NFD should fuse the two café spellings"
     );
 
-    // Full case folding is not `to_lowercase`, and that difference is the
-    // reason this crate depends on `caseless` at all. Under Unicode
-    // default case folding ß folds to "ss" and the ﬁ ligature to "fi";
-    // `to_lowercase` leaves both alone. macOS's kernel folds, so a
-    // `to_lowercase` "simplification" here would sort these drecs into
-    // the wrong B-tree bucket and the files would vanish on mount.
+    // Full case folding is not `to_lowercase`, and that difference is why
+    // the hash goes through a real Unicode implementation. Under full
+    // folding ß folds to "ss" and the ﬁ ligature to "fi"; `to_lowercase`
+    // leaves both alone. macOS's kernel folds, so a `to_lowercase`
+    // "simplification" here would sort these drecs into a bucket the
+    // kernel never looks up and the files would vanish on mount.
     for (a, b) in [("stra\u{00DF}e", "STRASSE"), ("\u{FB01}le", "file")] {
         assert_eq!(
             apfs_drec_name_len_and_hash(a, true) & !0x3FF,
@@ -1698,6 +1698,88 @@ fn apfs_drec_hash_known_vectors() {
             apfs_drec_name_len_and_hash(a, false) & !0x3FF,
             apfs_drec_name_len_and_hash(b, false) & !0x3FF,
             "{a:?} and {b:?} should differ without case-fold"
+        );
+    }
+}
+
+/// Absolute hash values, pinned.
+///
+/// The relational checks above would all still pass if the whole hash
+/// shifted — a different normalization or folding implementation, say —
+/// while every APFS volume we write silently stopped matching what the
+/// macOS kernel computes. These are the exact `u32`s, captured from the
+/// `caseless` + `unicode-normalization` implementation and unchanged by
+/// the move to `intl`.
+///
+/// The corpus is chosen for the cases where implementations disagree:
+/// Turkish dotted I, Greek final sigma, Cherokee (whose fold maps to
+/// *upper* case), supplementary-plane Deseret, ligatures, the angstrom
+/// sign, and a titlecase digraph.
+#[test]
+fn apfs_drec_hash_absolute_vectors() {
+    use fstool::fs::apfs::write::apfs_drec_name_len_and_hash;
+    const VECTORS: &[(&str, bool, u32)] = &[
+        ("foo", false, 0x568a8804),
+        ("foo", true, 0x568a8804),
+        ("Foo", false, 0x184a1004),
+        ("Foo", true, 0x568a8804),
+        ("lost+found", false, 0x3c48000b),
+        ("lost+found", true, 0x3c48000b),
+        ("caf\u{00E9}", false, 0x5e5c7806),
+        ("caf\u{00E9}", true, 0x5e5c7806),
+        ("stra\u{00DF}e", false, 0x019b0808),
+        ("stra\u{00DF}e", true, 0xae4df008),
+        ("STRASSE", false, 0xedbb8c08),
+        ("STRASSE", true, 0xae4df008),
+        ("\u{FB01}le", false, 0x4741b006),
+        ("\u{FB01}le", true, 0xc60e7806),
+        ("file", false, 0xc60e7805),
+        ("file", true, 0xc60e7805),
+        ("\u{0130}stanbul", false, 0x3b52940a),
+        ("\u{0130}stanbul", true, 0xc2540c0a),
+        (
+            "\u{03A3}\u{038A}\u{03A3}\u{03A5}\u{03A6}\u{039F}\u{03A3}",
+            false,
+            0xa108480f,
+        ),
+        (
+            "\u{03A3}\u{038A}\u{03A3}\u{03A5}\u{03A6}\u{039F}\u{03A3}",
+            true,
+            0x54d4200f,
+        ),
+        (
+            "\u{03C3}\u{03AF}\u{03C3}\u{03C5}\u{03C6}\u{03BF}\u{03C2}",
+            false,
+            0x427ec00f,
+        ),
+        (
+            "\u{03C3}\u{03AF}\u{03C3}\u{03C5}\u{03C6}\u{03BF}\u{03C2}",
+            true,
+            0x54d4200f,
+        ),
+        ("\u{13A3}\u{13B3}\u{13A9}", false, 0x90c6940a),
+        ("\u{13A3}\u{13B3}\u{13A9}", true, 0x90c6940a),
+        ("\u{65E5}\u{672C}\u{8A9E}", false, 0xfb62080a),
+        ("\u{65E5}\u{672C}\u{8A9E}", true, 0xfb62080a),
+        ("\u{1F600}", false, 0x41528c05),
+        ("\u{1F600}", true, 0x41528c05),
+        ("\u{10400}", false, 0x6ddea805),
+        ("\u{10400}", true, 0xe8031c05),
+        ("\u{10428}", false, 0xe8031c05),
+        ("\u{10428}", true, 0xe8031c05),
+        ("\u{00C5}", false, 0x66122c03),
+        ("\u{00C5}", true, 0x67844803),
+        ("\u{01C5}", false, 0x1f50a803),
+        ("\u{01C5}", true, 0x95744c03),
+        ("\u{00DF}", false, 0x06dc3803),
+        ("\u{00DF}", true, 0x7f865003),
+    ];
+    for &(name, fold, want) in VECTORS {
+        assert_eq!(
+            apfs_drec_name_len_and_hash(name, fold),
+            want,
+            "hash drift for {name:?} (fold={fold}) — every APFS volume \
+             fstool writes would stop matching the macOS kernel"
         );
     }
 }
