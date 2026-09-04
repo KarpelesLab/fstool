@@ -30,14 +30,21 @@ pub fn decode_name(bytes: &[u8], utf8_flag: bool) -> String {
         return s.to_string();
     }
     // Japanese legacy encodings, accepted only on a clean decode.
-    for enc in [encoding_rs::SHIFT_JIS, encoding_rs::EUC_JP] {
-        let (cow, _, had_errors) = enc.decode(bytes);
-        if !had_errors {
+    // `Malformed::Fail` is what makes `try_decode` report that; `Bom::Ignore`
+    // keeps a filename's leading bytes from being read as a declaration.
+    let opts = charcode::DecodeOptions::new()
+        .bom(charcode::Bom::Ignore)
+        .malformed(charcode::Malformed::Fail);
+    for enc in [charcode::SHIFT_JIS, charcode::EUC_JP] {
+        if let Ok((cow, _, _)) = enc.try_decode(bytes, opts) {
             return cow.into_owned();
         }
     }
     // ISO-8859-15 maps every byte, so this always succeeds.
-    let (cow, _, _) = encoding_rs::ISO_8859_15.decode(bytes);
+    let (cow, _, _) = charcode::ISO_8859_15.decode_with(
+        bytes,
+        charcode::DecodeOptions::new().bom(charcode::Bom::Ignore),
+    );
     cow.into_owned()
 }
 
@@ -61,8 +68,9 @@ mod tests {
     fn shift_jis_without_flag_round_trips() {
         // "ソ" (U+30BD) in Shift-JIS is 0x83 0x5C — invalid UTF-8, so the
         // detector must fall through to Shift-JIS.
-        let (sjis, _, err) = encoding_rs::SHIFT_JIS.encode("ソ.txt");
-        assert!(!err);
+        let (sjis, _, tally) = charcode::SHIFT_JIS.encode_html_form("ソ.txt");
+        assert_eq!(tally.errors, 0, "the fixture must encode cleanly");
+        assert_eq!(&sjis[..2], &[0x83, 0x5C], "Shift-JIS bytes for U+30BD");
         assert_eq!(decode_name(&sjis, false), "ソ.txt");
     }
 

@@ -273,7 +273,7 @@ pub fn encode_v5_leaf(
 /// Compute and store the CRC32C of a v5 attr-leaf block in place.
 pub fn stamp_v5_leaf_crc(block: &mut [u8]) {
     block[XFS_ATTR3_LEAF_CRC_OFF..XFS_ATTR3_LEAF_CRC_OFF + 4].copy_from_slice(&[0u8; 4]);
-    let crc = crc32c::crc32c(block);
+    let crc = crate::crc::crc32c(block);
     block[XFS_ATTR3_LEAF_CRC_OFF..XFS_ATTR3_LEAF_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes());
 }
 

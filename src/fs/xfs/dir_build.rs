@@ -244,7 +244,7 @@ pub fn build_data_block(
 /// Stamp the v5 `xfs_da3_blkinfo` CRC (offset 12), then return.
 fn stamp_da3_crc(block: &mut [u8]) {
     block[DA3_CRC_OFFSET..DA3_CRC_OFFSET + 4].copy_from_slice(&[0u8; 4]);
-    let crc = crc32c::crc32c(block);
+    let crc = crate::crc::crc32c(block);
     block[DA3_CRC_OFFSET..DA3_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
 }
 
@@ -492,7 +492,7 @@ mod tests {
         let stored = u32::from_le_bytes(block[off..off + 4].try_into().unwrap());
         let mut tmp = block.to_vec();
         tmp[off..off + 4].copy_from_slice(&[0u8; 4]);
-        crc32c::crc32c(&tmp) == stored
+        crate::crc::crc32c(&tmp) == stored
     }
 
     #[test]

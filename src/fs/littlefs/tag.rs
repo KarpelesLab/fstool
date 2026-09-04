@@ -153,13 +153,12 @@ impl Tag {
 /// `0xffffffff`, and — unlike the usual zlib flavour — **no final XOR**, so
 /// the running state can be fed straight back in for the next chunk.
 ///
-/// `crc32fast` computes the finalised (XOR-ed) form, so we un-XOR on the way
-/// in and re-XOR on the way out. The `crc_matches_reference` test pins this
-/// against a commit CRC taken from an image written by the C implementation.
+/// [`crate::crc::crc32_ieee_raw`] is that variant exactly — it is why the
+/// module carries a raw flavour alongside the finalised one. The
+/// `crc_matches_reference` test pins this against a commit CRC taken from
+/// an image written by the C implementation.
 pub fn crc(state: u32, data: &[u8]) -> u32 {
-    let mut h = crc32fast::Hasher::new_with_initial(state ^ 0xffff_ffff);
-    h.update(data);
-    h.finalize() ^ 0xffff_ffff
+    crate::crc::crc32_ieee_raw(state, data)
 }
 
 /// Read a big-endian tag word.

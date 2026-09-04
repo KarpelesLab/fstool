@@ -17,34 +17,12 @@ pub const F2FS_SUPER_MAGIC: u32 = 0xF2F5_2010;
 /// Compute the F2FS CRC32 over `buf`. F2FS uses Linux's raw `crc32_le`
 /// — IEEE 802.3 polynomial 0xEDB88320 but with NO initial XOR and NO
 /// final XOR, seeded with `F2FS_SUPER_MAGIC` instead of the usual
-/// 0xFFFFFFFF. The `crc32fast` crate's standard `hash()` is the
-/// final-XOR variant (Ethernet); using it here would produce values
-/// that fsck.f2fs / mkfs.f2fs reject, so we hand-roll the right one.
+/// 0xFFFFFFFF. That is [`crate::crc::crc32_ieee_raw`]'s shape; the
+/// finalised flavour every general-purpose CRC crate hands out would
+/// produce values `fsck.f2fs` / `mkfs.f2fs` reject.
 pub fn f2fs_crc32(buf: &[u8]) -> u32 {
-    let mut crc = F2FS_SUPER_MAGIC;
-    for &b in buf {
-        crc = (crc >> 8) ^ F2FS_CRC32_TABLE[((crc ^ u32::from(b)) & 0xFF) as usize];
-    }
-    crc
+    crate::crc::crc32_ieee_raw(F2FS_SUPER_MAGIC, buf)
 }
-
-/// Reflected IEEE 802.3 CRC32 table (polynomial 0xEDB88320). Built at
-/// compile time so the codec stays zero-cost.
-const F2FS_CRC32_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
-    let mut i = 0u32;
-    while i < 256 {
-        let mut c = i;
-        let mut j = 0;
-        while j < 8 {
-            c = (c >> 1) ^ ((c & 1).wrapping_neg() & 0xEDB8_8320);
-            j += 1;
-        }
-        table[i as usize] = c;
-        i += 1;
-    }
-    table
-};
 
 /// Inode block — number of direct data-block pointers.
 ///
@@ -129,3 +107,20 @@ pub const F2FS_FT_BLKDEV: u8 = 4;
 pub const F2FS_FT_FIFO: u8 = 5;
 pub const F2FS_FT_SOCK: u8 = 6;
 pub const F2FS_FT_SYMLINK: u8 = 7;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin the F2FS CRC against values computed independently (a plain
+    /// bit-at-a-time reflected-IEEE loop seeded with the magic, no final
+    /// XOR). `fsck.f2fs` is the real check, but it is not installed
+    /// everywhere, so this guards the seed-and-no-final-XOR framing on
+    /// its own.
+    #[test]
+    fn crc_matches_independent_reference() {
+        assert_eq!(f2fs_crc32(b""), F2FS_SUPER_MAGIC);
+        assert_eq!(f2fs_crc32(b"123456789"), 0x1657_A0C3);
+        assert_eq!(f2fs_crc32(b"f2fs superblock"), 0xA664_33E2);
+    }
+}

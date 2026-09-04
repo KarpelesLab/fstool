@@ -38,7 +38,7 @@ const XOR: u32 = 0xFFFF_FFFF;
 /// `crc32c_append(c, d) == raw_update(c ^ XOR, d) ^ XOR`, so un-XOR the
 /// input and the output to recover the raw form.
 pub fn raw_update(crc: u32, data: &[u8]) -> u32 {
-    crc32c::crc32c_append(crc ^ XOR, data) ^ XOR
+    crate::crc::crc32c_append(crc ^ XOR, data) ^ XOR
 }
 
 /// The filesystem-wide checksum seed. `csum_seed` is the explicit

@@ -160,7 +160,7 @@ impl Gpt {
             ))
         })?;
         dev.read_at(entries_offset, &mut entries_buf)?;
-        let computed = crc32fast::hash(&entries_buf);
+        let computed = crate::crc::crc32(&entries_buf);
         if computed != hdr.entries_crc {
             return Err(crate::Error::InvalidImage(format!(
                 "GPT entries CRC mismatch: stored {:#010x}, computed {:#010x}",
@@ -252,7 +252,7 @@ impl PartitionTable for Gpt {
             let off = i * ENTRY_SIZE as usize;
             encode_entry(p, &mut entries[off..off + ENTRY_SIZE as usize]);
         }
-        let entries_crc = crc32fast::hash(&entries);
+        let entries_crc = crate::crc::crc32(&entries);
 
         // 3. Write primary entries at LBA 2.
         dev.write_at(2 * 512, &entries)?;
@@ -338,7 +338,7 @@ fn encode_header(h: &Header) -> [u8; 512] {
     buf[84..88].copy_from_slice(&h.entry_size.to_le_bytes());
     buf[88..92].copy_from_slice(&h.entries_crc.to_le_bytes());
 
-    let crc = crc32fast::hash(&buf[..HEADER_SIZE as usize]);
+    let crc = crate::crc::crc32(&buf[..HEADER_SIZE as usize]);
     buf[16..20].copy_from_slice(&crc.to_le_bytes());
     buf
 }
@@ -365,7 +365,7 @@ fn parse_header(buf: &[u8; 512]) -> Result<Header> {
     // Recompute with CRC field zeroed
     let mut tmp = *buf;
     tmp[16..20].fill(0);
-    let computed = crc32fast::hash(&tmp[..header_size as usize]);
+    let computed = crate::crc::crc32(&tmp[..header_size as usize]);
     if stored_crc != computed {
         return Err(crate::Error::InvalidImage(format!(
             "GPT header CRC mismatch: stored {stored_crc:#010x}, computed {computed:#010x}"
@@ -577,7 +577,7 @@ mod tests {
         mutate(&mut hdr);
         let header_size = u32::from_le_bytes(hdr[12..16].try_into().unwrap());
         hdr[16..20].fill(0);
-        let crc = crc32fast::hash(&hdr[..header_size as usize]);
+        let crc = crate::crc::crc32(&hdr[..header_size as usize]);
         hdr[16..20].copy_from_slice(&crc.to_le_bytes());
         dev.write_at(512, &hdr).unwrap();
     }

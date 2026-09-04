@@ -190,7 +190,7 @@ impl ZipWriter {
         let (crc, comp_size) = match body.take() {
             Some((reader, len)) => self.stream_body(dev, reader, len, method)?,
             None => {
-                let crc = crc32fast::hash(inline);
+                let crc = crate::crc::crc32(inline);
                 self.cursor.write(dev, inline)?;
                 (crc, inline.len() as u64)
             }
@@ -230,7 +230,9 @@ impl ZipWriter {
         len: u64,
         method: Compression,
     ) -> Result<(u32, u64)> {
-        let mut crc = crc32fast::Hasher::new();
+        // The running CRC is just its state; `crc32_append` composes, so
+        // there is nothing to hold but a `u32`.
+        let mut crc = 0u32;
         let mut buf = vec![0u8; 64 * 1024];
         match method {
             Compression::Stored => {
@@ -238,11 +240,11 @@ impl ZipWriter {
                 while remaining > 0 {
                     let want = remaining.min(buf.len() as u64) as usize;
                     reader.read_exact(&mut buf[..want]).map_err(Error::from)?;
-                    crc.update(&buf[..want]);
+                    crc = crate::crc::crc32_append(crc, &buf[..want]);
                     self.cursor.write(dev, &buf[..want])?;
                     remaining -= want as u64;
                 }
-                Ok((crc.finalize(), len))
+                Ok((crc, len))
             }
             Compression::Deflate => self.stream_deflate(dev, reader, len, &mut crc, &mut buf),
         }
@@ -254,7 +256,7 @@ impl ZipWriter {
         dev: &mut dyn BlockDevice,
         reader: &mut dyn std::io::Read,
         len: u64,
-        crc: &mut crc32fast::Hasher,
+        crc: &mut u32,
         buf: &mut [u8],
     ) -> Result<(u32, u64)> {
         let sink = CursorSink {
@@ -272,12 +274,12 @@ impl ZipWriter {
         while remaining > 0 {
             let want = remaining.min(buf.len() as u64) as usize;
             reader.read_exact(&mut buf[..want]).map_err(Error::from)?;
-            crc.update(&buf[..want]);
+            *crc = crate::crc::crc32_append(*crc, &buf[..want]);
             enc.write_all(&buf[..want]).map_err(Error::from)?;
             remaining -= want as u64;
         }
         let sink = enc.finish().map_err(Error::from)?;
-        Ok((crc.clone().finalize(), sink.written))
+        Ok((*crc, sink.written))
     }
 
     #[cfg(not(feature = "gzip"))]
@@ -286,7 +288,7 @@ impl ZipWriter {
         _dev: &mut dyn BlockDevice,
         _reader: &mut dyn std::io::Read,
         _len: u64,
-        _crc: &mut crc32fast::Hasher,
+        _crc: &mut u32,
         _buf: &mut [u8],
     ) -> Result<(u32, u64)> {
         Err(Error::Unsupported(

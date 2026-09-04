@@ -140,10 +140,8 @@ qcow2-crypto = ["luks"]
 fuse = ["dep:fuser"]
 
 [dependencies]
-thiserror = "2"
 log = "0.4"
 uuid = { version = "1", features = ["v4"] }
-crc32fast = "1"
 # Argument parsing for the `fstool` binary — see the `cli` feature. The
 # library itself needs clap only to derive `ValueEnum` on `PathStyle`,
 # which is `cfg_attr`-gated on the same feature.
@@ -151,7 +149,6 @@ clap = { version = "4", features = ["derive"], optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"
 toml = "1.1.2"
-crc32c = "0.6.8"
 # Unicode NFD + full case folding for the APFS drec hash function.
 # Volumes formatted with APFS_INCOMPAT_NORMALIZATION_INSENSITIVE (the
 # macOS default for user data volumes) store drec keys with a 22-bit
@@ -171,10 +168,14 @@ crc32c = "0.6.8"
 # exact hashes).
 intl = { version = "0.6.1", default-features = false, features = ["case", "full"] }
 
-# CP949 (Korean) ↔ UTF-8 for the GRF backend (Gravity Ragnarok archives
-# store filenames in CP949). encoding_rs's `EUC_KR` label is the WHATWG
-# alias that covers CP949 — the spec mapping is identical in practice.
-encoding_rs = "0.8"
+# Legacy character encodings, via `charcode` (KarpelesLab) — the WHATWG
+# Encoding Standard with no dependencies of its own. Four of its tables
+# are enough for us: `euc-kr` (which the standard defines as CP949, the
+# Microsoft superset, and which GRF filenames use), `shift-jis` and
+# `euc-jp` (the Japanese legacy encodings a ZIP filename may be in when
+# it carries no UTF-8 flag), and `single-byte` for the ISO-8859-15
+# fallback that maps every byte.
+charcode = { version = "0.1.3", default-features = false, features = ["std", "euc-kr", "shift-jis", "euc-jp", "single-byte"] }
 
 # Compression codecs — all optional and feature-gated. Pure-rust where
 # possible (flate2 via miniz_oxide, lz4_flex, lzma-rs); zstd and lzo
@@ -182,7 +183,7 @@ encoding_rs = "0.8"
 # compcol: uniform no_std codec collection serving gzip/zlib/deflate/xz/zstd
 # /lz4/lzo plus the CAB codecs. `std` is always on (for the `io` Read/Write
 # adapters); per-algorithm features are added by fstool's feature flags.
-compcol = { version = "0.6.10", optional = true, default-features = false, features = ["std"] }
+compcol = { version = "0.6.11", optional = true, default-features = false, features = ["std", "checksum"] }
 
 # Line editing + persistent history for the interactive shell. Optional, behind
 # the `readline` feature; the bin enables it by default. Pure-Rust line editor.

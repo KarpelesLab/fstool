@@ -6,31 +6,37 @@
 //! fstool `Filesystem` trait surface is UTF-8 strings. Conversion
 //! happens once at the GRF boundary (during table parse / write).
 //!
-//! We use `encoding_rs::EUC_KR`. The WHATWG `euc-kr` label is
-//! intentionally defined to be CP949 for web-compatibility — the spec
-//! mapping is the union we want.
+//! We use `charcode::EUC_KR`. The WHATWG `euc-kr` label is intentionally
+//! defined to be CP949 for web-compatibility — the spec mapping is the
+//! union we want.
 
 use std::borrow::Cow;
 
-use encoding_rs::EUC_KR;
+use charcode::{Bom, DecodeOptions, EUC_KR};
 
 /// Decode a CP949 byte slice into UTF-8. Stray bytes that don't map
 /// (corruption, truncation) are replaced with U+FFFD — we don't
 /// surface decoding errors because GRFs in the wild ship occasional
 /// junk filenames and refusing the whole archive helps nobody.
 pub fn cp949_to_utf8(bytes: &[u8]) -> Cow<'_, str> {
-    let (decoded, _, _had_errors) = EUC_KR.decode(bytes);
+    // `Bom::Ignore`: a filename is not a document, so a leading EF BB BF
+    // is content to decode, not a declaration that switches encoding.
+    let (decoded, _, _tally) = EUC_KR.decode_with(bytes, DecodeOptions::new().bom(Bom::Ignore));
     decoded
 }
 
-/// Encode a UTF-8 string back to CP949 bytes. Characters outside
-/// CP949 are emitted as numeric character references (`&#NNNN;`)
-/// because that's what `encoding_rs` does for unmappable codepoints
-/// — practical for round-trip with our own reader since we'll just
-/// decode them back to the references. Filenames are normally ASCII
-/// or Hangul, so this path is rare.
+/// Encode a UTF-8 string back to CP949 bytes. Characters outside CP949
+/// are emitted as decimal numeric character references (`&#NNNN;`) —
+/// practical for round-trip with our own reader since we'll just decode
+/// them back to the references. Filenames are normally ASCII or Hangul,
+/// so this path is rare.
+///
+/// `encode_html_form` is the WHATWG `encode` hook: references for what
+/// it cannot map, and `&` left alone. (`Unmappable::Html` would also
+/// rewrite a literal `&` as `&amp;`, which would change names that
+/// encode perfectly well.)
 pub fn utf8_to_cp949(s: &str) -> Vec<u8> {
-    let (encoded, _, _had_errors) = EUC_KR.encode(s);
+    let (encoded, _, _tally) = EUC_KR.encode_html_form(s);
     encoded.into_owned()
 }
 

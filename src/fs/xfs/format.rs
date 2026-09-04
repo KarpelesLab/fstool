@@ -903,25 +903,25 @@ pub const SB_CRC_OFFSET: usize = 224;
 
 pub fn stamp_v5_superblock_crc(buf: &mut [u8]) {
     buf[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].copy_from_slice(&[0u8; 4]);
-    let crc = crc32c::crc32c(&buf[..XFS_SECTSIZE as usize]);
+    let crc = crate::crc::crc32c(&buf[..XFS_SECTSIZE as usize]);
     buf[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
 }
 
 pub fn stamp_v5_agf_crc(buf: &mut [u8]) {
     buf[AGF_CRC_OFFSET..AGF_CRC_OFFSET + 4].copy_from_slice(&[0u8; 4]);
-    let crc = crc32c::crc32c(&buf[..XFS_SECTSIZE as usize]);
+    let crc = crate::crc::crc32c(&buf[..XFS_SECTSIZE as usize]);
     buf[AGF_CRC_OFFSET..AGF_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
 }
 
 pub fn stamp_v5_agi_crc(buf: &mut [u8]) {
     buf[AGI_CRC_OFFSET..AGI_CRC_OFFSET + 4].copy_from_slice(&[0u8; 4]);
-    let crc = crc32c::crc32c(&buf[..XFS_SECTSIZE as usize]);
+    let crc = crate::crc::crc32c(&buf[..XFS_SECTSIZE as usize]);
     buf[AGI_CRC_OFFSET..AGI_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
 }
 
 pub fn stamp_v5_agfl_crc(buf: &mut [u8]) {
     buf[AGFL_CRC_OFFSET..AGFL_CRC_OFFSET + 4].copy_from_slice(&[0u8; 4]);
-    let crc = crc32c::crc32c(&buf[..XFS_SECTSIZE as usize]);
+    let crc = crate::crc::crc32c(&buf[..XFS_SECTSIZE as usize]);
     buf[AGFL_CRC_OFFSET..AGFL_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
 }
 
@@ -932,7 +932,7 @@ pub const BTREE_SBLOCK_CRC_OFFSET: usize = 52;
 
 pub fn stamp_v5_btree_block_crc(buf: &mut [u8]) {
     buf[BTREE_SBLOCK_CRC_OFFSET..BTREE_SBLOCK_CRC_OFFSET + 4].copy_from_slice(&[0u8; 4]);
-    let crc = crc32c::crc32c(buf);
+    let crc = crate::crc::crc32c(buf);
     buf[BTREE_SBLOCK_CRC_OFFSET..BTREE_SBLOCK_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
 }
 

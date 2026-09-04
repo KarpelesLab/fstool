@@ -331,7 +331,7 @@ fn encode_ts(ts: XfsTimestamp) -> [u8; 8] {
 /// then written back as little-endian.
 pub fn stamp_v3_inode_crc(buf: &mut [u8]) {
     buf[V3_CRC_OFFSET..V3_CRC_OFFSET + 4].copy_from_slice(&[0u8; 4]);
-    let crc = crc32c::crc32c(buf);
+    let crc = crate::crc::crc32c(buf);
     buf[V3_CRC_OFFSET..V3_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
 }
 

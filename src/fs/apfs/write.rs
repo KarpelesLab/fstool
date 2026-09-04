@@ -366,7 +366,7 @@ pub fn apfs_drec_name_len_and_hash(name: &str, case_fold: bool) -> u32 {
         normalize::nfd(name.chars()).map(|c| c as u32).collect()
     };
     let bytes: Vec<u8> = chars.iter().flat_map(|c| c.to_le_bytes()).collect();
-    let crc = crc32c::crc32c(&bytes);
+    let crc = crate::crc::crc32c(&bytes);
     let name_len = (name.len() + 1) as u32; // include trailing NUL
     ((crc & 0x003F_FFFF) << 10) | (name_len & 0x0000_03FF)
 }

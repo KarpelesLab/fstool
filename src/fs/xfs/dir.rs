@@ -483,7 +483,7 @@ pub const V5_DATA_HDR_SIZE: usize = 64;
 /// then stored as little-endian.
 pub fn stamp_v5_dir_block_crc(block: &mut [u8]) {
     block[V5_DIR_CRC_OFFSET..V5_DIR_CRC_OFFSET + 4].copy_from_slice(&[0u8; 4]);
-    let crc = crc32c::crc32c(block);
+    let crc = crate::crc::crc32c(block);
     block[V5_DIR_CRC_OFFSET..V5_DIR_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
 }
 
