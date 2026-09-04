@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.25](https://github.com/KarpelesLab/fstool/compare/v0.4.24...v0.4.25) - 2026-09-04
+
+### Fixed
+
+- *(grf)* refuse a filename CP949 cannot hold, instead of mangling it
+
+### Other
+
+- *(deps)* drop thiserror, encoding_rs, crc32fast and crc32c
+- *(apfs)* hash drec names through intl instead of caseless
+- *(apfs)* pin the case-fold vectors that justify the caseless dep
+
 ## [0.4.24](https://github.com/KarpelesLab/fstool/compare/v0.4.23...v0.4.24) - 2026-09-01
 
 ### Other
