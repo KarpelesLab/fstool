@@ -25,19 +25,24 @@ pub fn cp949_to_utf8(bytes: &[u8]) -> Cow<'_, str> {
     decoded
 }
 
-/// Encode a UTF-8 string back to CP949 bytes. Characters outside CP949
-/// are emitted as decimal numeric character references (`&#NNNN;`) —
-/// practical for round-trip with our own reader since we'll just decode
-/// them back to the references. Filenames are normally ASCII or Hangul,
-/// so this path is rare.
+/// Encode a UTF-8 string to CP949 bytes, failing on the first character
+/// the codepage cannot represent.
 ///
-/// `encode_html_form` is the WHATWG `encode` hook: references for what
-/// it cannot map, and `&` left alone. (`Unmappable::Html` would also
-/// rewrite a literal `&` as `&amp;`, which would change names that
-/// encode perfectly well.)
-pub fn utf8_to_cp949(s: &str) -> Vec<u8> {
-    let (encoded, _, _tally) = EUC_KR.encode_html_form(s);
-    encoded.into_owned()
+/// Failing is the point. The WHATWG `encode` hook — what `encoding_rs`
+/// gave us and what `charcode`'s `encode_html_form` still gives — writes
+/// a decimal numeric character reference instead, so `café.txt` would go
+/// to disk as `caf&#233;.txt`. That is the right answer for an HTML form
+/// and the wrong one for a filesystem: the archive would hold a filename
+/// nobody asked for and no reader would undo. CP949 is wide (all of
+/// Hangul, and the CJK ideographs with it), so this only rejects names
+/// genuinely outside it — accented Latin, emoji.
+pub fn utf8_to_cp949(s: &str) -> crate::Result<Vec<u8>> {
+    match EUC_KR.encode(s) {
+        Ok((encoded, _, _)) => Ok(encoded.into_owned()),
+        Err(e) => Err(crate::Error::InvalidArgument(format!(
+            "grf: filename {s:?} cannot be stored — {e}"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -49,19 +54,69 @@ mod tests {
         let plain = b"data/info.txt";
         let utf = cp949_to_utf8(plain);
         assert_eq!(utf, "data/info.txt");
-        let back = utf8_to_cp949(&utf);
+        let back = utf8_to_cp949(&utf).unwrap();
         assert_eq!(back, plain);
     }
 
+    /// An unrepresentable name is refused, not silently mangled.
+    ///
+    /// This is the WHATWG-vs-filesystem split in one test: the standard's
+    /// `encode` hook would write `caf&#233;.txt`, which is right for an
+    /// HTML form and wrong for an archive.
     #[test]
-    fn hangul_round_trip() {
-        let utf = "한국어.txt";
-        let bytes = utf8_to_cp949(utf);
-        // CP949 encodes each Hangul syllable as 2 bytes; UTF-8 uses 3
-        // bytes per Hangul codepoint. Three syllables + ".txt" =
-        // 6 + 4 = 10 bytes in CP949 vs 13 bytes in UTF-8.
-        assert_eq!(bytes.len(), 10);
-        let back = cp949_to_utf8(&bytes);
-        assert_eq!(back, utf);
+    fn unrepresentable_names_are_refused() {
+        for name in ["café.txt", "😀.txt", "Ω\u{303}.txt"] {
+            let err = utf8_to_cp949(name).unwrap_err();
+            assert!(
+                matches!(err, crate::Error::InvalidArgument(_)),
+                "{name:?}: {err}"
+            );
+            let msg = err.to_string();
+            // The message names the file and says which character stopped
+            // it. (`{:?}` escapes a bare combining mark rather than
+            // emitting it into a terminal, so match on the debug form.)
+            assert!(
+                msg.contains(&format!("{name:?}")),
+                "should name the file: {msg}"
+            );
+            assert!(
+                msg.contains("cannot be represented"),
+                "should say why: {msg}"
+            );
+        }
+    }
+
+    /// CP949 is Unified Hangul Code — wider than EUC-KR, and it carries
+    /// the CJK ideographs too, so these are *not* rejected.
+    #[test]
+    fn cp949_covers_hangul_and_hanja() {
+        for name in ["한국어.txt", "日本.txt", "Ω.txt", "plain.txt"] {
+            let bytes = utf8_to_cp949(name).expect("representable");
+            assert_eq!(cp949_to_utf8(&bytes), name, "round-trip {name:?}");
+        }
+    }
+
+    /// Every valid two-byte CP949 sequence must survive decode → encode
+    /// unchanged. Byte-exact round-tripping is what a filesystem needs
+    /// and what a web decoder is not obliged to give.
+    #[test]
+    fn every_two_byte_sequence_round_trips() {
+        let mut checked = 0u32;
+        for hi in 0x81u8..=0xFE {
+            for lo in 0x41u8..=0xFE {
+                let src = [hi, lo];
+                let text = cp949_to_utf8(&src);
+                if text.contains('\u{FFFD}') {
+                    continue; // not a valid sequence
+                }
+                let back = utf8_to_cp949(&text).expect("decoded, so representable");
+                assert_eq!(back, &src[..], "round-trip {src:02x?}");
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 17_000,
+            "expected the full CP949 table, saw {checked}"
+        );
     }
 }

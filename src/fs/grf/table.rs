@@ -282,10 +282,10 @@ fn apply_v102_crypto_heuristic(entry: &mut Entry) {
 /// Encode a slice of entries as a v0x200-format uncompressed table
 /// blob. The caller is responsible for zlib-compressing the result
 /// before writing it to disk.
-pub(crate) fn encode_v200(entries: &[Entry]) -> Vec<u8> {
+pub(crate) fn encode_v200(entries: &[Entry]) -> crate::Result<Vec<u8>> {
     let mut out = Vec::new();
     for e in entries {
-        let cp949 = encoding::utf8_to_cp949(&e.name);
+        let cp949 = encoding::utf8_to_cp949(&e.name)?;
         out.extend_from_slice(&cp949);
         out.push(0); // null terminator
         let raw = RawEntry {
@@ -297,7 +297,7 @@ pub(crate) fn encode_v200(entries: &[Entry]) -> Vec<u8> {
         };
         raw.encode_into(&mut out);
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -324,7 +324,7 @@ mod tests {
                 flags: GRF_FLAG_FILE,
             },
         ];
-        let blob = encode_v200(&entries);
+        let blob = encode_v200(&entries).unwrap();
         let back = decode_v200(&blob).unwrap();
         assert_eq!(back.len(), 2);
         assert_eq!(back[0].name, "data/info.txt");

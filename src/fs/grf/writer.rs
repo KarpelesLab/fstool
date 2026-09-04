@@ -138,7 +138,7 @@ pub(super) fn flush(grf: &mut Grf, dev: &mut dyn BlockDevice) -> Result<()> {
     let mut by_pos: Vec<_> = grf.entries.values().cloned().collect();
     by_pos.sort_by_key(|e| e.pos);
 
-    let raw_table = table::encode_v200(&by_pos);
+    let raw_table = table::encode_v200(&by_pos)?;
     let compressed = crate::compression::compress(crate::compression::Algo::Zlib, &raw_table)?;
 
     // Table sits at data_end. Write the 8-byte posinfo header,
