@@ -625,7 +625,7 @@ Four more features carve up what is left, all on by default:
 
 | Feature | Enables | Pulls |
 |---------|---------|-------|
-| `spec` | the TOML spec engine — `spec::Spec`, `spec::build`, `-O` from a file | `toml`, `serde` |
+| `spec` | the TOML spec engine — `spec::Spec`, `spec::build`, `-O` from a file | `tomlproc`, `serde` |
 | `json` | `Serialize` on the report types, `--json` output, the wasm bridge, and LUKS2 (whose metadata *is* JSON) | `serde`, `serde_json` |
 | `log` | the `log` facade — four call sites, all reporting something recovered from | `log` |
 | `unix-host` | block-device capacity ioctls, `O_EXCL` on a mounted disk, terminal width, the CLI's Ctrl-C | `libc` |
@@ -644,7 +644,8 @@ three that matter are ours:
 character encodings, and
 [`intl`](https://github.com/KarpelesLab/intlrs) for the Unicode
 normalization and case folding the APFS directory-record hash needs.
-Add `containers` and
+Add `spec` and [`tomlproc`](https://github.com/KarpelesLab/tomlproc)
+parses the TOML; add `containers` and
 [`purecrypto`](https://github.com/KarpelesLab/purecrypto) joins them for
 every cipher, hash and KDF. All four are pure Rust with no foreign code.
 The only third-party crate left in that floor is `uuid` (with

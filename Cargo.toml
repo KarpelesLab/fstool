@@ -62,7 +62,7 @@ containers = ["dmg-encrypted", "luks", "qcow2-crypto"]
 # image. Pulls `toml` (and `serde`, which it is built on). Off, the
 # library is driven through its Rust API instead; `spec::parse_size` and
 # the other pure helpers stay either way.
-spec = ["dep:toml", "dep:serde"]
+spec = ["dep:tomlproc", "dep:serde"]
 
 # Speaking JSON: `Serialize` on the report types, the `--json` output of
 # `analyze`, the wasm bridge's return values — and LUKS2, whose on-disk
@@ -171,11 +171,14 @@ uuid = { version = "1", features = ["v4"] }
 # library itself needs clap only to derive `ValueEnum` on `PathStyle`,
 # which is `cfg_attr`-gated on the same feature.
 clap = { version = "4", features = ["derive"], optional = true }
-# Serialization, behind the `serde` feature. `toml` is here because it is
-# built on serde and cannot exist without it; the three travel together.
+# Serialization, behind the `json` and `spec` features.
 serde = { version = "1.0.228", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
-toml = { version = "1.1.2", optional = true }
+# TOML for the spec engine, via `tomlproc` (KarpelesLab) — a
+# self-contained TOML 1.0.0 parser whose only dependency is the `serde`
+# we already take. The `toml` crate it replaces brought five more
+# (toml_datetime, toml_parser, toml_writer, serde_spanned, winnow).
+tomlproc = { version = "0.1.1", optional = true, default-features = false, features = ["serde"] }
 # Unicode NFD + full case folding for the APFS drec hash function.
 # Volumes formatted with APFS_INCOMPAT_NORMALIZATION_INSENSITIVE (the
 # macOS default for user data volumes) store drec keys with a 22-bit

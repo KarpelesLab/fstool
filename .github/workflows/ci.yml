@@ -122,7 +122,7 @@ jobs:
           set -euo pipefail
           cargo clippy --no-default-features --features codecs --all-targets -- -D warnings
           cargo test --no-default-features --features codecs
-          for crate in serde serde_json toml clap rustyline log; do
+          for crate in serde serde_json tomlproc clap rustyline log; do
             if cargo tree -e normal --no-default-features --features codecs \
                  --prefix none | grep -qw "$crate"; then
               echo "::error::$crate leaked into the leanest build"; exit 1

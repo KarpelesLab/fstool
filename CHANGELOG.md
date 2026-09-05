@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- *(deps)* the `spec` feature now parses TOML with `tomlproc`
+  (KarpelesLab) instead of the `toml` crate. `tomlproc` is a
+  self-contained TOML 1.0.0 implementation whose only dependency is the
+  `serde` we already take, so six crates leave the tree — `toml`,
+  `toml_datetime`, `toml_parser`, `toml_writer`, `serde_spanned` and
+  `winnow` — for one. The default resolve goes 26 → 21 crates. The
+  public `FilesystemSpec::options` field changes type from `toml::Table`
+  to `tomlproc::Table`, as does `OptionMap::merge_toml`'s argument.
+
 - *(deps)* four more capabilities are feature-gated, all on by default:
   `spec` (the TOML engine → `toml` + `serde`), `json` (`Serialize`, the
   `--json` output, the wasm bridge, and LUKS2 → `serde` + `serde_json`),

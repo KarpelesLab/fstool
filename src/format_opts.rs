@@ -88,22 +88,22 @@ impl OptionMap {
     /// integers / floats → decimal, strings → their raw text. Nested
     /// arrays / tables aren't accepted — pass scalar values only.
     #[cfg(feature = "spec")]
-    pub fn merge_toml(&mut self, table: &toml::Table) -> Result<()> {
+    pub fn merge_toml(&mut self, table: &tomlproc::Table) -> Result<()> {
         for (k, v) in table.iter() {
             let s = match v {
-                toml::Value::String(s) => s.clone(),
-                toml::Value::Integer(i) => i.to_string(),
-                toml::Value::Float(f) => f.to_string(),
-                toml::Value::Boolean(b) => b.to_string(),
+                tomlproc::Value::String(s) => s.clone(),
+                tomlproc::Value::Integer(i) => i.to_string(),
+                tomlproc::Value::Float(f) => f.to_string(),
+                tomlproc::Value::Boolean(b) => b.to_string(),
                 _ => {
                     return Err(Error::InvalidArgument(format!(
                         "spec: option {k:?} must be a scalar (string / int / float / bool), \
                          not {kind}",
-                        kind = v.type_str()
+                        kind = v.type_name()
                     )));
                 }
             };
-            self.map.insert(k.clone(), s);
+            self.map.insert(k.to_owned(), s);
         }
         Ok(())
     }
@@ -298,7 +298,7 @@ mod tests {
     #[cfg(feature = "spec")]
     #[test]
     fn toml_table_round_trips() {
-        let table: toml::Table = toml::from_str(
+        let table: tomlproc::Table = tomlproc::parse(
             r#"
             block_size = 4096
             sparse = true

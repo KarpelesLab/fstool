@@ -104,7 +104,7 @@ pub struct PartitionSpec {
 /// free-form [`Self::options`] table — new FS-specific knobs land there
 /// without needing a new flat field, but the door is kept open for either
 /// route. External crates should construct `FilesystemSpec` only through
-/// `toml::from_str` (or one of the [`Spec`] parse helpers), not via a
+/// `tomlproc::serde::from_str` (or one of the [`Spec`] parse helpers), not via a
 /// struct literal.
 #[cfg(feature = "spec")]
 #[derive(Debug, Deserialize)]
@@ -145,14 +145,14 @@ pub struct FilesystemSpec {
     /// `options` lets you reach knobs that don't have a dedicated flat
     /// field (e.g. squashfs `compression`, ntfs `bytes_per_sector`,
     /// hfs+ `journaled`).
-    pub options: Option<toml::Table>,
+    pub options: Option<tomlproc::Table>,
 }
 
 #[cfg(feature = "spec")]
 impl Spec {
     /// Parse a spec from TOML text.
     pub fn parse(toml_text: &str) -> Result<Self> {
-        let spec: Spec = toml::from_str(toml_text)
+        let spec: Spec = tomlproc::serde::from_str(toml_text)
             .map_err(|e| crate::Error::InvalidArgument(format!("spec: invalid TOML: {e}")))?;
         spec.validate()?;
         Ok(spec)
