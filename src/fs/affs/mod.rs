@@ -2,14 +2,18 @@
 //!
 //! Reads Amiga DOS volumes (`.adf` floppy images and larger hard-file
 //! volumes) in both their OFS ("Old File System") and FFS ("Fast File
-//! System") variants, including the International and (transparently
-//! ignored) directory-cache flavours.
+//! System") variants, including the International and directory-cache
+//! flavours (`DOS\0`..`DOS\5`). The long-filename variants `DOS\6` /
+//! `DOS\7` (OS 3.1.4+) lay the name and comment out differently and are
+//! refused at open rather than misread.
 //!
 //! ## On-disk format (big-endian, 512-byte blocks)
 //!
 //! Block 0–1 hold the *boot block*: bytes `"DOS"` then a flag byte whose
 //! low three bits select the variant (`DOS\0`..`DOS\7`): bit0 FFS/OFS, bit1
-//! International name hashing, bit2 directory cache. The *root block* sits at
+//! International name hashing, bit2 directory cache — and directory cache
+//! *implies* International (`DOS\4`/`DOS\5` fold names with the
+//! international table even though bit1 is clear). The *root block* sits at
 //! the middle of the volume and carries an `ADF_HT_SIZE`-entry name hash
 //! table plus the volume bitmap pointers and name. Directories are the same
 //! shape (a hash table of entries); files chain through a *file header* (and
@@ -64,6 +68,8 @@ const MAX_NAME_LEN: usize = 30;
 // Primary block types (word @0).
 const T_HEADER: i32 = 2;
 const T_LIST: i32 = 16;
+/// Directory-cache block (`DOS\4`/`DOS\5`).
+const T_DIRCACHE: i32 = 33;
 /// OFS data-block type (used when building/validating OFS data blocks).
 const T_DATA: i32 = 8;
 
@@ -139,9 +145,16 @@ pub struct Variant {
     /// Fast File System (raw data blocks) when set; OFS (24-byte data-block
     /// headers) when clear.
     pub ffs: bool,
-    /// International case-insensitive name hashing.
+    /// International case-insensitive name hashing. Always set on the
+    /// directory-cache variants: `DOS\4`/`DOS\5` were introduced alongside
+    /// International mode and there is no non-international dircache
+    /// flavour, so the fold table is a property of the variant, not of
+    /// bit 1 alone.
     pub intl: bool,
-    /// Directory-cache mode (read transparently via the hash table).
+    /// Directory-cache mode (`DOS\4`/`DOS\5`). Reads go through the hash
+    /// table regardless; in-place writes keep each directory's
+    /// `T_DIRCACHE` chain in step with its hash chains, since AmigaDOS
+    /// serves listings from the cache.
     pub dircache: bool,
 }
 
@@ -149,14 +162,22 @@ impl Variant {
     fn from_flag(flag: u8) -> Self {
         Self {
             ffs: flag & 1 != 0,
-            intl: flag & 2 != 0,
+            // `DOS\2`..`DOS\7` all hash with the international table; only
+            // `DOS\0` (OFS) and `DOS\1` (FFS) use the classic ASCII fold.
+            intl: flag >= 2,
             dircache: flag & 4 != 0,
         }
     }
 
     /// The `DOS\n` label for this variant.
     pub fn dos_label(&self) -> String {
-        let n = (self.ffs as u8) | (self.intl as u8) << 1 | (self.dircache as u8) << 2;
+        // Dircache implies intl, so the label's bit 1 is clear on DOS\4/5.
+        let hi = if self.dircache {
+            4
+        } else {
+            (self.intl as u8) << 1
+        };
+        let n = (self.ffs as u8) | hi;
         format!("DOS\\{n}")
     }
 }
@@ -205,6 +226,16 @@ impl Affs {
             return Err(Error::InvalidImage(
                 "affs: missing DOS boot signature".into(),
             ));
+        }
+        // DOS\6 / DOS\7 (OS 3.1.4+ long filenames) merge the name and
+        // comment into one 112-byte field, so the classic name offset lands
+        // inside the comment area. Refuse them rather than return garbage
+        // names — and bit 2 means "long names" there, not dircache.
+        if boot[3] >= 6 {
+            return Err(Error::Unsupported(format!(
+                "affs: DOS\\{} long-filename volumes are not supported",
+                boot[3]
+            )));
         }
         let variant = Variant::from_flag(boot[3]);
 

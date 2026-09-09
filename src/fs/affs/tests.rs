@@ -168,8 +168,51 @@ fn variant_flags_decode() {
             dircache: false
         }
     );
-    assert_eq!(Variant::from_flag(0).dos_label(), "DOS\\0");
-    assert_eq!(Variant::from_flag(7).dos_label(), "DOS\\7");
+    // Only DOS\0 / DOS\1 fold with the classic table.
+    assert!(!Variant::from_flag(0).intl);
+    assert!(!Variant::from_flag(1).intl);
+    for flag in 2..=5u8 {
+        assert!(
+            Variant::from_flag(flag).intl,
+            "DOS\\{flag} must be international"
+        );
+    }
+    // Directory cache implies international (issue #42): there is no
+    // non-intl dircache flavour, so DOS\4 / DOS\5 must hash with the
+    // international table even though bit 1 is clear.
+    assert_eq!(
+        Variant::from_flag(5),
+        Variant {
+            ffs: true,
+            intl: true,
+            dircache: true
+        }
+    );
+    assert!(!Variant::from_flag(4).ffs);
+    // The label round-trips for every supported flag.
+    for flag in 0..=5u8 {
+        assert_eq!(Variant::from_flag(flag).dos_label(), format!("DOS\\{flag}"));
+    }
+}
+
+#[test]
+fn open_refuses_long_filename_variants() {
+    for flag in [6u8, 7] {
+        let mut dev = MemoryBackend::new(880 * 1024);
+        Affs::format(&mut dev, &super::AffsFormatOpts::default())
+            .unwrap()
+            .flush(&mut dev)
+            .unwrap();
+        dev.write_at(3, &[flag]).unwrap();
+        let err = match Affs::open(&mut dev) {
+            Ok(_) => panic!("DOS\\{flag}: open must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("long-filename")),
+            "DOS\\{flag}: expected an Unsupported error, got {err:?}"
+        );
+    }
 }
 
 #[test]
@@ -374,7 +417,9 @@ fn assert_conformant(dev: &mut MemoryBackend) {
     };
     let boot = read(dev, 0);
     let ffs = boot[3] & 1 != 0;
-    let intl = boot[3] & 2 != 0;
+    // DOS\2..DOS\5 are international; dircache (bit 2) implies it.
+    let intl = boot[3] >= 2;
+    let dircache = boot[3] & 4 != 0;
     let csum_ok = |blk: &[u8]| {
         let mut s = 0u32;
         let mut i = 0;
@@ -399,6 +444,9 @@ fn assert_conformant(dev: &mut MemoryBackend) {
     let mut stack = vec![root];
     while let Some(dirblk) = stack.pop() {
         let db = read(dev, dirblk);
+        // (entry block, name, size, secondary type) per hash-chain entry,
+        // to compare against the directory cache below.
+        let mut chain_entries: Vec<(u32, String, u32, i32)> = Vec::new();
         for slot in 0..HT_SIZE {
             let mut e = be_u32(&db, 0x18 + slot * 4) as usize;
             while e != 0 {
@@ -408,6 +456,13 @@ fn assert_conformant(dev: &mut MemoryBackend) {
                 let name = read_name(&eb);
                 let h = super::writer::hash_name_for_test(&name, intl);
                 assert_eq!(h, slot, "entry {name:?} in slot {slot} but hashes to {h}");
+                let st = be_i32(&eb, 0x1fc);
+                let size = if st == super::ST_FILE {
+                    be_u32(&eb, 0x144)
+                } else {
+                    0
+                };
+                chain_entries.push((e as u32, name.clone(), size, st));
                 match be_i32(&eb, 0x1fc) {
                     s if s == super::ST_USERDIR => stack.push(e),
                     s if s == super::ST_FILE => {
@@ -435,6 +490,52 @@ fn assert_conformant(dev: &mut MemoryBackend) {
                 }
                 e = be_u32(&eb, 0x1f0) as usize;
             }
+        }
+        if dircache {
+            // The directory cache must exist, be structurally sound, and
+            // describe exactly the entries the hash chains hold
+            // (issue #43: AmigaDOS lists directories from the cache).
+            let mut cached: Vec<(u32, String, u32, i32)> = Vec::new();
+            let mut dc = be_u32(&db, 0x1f8) as usize;
+            assert_ne!(dc, 0, "directory {dirblk} has no dircache chain");
+            let mut guard = 0;
+            while dc != 0 {
+                assert!(used.insert(dc), "dircache block {dc} reachable twice");
+                let cb = read(dev, dc);
+                assert!(csum_ok(&cb), "dircache {dc} checksum");
+                assert_eq!(be_i32(&cb, 0x00), super::T_DIRCACHE, "dircache {dc} type");
+                assert_eq!(be_u32(&cb, 0x04) as usize, dc, "dircache {dc} own key");
+                assert_eq!(be_u32(&cb, 0x08) as usize, dirblk, "dircache {dc} parent");
+                let count = be_u32(&cb, 0x0c) as usize;
+                let mut off = 0x18;
+                for _ in 0..count {
+                    let name_len = cb[off + 23] as usize;
+                    let name: String = cb[off + 24..off + 24 + name_len]
+                        .iter()
+                        .map(|&b| b as char)
+                        .collect();
+                    let comment_len = cb[off + 24 + name_len] as usize;
+                    cached.push((
+                        be_u32(&cb, off),
+                        name,
+                        be_u32(&cb, off + 4),
+                        cb[off + 22] as i8 as i32,
+                    ));
+                    let raw = 25 + name_len + comment_len;
+                    off += raw + (raw & 1);
+                    assert!(off <= BSIZE, "dircache {dc} record overruns the block");
+                }
+                dc = be_u32(&cb, 0x10) as usize;
+                guard += 1;
+                assert!(guard < 64, "dircache chain loop at {dc}");
+            }
+            let mut want = chain_entries.clone();
+            want.sort();
+            cached.sort();
+            assert_eq!(
+                cached, want,
+                "dircache of directory {dirblk} disagrees with its hash chains"
+            );
         }
     }
 
@@ -626,4 +727,146 @@ fn latin1_names_decode() {
     block[OFF_NAME_LEN] = 4;
     block[OFF_NAME_LEN + 1..OFF_NAME_LEN + 5].copy_from_slice(&[b'c', b'a', b'f', 0xE9]);
     assert_eq!(read_name(&block), "café");
+}
+
+/// Turn a freshly formatted DOS\3 volume into DOS\5 by flipping the boot
+/// flag. The root has no cache yet (pointer 0), which is exactly the state
+/// a stale-cache-unaware tool leaves behind; the editor rebuilds it on the
+/// first mutation.
+fn format_dos5(dev: &mut MemoryBackend) {
+    let mut fs = Affs::format(
+        dev,
+        &super::AffsFormatOpts {
+            volume_name: "DcVol".into(),
+            ffs: true,
+            intl: true,
+        },
+    )
+    .unwrap();
+    fs.flush(dev).unwrap();
+    dev.write_at(3, &[5]).unwrap();
+}
+
+/// Issues #42 + #43: on a DOS\5 volume, an in-place write must hash
+/// accented names with the international table *and* keep every touched
+/// directory's cache chain in step with its hash chains — through adds,
+/// mkdirs, removals, and a root listing big enough to span several cache
+/// blocks.
+#[test]
+fn in_place_edits_maintain_dircache_on_dos5() {
+    use crate::fs::{FileMeta, FileSource, Filesystem};
+    use std::path::Path;
+    let mut dev = MemoryBackend::new(880 * 1024);
+    format_dos5(&mut dev);
+
+    let mut fs = Affs::open_writable(&mut dev).unwrap();
+    assert!(fs.variant().dircache && fs.variant().intl);
+    let put = |fs: &mut Affs, dev: &mut MemoryBackend, path: &str, len: usize| {
+        fs.create_file(
+            dev,
+            Path::new(path),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(vec![0x42u8; len])),
+                len: len as u64,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+    };
+    // The reporter's reproduction: an accented name on a DOS\5 volume.
+    put(&mut fs, &mut dev, "/éclair", 1);
+    // Enough root entries that the cache needs more than one block
+    // (≈ 45 bytes per record, 488 bytes per block).
+    for i in 0..40 {
+        put(&mut fs, &mut dev, &format!("/file_number_{i}"), 700);
+    }
+    fs.create_dir(&mut dev, Path::new("/Docs"), FileMeta::default())
+        .unwrap();
+    fs.create_dir(&mut dev, Path::new("/Docs/Empty"), FileMeta::default())
+        .unwrap();
+    put(&mut fs, &mut dev, "/Docs/Zwölf", 3000);
+    put(&mut fs, &mut dev, "/Docs/tiny", 1);
+    fs.remove(&mut dev, Path::new("/file_number_7")).unwrap();
+    fs.remove(&mut dev, Path::new("/Docs/tiny")).unwrap();
+    fs.remove(&mut dev, Path::new("/Docs/Empty")).unwrap();
+    fs.flush(&mut dev).unwrap();
+
+    // `éclair` must sit where the international fold puts it (slot 18),
+    // not where the classic table would (slot 10).
+    assert_eq!(super::writer::hash_name_for_test("éclair", true), 18);
+    assert_eq!(super::writer::hash_name_for_test("éclair", false), 10);
+    let root = 880 * 1024 / BSIZE / 2;
+    let mut rb = vec![0u8; BSIZE];
+    dev.read_at(root as u64 * BSIZE as u64, &mut rb).unwrap();
+    let head = be_u32(&rb, 0x18 + 18 * 4);
+    assert_ne!(head, 0, "éclair must be reachable from hash slot 18");
+
+    // Root cache spans several blocks; each block's record count is what
+    // its records occupy.
+    let mut dc = be_u32(&rb, 0x1f8);
+    let mut chain = 0;
+    while dc != 0 {
+        let mut cb = vec![0u8; BSIZE];
+        dev.read_at(dc as u64 * BSIZE as u64, &mut cb).unwrap();
+        chain += 1;
+        dc = be_u32(&cb, 0x10);
+    }
+    assert!(
+        chain >= 3,
+        "expected a multi-block root cache, got {chain} block(s)"
+    );
+
+    // Structural + cache-vs-chain + bitmap conformance, every directory.
+    assert_conformant(&mut dev);
+
+    // And the reader still sees everything.
+    let affs = Affs::open(&mut dev).unwrap();
+    let names: std::collections::BTreeSet<String> = affs
+        .list_path("/")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert!(names.contains("éclair"));
+    assert!(names.contains("Docs"));
+    assert!(!names.contains("file_number_7"));
+    let docs: Vec<String> = affs
+        .list_path("/Docs")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(docs, ["Zwölf"]);
+}
+
+/// A directory that ends up empty again keeps a single zero-record cache
+/// block, and removing a directory releases its cache block.
+#[test]
+fn dos5_empty_directory_keeps_an_empty_cache_block() {
+    use crate::fs::{FileMeta, Filesystem};
+    use std::path::Path;
+    let mut dev = MemoryBackend::new(880 * 1024);
+    format_dos5(&mut dev);
+    let mut fs = Affs::open_writable(&mut dev).unwrap();
+    fs.create_dir(&mut dev, Path::new("/A"), FileMeta::default())
+        .unwrap();
+    fs.create_dir(&mut dev, Path::new("/A/B"), FileMeta::default())
+        .unwrap();
+    fs.remove(&mut dev, Path::new("/A/B")).unwrap();
+    fs.flush(&mut dev).unwrap();
+    assert_conformant(&mut dev);
+
+    let affs = Affs::open(&mut dev).unwrap();
+    let Some(super::Resolved::Dir(a)) = affs.resolve("A") else {
+        panic!("expected /A to be a directory");
+    };
+    let mut ab = vec![0u8; BSIZE];
+    dev.read_at(a as u64 * BSIZE as u64, &mut ab).unwrap();
+    let dc = be_u32(&ab, 0x1f8);
+    assert_ne!(dc, 0, "empty dir must still own a cache block");
+    let mut cb = vec![0u8; BSIZE];
+    dev.read_at(dc as u64 * BSIZE as u64, &mut cb).unwrap();
+    assert_eq!(be_i32(&cb, 0), super::T_DIRCACHE);
+    assert_eq!(be_u32(&cb, 0x0c), 0, "record count of an empty dir's cache");
+    assert_eq!(be_u32(&cb, 0x10), 0, "an empty cache is a single block");
 }

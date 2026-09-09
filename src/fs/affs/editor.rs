@@ -6,6 +6,12 @@
 //! the parent directory's hash chain, and the new/removed file's header, data,
 //! and extension blocks — leaving every other block byte-for-byte unchanged.
 //! RAM use is bounded by the bitmap, never by file contents.
+//!
+//! On the directory-cache variants (`DOS\4`/`DOS\5`) every mutation also
+//! regenerates the affected directory's `T_DIRCACHE` chain from its hash
+//! chains. AmigaDOS serves `List`/`ExNext` from that cache, so a file whose
+//! header is linked into the hash table but absent from the cache does not
+//! exist as far as the Amiga is concerned — see [`AffsEditor::rebuild_dircache`].
 
 use std::io::Read;
 
@@ -17,8 +23,8 @@ use super::writer::{
 };
 use super::{
     BSIZE, HT_SIZE, MAX_DATABLK, MAX_NAME_LEN, OFF_BYTE_SIZE, OFF_DAYS, OFF_EXTENSION,
-    OFF_HASHTABLE, OFF_HIGH_SEQ, OFF_NEXT_SAME_HASH, OFF_SEC_TYPE, OFF_TYPE, ST_FILE, ST_LINKFILE,
-    ST_USERDIR, T_DATA, T_HEADER, T_LIST, Variant, be_i32, be_u32,
+    OFF_HASHTABLE, OFF_HIGH_SEQ, OFF_NAME_LEN, OFF_NEXT_SAME_HASH, OFF_SEC_TYPE, OFF_TYPE, ST_FILE,
+    ST_LINKFILE, ST_USERDIR, T_DATA, T_DIRCACHE, T_HEADER, T_LIST, Variant, be_i32, be_u32,
 };
 
 /// Root-block offsets specific to the bitmap.
@@ -28,6 +34,23 @@ const OFF_BM_EXT: usize = 0x1a0; // bitmap-extension block chain
 const OFF_PARENT: usize = 0x1f4;
 /// First-data-block pointer in a file header.
 const OFF_FIRST_DATA: usize = 0x010;
+/// Header tail: owner UID (word) then GID (word).
+const OFF_OWNER: usize = 0x13c;
+/// Header tail: protection bits.
+const OFF_PROTECT: usize = 0x140;
+/// Header tail: BCPL comment (length byte, then up to 79 chars).
+const OFF_COMMENT_LEN: usize = 0x148;
+const MAX_COMMENT_LEN: usize = 79;
+
+// `T_DIRCACHE` block layout (adflib `bDirCacheBlock`): type, own key,
+// then the directory it caches, the record count, the next cache block,
+// the checksum at the usual longword 5, and packed records from byte 24.
+const OFF_DC_PARENT: usize = 0x08;
+const OFF_DC_RECORDS: usize = 0x0c;
+const OFF_DC_NEXT: usize = 0x10;
+const OFF_DC_RECORDS_START: usize = 0x18;
+/// Record bytes available per cache block.
+const DC_CAPACITY: usize = BSIZE - OFF_DC_RECORDS_START;
 
 /// Disk-backed incremental editor over an existing AFFS volume.
 pub(super) struct AffsEditor {
@@ -226,6 +249,139 @@ impl AffsEditor {
         put_u32(buf, OFF_DAYS + 8, t as u32);
     }
 
+    // ── directory cache (DOS\4 / DOS\5) ──
+
+    /// Pack one dircache record for the entry whose header block (`hdr`)
+    /// lives at `entry_block`. Layout, after adflib and cross-checked
+    /// against xdftool-built `DOS\5` volumes: entry block, size and
+    /// protection as longwords; UID and GID as words; the DateStamp as
+    /// three *words*; the secondary type as a signed byte; then the BCPL
+    /// name and comment — the whole record padded to an even length.
+    fn dircache_record(entry_block: u32, hdr: &[u8]) -> Vec<u8> {
+        let sectype = be_i32(hdr, OFF_SEC_TYPE);
+        let name_len = (hdr[OFF_NAME_LEN] as usize).min(MAX_NAME_LEN);
+        let comment_len = (hdr[OFF_COMMENT_LEN] as usize).min(MAX_COMMENT_LEN);
+        let raw = 25 + name_len + comment_len;
+        let mut r = vec![0u8; raw + (raw & 1)];
+        put_u32(&mut r, 0, entry_block);
+        // Longword −47 is a byte size only in a file header; in a directory
+        // it is spare, and the cache records 0 for it.
+        let size = if sectype == ST_FILE || sectype == ST_LINKFILE {
+            be_u32(hdr, OFF_BYTE_SIZE)
+        } else {
+            0
+        };
+        put_u32(&mut r, 4, size);
+        put_u32(&mut r, 8, be_u32(hdr, OFF_PROTECT));
+        r[12..16].copy_from_slice(&hdr[OFF_OWNER..OFF_OWNER + 4]);
+        for i in 0..3 {
+            let v = be_u32(hdr, OFF_DAYS + i * 4) as u16;
+            r[16 + i * 2..18 + i * 2].copy_from_slice(&v.to_be_bytes());
+        }
+        r[22] = sectype as u8; // i8 view of the secondary type (-3 → 0xFD)
+        r[23] = name_len as u8;
+        let name_at = 24;
+        r[name_at..name_at + name_len]
+            .copy_from_slice(&hdr[OFF_NAME_LEN + 1..OFF_NAME_LEN + 1 + name_len]);
+        let comment_at = name_at + name_len;
+        r[comment_at] = comment_len as u8;
+        r[comment_at + 1..comment_at + 1 + comment_len]
+            .copy_from_slice(&hdr[OFF_COMMENT_LEN + 1..OFF_COMMENT_LEN + 1 + comment_len]);
+        r
+    }
+
+    /// Free the `T_DIRCACHE` chain starting at `head`. Stops (without
+    /// freeing) at the first block that is not a cache block: a stale or
+    /// foreign pointer must not cost some other structure its block.
+    fn free_dircache_chain(&mut self, dev: &mut dyn BlockDevice, head: u32) -> Result<()> {
+        let mut cur = head;
+        let mut guard = 0u32;
+        while cur != 0 && cur < self.total_blocks {
+            let b = self.read_block(dev, cur)?;
+            if be_i32(&b, OFF_TYPE) != T_DIRCACHE {
+                break;
+            }
+            let next = be_u32(&b, OFF_DC_NEXT);
+            self.free(cur);
+            cur = next;
+            guard += 1;
+            if guard > self.total_blocks {
+                return Err(Error::InvalidImage("affs: directory cache loop".into()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Regenerate `dir_block`'s directory cache from its hash chains and
+    /// point the directory's `extension` longword at the new chain. No-op
+    /// on variants without a cache.
+    ///
+    /// The old chain is released and a fresh one written, one record per
+    /// entry in hash-table order, spilling into another block whenever a
+    /// record would not fit (a record never straddles blocks). An empty
+    /// directory keeps a single zero-record cache block, which is what the
+    /// ROM filesystem and adflib create for a new directory.
+    fn rebuild_dircache(&mut self, dev: &mut dyn BlockDevice, dir_block: u32) -> Result<()> {
+        if !self.variant.dircache {
+            return Ok(());
+        }
+        let mut dir = self.read_block(dev, dir_block)?;
+        self.free_dircache_chain(dev, be_u32(&dir, OFF_EXTENSION))?;
+
+        // Pack records into block payloads as we walk the hash table.
+        let mut payloads: Vec<(Vec<u8>, u32)> = Vec::new();
+        let mut payload: Vec<u8> = Vec::with_capacity(DC_CAPACITY);
+        let mut count = 0u32;
+        for slot in 0..HT_SIZE {
+            let mut cur = be_u32(&dir, OFF_HASHTABLE + slot * 4);
+            let mut guard = 0u32;
+            while cur != 0 {
+                if cur >= self.total_blocks {
+                    return Err(Error::InvalidImage(
+                        "affs: hash chain pointer out of range".into(),
+                    ));
+                }
+                let hdr = self.read_block(dev, cur)?;
+                let rec = Self::dircache_record(cur, &hdr);
+                if payload.len() + rec.len() > DC_CAPACITY {
+                    payloads.push((std::mem::take(&mut payload), count));
+                    count = 0;
+                }
+                payload.extend_from_slice(&rec);
+                count += 1;
+                cur = be_u32(&hdr, OFF_NEXT_SAME_HASH);
+                guard += 1;
+                if guard > self.total_blocks {
+                    return Err(Error::InvalidImage("affs: hash chain loop".into()));
+                }
+            }
+        }
+        payloads.push((payload, count));
+
+        let blocks = payloads
+            .iter()
+            .map(|_| self.alloc())
+            .collect::<Result<Vec<u32>>>()?;
+        // Write back to front so each block can name its successor.
+        let mut next = 0u32;
+        for (i, (payload, count)) in payloads.iter().enumerate().rev() {
+            let mut buf = vec![0u8; BSIZE];
+            put_u32(&mut buf, OFF_TYPE, T_DIRCACHE as u32);
+            put_u32(&mut buf, 0x04, blocks[i]);
+            put_u32(&mut buf, OFF_DC_PARENT, dir_block);
+            put_u32(&mut buf, OFF_DC_RECORDS, *count);
+            put_u32(&mut buf, OFF_DC_NEXT, next);
+            buf[OFF_DC_RECORDS_START..OFF_DC_RECORDS_START + payload.len()]
+                .copy_from_slice(payload);
+            fix_checksum(&mut buf, 0x14);
+            self.write_block(dev, blocks[i], &buf)?;
+            next = blocks[i];
+        }
+        put_u32(&mut dir, OFF_EXTENSION, blocks[0]);
+        fix_checksum(&mut dir, 0x14);
+        self.write_block(dev, dir_block, &dir)
+    }
+
     // ── mutations ──
 
     /// Create an empty directory under `parent_block`. Returns its block.
@@ -257,6 +413,9 @@ impl AffsEditor {
         self.write_block(dev, new, &b)?;
 
         self.link_into_parent(dev, parent_block, slot, new)?;
+        // A new directory gets its own (empty) cache; the parent's grows.
+        self.rebuild_dircache(dev, new)?;
+        self.rebuild_dircache(dev, parent_block)?;
         Ok(new)
     }
 
@@ -371,6 +530,7 @@ impl AffsEditor {
         self.write_block(dev, header, &hdr)?;
 
         self.link_into_parent(dev, parent_block, slot, header)?;
+        self.rebuild_dircache(dev, parent_block)?;
         Ok(header)
     }
 
@@ -425,6 +585,10 @@ impl AffsEditor {
             }
         }
 
+        // An (empty) directory still owns its cache chain on DOS\4/5.
+        if sectype == ST_USERDIR && self.variant.dircache {
+            self.free_dircache_chain(dev, be_u32(&entry, OFF_EXTENSION))?;
+        }
         // Free the data + extension blocks for files; then the header itself.
         if sectype == ST_FILE || sectype == ST_LINKFILE {
             let mut cur = entry_block;
@@ -450,7 +614,7 @@ impl AffsEditor {
             }
         }
         self.free(entry_block);
-        Ok(())
+        self.rebuild_dircache(dev, parent_block)
     }
 
     /// Persist the bitmap (recomputing each touched page's checksum).
