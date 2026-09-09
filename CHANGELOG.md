@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.27](https://github.com/KarpelesLab/fstool/compare/v0.4.26...v0.4.27) - 2026-09-09
+
+### Added
+
+- *(ext4)* honour metadata_csum_seed when stamping checksums
+
+### Fixed
+
+- *(affs)* treat DOS\4/DOS\5 as international and maintain the directory cache
+
 ## [0.4.26](https://github.com/KarpelesLab/fstool/compare/v0.4.25...v0.4.26) - 2026-09-05
 
 ### Other
