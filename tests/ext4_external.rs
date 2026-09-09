@@ -1967,3 +1967,270 @@ fn ext4_fragmented_file_one_shot_promotes_to_depth1() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// Run `e2fsck -fn` and panic with its output unless it is clean.
+fn assert_e2fsck_clean(path: &std::path::Path, what: &str) {
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck rejected {what}:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+}
+
+/// `dumpe2fs -h` feature line must (or must not) list `feature`.
+fn assert_dumpe2fs_feature(path: &std::path::Path, feature: &str, present: bool) {
+    let out = Command::new("dumpe2fs")
+        .arg("-h")
+        .arg(path)
+        .output()
+        .unwrap();
+    let dump = String::from_utf8_lossy(&out.stdout);
+    let line = dump
+        .lines()
+        .find(|l| l.starts_with("Filesystem features:"))
+        .unwrap_or_else(|| panic!("no feature line in dumpe2fs output:\n{dump}"));
+    let has = line.split_whitespace().any(|f| f == feature);
+    assert_eq!(
+        has, present,
+        "expected `{feature}` present={present} in dumpe2fs features: {line}"
+    );
+}
+
+/// Open an mke2fs-built `metadata_csum_seed` image whose UUID was then
+/// changed with `tune2fs -U`, write into it, and confirm e2fsck stays
+/// clean. With `metadata_csum_seed` the seed is pinned in
+/// `s_checksum_seed`; after the UUID change it no longer matches the
+/// UUID-derived value, so a writer that ignores the feature stamps
+/// every group descriptor, bitmap, inode and directory block with the
+/// wrong checksum.
+#[test]
+fn ext4_open_honours_metadata_csum_seed_after_uuid_change() {
+    use std::io::Read;
+    for tool in ["mke2fs", "tune2fs", "e2fsck", "dumpe2fs"] {
+        if which(tool).is_none() {
+            eprintln!("skipping: {tool} not installed");
+            return;
+        }
+    }
+
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("readme"), b"seeded ext4\n").unwrap();
+
+    let tmp = NamedTempFile::new().unwrap();
+    // `-I 128` and `^resize_inode` sidestep two writer limitations that
+    // have nothing to do with the seed: writing into an image with
+    // 256-byte inodes leaves inode / directory-block checksums stale,
+    // and the writer does not account for the reserved-GDT blocks
+    // owned by the resize inode. Both reproduce identically without
+    // `metadata_csum_seed`; this test isolates the seed handling.
+    let out = Command::new("mke2fs")
+        .args([
+            "-F",
+            "-t",
+            "ext4",
+            "-b",
+            "1024",
+            "-I",
+            "128",
+            "-O",
+            "^resize_inode,metadata_csum,metadata_csum_seed",
+            "-L",
+            "",
+            "-U",
+            "12345678-1234-1234-1234-123456789abc",
+            "-E",
+            "nodiscard",
+            "-d",
+        ])
+        .arg(srcdir.path())
+        .arg(tmp.path())
+        .arg("8192")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "mke2fs failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_dumpe2fs_feature(tmp.path(), "metadata_csum_seed", true);
+
+    // Change the UUID. With metadata_csum_seed this is instant and
+    // leaves `s_checksum_seed` (and thus every checksum) untouched, so
+    // the seed now differs from crc32c(~0, uuid).
+    let out = Command::new("tune2fs")
+        .args(["-U", "0f0e0d0c-0b0a-0908-0706-050403020100"])
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "tune2fs -U failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_e2fsck_clean(tmp.path(), "the tune2fs -U'd source image");
+
+    // Write into it with fstool.
+    {
+        let mut dev = FileBackend::open(tmp.path()).unwrap();
+        let mut ext = Ext::open(&mut dev).unwrap();
+        assert_eq!(ext.kind, FsKind::Ext4);
+        let mut src = NamedTempFile::new().unwrap();
+        src.as_file_mut()
+            .write_all(b"written with the pinned seed\n")
+            .unwrap();
+        let sub = ext
+            .add_dir_to(&mut dev, 2, b"sub", FileMeta::with_mode(0o755))
+            .unwrap();
+        ext.add_file_to(
+            &mut dev,
+            sub,
+            b"added.txt",
+            FileSource::HostPath(src.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+        ext.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+
+    assert_e2fsck_clean(
+        tmp.path(),
+        "the image after writing with metadata_csum_seed",
+    );
+    assert_dumpe2fs_feature(tmp.path(), "metadata_csum_seed", true);
+
+    // Re-open and read both the original and the added file back.
+    let mut dev = FileBackend::open(tmp.path()).unwrap();
+    let ext = Ext::open(&mut dev).unwrap();
+    for (path, want) in [
+        ("/readme", &b"seeded ext4\n"[..]),
+        ("/sub/added.txt", &b"written with the pinned seed\n"[..]),
+    ] {
+        let ino = ext.path_to_inode(&mut dev, path).unwrap();
+        let mut body = Vec::new();
+        ext.open_file_reader(&mut dev, ino)
+            .unwrap()
+            .read_to_end(&mut body)
+            .unwrap();
+        assert_eq!(body, want, "{path} read-back mismatch");
+    }
+}
+
+/// Format with `metadata_csum_seed` on: e2fsck must be clean, dumpe2fs
+/// must list the feature, and a subsequent `tune2fs -U` (cheap only
+/// because the seed is pinned) followed by another fstool write must
+/// still leave a clean filesystem.
+#[test]
+fn ext4_format_with_metadata_csum_seed() {
+    for tool in ["tune2fs", "e2fsck", "dumpe2fs"] {
+        if which(tool).is_none() {
+            eprintln!("skipping: {tool} not installed");
+            return;
+        }
+    }
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 4096,
+        blocks_count: 8192,
+        inodes_count: 64,
+        journal_blocks: 1024,
+        uuid: [0x5a; 16],
+        metadata_csum_seed: true,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    assert!(
+        ext.sb.feature_incompat & 0x2000 != 0,
+        "INCOMPAT_CSUM_SEED not set"
+    );
+    assert_ne!(ext.sb.checksum_seed, 0, "s_checksum_seed left zero");
+
+    let mut src = NamedTempFile::new().unwrap();
+    src.as_file_mut().write_all(b"first write\n").unwrap();
+    ext.add_file_to(
+        &mut dev,
+        2,
+        b"first.txt",
+        FileSource::HostPath(src.path().to_path_buf()),
+        FileMeta::with_mode(0o644),
+    )
+    .unwrap();
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    assert_e2fsck_clean(tmp.path(), "the freshly formatted metadata_csum_seed image");
+    assert_dumpe2fs_feature(tmp.path(), "metadata_csum_seed", true);
+    assert_dumpe2fs_feature(tmp.path(), "metadata_csum", true);
+
+    // Rotate the UUID; only possible without a full checksum rewrite
+    // because the seed is pinned.
+    let out = Command::new("tune2fs")
+        .args(["-U", "11111111-2222-3333-4444-555555555555"])
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "tune2fs -U failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_e2fsck_clean(tmp.path(), "our image after tune2fs -U");
+
+    {
+        let mut dev = FileBackend::open(tmp.path()).unwrap();
+        let mut ext = Ext::open(&mut dev).unwrap();
+        assert_eq!(
+            ext.sb.uuid[0], 0x11,
+            "tune2fs -U should have changed the UUID"
+        );
+        let mut src = NamedTempFile::new().unwrap();
+        src.as_file_mut().write_all(b"second write\n").unwrap();
+        ext.add_file_to(
+            &mut dev,
+            2,
+            b"second.txt",
+            FileSource::HostPath(src.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+        ext.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+    assert_e2fsck_clean(tmp.path(), "our image after a post-UUID-change write");
+}
+
+/// `metadata_csum_seed` without `metadata_csum` is an e2fsck error, so
+/// the formatter refuses it for the non-checksummed flavours.
+#[test]
+fn ext_metadata_csum_seed_requires_ext4() {
+    for kind in [FsKind::Ext2, FsKind::Ext3] {
+        let opts = FormatOpts {
+            kind,
+            block_size: 1024,
+            blocks_count: 8192,
+            inodes_count: 64,
+            journal_blocks: 1024,
+            metadata_csum_seed: true,
+            ..FormatOpts::default()
+        };
+        let mut dev = fstool::block::MemoryBackend::new(8192 * 1024);
+        let err = Ext::format_with(&mut dev, &opts).unwrap_err();
+        assert!(
+            matches!(err, fstool::Error::InvalidArgument(_)),
+            "{kind:?}: expected InvalidArgument, got {err:?}"
+        );
+    }
+}

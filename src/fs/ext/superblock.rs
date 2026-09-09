@@ -67,6 +67,10 @@ pub struct Superblock {
     /// that hold SB+GDT backups when the `sparse_super2` compat feature
     /// is set. Zero otherwise.
     pub backup_bgs: [u32; 2],
+    /// `s_checksum_seed` at offset 0x270. The filesystem-wide CRC32C seed
+    /// when the `metadata_csum_seed` (`INCOMPAT_CSUM_SEED`) feature is
+    /// set; ignored otherwise (the seed is then derived from `uuid`).
+    pub checksum_seed: u32,
 }
 
 impl Superblock {
@@ -128,6 +132,7 @@ impl Superblock {
             desc_size: 0,
             log_groups_per_flex: 0,
             backup_bgs: [0, 0],
+            checksum_seed: 0,
         }
     }
 
@@ -199,6 +204,8 @@ impl Superblock {
         // `sparse_super2` compat feature is on.
         write_u32(p, 0x24C, self.backup_bgs[0]);
         write_u32(p, 0x250, self.backup_bgs[1]);
+        // 0x270: s_checksum_seed — meaningful with `INCOMPAT_CSUM_SEED`.
+        write_u32(p, 0x270, self.checksum_seed);
         buf
     }
 
@@ -263,6 +270,7 @@ impl Superblock {
             desc_size: read_u16(buf, 254),
             log_groups_per_flex: buf[0x174],
             backup_bgs: [read_u32(buf, 0x24C), read_u32(buf, 0x250)],
+            checksum_seed: read_u32(buf, 0x270),
         })
     }
 }
@@ -304,11 +312,14 @@ mod tests {
         sb.inodes_per_group = 1024;
         sb.first_data_block = 1;
         sb.uuid = [0x42; 16];
+        sb.checksum_seed = 0xDEAD_BEEF;
         let buf = sb.encode();
+        assert_eq!(&buf[0x270..0x274], &0xDEAD_BEEFu32.to_le_bytes());
         let decoded = Superblock::decode(&buf).unwrap();
         assert_eq!(decoded.inodes_count, sb.inodes_count);
         assert_eq!(decoded.blocks_count, sb.blocks_count);
         assert_eq!(decoded.uuid, sb.uuid);
+        assert_eq!(decoded.checksum_seed, 0xDEAD_BEEF);
         assert_eq!(decoded.magic, EXT2_MAGIC);
         assert_eq!(decoded.block_size(), 1024);
     }

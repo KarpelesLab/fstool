@@ -138,6 +138,16 @@ pub struct FormatOpts {
     /// shape of the FS so kernel/e2fsck installations older than ~3.8
     /// would refuse to mount the result.
     pub inline_data: bool,
+    /// When true, advertise `INCOMPAT_CSUM_SEED` (`metadata_csum_seed`)
+    /// and store the CRC32C seed in the superblock's `s_checksum_seed`
+    /// field instead of deriving it from the UUID on every use. The
+    /// seed is initialised to the UUID-derived value (exactly what
+    /// mke2fs does), so the only on-disk difference is the flag and the
+    /// field — but it lets `tune2fs -U` change the UUID later without
+    /// rewriting every checksum on the filesystem. Requires ext4
+    /// (`metadata_csum`); rejected for ext2/ext3. Off by default so
+    /// existing output stays byte-identical.
+    pub metadata_csum_seed: bool,
     /// When true, the caller guarantees the device's first
     /// `blocks_count * block_size` bytes already read back as zero
     /// (e.g. a freshly-`set_len`'d sparse file, a fresh `Qcow2Backend`,
@@ -174,6 +184,7 @@ impl Default for FormatOpts {
             use_64bit: false,
             sparse_super2: false,
             inline_data: false,
+            metadata_csum_seed: false,
             prezeroed: false,
         }
     }
@@ -203,6 +214,8 @@ impl FormatOpts {
     /// - `sparse_super2` (bool)
     /// - `use_64bit` (bool)
     /// - `log_groups_per_flex` (u8, 0..=5)
+    /// - `inline_data` (bool)
+    /// - `metadata_csum_seed` (bool, ext4 only)
     /// - `volume_label` (string, ≤ 16 bytes; longer is rejected)
     /// - `create_lost_found` (bool)
     ///
@@ -244,6 +257,12 @@ impl FormatOpts {
         }
         if let Some(v) = map.take_u8("log_groups_per_flex")? {
             self.log_groups_per_flex = v;
+        }
+        if let Some(v) = map.take_bool("inline_data")? {
+            self.inline_data = v;
+        }
+        if let Some(v) = map.take_bool("metadata_csum_seed")? {
+            self.metadata_csum_seed = v;
         }
         if let Some(v) = map.take_bool("create_lost_found")? {
             self.create_lost_found = v;
@@ -570,6 +589,20 @@ impl Ext {
         if opts.inline_data {
             ext.sb.feature_incompat |= constants::feature::INCOMPAT_INLINE_DATA;
         }
+        // metadata_csum_seed: pin the seed in the superblock. e2fsck
+        // treats the flag without metadata_csum as an error, so only
+        // allow it where we set metadata_csum (ext4). The initial value
+        // is the UUID-derived seed, matching mke2fs — the flag only
+        // changes *where* the seed comes from, not its value.
+        if opts.metadata_csum_seed {
+            if !ext.has_metadata_csum() {
+                return Err(crate::Error::InvalidArgument(
+                    "ext: metadata_csum_seed requires metadata_csum (ext4)".into(),
+                ));
+            }
+            ext.sb.feature_incompat |= constants::feature::INCOMPAT_CSUM_SEED;
+            ext.sb.checksum_seed = csum::fs_seed(&ext.sb.uuid, None);
+        }
 
         // Reserve inodes 1..first_ino-1 (1..=10 for dynamic rev).
         let first_ino = ext.sb.first_ino;
@@ -655,11 +688,21 @@ impl Ext {
         self.sb.feature_incompat & constants::feature::INCOMPAT_FILETYPE != 0
     }
 
-    /// The filesystem-wide checksum seed. genfs never sets the
-    /// `metadata_csum_seed` feature, so the seed is always derived from the
-    /// UUID.
+    /// Whether the `metadata_csum_seed` feature is active: the checksum
+    /// seed is the explicit `s_checksum_seed` field rather than a
+    /// function of the UUID.
+    pub(crate) fn has_csum_seed(&self) -> bool {
+        self.sb.feature_incompat & constants::feature::INCOMPAT_CSUM_SEED != 0
+    }
+
+    /// The filesystem-wide checksum seed. With `metadata_csum_seed` this
+    /// is the superblock's `s_checksum_seed` verbatim — which, after a
+    /// `tune2fs -U`, no longer matches anything derivable from the UUID.
+    /// Without the feature it is `crc32c(~0, uuid)`. Mirrors the kernel's
+    /// `ext4_fill_super` seed selection.
     fn csum_seed(&self) -> u32 {
-        csum::fs_seed(&self.sb.uuid, None)
+        let explicit = self.has_csum_seed().then_some(self.sb.checksum_seed);
+        csum::fs_seed(&self.sb.uuid, explicit)
     }
 
     /// Wire `data_blocks` into an inode's block-pointer array. Picks the

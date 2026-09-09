@@ -108,6 +108,10 @@ pub mod feature {
     pub const INCOMPAT_64BIT: u32 = 0x0080;
     pub const INCOMPAT_FLEX_BG: u32 = 0x0200;
     pub const INCOMPAT_INLINE_DATA: u32 = 0x8000;
+    /// `metadata_csum_seed`: the checksum seed lives in the explicit
+    /// `s_checksum_seed` superblock field instead of being derived from
+    /// the UUID (so the UUID can change without rewriting every checksum).
+    pub const INCOMPAT_CSUM_SEED: u32 = 0x2000;
 
     // ro_compat
     pub const RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
