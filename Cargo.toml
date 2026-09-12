@@ -58,6 +58,10 @@ required-features = ["std"]
 # clean `Unsupported` for methods whose codec hasn't landed in compcol yet.
 default = [
     "std",
+    # Implied by `std`, but named here because it is a deliberate part of
+    # the default rather than an accident of it: the floor below is a
+    # build with `alloc` off (see the feature's own note).
+    "alloc",
     "filesystems",
     "containers",
     "codecs",
