@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/KarpelesLab/fstool/compare/v0.4.29...v0.5.0) - 2026-09-12
+
+### Fixed
+
+- *(fat)* export the driver's error as `fs::fat::Error`
+- *(build)* drop the cdylib crate type so a no_std build needs no panic handler
+
+### Other
+
+- record the fs::fat move as breaking, with the one-line migration
+- v0.4.29 release commit from origin
+- *(fat)* [**breaking**] one module, one API shape — `fs::fat` with or without a heap
+
 ### Fixed
 
 - *(build)* the library declared a `cdylib` alongside its `rlib`, which
