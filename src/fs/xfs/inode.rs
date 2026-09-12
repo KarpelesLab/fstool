@@ -96,6 +96,24 @@ pub const S_IFREG: u16 = 0o100_000;
 pub const S_IFLNK: u16 = 0o120_000;
 pub const S_IFSOCK: u16 = 0o140_000;
 
+/// Encode a `(major, minor)` device number pair the way XFS stores it in
+/// the data fork of a `XFS_DINODE_FMT_DEV` inode: a 4-byte big-endian
+/// `xfs_dev_t` holding the SysV ("old") encoding the kernel produces with
+/// `sysv_encode_dev()` — `minor & 0x3ffff | (major << 18)`.
+///
+/// See `xfs_dinode_put_rdev` / `xfs_inode_to_disk` in
+/// `fs/xfs/libxfs/xfs_inode_buf.c` and `sysv_encode_dev` in
+/// `include/linux/kdev_t.h`.
+pub fn encode_xfs_dev(major: u32, minor: u32) -> u32 {
+    (minor & 0x3_ffff) | ((major & 0x3fff) << 18)
+}
+
+/// Inverse of [`encode_xfs_dev`] — `(major, minor)` out of an on-disk
+/// `xfs_dev_t` (`sysv_major` / `sysv_minor`).
+pub fn decode_xfs_dev(raw: u32) -> (u32, u32) {
+    ((raw >> 18) & 0x3fff, raw & 0x3_ffff)
+}
+
 /// A timestamp the way XFS v3 stores it on disk: 32-bit big-endian seconds
 /// followed by 32-bit big-endian nanoseconds. XFS v5 with the BIGTIME
 /// feature reinterprets this as a single 64-bit count; we don't enable that

@@ -49,6 +49,9 @@ pub mod write;
 pub mod xattr;
 pub mod xattr_leaf;
 
+#[cfg(test)]
+mod regress;
+
 pub use format::{FormatOpts, format};
 pub use write::{DeviceKind, EntryMeta, WriteState};
 
@@ -160,6 +163,25 @@ impl Xfs {
             .checked_add(blk_bytes)
             .and_then(|v| v.checked_add(slot_bytes))
             .ok_or_else(overflow)
+    }
+
+    /// Device number of a char/block special inode, in the crate-wide
+    /// interchange encoding ([`crate::fs::devnum`]). XFS keeps the raw
+    /// `xfs_dev_t` (SysV packing) as a 4-byte big-endian word at the head
+    /// of the data fork of a `XFS_DINODE_FMT_DEV` inode; every other
+    /// inode type reports 0.
+    fn dinode_rdev(&self, ino_buf: &[u8], core: &DinodeCore) -> u32 {
+        let is_special = matches!(core.mode & inode::S_IFMT, inode::S_IFCHR | inode::S_IFBLK);
+        if !is_special || core.format != DiFormat::Dev {
+            return 0;
+        }
+        let lit = core.literal_area(ino_buf, self.sb.inodesize as usize);
+        if lit.len() < 4 {
+            return 0;
+        }
+        let raw = u32::from_be_bytes(lit[0..4].try_into().unwrap());
+        let (major, minor) = inode::decode_xfs_dev(raw);
+        crate::fs::devnum::encode_devnum(major, minor)
     }
 
     /// Read an inode by number, returning the raw bytes plus the decoded core.
@@ -895,7 +917,7 @@ impl crate::fs::Filesystem for Xfs {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("xfs: non-UTF-8 path".into()))?;
-        let (ino, _buf, core) = self.resolve_path(dev, s)?;
+        let (ino, ino_buf, core) = self.resolve_path(dev, s)?;
         let kind = match core.mode & xi::S_IFMT {
             xi::S_IFREG => crate::fs::EntryKind::Regular,
             xi::S_IFDIR => crate::fs::EntryKind::Dir,
@@ -917,8 +939,7 @@ impl crate::fs::Filesystem for Xfs {
             atime: core.atime.sec,
             mtime: core.mtime.sec,
             ctime: core.ctime.sec,
-            // Device-node rdev lives in the data fork; not surfaced yet.
-            rdev: 0,
+            rdev: self.dinode_rdev(&ino_buf, &core),
             inode: ino as u32,
         })
     }

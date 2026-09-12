@@ -1408,11 +1408,11 @@ impl Xfs {
         let ino = self.alloc_inode(dev)?;
         let uuid = self.uuid_for_writes();
         let (atime, mtime, ctime) = meta.ts();
-        // For dev nodes the literal area holds an 8-byte big-endian
-        // packed dev number: major << 20 | minor (Linux MKDEV scheme).
-        let packed = ((major as u64) << 20) | (minor as u64 & 0xFFFFF);
-        let mut lit = [0u8; 8];
-        lit.copy_from_slice(&packed.to_be_bytes());
+        // For dev nodes the data fork holds a 4-byte big-endian
+        // `xfs_dev_t` in the SysV encoding (`minor | major << 18`) —
+        // see `xfs_dinode_put_rdev` in fs/xfs/libxfs/xfs_inode_buf.c.
+        // FIFOs and sockets use XFS_DINODE_FMT_DEV too, with rdev 0.
+        let lit = super::inode::encode_xfs_dev(major, minor).to_be_bytes();
         let builder = V3DinodeBuilder {
             inodesize: XFS_INODESIZE as usize,
             mode: kind.s_ifmt() | (meta.mode & 0o7777),
