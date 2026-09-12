@@ -870,3 +870,268 @@ fn dos5_empty_directory_keeps_an_empty_cache_block() {
     assert_eq!(be_u32(&cb, 0x0c), 0, "record count of an empty dir's cache");
     assert_eq!(be_u32(&cb, 0x10), 0, "an empty cache is a single block");
 }
+
+/// Only 25 bitmap-page pointers fit in the root block, so a volume
+/// bigger than 25 × 4064 blocks (~49.6 MiB at 512-byte blocks) needs a
+/// bitmap-extension chain hanging off `bmExt` (root offset 0x1a0). The
+/// writer used to emit the first 25 pages and stop, leaving the tail of
+/// the volume undescribed — and, because the extension blocks weren't
+/// reserved either, whatever landed on those blocks was corrupted by
+/// the next allocation.
+#[test]
+fn writer_emits_bitmap_extension_blocks_on_a_large_volume() {
+    use crate::fs::{FileMeta, FileSource, Filesystem};
+    use std::path::Path;
+
+    const BLOCKS: u64 = 140_000; // ~68 MiB → 35 bitmap pages
+    let mut dev = MemoryBackend::new(BLOCKS * BSIZE as u64);
+    let mut fs = Affs::format(
+        &mut dev,
+        &super::AffsFormatOpts {
+            volume_name: "BigVol".into(),
+            ffs: true,
+            intl: true,
+        },
+    )
+    .unwrap();
+    fs.create_file(
+        &mut dev,
+        Path::new("/payload"),
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(vec![0x5Au8; 4096])),
+            len: 4096,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    fs.flush(&mut dev).unwrap();
+
+    let read = |dev: &mut MemoryBackend, b: u64| {
+        let mut buf = vec![0u8; BSIZE];
+        dev.read_at(b * BSIZE as u64, &mut buf).unwrap();
+        buf
+    };
+    let root_block = BLOCKS / 2;
+    let root = read(&mut dev, root_block);
+
+    // Collect every bitmap page: the 25 inline pointers plus the chain.
+    let words_per_ext = BSIZE / 4 - 1;
+    let mut pages: Vec<u32> = Vec::new();
+    for i in 0..25 {
+        let p = be_u32(&root, 0x13c + i * 4);
+        if p != 0 {
+            pages.push(p);
+        }
+    }
+    let mut ext = be_u32(&root, 0x1a0);
+    assert_ne!(ext, 0, "bmExt must be set on a >25-page volume");
+    let mut guard = 0;
+    while ext != 0 {
+        guard += 1;
+        assert!(guard < 64, "bmExt chain runs away");
+        let blk = read(&mut dev, ext as u64);
+        for w in 0..words_per_ext {
+            let p = be_u32(&blk, w * 4);
+            if p != 0 {
+                pages.push(p);
+            }
+        }
+        ext = be_u32(&blk, words_per_ext * 4);
+    }
+    let want_pages = (BLOCKS - 2).div_ceil(u64::from(super::writer::BM_BITS_PER_BLOCK)) as usize;
+    assert_eq!(
+        pages.len(),
+        want_pages,
+        "bitmap must describe the whole volume"
+    );
+
+    // Every page must be inside the volume, distinct, and checksum-valid.
+    let mut seen = std::collections::BTreeSet::new();
+    for &p in &pages {
+        assert!((p as u64) < BLOCKS, "bitmap page {p} out of range");
+        assert!(seen.insert(p), "bitmap page {p} listed twice");
+        let blk = read(&mut dev, p as u64);
+        let mut sum = 0u32;
+        let mut i = 0;
+        while i < BSIZE {
+            sum = sum.wrapping_add(be_u32(&blk, i));
+            i += 4;
+        }
+        assert_eq!(sum, 0, "bitmap page {p} checksum");
+    }
+
+    // The last block of the volume is described, and reported free.
+    let last = BLOCKS - 1;
+    let bit = last - 2;
+    let page_idx = (bit / u64::from(super::writer::BM_BITS_PER_BLOCK)) as usize;
+    let within = bit % u64::from(super::writer::BM_BITS_PER_BLOCK);
+    let blk = read(&mut dev, pages[page_idx] as u64);
+    let word = be_u32(&blk, 4 + (within / 32) as usize * 4);
+    assert_ne!(
+        word & (1 << (within % 32)),
+        0,
+        "last block of the volume must be marked free in the bitmap"
+    );
+
+    // And the file still reads back.
+    let fs = Affs::open(&mut dev).unwrap();
+    let mut got = Vec::new();
+    std::io::Read::read_to_end(
+        &mut fs.open_file_reader(&mut dev, "/payload").unwrap(),
+        &mut got,
+    )
+    .unwrap();
+    assert_eq!(got, vec![0x5Au8; 4096]);
+}
+
+/// An AFFS hard link (`ST_LINKFILE` / `ST_LINKDIR`) is a header with no
+/// content of its own — zero `byteSize`, empty data-block table, empty
+/// hash table — and `realEntry` at 0x1d4 names the header that holds
+/// everything. Reading the link header directly therefore reports an
+/// empty file and an empty directory; the reader has to follow the
+/// pointer.
+#[test]
+fn hard_links_resolve_to_their_target() {
+    use crate::fs::{FileMeta, FileSource, Filesystem};
+    use std::path::Path;
+
+    const BLOCKS: u64 = 1760;
+    let payload = vec![0xC3u8; 2000];
+    let mut dev = MemoryBackend::new(BLOCKS * BSIZE as u64);
+    {
+        let mut fs = Affs::format(
+            &mut dev,
+            &super::AffsFormatOpts {
+                volume_name: "Links".into(),
+                ffs: true,
+                intl: true,
+            },
+        )
+        .unwrap();
+        fs.create_dir(&mut dev, Path::new("/realdir"), FileMeta::default())
+            .unwrap();
+        fs.create_file(
+            &mut dev,
+            Path::new("/realdir/inner.txt"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(b"inner\n".to_vec())),
+                len: 6,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.create_file(
+            &mut dev,
+            Path::new("/real.txt"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(payload.clone())),
+                len: payload.len() as u64,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+    }
+
+    let root_block = BLOCKS / 2;
+    let read = |dev: &mut MemoryBackend, b: u64| {
+        let mut buf = vec![0u8; BSIZE];
+        dev.read_at(b * BSIZE as u64, &mut buf).unwrap();
+        buf
+    };
+    // Locate the two real headers by walking the root's hash table.
+    let root = read(&mut dev, root_block);
+    let mut real_file = 0u32;
+    let mut real_dir = 0u32;
+    for slot in 0..HT_SIZE {
+        let mut e = be_u32(&root, 0x18 + slot * 4);
+        while e != 0 {
+            let hb = read(&mut dev, e as u64);
+            match read_name(&hb).as_str() {
+                "real.txt" => real_file = e,
+                "realdir" => real_dir = e,
+                _ => {}
+            }
+            e = be_u32(&hb, 0x1f0);
+        }
+    }
+    assert!(real_file != 0 && real_dir != 0);
+
+    // Hand-craft two link headers on otherwise-unused blocks and splice
+    // them into the root's hash chains. (Our writer can't create hard
+    // links; a real Amiga volume would.)
+    let mut root = root;
+    for (block, name, target, sec_type) in [
+        (BLOCKS as u32 - 3, "hardfile", real_file, super::ST_LINKFILE),
+        (BLOCKS as u32 - 4, "harddir", real_dir, super::ST_LINKDIR),
+    ] {
+        let slot = super::writer::hash_name_for_test(name, true);
+        let mut hb = vec![0u8; BSIZE];
+        super::writer::put_u32(&mut hb, 0x00, super::T_HEADER as u32);
+        super::writer::put_u32(&mut hb, 0x04, block);
+        let nb = name.as_bytes();
+        hb[0x1b0] = nb.len() as u8;
+        hb[0x1b1..0x1b1 + nb.len()].copy_from_slice(nb);
+        super::writer::put_u32(&mut hb, 0x1d4, target); // realEntry
+        super::writer::put_u32(&mut hb, 0x1f0, be_u32(&root, 0x18 + slot * 4));
+        super::writer::put_u32(&mut hb, 0x1f4, root_block as u32);
+        super::writer::put_u32(&mut hb, 0x1fc, sec_type as u32);
+        let mut sum = 0u32;
+        let mut i = 0;
+        while i < BSIZE {
+            if i != 0x14 {
+                sum = sum.wrapping_add(be_u32(&hb, i));
+            }
+            i += 4;
+        }
+        super::writer::put_u32(&mut hb, 0x14, (!sum).wrapping_add(1));
+        dev.write_at(block as u64 * BSIZE as u64, &hb).unwrap();
+        super::writer::put_u32(&mut root, 0x18 + slot * 4, block);
+    }
+    // Re-checksum the root and write it back.
+    let mut sum = 0u32;
+    let mut i = 0;
+    while i < BSIZE {
+        if i != 0x14 {
+            sum = sum.wrapping_add(be_u32(&root, i));
+        }
+        i += 4;
+    }
+    super::writer::put_u32(&mut root, 0x14, (!sum).wrapping_add(1));
+    dev.write_at(root_block * BSIZE as u64, &root).unwrap();
+
+    let fs = Affs::open(&mut dev).unwrap();
+    let names: std::collections::BTreeSet<String> = fs
+        .list_path("/")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert!(names.contains("hardfile"), "{names:?}");
+    assert!(names.contains("harddir"), "{names:?}");
+
+    // The linked file has the target's size and contents.
+    let hardfile = fs
+        .list_path("/")
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "hardfile")
+        .unwrap();
+    assert_eq!(hardfile.size, payload.len() as u64, "link reports no size");
+    let mut got = Vec::new();
+    std::io::Read::read_to_end(
+        &mut fs.open_file_reader(&mut dev, "/hardfile").unwrap(),
+        &mut got,
+    )
+    .unwrap();
+    assert_eq!(got, payload);
+
+    // The linked directory lists the target's children.
+    let inner: Vec<String> = fs
+        .list_path("/harddir")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(inner, vec!["inner.txt".to_string()]);
+}

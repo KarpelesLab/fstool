@@ -90,7 +90,11 @@ impl FsSizePlan for AffsSizePlan {
         let mut total = self.content_blocks;
         for _ in 0..8 {
             let bitmap = total.saturating_sub(2).div_ceil(BM_BITS_PER_BLOCK);
-            let next = self.content_blocks + bitmap;
+            // Only 25 bitmap-page pointers fit in the root block; the
+            // rest need bitmap-extension blocks, which are themselves
+            // blocks the volume has to hold.
+            let bm_ext = bitmap.saturating_sub(25).div_ceil(BSIZE as u64 / 4 - 1);
+            let next = self.content_blocks + bitmap + bm_ext;
             if next == total {
                 break;
             }
