@@ -41,9 +41,7 @@ use crate::Result;
 use crate::block::BlockDevice;
 use crate::fs::FileHandle;
 
-use super::attribute::{
-    AttributeIter, AttributeKind, FileName, TYPE_DATA, TYPE_FILE_NAME, decode_utf16le,
-};
+use super::attribute::{AttributeIter, AttributeKind, FileName, TYPE_DATA, TYPE_FILE_NAME};
 use super::format::{
     self, build_file_name_value, build_non_resident_attr, build_resident_attr, encode_run_list,
 };
@@ -525,73 +523,43 @@ impl<'a> NtfsFileHandle<'a> {
             return Ok(None);
         }
         let hdr = mft::RecordHeader::parse(&rec)?;
-        let bytes_in_use = hdr.bytes_in_use as usize;
-        let first = hdr.first_attribute_offset as usize;
-        let mut cursor = first;
-        let mut root_off_in_rec: Option<(usize, usize, usize)> = None;
+        // `(value_start, value_end)` of the resident `$INDEX_ROOT:$I30`
+        // within `rec`, and the `$INDEX_ALLOCATION:$I30` run list. Every
+        // attribute length / offset is validated by `AttributeIter`, so a
+        // malformed record ends the scan instead of overrunning `rec`.
+        let mut root_range: Option<(usize, usize)> = None;
         let mut alloc_runs: Option<Vec<Extent>> = None;
-        // Clamp the scan bound to the record's real length: a malformed
-        // `bytes_in_use` must never push the cursor past `rec`.
-        let scan_end = bytes_in_use.min(rec.len());
-        while cursor + 16 <= scan_end {
-            let tc = u32::from_le_bytes(rec[cursor..cursor + 4].try_into().unwrap());
-            if tc == 0xFFFF_FFFF {
-                break;
+        for attr in
+            AttributeIter::new(&rec, hdr.first_attribute_offset as usize).map_while(Result::ok)
+        {
+            if attr.name != "$I30" {
+                continue;
             }
-            let len = u32::from_le_bytes(rec[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
-            // Reject degenerate / out-of-bounds attribute records: `len < 16`
-            // would loop forever; an overrun would slice past `rec`.
-            if len < 16 || cursor + len > scan_end {
-                break;
-            }
-            let non_resident = rec[cursor + 8] != 0;
-            let name_len = rec[cursor + 9] as usize;
-            let name_off =
-                u16::from_le_bytes(rec[cursor + 10..cursor + 12].try_into().unwrap()) as usize;
-            let name_end = cursor
-                .checked_add(name_off)
-                .and_then(|s| name_len.checked_mul(2).and_then(|n| s.checked_add(n)));
-            let attr_name = match name_end {
-                _ if name_len == 0 => String::new(),
-                Some(end) if end <= cursor + len => decode_utf16le(&rec[cursor + name_off..end]),
-                // Name field overruns the attribute — skip safely.
-                _ => {
-                    cursor += len;
-                    continue;
+            match (attr.type_code, attr.kind) {
+                (super::attribute::TYPE_INDEX_ROOT, AttributeKind::Resident { value, .. }) => {
+                    // Resident header: value_offset is a u16 at attr+0x14.
+                    // `AttributeIter` has already checked that the value
+                    // lies inside the attribute (and thus inside `rec`).
+                    let value_off = u16::from_le_bytes(
+                        rec[attr.offset + 0x14..attr.offset + 0x16]
+                            .try_into()
+                            .unwrap(),
+                    ) as usize;
+                    let start = attr.offset + value_off;
+                    root_range = Some((start, start + value.len()));
                 }
-            };
-            if attr_name == "$I30" {
-                if tc == super::attribute::TYPE_INDEX_ROOT && !non_resident && len >= 0x16 {
-                    let value_off =
-                        u16::from_le_bytes(rec[cursor + 0x14..cursor + 0x16].try_into().unwrap())
-                            as usize;
-                    let value_len =
-                        u32::from_le_bytes(rec[cursor + 0x10..cursor + 0x14].try_into().unwrap())
-                            as usize;
-                    root_off_in_rec = Some((cursor, value_off, value_len));
-                } else if tc == super::attribute::TYPE_INDEX_ALLOCATION
-                    && non_resident
-                    && len >= 0x22
-                {
-                    let runs_off =
-                        u16::from_le_bytes(rec[cursor + 0x20..cursor + 0x22].try_into().unwrap())
-                            as usize;
-                    // Bounds-check the run-list slice against the attribute.
-                    if runs_off <= len && cursor + len <= rec.len() {
-                        let runs_bytes = &rec[cursor + runs_off..cursor + len];
-                        if let Ok(rs) = super::run_list::decode(runs_bytes) {
-                            alloc_runs = Some(rs);
-                        }
-                    }
+                (
+                    super::attribute::TYPE_INDEX_ALLOCATION,
+                    AttributeKind::NonResident { runs, .. },
+                ) => {
+                    alloc_runs = Some(runs);
                 }
+                _ => {}
             }
-            cursor += len;
         }
-        let Some((attr_start, value_off, value_len)) = root_off_in_rec else {
+        let Some((root_v_start, root_v_end)) = root_range else {
             return Ok(None);
         };
-        let root_v_start = attr_start + value_off;
-        let root_v_end = root_v_start + value_len;
         let root_val = &mut rec[root_v_start..root_v_end];
         if root_val.len() < 32 {
             return Ok(None);

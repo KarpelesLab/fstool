@@ -1982,11 +1982,12 @@ pub fn rewrite_resident_attr(
     new_value: &[u8],
 ) -> Result<()> {
     let hdr = mft::RecordHeader::parse(rec)?;
-    let bytes_in_use = hdr.bytes_in_use as usize;
+    // Clamp to the buffer: `bytes_in_use` is an on-disk field.
+    let bytes_in_use = (hdr.bytes_in_use as usize).min(rec.len()).min(rec_size);
     let first = hdr.first_attribute_offset as usize;
     let mut cursor = first;
     loop {
-        if cursor + 4 > bytes_in_use {
+        if cursor + 16 > bytes_in_use {
             return Err(crate::Error::InvalidImage(
                 "ntfs: attribute walk past bytes_in_use".into(),
             ));
@@ -1999,6 +2000,13 @@ pub fn rewrite_resident_attr(
             )));
         }
         let len = u32::from_le_bytes(rec[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+        // A zero / undersized length would loop forever; an oversized one
+        // would slice past the record.
+        if len < 16 || cursor + len > bytes_in_use {
+            return Err(crate::Error::InvalidImage(format!(
+                "ntfs: attribute length {len} oversteps record"
+            )));
+        }
         let non_resident = rec[cursor + 8] != 0;
         let name_len = rec[cursor + 9] as usize;
         let name_off =
@@ -2006,14 +2014,28 @@ pub fn rewrite_resident_attr(
         let attr_name = if name_len == 0 {
             String::new()
         } else {
-            super::attribute::decode_utf16le(
-                &rec[cursor + name_off..cursor + name_off + name_len * 2],
-            )
+            let name_end = name_off + name_len * 2;
+            if name_end > len {
+                return Err(crate::Error::InvalidImage(
+                    "ntfs: attribute name oversteps attribute".into(),
+                ));
+            }
+            super::attribute::decode_utf16le(&rec[cursor + name_off..cursor + name_end])
         };
         if tc == type_code && attr_name == name && !non_resident {
             // Resident value layout: 0x10 value_length(u32), 0x14 value_offset(u16), 0x16 indexed_flag
+            if len < 0x18 {
+                return Err(crate::Error::InvalidImage(
+                    "ntfs: resident attribute header too short".into(),
+                ));
+            }
             let value_off =
                 u16::from_le_bytes(rec[cursor + 0x14..cursor + 0x16].try_into().unwrap()) as usize;
+            if value_off < 0x18 || value_off > len {
+                return Err(crate::Error::InvalidImage(
+                    "ntfs: resident value offset outside attribute".into(),
+                ));
+            }
             let header_block_len = value_off; // bytes up to value
             let new_total = (header_block_len + new_value.len() + 7) & !7;
             let old_total = len;

@@ -1310,7 +1310,12 @@ pub struct ResidentReader {
 
 impl Read for ResidentReader {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        let n = (self.bytes.len() - self.pos).min(out.len());
+        // `seek` may legitimately leave `pos` past the end of the value;
+        // a read from there is EOF, not an underflow.
+        let n = self.bytes.len().saturating_sub(self.pos).min(out.len());
+        if n == 0 {
+            return Ok(0);
+        }
         out[..n].copy_from_slice(&self.bytes[self.pos..self.pos + n]);
         self.pos += n;
         Ok(n)

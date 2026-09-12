@@ -27,8 +27,8 @@ use crate::fs::dir_batch::{DEFAULT_CAPACITY, DirBatch};
 use crate::fs::{DeviceKind, FileMeta, FileSource};
 
 use super::attribute::{
-    FileName, TYPE_DATA, TYPE_FILE_NAME, TYPE_INDEX_ALLOCATION, TYPE_INDEX_ROOT,
-    TYPE_REPARSE_POINT, TYPE_STANDARD_INFORMATION,
+    AttributeIter, AttributeKind, FileName, TYPE_DATA, TYPE_FILE_NAME, TYPE_INDEX_ALLOCATION,
+    TYPE_INDEX_ROOT, TYPE_REPARSE_POINT, TYPE_STANDARD_INFORMATION,
 };
 use super::format::{
     self, FIRST_USER_RECORD, FormatOpts, LayoutResult, REC_ROOT, build_file_name_value,
@@ -1531,43 +1531,34 @@ fn read_runs_prefix(
     Ok(out)
 }
 
+/// Iterate the attributes of an (already fixup-removed) MFT record
+/// through the validated [`AttributeIter`] — every length / offset field
+/// is bounds-checked there, so a malformed record (zero attribute
+/// length, name or value past the record, …) ends the walk instead of
+/// looping forever or slicing out of bounds. Decode errors simply end
+/// the iteration: the callers below treat "not found" and "malformed"
+/// the same way.
+fn record_attrs(rec: &[u8]) -> impl Iterator<Item = super::attribute::Attribute<'_>> {
+    let first = mft::RecordHeader::parse(rec)
+        .map(|h| h.first_attribute_offset as usize)
+        .unwrap_or(rec.len());
+    AttributeIter::new(rec, first).map_while(Result::ok)
+}
+
 fn extract_non_resident_runs(rec: &[u8], type_code: u32, name: &str) -> Option<Vec<(u64, u64)>> {
-    let hdr = mft::RecordHeader::parse(rec).ok()?;
-    let bytes_in_use = hdr.bytes_in_use as usize;
-    let first = hdr.first_attribute_offset as usize;
-    let mut cursor = first;
-    while cursor + 4 <= bytes_in_use {
-        let tc = u32::from_le_bytes(rec[cursor..cursor + 4].try_into().ok()?);
-        if tc == 0xFFFF_FFFF {
+    record_attrs(rec).find_map(|attr| {
+        if attr.type_code != type_code || attr.name != name {
             return None;
         }
-        let len = u32::from_le_bytes(rec[cursor + 4..cursor + 8].try_into().ok()?) as usize;
-        let non_resident = rec[cursor + 8] != 0;
-        let name_len = rec[cursor + 9] as usize;
-        let name_off = u16::from_le_bytes(rec[cursor + 10..cursor + 12].try_into().ok()?) as usize;
-        let attr_name = if name_len == 0 {
-            String::new()
-        } else {
-            super::attribute::decode_utf16le(
-                &rec[cursor + name_off..cursor + name_off + name_len * 2],
-            )
-        };
-        if tc == type_code && attr_name == name && non_resident {
-            let runs_off =
-                u16::from_le_bytes(rec[cursor + 0x20..cursor + 0x22].try_into().ok()?) as usize;
-            let runs_bytes = &rec[cursor + runs_off..cursor + len];
-            let extents = super::run_list::decode(runs_bytes).ok()?;
-            let mut out = Vec::new();
-            for e in extents {
-                if let Some(lcn) = e.lcn {
-                    out.push((lcn, e.length));
-                }
-            }
-            return Some(out);
+        match attr.kind {
+            AttributeKind::NonResident { runs, .. } => Some(
+                runs.into_iter()
+                    .filter_map(|e| e.lcn.map(|lcn| (lcn, e.length)))
+                    .collect(),
+            ),
+            AttributeKind::Resident { .. } => None,
         }
-        cursor += len;
-    }
-    None
+    })
 }
 
 /// `(type_code, attribute_name, runs)` — one entry per non-resident
@@ -1584,94 +1575,32 @@ type NonResidentAttrInfo = (u32, String, Vec<(u64, u64)>);
 /// directory's `$INDEX_ALLOCATION`, and a non-resident `$BITMAP` — all
 /// must be freed when the file is removed.
 fn for_each_non_resident_attr(rec: &[u8]) -> Vec<NonResidentAttrInfo> {
-    let mut out: Vec<NonResidentAttrInfo> = Vec::new();
-    let Ok(hdr) = mft::RecordHeader::parse(rec) else {
-        return out;
-    };
-    let bytes_in_use = hdr.bytes_in_use as usize;
-    let first = hdr.first_attribute_offset as usize;
-    let mut cursor = first;
-    while cursor + 4 <= bytes_in_use {
-        let Ok(tc_b) = rec[cursor..cursor + 4].try_into() else {
-            break;
-        };
-        let tc = u32::from_le_bytes(tc_b);
-        if tc == 0xFFFF_FFFF {
-            break;
-        }
-        let Ok(len_b) = rec[cursor + 4..cursor + 8].try_into() else {
-            break;
-        };
-        let len = u32::from_le_bytes(len_b) as usize;
-        if len == 0 || cursor + len > bytes_in_use {
-            break;
-        }
-        let non_resident = rec[cursor + 8] != 0;
-        let name_len = rec[cursor + 9] as usize;
-        let name_off =
-            u16::from_le_bytes(rec[cursor + 10..cursor + 12].try_into().unwrap_or([0; 2])) as usize;
-        let attr_name = if name_len == 0 {
-            String::new()
-        } else {
-            super::attribute::decode_utf16le(
-                &rec[cursor + name_off..cursor + name_off + name_len * 2],
-            )
-        };
-        if non_resident {
-            let runs_off = u16::from_le_bytes(
-                rec[cursor + 0x20..cursor + 0x22]
-                    .try_into()
-                    .unwrap_or([0; 2]),
-            ) as usize;
-            let runs_bytes = &rec[cursor + runs_off..cursor + len];
-            if let Ok(extents) = super::run_list::decode(runs_bytes) {
-                let runs: Vec<(u64, u64)> = extents
+    record_attrs(rec)
+        .filter_map(|attr| match attr.kind {
+            AttributeKind::NonResident { runs, .. } => {
+                let runs: Vec<(u64, u64)> = runs
                     .into_iter()
                     .filter_map(|e| e.lcn.map(|lcn| (lcn, e.length)))
                     .collect();
-                if !runs.is_empty() {
-                    out.push((tc, attr_name, runs));
-                }
+                (!runs.is_empty()).then_some((attr.type_code, attr.name, runs))
             }
-        }
-        cursor += len;
-    }
-    out
+            AttributeKind::Resident { .. } => None,
+        })
+        .collect()
 }
 
 /// Walk an MFT record looking for a resident attribute of `(type_code, name)`.
 /// Returns its value bytes.
 fn extract_resident_attr_value(rec: &[u8], type_code: u32, name: &str) -> Option<Vec<u8>> {
-    let hdr = mft::RecordHeader::parse(rec).ok()?;
-    let bytes_in_use = hdr.bytes_in_use as usize;
-    let first = hdr.first_attribute_offset as usize;
-    let mut cursor = first;
-    while cursor + 4 <= bytes_in_use {
-        let tc = u32::from_le_bytes(rec[cursor..cursor + 4].try_into().ok()?);
-        if tc == 0xFFFF_FFFF {
+    record_attrs(rec).find_map(|attr| {
+        if attr.type_code != type_code || attr.name != name {
             return None;
         }
-        let len = u32::from_le_bytes(rec[cursor + 4..cursor + 8].try_into().ok()?) as usize;
-        let non_resident = rec[cursor + 8] != 0;
-        let name_len = rec[cursor + 9] as usize;
-        let name_off = u16::from_le_bytes(rec[cursor + 10..cursor + 12].try_into().ok()?) as usize;
-        let attr_name = if name_len == 0 {
-            String::new()
-        } else {
-            super::attribute::decode_utf16le(
-                &rec[cursor + name_off..cursor + name_off + name_len * 2],
-            )
-        };
-        if tc == type_code && attr_name == name && !non_resident {
-            let value_len =
-                u32::from_le_bytes(rec[cursor + 0x10..cursor + 0x14].try_into().ok()?) as usize;
-            let value_off =
-                u16::from_le_bytes(rec[cursor + 0x14..cursor + 0x16].try_into().ok()?) as usize;
-            return Some(rec[cursor + value_off..cursor + value_off + value_len].to_vec());
+        match attr.kind {
+            AttributeKind::Resident { value, .. } => Some(value.to_vec()),
+            AttributeKind::NonResident { .. } => None,
         }
-        cursor += len;
-    }
-    None
+    })
 }
 
 /// Append the given attributes into `rec` just before the 0xFFFFFFFF
@@ -2034,4 +1963,51 @@ fn normalize_path(path: &str) -> String {
         return "/".to_string();
     }
     path.trim_end_matches('/').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fixup-free 1 KiB record whose first attribute header carries a
+    /// hostile `length` (zero → the old walkers looped forever; huge → they
+    /// sliced past the buffer) and, for the resident case, a value that
+    /// extends past the attribute.
+    fn hostile_record(attr_len: u32, value_len: u32) -> Vec<u8> {
+        let mut rec = vec![0u8; 1024];
+        rec[0..4].copy_from_slice(b"FILE");
+        rec[4..6].copy_from_slice(&0x30u16.to_le_bytes());
+        rec[6..8].copy_from_slice(&3u16.to_le_bytes());
+        let first = 0x38u16;
+        rec[0x14..0x16].copy_from_slice(&first.to_le_bytes());
+        rec[0x16..0x18].copy_from_slice(&mft::RecordHeader::FLAG_IN_USE.to_le_bytes());
+        rec[0x18..0x1C].copy_from_slice(&1024u32.to_le_bytes()); // bytes_in_use (lies)
+        rec[0x1C..0x20].copy_from_slice(&1024u32.to_le_bytes());
+        let a = first as usize;
+        rec[a..a + 4].copy_from_slice(&TYPE_INDEX_ROOT.to_le_bytes());
+        rec[a + 4..a + 8].copy_from_slice(&attr_len.to_le_bytes());
+        rec[a + 8] = 0; // resident
+        rec[a + 0x10..a + 0x14].copy_from_slice(&value_len.to_le_bytes());
+        rec[a + 0x14..a + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+        rec
+    }
+
+    #[test]
+    fn attribute_walkers_survive_zero_length_attribute() {
+        let rec = hostile_record(0, 0);
+        assert!(extract_resident_attr_value(&rec, TYPE_INDEX_ROOT, "").is_none());
+        assert!(extract_non_resident_runs(&rec, TYPE_DATA, "").is_none());
+        assert!(for_each_non_resident_attr(&rec).is_empty());
+    }
+
+    #[test]
+    fn attribute_walkers_survive_oversized_attribute_and_value() {
+        // Attribute claims to extend past the record.
+        let rec = hostile_record(0x10_0000, 8);
+        assert!(extract_resident_attr_value(&rec, TYPE_INDEX_ROOT, "").is_none());
+        assert!(for_each_non_resident_attr(&rec).is_empty());
+        // Attribute fits, but its resident value overruns it.
+        let rec = hostile_record(0x20, 0x1000);
+        assert!(extract_resident_attr_value(&rec, TYPE_INDEX_ROOT, "").is_none());
+    }
 }

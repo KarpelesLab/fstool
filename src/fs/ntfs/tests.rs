@@ -566,6 +566,23 @@ fn read_hello_txt() {
     assert_eq!(buf, b"hi\n");
 }
 
+/// A seek past the end of a resident `$DATA` followed by a read must
+/// report EOF (0 bytes), not underflow `bytes.len() - pos`.
+#[test]
+fn resident_reader_read_after_seek_past_eof_is_eof() {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut dev = build_tiny_image();
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    let mut r = ntfs.open_file_seekable(&mut dev, "/hello.txt").unwrap();
+    r.seek(SeekFrom::Start(100)).unwrap();
+    let mut buf = [0u8; 8];
+    assert_eq!(r.read(&mut buf).unwrap(), 0);
+    // Seeking back inside the value still works afterwards.
+    r.seek(SeekFrom::Start(1)).unwrap();
+    assert_eq!(r.read(&mut buf).unwrap(), 2);
+    assert_eq!(&buf[..2], b"i\n");
+}
+
 #[test]
 fn read_xattrs_includes_dos_attrs_and_ads() {
     let mut dev = build_tiny_image();
