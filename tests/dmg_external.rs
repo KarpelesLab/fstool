@@ -211,3 +211,114 @@ fn dmg_udzo_hfs_plus_walks_through_fstool() {
         entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>()
     );
 }
+
+/// Ask `hdiutil` for a password-protected (`encrcdsa` v2) image holding a
+/// small FAT volume, `-encryption AES-128` or `AES-256`. Returns `None`
+/// when `hdiutil` refuses, so the caller can skip rather than fail.
+#[cfg(feature = "dmg-encrypted")]
+fn create_hdiutil_encrypted_dmg(
+    dir: &Path,
+    name: &str,
+    encryption: &str,
+    password: &str,
+) -> Option<PathBuf> {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let path = dir.join(format!("{name}.dmg"));
+    let mut child = Command::new("hdiutil")
+        .args([
+            "create",
+            "-size",
+            "64k",
+            "-fs",
+            "MS-DOS",
+            "-layout",
+            "NONE",
+            "-volname",
+            "FSTOOLENC",
+            "-encryption",
+            encryption,
+            "-stdinpass",
+            "-ov",
+        ])
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("hdiutil create failed to spawn");
+    // `-stdinpass` reads the passphrase verbatim (no trailing newline).
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(password.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    if !out.status.success() {
+        eprintln!(
+            "skipping {encryption}: hdiutil create refused:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return None;
+    }
+    Some(path)
+}
+
+/// Encrypted images straight out of `hdiutil`, for both key sizes, must
+/// open with the right password and decrypt to a FAT boot sector; the
+/// wrong password must be refused. This is the guard against the header
+/// layout drifting away from what Apple actually writes — the synthetic
+/// unit tests can only check that the reader agrees with itself.
+#[cfg(feature = "dmg-encrypted")]
+#[test]
+fn dmg_encrypted_hdiutil_images_decrypt() {
+    use fstool::block::dmg::EncryptedDmgBackend;
+
+    if skip_unless_macos_hdiutil() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    for (encryption, key_bits) in [("AES-128", 128u32), ("AES-256", 256u32)] {
+        let Some(path) = create_hdiutil_encrypted_dmg(
+            dir.path(),
+            &format!("enc{key_bits}"),
+            encryption,
+            "hunter2",
+        ) else {
+            continue;
+        };
+        assert!(fstool::block::dmg::probe_encrypted(&path).unwrap());
+
+        let mut be = EncryptedDmgBackend::open_with_password(&path, "hunter2")
+            .unwrap_or_else(|e| panic!("{encryption}: open_with_password: {e}"));
+        assert_eq!(be.header().key_bits, key_bits, "{encryption}: key_bits");
+        assert_eq!(be.total_size(), 64 * 1024, "{encryption}: data_size");
+
+        let mut boot = vec![0u8; 512];
+        be.read_at(0, &mut boot).unwrap();
+        assert_eq!(
+            &boot[510..512],
+            &[0x55, 0xAA],
+            "{encryption}: boot signature"
+        );
+        assert_eq!(
+            &boot[0x36..0x3E],
+            b"FAT12   ",
+            "{encryption}: FAT type string"
+        );
+
+        // Every chunk decrypts without error.
+        let mut all = vec![0u8; 64 * 1024];
+        be.read_at(0, &mut all).unwrap();
+        assert_eq!(&all[..512], &boot[..]);
+
+        let err = EncryptedDmgBackend::open_with_password(&path, "hunter3").unwrap_err();
+        assert!(
+            matches!(err, fstool::Error::Unsupported(_)),
+            "{encryption}: wrong password should be refused, got {err:?}"
+        );
+    }
+}
