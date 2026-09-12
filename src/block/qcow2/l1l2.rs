@@ -72,6 +72,8 @@ pub struct L1L2 {
     pub l1: Vec<u64>,
     /// Byte offset of the L1 table on disk.
     pub l1_table_offset: u64,
+    /// True when `l1` has entries the on-disk table lacks.
+    pub l1_dirty: bool,
     /// Cached L2 tables, keyed by physical L2 cluster offset.
     pub l2_cache: HashMap<u64, L2Entry>,
     /// L2 cache size cap (number of cached L2 clusters). Old entries
@@ -126,6 +128,7 @@ impl L1L2 {
             l2_entries,
             l1,
             l1_table_offset: header.l1_table_offset,
+            l1_dirty: false,
             l2_cache: HashMap::new(),
             l2_cache_cap: 32,
             zero_flag: header.version >= 3,
@@ -251,9 +254,9 @@ impl L1L2 {
     }
 
     /// Set `L1[l1_idx]` = value and mark the L1 table for flush.
-    /// (Phase A doesn't write; this is for Phase B's allocator.)
     pub fn set_l1(&mut self, l1_idx: usize, value: u64) {
         self.l1[l1_idx] = value;
+        self.l1_dirty = true;
     }
 
     /// Look up `vaddr`'s mapping for *writing*: if no L1/L2 entry exists,
@@ -282,7 +285,7 @@ impl L1L2 {
             let l2_cluster_idx = alloc_cluster(file)?;
             let new_l2_off = l2_cluster_idx * self.cluster_size;
             self.insert_empty_l2(new_l2_off);
-            self.l1[l1_idx] = new_l2_off | COPIED;
+            self.set_l1(l1_idx, new_l2_off | COPIED);
             return Ok((new_l2_off, l2_idx));
         }
         // Make sure the L2 is in cache so set_l2_entry can find it.
@@ -304,13 +307,16 @@ impl L1L2 {
             file.write_all(&raw)?;
             entry.dirty = false;
         }
-        // Re-emit the L1 table. Always — small + cheap.
+        if !self.l1_dirty {
+            return Ok(());
+        }
         let mut raw = vec![0u8; self.l1.len() * 8];
         for (i, &e) in self.l1.iter().enumerate() {
             raw[i * 8..i * 8 + 8].copy_from_slice(&e.to_be_bytes());
         }
         file.seek(SeekFrom::Start(self.l1_table_offset))?;
         file.write_all(&raw)?;
+        self.l1_dirty = false;
         Ok(())
     }
 
@@ -339,6 +345,7 @@ mod tests {
             l2_entries: 8192,
             l1: vec![0; 4],
             l1_table_offset: 0,
+            l1_dirty: false,
             l2_cache: HashMap::new(),
             l2_cache_cap: 32,
             zero_flag: true,
