@@ -33,6 +33,9 @@ pub mod rw;
 pub mod superblock;
 pub mod xattr;
 
+#[cfg(test)]
+mod regress;
+
 pub use build_plan::BuildPlan;
 
 use std::io::Read;
