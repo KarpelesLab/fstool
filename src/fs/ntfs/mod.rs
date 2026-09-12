@@ -154,6 +154,10 @@ pub struct Ntfs {
     /// `None` means "haven't tried yet". An empty `Some(_)` means we tried
     /// and the image had no usable `$Secure`.
     sii_cache: Option<HashMap<u32, (u64, u32)>>,
+    /// `security_id` → the `$SDS` descriptor bytes (or `None` when the
+    /// id has no `$SII` row). Populated on demand; a directory listing
+    /// otherwise re-reads `$SDS` once per file.
+    sd_cache: HashMap<u32, Option<Vec<u8>>>,
     /// Writer state — populated only after `Ntfs::format` (or
     /// `Ntfs::open_for_write`). Read-only opens leave this `None`.
     writer: Option<writer::WriterState>,
@@ -198,6 +202,7 @@ impl Ntfs {
             mft_runs: Vec::new(),
             upcase: None,
             sii_cache: None,
+            sd_cache: HashMap::new(),
             writer: None,
         })
     }
@@ -784,7 +789,7 @@ impl Ntfs {
         path: &str,
     ) -> Result<Box<dyn Read + 'a>> {
         let rec_no = self.lookup_path(dev, path)?;
-        self.open_stream_by_record(dev, rec_no, "")
+        Ok(Box::new(self.open_stream_by_record(dev, rec_no, "")?))
     }
 
     /// Open a named stream by MFT record + name. `""` means the default
@@ -797,12 +802,16 @@ impl Ntfs {
     /// Compressed `$DATA` (LZNT1) is decoded on the fly, one 16-cluster
     /// "compression unit" at a time. Encrypted `$DATA` (EFS) is refused
     /// with [`crate::Error::Unsupported`].
+    ///
+    /// The reader is seekable, so a caller after a byte range in the
+    /// middle of a big system stream (`$Secure:$SDS`) can jump straight
+    /// to it instead of reading and discarding the prefix.
     pub fn open_stream_by_record<'a>(
         &'a mut self,
         dev: &'a mut dyn BlockDevice,
         rec_no: u64,
         stream_name: &str,
-    ) -> Result<Box<dyn Read + 'a>> {
+    ) -> Result<NtfsSeekableReader<'a>> {
         let records = self.load_record_set(dev, rec_no)?;
         let hdr = mft::RecordHeader::parse(&records[0].1)?;
         if !hdr.is_in_use() {
@@ -870,7 +879,10 @@ impl Ntfs {
         }
 
         if let Some(bytes) = resident_bytes {
-            return Ok(Box::new(ResidentReader { bytes, pos: 0 }));
+            return Ok(NtfsSeekableReader::Resident(ResidentReader {
+                bytes,
+                pos: 0,
+            }));
         }
 
         if segments.is_empty() {
@@ -899,7 +911,7 @@ impl Ntfs {
                 crate::Error::InvalidImage("ntfs: compression-unit size overflow".into())
             })?;
             checked_alloc_len(cu_size, dev.total_size(), "compression unit")?;
-            return Ok(Box::new(CompressedReader::new(
+            return Ok(NtfsSeekableReader::Compressed(CompressedReader::new(
                 dev,
                 cluster_size,
                 cu_clusters,
@@ -909,7 +921,7 @@ impl Ntfs {
             )));
         }
 
-        Ok(Box::new(NonResidentReader {
+        Ok(NtfsSeekableReader::NonResident(NonResidentReader {
             dev,
             cluster_size,
             runs,
@@ -1232,6 +1244,23 @@ impl Ntfs {
         dev: &mut dyn BlockDevice,
         security_id: u32,
     ) -> Result<Option<Vec<u8>>> {
+        // A whole directory's worth of files usually shares a handful of
+        // security ids, and `getattr` asks for one per file, so memoise
+        // the answer — including the negative one.
+        if let Some(hit) = self.sd_cache.get(&security_id) {
+            return Ok(hit.clone());
+        }
+        let sd = self.load_security_descriptor(dev, security_id)?;
+        self.sd_cache.insert(security_id, sd.clone());
+        Ok(sd)
+    }
+
+    /// Uncached body of [`Self::resolve_security_descriptor`].
+    fn load_security_descriptor(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        security_id: u32,
+    ) -> Result<Option<Vec<u8>>> {
         // Build / reuse the $SII cache.
         if self.sii_cache.is_none() {
             let cache = self.build_sii_cache(dev).unwrap_or_default();
@@ -1245,18 +1274,18 @@ impl Ntfs {
             return Ok(None);
         }
 
-        // Read `size` bytes from $Secure:$SDS starting at `offset`.
+        // Read `size` bytes from $Secure:$SDS starting at `offset`. $SDS
+        // grows to megabytes on a real volume, so seek rather than read
+        // the prefix into a sink.
         let mut reader = self.open_stream_by_record(dev, MFT_RECORD_SECURE, "$SDS")?;
-        // Skip to `offset`.
-        let mut skipped: u64 = 0;
-        let mut sink = [0u8; 8192];
-        while skipped < offset {
-            let want = (offset - skipped).min(sink.len() as u64) as usize;
-            let n = reader.read(&mut sink[..want]).map_err(crate::Error::from)?;
-            if n == 0 {
+        {
+            use std::io::Seek as _;
+            let landed = reader
+                .seek(std::io::SeekFrom::Start(offset))
+                .map_err(crate::Error::from)?;
+            if landed != offset {
                 return Ok(None);
             }
-            skipped += n as u64;
         }
         let mut blob = vec![0u8; size as usize];
         let mut filled = 0;

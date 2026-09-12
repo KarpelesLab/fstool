@@ -2436,3 +2436,30 @@ fn mft_bootstrap_follows_attribute_list_on_record_zero() {
     // The root directory (in the head segment) still lists normally.
     assert!(ro.list_path(&mut dev, "/").is_ok());
 }
+
+/// A `FileSource::Reader` that hands over fewer bytes than it declared
+/// must be rejected, not padded with zeros: the declared length is
+/// already stamped into `$FILE_NAME` and the `$DATA` header, so padding
+/// invents file content.
+#[test]
+fn create_file_rejects_a_short_source() {
+    for declared in [64u64, 200_000] {
+        let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+        let err = ntfs
+            .create_file(
+                &mut dev,
+                "/short.bin",
+                FileSource::Reader {
+                    reader: Box::new(std::io::Cursor::new(vec![b'x'; 8])),
+                    len: declared,
+                },
+                FileMeta::default(),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("a {declared}-byte promise with 8 bytes must fail"));
+        match err {
+            crate::Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof),
+            other => panic!("expected UnexpectedEof, got {other:?}"),
+        }
+    }
+}

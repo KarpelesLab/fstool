@@ -354,7 +354,7 @@ impl super::Ntfs {
                 let want = (remaining as usize).min(tmp.len());
                 let n = reader.read(&mut tmp[..want]).map_err(crate::Error::from)?;
                 if n == 0 {
-                    break;
+                    return Err(short_source(file_size, file_size - remaining));
                 }
                 buf.extend_from_slice(&tmp[..n]);
                 remaining -= n as u64;
@@ -380,10 +380,7 @@ impl super::Ntfs {
                     filled += n;
                 }
                 if filled < chunk {
-                    // Underflow — zero-pad and stop.
-                    for b in &mut scratch[filled..chunk] {
-                        *b = 0;
-                    }
+                    return Err(short_source(file_size, written + filled as u64));
                 }
                 let phys = data_lcn * cluster_size + written;
                 dev.write_at(phys, &scratch[..chunk])?;
@@ -2081,6 +2078,19 @@ fn build_index_btree(
 /// Resident `$BITMAP` value for an index allocation holding
 /// `capacity_blocks` INDX blocks, with the first `in_use` marked. Sized to
 /// cover every block in the allocation, rounded up to an 8-byte multiple.
+/// A `FileSource` that promised `want` bytes and delivered `got`.
+///
+/// The declared length is already baked into `$FILE_NAME`, `$STANDARD_
+/// INFORMATION` and the `$DATA` header by the time the bytes are
+/// streamed, so silently zero-padding produced a file whose tail was
+/// fabricated. Refuse instead, the way the f2fs writer does.
+fn short_source(want: u64, got: u64) -> crate::Error {
+    crate::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        format!("ntfs: source ended early ({got} of {want} bytes)"),
+    ))
+}
+
 fn build_index_bitmap(in_use: u64, capacity_blocks: u64) -> Vec<u8> {
     let bits = capacity_blocks.max(in_use).max(1) as usize;
     let nbytes = (bits.div_ceil(8) + 7) & !7;
