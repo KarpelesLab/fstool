@@ -57,6 +57,7 @@ use crate::fs::FileHandle;
 /// index nodes at any depth *and* leaf blocks) the inode currently
 /// references. The inline root lives in `i_block`, so it is never listed.
 /// The `meta_blocks` list is empty for a depth-0 inline tree.
+#[derive(Clone)]
 struct ExtentTreeState {
     runs: Vec<ExtentRun>,
     meta_blocks: Vec<u32>,
@@ -73,6 +74,13 @@ pub struct Ext2FileHandle<'a> {
     /// Logical file length tracked locally so successive writes / seeks
     /// see the latest size without re-reading the inode.
     len: u64,
+    /// The inode's extent tree, walked from disk on first use and then
+    /// kept here for the life of the handle. See
+    /// [`Self::extent_state`].
+    extent_cache: Option<ExtentTreeState>,
+    /// Set when `extent_cache.runs` has been changed but not yet packed
+    /// back into `i_block` / the on-disk tree.
+    extent_dirty: bool,
 }
 
 impl<'a> Ext2FileHandle<'a> {
@@ -94,6 +102,8 @@ impl<'a> Ext2FileHandle<'a> {
             ino,
             pos: 0,
             len,
+            extent_cache: None,
+            extent_dirty: false,
         })
     }
 
@@ -244,7 +254,7 @@ impl<'a> Ext2FileHandle<'a> {
     /// blocks need to be freed when the tree is re-packed. Walks trees of
     /// any depth: the inline root is decoded here, then every subtree is
     /// gathered recursively by [`Self::collect_extent_tree`].
-    fn read_extent_tree_state(&mut self) -> Result<ExtentTreeState> {
+    fn load_extent_tree_state(&mut self) -> Result<ExtentTreeState> {
         let inode = *self.staged_inode();
         let bytes = extent::iblock_to_bytes(&inode.block);
         let header = extent::decode_header(&bytes[..12])?;
@@ -331,11 +341,85 @@ impl<'a> Ext2FileHandle<'a> {
         Ok(())
     }
 
+    /// The inode's extent-tree state, walked from disk on first use and
+    /// cached thereafter.
+    ///
+    /// Every write used to re-walk the whole tree (one device read per
+    /// leaf and index node) and then immediately re-pack and rewrite
+    /// it. On a fragmented file — where the run list grows with every
+    /// block written — that made a sequence of `n` writes cost O(n²)
+    /// tree traffic. The cache makes the walk once; [`Self::stage_runs`]
+    /// keeps the run list in memory and
+    /// [`Self::pack_extent_tree_if_dirty`] packs it exactly once, at
+    /// `sync` / `set_len` / drop.
+    fn extent_state(&mut self) -> Result<&ExtentTreeState> {
+        if self.extent_cache.is_none() {
+            let mut state = self.load_extent_tree_state()?;
+            // A well-formed tree already walks in logical order, but a
+            // forged one need not; the insert path below relies on the
+            // ordering, so establish it once here.
+            state.runs.sort_by_key(|r| r.logical);
+            self.extent_cache = Some(state);
+        }
+        Ok(self.extent_cache.as_ref().expect("just populated"))
+    }
+
+    /// The cached run list. Only valid after [`Self::extent_state`] has
+    /// populated the cache.
+    fn runs(&self) -> &[ExtentRun] {
+        &self
+            .extent_cache
+            .as_ref()
+            .expect("extent cache populated")
+            .runs
+    }
+
+    /// Mutable view of the cached run list. Callers must set
+    /// `extent_dirty` themselves.
+    fn runs_mut(&mut self) -> &mut Vec<ExtentRun> {
+        &mut self
+            .extent_cache
+            .as_mut()
+            .expect("extent cache populated")
+            .runs
+    }
+
+    /// Record a new leaf-run list without touching the on-disk tree.
+    fn stage_runs(&mut self, runs: Vec<ExtentRun>) -> Result<()> {
+        self.extent_state()?;
+        self.extent_cache
+            .as_mut()
+            .expect("populated by extent_state")
+            .runs = runs;
+        self.extent_dirty = true;
+        Ok(())
+    }
+
+    /// Pack the staged run list back into `i_block` plus fresh on-disk
+    /// tree blocks, if anything changed since the last pack.
+    fn pack_extent_tree_if_dirty(&mut self) -> Result<()> {
+        if !self.extent_dirty {
+            return Ok(());
+        }
+        let state = self
+            .extent_cache
+            .as_ref()
+            .expect("dirty implies populated")
+            .clone();
+        let new_meta = self.write_extent_runs_with_state(&state.runs, &state)?;
+        self.extent_cache = Some(ExtentTreeState {
+            runs: state.runs,
+            meta_blocks: new_meta,
+        });
+        self.extent_dirty = false;
+        Ok(())
+    }
+
     /// Read the current set of leaf extents (flat list across all leaves).
-    /// Equivalent to [`Self::read_extent_tree_state`] but discards the
-    /// leaf-block tracking — used by read-only paths.
+    /// Equivalent to [`Self::extent_state`] but discards the leaf-block
+    /// tracking — used by read-only paths.
     fn read_extent_runs(&mut self) -> Result<Vec<ExtentRun>> {
-        Ok(self.read_extent_tree_state()?.runs)
+        Ok(self.extent_state()?.runs.clone())
     }
 
     /// Stamp a new extent run list onto the staged inode, re-packing the
@@ -352,7 +436,7 @@ impl<'a> Ext2FileHandle<'a> {
         &mut self,
         runs: &[ExtentRun],
         old_state: &ExtentTreeState,
-    ) -> Result<()> {
+    ) -> Result<Vec<u32>> {
         let bs = self.ext.layout.block_size;
         let csum_tail = self.ext.has_metadata_csum();
         let ino = self.ino;
@@ -370,14 +454,16 @@ impl<'a> Ext2FileHandle<'a> {
             let mut alloc = || self.ext.alloc_data_block();
             extent::pack_extent_tree(runs, bs, csum_tail, &mut alloc)?
         };
+        let mut new_meta = Vec::with_capacity(tree_blocks.len());
         for tb in tree_blocks {
             self.write_indirect_block(tb.phys, &tb.image)?;
             // Index nodes carry the same `ext4_extent_tail` CRC as leaves;
             // track every staged block for stamping at flush time.
             self.ext.track_extent_leaf_block(tb.phys, ino);
+            new_meta.push(tb.phys);
         }
         self.staged_inode_mut().block = extent::bytes_to_iblock(&i_block_bytes);
-        Ok(())
+        Ok(new_meta)
     }
 
     /// Free a leaf block (depth-1 internal node). Also evicts the staged
@@ -387,7 +473,7 @@ impl<'a> Ext2FileHandle<'a> {
     /// stamped at flush.
     fn free_leaf_block(&mut self, blk: u32) {
         self.ext.free_block(blk);
-        self.ext.data_blocks.retain(|(b, _)| *b != blk);
+        self.ext.remove_data_block(blk);
         self.ext.untrack_extent_leaf_block(blk);
     }
 
@@ -395,7 +481,10 @@ impl<'a> Ext2FileHandle<'a> {
     /// number of allocated leaf/idx metadata blocks. Used to update
     /// `blocks_512`.
     fn recompute_blocks_512_extent(&mut self) -> Result<()> {
-        let state = self.read_extent_tree_state()?;
+        // The sector count has to describe the tree as it will land on
+        // disk, so settle any pending run-list change first.
+        self.pack_extent_tree_if_dirty()?;
+        let state = self.extent_state()?.clone();
         let bs = self.ext.layout.block_size as u64;
         let mut data = 0u64;
         for r in &state.runs {
@@ -433,132 +522,134 @@ impl<'a> Ext2FileHandle<'a> {
     /// Resolve logical block `n` against the extent tree, allocating a
     /// new physical block if `n` is uncovered. Merges with an adjacent
     /// extent when the freshly-allocated block lies right before / after
-    /// one; otherwise appends a new leaf. Auto-promotes a depth-0 tree
-    /// to depth-1 when the leaf count overflows 4.
+    /// one; otherwise inserts a new run. The packed tree gains whatever
+    /// depth the run count needs, but only once, at
+    /// [`Self::pack_extent_tree_if_dirty`].
+    ///
+    /// The run list is kept sorted by `logical`, so every step here is a
+    /// binary search plus a local splice. It used to clone the whole
+    /// list, scan it linearly, re-sort it and coalesce it end-to-end on
+    /// every single block — O(n log n) per write, so writing a
+    /// fragmented file of n blocks cost O(n² log n).
     fn get_or_alloc_block_extent(&mut self, n: u32) -> Result<u32> {
-        let state = self.read_extent_tree_state()?;
-        let mut runs = state.runs.clone();
+        self.extent_state()?;
+
+        // Index of the last run whose `logical` is <= n, if any.
+        let at = {
+            let runs = &self.runs();
+            runs.partition_point(|r| r.logical <= n).checked_sub(1)
+        };
 
         // Already mapped?
-        let mut unwritten_at = None;
-        for (i, r) in runs.iter().enumerate() {
-            let len = r.actual_len();
-            if n >= r.logical && n < r.logical + len as u32 {
-                if r.is_unwritten() {
-                    unwritten_at = Some(i);
-                    break;
+        if let Some(i) = at {
+            let r = self.runs()[i];
+            if n < r.logical + r.actual_len() as u32 {
+                if !r.is_unwritten() {
+                    return Ok((r.physical + (n - r.logical) as u64) as u32);
                 }
-                let phys = r.physical + (n - r.logical) as u64;
+                // The block sits inside a preallocated (unwritten)
+                // extent. Its physical block is already ours, but the
+                // range reads as zeroes until the extent is marked
+                // initialized, so a write through it would be invisible
+                // to Linux. Split it the way `ext4_split_extent_at`
+                // does — unwritten head, one initialized block,
+                // unwritten tail — and zero the block first, since what
+                // is on disk there is stale data the old owner freed.
+                let len = r.actual_len() as u32;
+                let off = n - r.logical;
+                let phys = r.physical + off as u64;
+                self.zero_block_on_disk(phys as u32)?;
+                let mut repl: Vec<ExtentRun> = Vec::with_capacity(3);
+                if off > 0 {
+                    repl.push(ExtentRun {
+                        logical: r.logical,
+                        len: off as u16 + MAX_LEN_PER_EXTENT,
+                        physical: r.physical,
+                    });
+                }
+                repl.push(ExtentRun {
+                    logical: n,
+                    len: 1,
+                    physical: phys,
+                });
+                if off + 1 < len {
+                    repl.push(ExtentRun {
+                        logical: n + 1,
+                        len: (len - off - 1) as u16 + MAX_LEN_PER_EXTENT,
+                        physical: phys + 1,
+                    });
+                }
+                self.runs_mut().splice(i..=i, repl);
+                self.extent_dirty = true;
                 return Ok(phys as u32);
             }
-        }
-        // The block sits inside a preallocated (unwritten) extent. Its
-        // physical block is already ours, but the range reads as zeroes
-        // until the extent is marked initialized, so a write through it
-        // would be invisible to Linux. Split the extent the way
-        // `ext4_split_extent_at` does — unwritten head, one initialized
-        // block, unwritten tail — and zero the block first, since what
-        // is on disk there is stale data the old owner freed.
-        if let Some(i) = unwritten_at {
-            let r = runs[i];
-            let len = r.actual_len() as u32;
-            let off = n - r.logical;
-            let phys = r.physical + off as u64;
-            self.zero_block_on_disk(phys as u32)?;
-            let mut repl: Vec<ExtentRun> = Vec::with_capacity(3);
-            if off > 0 {
-                repl.push(ExtentRun {
-                    logical: r.logical,
-                    len: off as u16 + MAX_LEN_PER_EXTENT,
-                    physical: r.physical,
-                });
-            }
-            repl.push(ExtentRun {
-                logical: n,
-                len: 1,
-                physical: phys,
-            });
-            if off + 1 < len {
-                repl.push(ExtentRun {
-                    logical: n + 1,
-                    len: (len - off - 1) as u16 + MAX_LEN_PER_EXTENT,
-                    physical: phys + 1,
-                });
-            }
-            runs.splice(i..=i, repl);
-            self.write_extent_runs_with_state(&runs, &state)?;
-            return Ok(phys as u32);
         }
 
         // Need a fresh physical block.
         let new_phys = self.ext.alloc_data_block()? as u64;
         self.zero_block_on_disk(new_phys as u32)?;
 
-        // Try to extend an existing extent whose tail meets the new block
-        // both logically and physically. Only "initialized" extents are
-        // mutable here — leave any (unexpected) uninitialised extents
-        // alone.
-        let mut merged = false;
-        for r in runs.iter_mut() {
-            if r.len >= MAX_LEN_PER_EXTENT {
-                continue;
-            }
-            let tail_logical = r.logical + r.len as u32;
-            let tail_phys = r.physical + r.len as u64;
-            if tail_logical == n && tail_phys == new_phys {
-                r.len += 1;
-                merged = true;
-                break;
-            }
-        }
+        // `at` is the run immediately before `n`; `at + 1` (or 0) the
+        // one immediately after. Only those two can possibly absorb the
+        // new block, and only when they are initialized extents with
+        // room left.
+        let before = at;
+        let after = at.map_or(0, |i| i + 1);
+        let extendable = |r: &ExtentRun| r.len < MAX_LEN_PER_EXTENT;
 
-        // If not, try to prepend to an extent that starts immediately
-        // after the new block.
-        if !merged {
-            for r in runs.iter_mut() {
-                if r.len >= MAX_LEN_PER_EXTENT {
-                    continue;
-                }
-                if n + 1 == r.logical && new_phys + 1 == r.physical {
-                    r.logical = n;
-                    r.physical = new_phys;
-                    r.len += 1;
-                    merged = true;
-                    break;
-                }
+        let mut merged_at = None;
+        if let Some(i) = before {
+            let r = self.runs()[i];
+            if extendable(&r)
+                && r.logical + r.len as u32 == n
+                && r.physical + r.len as u64 == new_phys
+            {
+                self.runs_mut()[i].len += 1;
+                merged_at = Some(i);
             }
         }
-
-        if !merged {
-            // No capacity ceiling: write_extent_runs_with_state re-packs the
-            // run list into an extent tree of whatever depth it needs.
-            runs.push(ExtentRun {
-                logical: n,
-                len: 1,
-                physical: new_phys,
-            });
-            runs.sort_by_key(|r| r.logical);
+        if merged_at.is_none() && after < self.runs().len() {
+            let r = self.runs()[after];
+            if extendable(&r) && n + 1 == r.logical && new_phys + 1 == r.physical {
+                let slot = &mut self.runs_mut()[after];
+                slot.logical = n;
+                slot.physical = new_phys;
+                slot.len += 1;
+                merged_at = Some(after);
+            }
         }
+        let merged_at = match merged_at {
+            Some(i) => i,
+            None => {
+                self.runs_mut().insert(
+                    after,
+                    ExtentRun {
+                        logical: n,
+                        len: 1,
+                        physical: new_phys,
+                    },
+                );
+                after
+            }
+        };
 
-        // After a merge two adjacent extents may now meet; coalesce
-        // whenever the tail of [i] meets the head of [i+1].
-        let mut i = 0;
-        while i + 1 < runs.len() {
-            let (a, b) = (runs[i], runs[i + 1]);
+        // A merge can make the run meet its right-hand neighbour; only
+        // that one pair can have become joinable.
+        if merged_at + 1 < self.runs().len() {
+            let a = self.runs()[merged_at];
+            let b = self.runs()[merged_at + 1];
             let a_len = a.actual_len();
             if a.len < MAX_LEN_PER_EXTENT
                 && a.logical + a_len as u32 == b.logical
                 && a.physical + a_len as u64 == b.physical
                 && a.len.saturating_add(b.len) <= MAX_LEN_PER_EXTENT
             {
-                runs[i].len += b.len;
-                runs.remove(i + 1);
-            } else {
-                i += 1;
+                self.runs_mut()[merged_at].len += b.len;
+                self.runs_mut().remove(merged_at + 1);
             }
         }
 
-        self.write_extent_runs_with_state(&runs, &state)?;
+        self.extent_dirty = true;
         Ok(new_phys as u32)
     }
 
@@ -567,9 +658,9 @@ impl<'a> Ext2FileHandle<'a> {
     /// shrinking the one (if any) that straddles `from`. Re-partitions
     /// the surviving runs across depth-0 or depth-1 as appropriate.
     fn free_blocks_from_extent(&mut self, from: u32) -> Result<()> {
-        let state = self.read_extent_tree_state()?;
-        let mut kept: Vec<ExtentRun> = Vec::with_capacity(state.runs.len());
-        for r in &state.runs {
+        let runs = self.extent_state()?.runs.clone();
+        let mut kept: Vec<ExtentRun> = Vec::with_capacity(runs.len());
+        for r in &runs {
             let r = *r;
             let len = r.actual_len();
             if r.logical >= from {
@@ -599,7 +690,7 @@ impl<'a> Ext2FileHandle<'a> {
                 kept.push(r);
             }
         }
-        self.write_extent_runs_with_state(&kept, &state)?;
+        self.stage_runs(kept)?;
         Ok(())
     }
 
@@ -636,13 +727,11 @@ impl<'a> Ext2FileHandle<'a> {
     /// without an explicit sync (ext2's existing best-effort model).
     fn write_indirect_block(&mut self, blk: u32, bytes: &[u8]) -> Result<()> {
         let bs = self.ext.layout.block_size as u64;
-        // Update the staged copy if present, otherwise add one.
-        if let Some(slot) = self.ext.data_blocks.iter_mut().find(|(b, _)| *b == blk) {
-            slot.1.clear();
-            slot.1.extend_from_slice(bytes);
-        } else {
-            self.ext.data_blocks.push((blk, bytes.to_vec()));
-        }
+        // `push_data_block` replaces any image already staged for this
+        // block and keeps `data_block_idx` in sync — pushing straight
+        // onto `data_blocks` (as this did) left the index stale and
+        // cost a linear scan of every staged block per write.
+        self.ext.push_data_block(blk, bytes.to_vec());
         self.dev.write_at(blk as u64 * bs, bytes)?;
         Ok(())
     }
@@ -1162,7 +1251,10 @@ impl<'a> Write for Ext2FileHandle<'a> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        // Settle the extent tree and `i_blocks`: writes stage the run
+        // list in memory, so without this a `flush` would leave the
+        // inode describing the pre-write tree.
+        self.recompute_blocks_512().map_err(io::Error::other)
     }
 }
 

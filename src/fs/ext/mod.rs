@@ -1139,8 +1139,7 @@ impl Ext {
         // All trailing data blocks: empty-placeholder entry so e2fsck reads
         // them as well-formed empty dir blocks.
         for &blk in &data_blocks[1..] {
-            self.data_blocks
-                .push((blk, dir::make_empty_dir_block(bs, csum_tail)));
+            self.push_data_block(blk, dir::make_empty_dir_block(bs, csum_tail));
             self.track_dir_block(blk, ino);
         }
 
@@ -1288,15 +1287,40 @@ impl Ext {
         self.inode_idx.get(&ino).copied()
     }
 
-    /// Push a staged data block and keep `data_block_idx` in sync. All
+    /// Stage a data block, replacing any image already staged for that
+    /// block number, and keep `data_block_idx` in sync. All
     /// `data_blocks` growth must go through here.
-    fn push_data_block(&mut self, blk: u32, bytes: Vec<u8>) {
+    pub(crate) fn push_data_block(&mut self, blk: u32, bytes: Vec<u8>) {
+        if let Some(&pos) = self.data_block_idx.get(&blk) {
+            self.data_blocks[pos] = (blk, bytes);
+            return;
+        }
         self.data_block_idx.insert(blk, self.data_blocks.len());
         self.data_blocks.push((blk, bytes));
     }
 
+    /// Drop the staged image of `blk`, if any — used when the block
+    /// stops belonging to the inode that staged it, so a later read
+    /// sees the new owner's content instead of a stale metadata image.
+    ///
+    /// `swap_remove` keeps this O(1); the entry that moves into the
+    /// vacated slot has its index repaired. (A `retain` here would
+    /// shift every later entry and silently invalidate the whole
+    /// `data_block_idx` map.)
+    pub(crate) fn remove_data_block(&mut self, blk: u32) {
+        let Some(pos) = self.data_block_idx.remove(&blk) else {
+            return;
+        };
+        let last = self.data_blocks.len() - 1;
+        self.data_blocks.swap_remove(pos);
+        if pos != last {
+            let moved = self.data_blocks[pos].0;
+            self.data_block_idx.insert(moved, pos);
+        }
+    }
+
     /// O(1) staged-data-block position by block number.
-    fn data_block_pos(&self, blk: u32) -> Option<usize> {
+    pub(crate) fn data_block_pos(&self, blk: u32) -> Option<usize> {
         self.data_block_idx.get(&blk).copied()
     }
 
@@ -1575,11 +1599,7 @@ impl Ext {
         let (i_block_bytes, leaf_images) = extent::pack_depth1(&runs, bs, csum_tail, &leaf_phys)?;
         for (phys, image) in leaf_phys.iter().zip(leaf_images) {
             // Stage in data_blocks; track for CRC stamping at flush.
-            if let Some(slot) = self.data_blocks.iter_mut().find(|(b, _)| b == phys) {
-                slot.1 = image;
-            } else {
-                self.push_data_block(*phys, image);
-            }
+            self.push_data_block(*phys, image);
             self.track_extent_leaf_block(*phys, inode_no);
         }
         self.patch_inode(dev, inode_no, |i| {
@@ -1623,12 +1643,10 @@ impl Ext {
         self.ensure_block_staged(dev, last_leaf_phys)?;
         self.track_extent_leaf_block(last_leaf_phys, inode_no);
 
-        let leaf_bytes = self
-            .data_blocks
-            .iter()
-            .find(|(b, _)| *b == last_leaf_phys)
-            .map(|(_, bytes)| bytes.clone())
-            .unwrap();
+        let leaf_pos = self
+            .data_block_pos(last_leaf_phys)
+            .expect("ensure_block_staged staged it");
+        let leaf_bytes = self.data_blocks[leaf_pos].1.clone();
         let (leaf_header, mut leaf_runs) = extent::decode_leaf_block(&leaf_bytes[..bs as usize])?;
         let _ = leaf_header;
 
@@ -1648,13 +1666,7 @@ impl Ext {
         if extended {
             // Re-encode the last leaf in place.
             let new_image = extent::encode_leaf_block(&leaf_runs, bs, csum_tail)?;
-            if let Some(slot) = self
-                .data_blocks
-                .iter_mut()
-                .find(|(b, _)| *b == last_leaf_phys)
-            {
-                slot.1 = new_image;
-            }
+            self.data_blocks[leaf_pos].1 = new_image;
             return Ok(allocated_meta);
         }
         // Try adding a new extent into the last leaf.
@@ -1665,13 +1677,7 @@ impl Ext {
                 physical: new_phys as u64,
             });
             let new_image = extent::encode_leaf_block(&leaf_runs, bs, csum_tail)?;
-            if let Some(slot) = self
-                .data_blocks
-                .iter_mut()
-                .find(|(b, _)| *b == last_leaf_phys)
-            {
-                slot.1 = new_image;
-            }
+            self.data_blocks[leaf_pos].1 = new_image;
             return Ok(allocated_meta);
         }
         // Last leaf is full. Allocate a new leaf with the single new
@@ -1981,12 +1987,10 @@ impl Ext {
                 (existing, 0u32)
             }
         };
-        let ind_buf = self
-            .data_blocks
-            .iter_mut()
-            .find(|(b, _)| *b == ind_blk)
-            .map(|(_, bytes)| bytes)
-            .unwrap();
+        let ind_pos = self
+            .data_block_pos(ind_blk)
+            .expect("ensure_block_staged staged it");
+        let ind_buf = &mut self.data_blocks[ind_pos].1;
         let off = single_off as usize * 4;
         ind_buf[off..off + 4].copy_from_slice(&new_phys.to_le_bytes());
         Ok(meta_added)
@@ -2943,8 +2947,7 @@ impl Ext {
         self.push_data_block(blocks[0], head);
         self.track_dir_block(blocks[0], ino);
         for &blk in &blocks[1..] {
-            self.data_blocks
-                .push((blk, dir::make_empty_dir_block(bs, csum_tail)));
+            self.push_data_block(blk, dir::make_empty_dir_block(bs, csum_tail));
             self.track_dir_block(blk, ino);
         }
         self.push_new_inode(ino, inode);
@@ -3161,8 +3164,7 @@ impl Ext {
         // Leaves start empty; the router fills them as entries arrive.
         for i in 0..n_leaves {
             let blk = blocks[(leaves_start_logical as usize) + i];
-            self.data_blocks
-                .push((blk, dir::make_empty_dir_block(bs, csum_tail)));
+            self.push_data_block(blk, dir::make_empty_dir_block(bs, csum_tail));
             self.track_dir_block(blk, ino);
         }
 
@@ -3194,12 +3196,11 @@ impl Ext {
         // Read dx_root from logical block 0.
         let dx_root_blk = self.file_block(dev, &inode_copy, 0)?;
         self.ensure_block_staged(dev, dx_root_blk)?;
-        let root_buf = self
-            .data_blocks
-            .iter()
-            .find(|(b, _)| *b == dx_root_blk)
-            .map(|(_, bytes)| bytes.clone())
-            .unwrap();
+        let root_buf = self.data_blocks[self
+            .data_block_pos(dx_root_blk)
+            .expect("ensure_block_staged staged it")]
+        .1
+        .clone();
         // dx_root_info: hash_version at offset 28, indirect_levels at 30.
         let indirect_levels = root_buf[30];
         let hash = self.dir_hash_for_index(root_buf[28], name)?;
@@ -3220,12 +3221,11 @@ impl Ext {
         // Read it and walk its dx_entry table to find the leaf.
         let dx_node_phys = self.file_block(dev, &inode_copy, next_logical)?;
         self.ensure_block_staged(dev, dx_node_phys)?;
-        let node_buf = self
-            .data_blocks
-            .iter()
-            .find(|(b, _)| *b == dx_node_phys)
-            .map(|(_, bytes)| bytes.clone())
-            .unwrap();
+        let node_buf = self.data_blocks[self
+            .data_block_pos(dx_node_phys)
+            .expect("ensure_block_staged staged it")]
+        .1
+        .clone();
         let leaf_logical = dx_lookup_logical(&node_buf, htree::DX_NODE_HEADER_LEN, hash)?;
         Ok(leaf_logical)
     }
@@ -3719,12 +3719,10 @@ impl Ext {
         if !self.dir_blocks.iter().any(|(b, _)| *b == blk) {
             self.track_dir_block(blk, dir_ino);
         }
-        let block = self
-            .data_blocks
-            .iter_mut()
-            .find(|(b, _)| *b == blk)
-            .map(|(_, bytes)| bytes)
-            .unwrap();
+        let pos = self
+            .data_block_pos(blk)
+            .expect("ensure_block_staged staged it");
+        let block = &mut self.data_blocks[pos].1;
         // "." at offset 0 (rec_len 12). ".." at offset 12: inode in
         // the first 4 bytes.
         block[12..16].copy_from_slice(&new_parent.to_le_bytes());
@@ -3987,7 +3985,7 @@ impl Ext {
     /// stop tracking it for `ext4_extent_tail` CRC stamping.
     fn release_map_meta_block(&mut self, blk: u32) {
         self.free_block(blk);
-        self.data_blocks.retain(|(b, _)| *b != blk);
+        self.remove_data_block(blk);
         self.untrack_extent_leaf_block(blk);
     }
 
@@ -4052,15 +4050,11 @@ impl Ext {
                 continue; // sparse hole
             }
             self.ensure_block_staged(dev, dir_block_num)?;
-            if !self.dir_blocks.iter().any(|(b, _)| *b == dir_block_num) {
-                self.track_dir_block(dir_block_num, dir_inode);
-            }
-            let block = self
-                .data_blocks
-                .iter_mut()
-                .find(|(b, _)| *b == dir_block_num)
-                .map(|(_, bytes)| bytes)
-                .unwrap();
+            self.track_dir_block(dir_block_num, dir_inode);
+            let pos = self
+                .data_block_pos(dir_block_num)
+                .expect("ensure_block_staged staged it");
+            let block = &mut self.data_blocks[pos].1;
 
             let mut off = 0usize;
             let mut prev_off: Option<usize> = None;
@@ -4454,11 +4448,9 @@ impl Ext {
         blk: u32,
         out: &mut [u8],
     ) -> Result<()> {
-        for (b, bytes) in &self.data_blocks {
-            if *b == blk {
-                out.copy_from_slice(bytes);
-                return Ok(());
-            }
+        if let Some(pos) = self.data_block_pos(blk) {
+            out.copy_from_slice(&self.data_blocks[pos].1);
+            return Ok(());
         }
         let bs = self.layout.block_size as u64;
         dev.read_at(blk as u64 * bs, out)?;
@@ -4730,17 +4722,100 @@ impl Ext {
         }
         let mut cur = constants::INO_ROOT_DIR;
         for comp in path.split('/').filter(|c| !c.is_empty()) {
-            let entries = self.list_inode(dev, cur)?;
-            let next = entries
-                .iter()
-                .find(|e| e.name == comp)
-                .map(|e| e.inode)
+            cur = self
+                .lookup_dir_entry(dev, cur, comp.as_bytes())?
                 .ok_or_else(|| {
                     crate::Error::InvalidArgument(format!("ext: no such entry {comp:?} in path"))
                 })?;
-            cur = next;
         }
         Ok(cur)
+    }
+
+    /// Resolve one path component inside the directory `dir_ino`,
+    /// returning its inode number, or `None` when the name isn't there.
+    ///
+    /// This is the names-only counterpart to [`Self::list_inode`]:
+    /// resolving a path needs nothing but the inode number, while
+    /// `list_inode` builds a full [`crate::fs::DirEntry`] and therefore
+    /// reads *every* child's inode to fill in its kind and size.
+    /// `path_to_inode` used to go through it, so a lookup in a
+    /// directory of 20 000 files cost 20 000 inode-table reads per
+    /// component.
+    pub fn lookup_dir_entry(
+        &self,
+        dev: &mut dyn BlockDevice,
+        dir_ino: u32,
+        name: &[u8],
+    ) -> Result<Option<u32>> {
+        let inode = self.read_inode(dev, dir_ino)?;
+        if inode.mode & constants::S_IFMT != constants::S_IFDIR {
+            return Err(crate::Error::InvalidArgument(format!(
+                "ext: inode {dir_ino} is not a directory"
+            )));
+        }
+        let bs = self.layout.block_size;
+        // Same clamp as `list_inode`: a forged `i_size` must not send the
+        // scan past the end of the volume.
+        let device_blocks = self.sb.blocks_count as u64;
+        let n_blocks = (inode.size.div_ceil(bs) as u64).min(device_blocks) as u32;
+        let with_filetype = self.has_filetype();
+        let metadata_csum = self.has_metadata_csum();
+        let indexed = inode.flags & constants::EXT4_INDEX_FL != 0;
+        let mut block_buf = vec![0u8; bs as usize];
+        for n in 0..n_blocks {
+            let blk = self.file_block(dev, &inode, n)?;
+            if blk == 0 {
+                continue;
+            }
+            self.read_block(dev, blk, &mut block_buf)?;
+            // An indexed dir's block 0 is a dx_root: only the fake
+            // `.` / `..` façade in its first 24 bytes is a dirent list.
+            let data = if indexed && n == 0 {
+                &block_buf[..24]
+            } else if metadata_csum {
+                &block_buf[..block_buf.len() - dir::CSUM_TAIL_LEN]
+            } else {
+                &block_buf[..]
+            };
+            if let Some(ino) = self.find_name_in_dir_block(data, with_filetype, name)? {
+                return Ok(Some(ino));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Scan one directory block's dirent list for `name`. Skips free
+    /// slots the way [`Self::decode_directory_entries`] does (inode 0 or
+    /// an emptied name) and rejects an entry pointing past the inode
+    /// count.
+    fn find_name_in_dir_block(
+        &self,
+        bytes: &[u8],
+        with_filetype: bool,
+        name: &[u8],
+    ) -> Result<Option<u32>> {
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let Some(entry) = dir::decode_entry(&bytes[off..], with_filetype) else {
+                break;
+            };
+            if entry.inode != 0 && !entry.name.is_empty() {
+                if entry.inode > self.sb.inodes_count {
+                    return Err(crate::Error::InvalidImage(format!(
+                        "ext: directory entry references inode {} beyond inode count {}",
+                        entry.inode, self.sb.inodes_count
+                    )));
+                }
+                if entry.name == name {
+                    return Ok(Some(entry.inode));
+                }
+            }
+            if entry.rec_len == 0 {
+                break;
+            }
+            off += entry.rec_len;
+        }
+        Ok(None)
     }
 
     /// Open a streaming reader over the regular file at `ino`. The reader
