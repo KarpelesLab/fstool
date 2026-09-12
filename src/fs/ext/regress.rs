@@ -880,3 +880,150 @@ fn meta_bg_is_never_emitted_and_is_refused_on_open() {
     let err = Ext::open(&mut dev).unwrap_err();
     assert!(matches!(err, crate::Error::Unsupported(_)), "{err:?}");
 }
+
+// ─────────── finding 6: HTree hash seed, signedness, version ───────────
+
+/// `dx_root_info.hash_version = 1` means "half-MD4"; whether the
+/// kernel then uses the *signed* or *unsigned* variant comes from
+/// `s_flags`. We emit the unsigned hash, so the superblock has to say
+/// `EXT2_FLAGS_UNSIGNED_HASH` — otherwise an x86 kernel (signed
+/// `char`) stamps `EXT2_FLAGS_SIGNED_HASH` on first mount and can no
+/// longer find indexed names containing a byte ≥ 0x80.
+#[test]
+fn ext4_superblock_declares_the_unsigned_htree_hash() {
+    let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+    let mut ext = Ext::format_with(&mut dev, &ext4_opts()).unwrap();
+    ext.flush(&mut dev).unwrap();
+    let re = Ext::open(&mut dev).unwrap();
+    assert_ne!(
+        re.sb.flags & super::superblock::FLAGS_UNSIGNED_HASH,
+        0,
+        "EXT2_FLAGS_UNSIGNED_HASH must be set"
+    );
+    assert_eq!(re.sb.flags & super::superblock::FLAGS_SIGNED_HASH, 0);
+    assert_eq!(re.sb.def_hash_version, super::htree::DX_HASH_HALF_MD4);
+    assert!(re.htree_hash_unsigned());
+}
+
+/// The signed and unsigned half-MD4 variants agree on ASCII and
+/// diverge on bytes ≥ 0x80 — which is exactly why the filesystem has
+/// to declare which one it means.
+#[test]
+fn signed_and_unsigned_half_md4_differ_on_high_bytes() {
+    let seed = [0u8; 16];
+    let ascii = b"entry_0000";
+    assert_eq!(
+        super::htree::half_md4_hash_with(ascii, &seed, true),
+        super::htree::half_md4_hash_with(ascii, &seed, false)
+    );
+    let high = b"caf\xc3\xa9";
+    assert_ne!(
+        super::htree::half_md4_hash_with(high, &seed, true),
+        super::htree::half_md4_hash_with(high, &seed, false)
+    );
+}
+
+/// `__ext4fs_dirhash` seeds the MD4 state from `s_hash_seed`, but only
+/// when all four words are non-zero. A seed with any zero word must
+/// fall back to the MD4 IV.
+#[test]
+fn hash_seed_is_honoured_only_when_fully_non_zero() {
+    let zero = [0u8; 16];
+    let full = [0x11u8; 16];
+    let mut partial = [0x11u8; 16];
+    partial[4..8].fill(0);
+
+    assert_eq!(
+        super::htree::hash_seed_words(&zero),
+        super::htree::hash_seed_words(&partial),
+        "a partially-zero seed falls back to the IV"
+    );
+    assert_ne!(
+        super::htree::half_md4_hash_with(b"name", &zero, true),
+        super::htree::half_md4_hash_with(b"name", &full, true),
+        "a full seed must actually change the hash"
+    );
+}
+
+/// An indexed directory built on a filesystem with a real
+/// `s_hash_seed` must be routed with that seed. Formatting can't
+/// produce one (we leave it zero, like a default mke2fs would not),
+/// so patch it in before building the index and check that lookups
+/// still find every name after a reopen.
+#[test]
+fn indexed_dir_round_trips_under_a_non_zero_hash_seed() {
+    let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+    let mut ext = Ext::format_with(&mut dev, &ext4_opts()).unwrap();
+    ext.sb.hash_seed = *b"\x9fseed-for-htree\x21";
+    let names: Vec<String> = (0..64).map(|i| format!("name_{i:04}")).collect();
+    let refs: Vec<&[u8]> = names.iter().map(|n| n.as_bytes()).collect();
+    let dir = ext
+        .add_dir_indexed(
+            &mut dev,
+            INO_ROOT_DIR,
+            b"idx",
+            FileMeta::with_mode(0o755),
+            &refs,
+        )
+        .unwrap();
+    for n in &names {
+        add_file(&mut ext, &mut dev, dir, n.as_bytes(), n.as_bytes());
+    }
+    ext.flush(&mut dev).unwrap();
+
+    let re = Ext::open(&mut dev).unwrap();
+    assert_eq!(re.sb.hash_seed, *b"\x9fseed-for-htree\x21");
+    let listed: Vec<String> = re
+        .list_inode(&mut dev, dir)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    for n in &names {
+        assert!(listed.contains(n), "{n} missing from {listed:?}");
+    }
+    for n in &names {
+        assert_eq!(read_path(&re, &mut dev, &format!("/idx/{n}")), n.as_bytes());
+    }
+}
+
+/// Routing a new entry into an index whose `hash_version` isn't
+/// half-MD4 would file it into a leaf no reader consults. Refuse.
+#[test]
+fn routing_into_a_non_half_md4_index_is_refused() {
+    let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+    let mut ext = Ext::format_with(&mut dev, &ext4_opts()).unwrap();
+    let names: Vec<String> = (0..64).map(|i| format!("name_{i:04}")).collect();
+    let refs: Vec<&[u8]> = names.iter().map(|n| n.as_bytes()).collect();
+    let dir = ext
+        .add_dir_indexed(
+            &mut dev,
+            INO_ROOT_DIR,
+            b"idx",
+            FileMeta::with_mode(0o755),
+            &refs,
+        )
+        .unwrap();
+    ext.flush(&mut dev).unwrap();
+
+    // dx_root sits in the directory's logical block 0;
+    // dx_root_info.hash_version is byte 28. Force it to TEA.
+    let mut re = Ext::open(&mut dev).unwrap();
+    let inode = re.read_inode(&mut dev, dir).unwrap();
+    let blk = re.file_block(&mut dev, &inode, 0).unwrap();
+    let bs = re.layout.block_size as u64;
+    dev.write_at(blk as u64 * bs + 28, &[super::htree::DX_HASH_TEA])
+        .unwrap();
+
+    let err = re
+        .add_file_to_streaming(
+            &mut dev,
+            dir,
+            b"name_0000",
+            &mut std::io::Cursor::new(Vec::new()),
+            0,
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap_err();
+    assert!(matches!(err, crate::Error::Unsupported(_)), "{err:?}");
+}

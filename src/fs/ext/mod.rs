@@ -617,6 +617,19 @@ impl Ext {
             // are still valid; we set EXT4_INDEX_FL per-inode on the
             // ones we actually emit as HTree.
             ext.sb.feature_compat |= constants::feature::COMPAT_DIR_INDEX;
+            // An HTree's `dx_root_info.hash_version` of 1 means
+            // "half-MD4", not "half-MD4 unsigned": `dx_probe` resolves
+            // the signedness from the *superblock*
+            // (`hash_version += EXT4_SB(sb)->s_hash_unsigned`, which is
+            // 3 only when `EXT2_FLAGS_UNSIGNED_HASH` is set). We emit
+            // the unsigned hash, so we have to say so — otherwise an
+            // x86 kernel (signed `char`) stamps `EXT2_FLAGS_SIGNED_HASH`
+            // on first mount and then cannot find any indexed name
+            // containing a byte ≥ 0x80.
+            ext.sb.flags |= superblock::FLAGS_UNSIGNED_HASH;
+            // mke2fs records the default hash for directories the
+            // kernel indexes later; 0 would mean the legacy hash.
+            ext.sb.def_hash_version = htree::DX_HASH_HALF_MD4;
         }
         if opts.sparse_super {
             ext.sb.feature_ro_compat |= constants::feature::RO_COMPAT_SPARSE_SUPER;
@@ -740,6 +753,56 @@ impl Ext {
     /// regular files (≤ 60 bytes) get stored in `i_block` directly
     /// instead of allocating a data block; readers honour the
     /// `EXT4_INLINE_DATA_FL` flag on the inode to decode them.
+    /// Whether this filesystem's HTree hashes widen name bytes as
+    /// `unsigned char`.
+    ///
+    /// `s_flags` carries the answer (`EXT2_FLAGS_UNSIGNED_HASH` /
+    /// `EXT2_FLAGS_SIGNED_HASH`). When neither bit is set the kernel
+    /// decides from its own build (`__CHAR_UNSIGNED__`) and stamps the
+    /// bit on the first read-write mount, so the image itself is
+    /// ambiguous; we assume unsigned, which is both the modern default
+    /// and what this writer has always emitted.
+    pub(crate) fn htree_hash_unsigned(&self) -> bool {
+        // Unsigned unless the image explicitly says signed.
+        self.sb.flags & superblock::FLAGS_SIGNED_HASH == 0
+            || self.sb.flags & superblock::FLAGS_UNSIGNED_HASH != 0
+    }
+
+    /// Major HTree hash of `name` under this filesystem's seed and
+    /// signedness. Used when *building* an index, where the hash
+    /// version is ours to choose (always half-MD4).
+    pub(crate) fn dir_hash(&self, name: &[u8]) -> u32 {
+        htree::half_md4_hash_with(name, &self.sb.hash_seed, self.htree_hash_unsigned()).0
+    }
+
+    /// Major HTree hash of `name` for an *existing* index whose
+    /// `dx_root_info.hash_version` is `hash_version`.
+    ///
+    /// Mirrors `dx_probe`: a stored version of `DX_HASH_TEA` or below
+    /// is offset by the superblock's signedness before being
+    /// dispatched. Anything that doesn't resolve to half-MD4 (legacy
+    /// `dx_hack_hash`, TEA, SipHash for casefolded dirs) would bucket
+    /// names differently than we hash them, so routing into such a
+    /// directory would file entries into leaves where no reader looks
+    /// for them — refuse instead.
+    pub(crate) fn dir_hash_for_index(&self, hash_version: u8, name: &[u8]) -> Result<u32> {
+        let effective = if hash_version <= htree::DX_HASH_TEA && self.htree_hash_unsigned() {
+            hash_version + 3
+        } else {
+            hash_version
+        };
+        let unsigned = match effective {
+            htree::DX_HASH_HALF_MD4 => false,
+            htree::DX_HASH_HALF_MD4_UNSIGNED => true,
+            other => {
+                return Err(crate::Error::Unsupported(format!(
+                    "ext4: indexed directory uses hash version {other}                      (stored {hash_version}); only half-MD4 is supported"
+                )));
+            }
+        };
+        Ok(htree::half_md4_hash_with(name, &self.sb.hash_seed, unsigned).0)
+    }
+
     pub(crate) fn has_inline_data(&self) -> bool {
         self.sb.feature_incompat & constants::feature::INCOMPAT_INLINE_DATA != 0
     }
@@ -2903,7 +2966,7 @@ impl Ext {
         let mut hashes: Vec<(u32, usize)> = expected_names
             .iter()
             .enumerate()
-            .map(|(i, n)| (htree::half_md4_hash(n).0, i))
+            .map(|(i, n)| (self.dir_hash(n), i))
             .collect();
         hashes.sort_by_key(|(h, _)| *h);
 
@@ -2926,7 +2989,7 @@ impl Ext {
             .iter()
             .map(|leaf| {
                 let idx = leaf[0];
-                htree::half_md4_hash(expected_names[idx]).0
+                self.dir_hash(expected_names[idx])
             })
             .collect();
 
@@ -3109,9 +3172,9 @@ impl Ext {
             .find(|(b, _)| *b == dx_root_blk)
             .map(|(_, bytes)| bytes.clone())
             .unwrap();
-        // dx_root_info.indirect_levels lives at offset 30.
+        // dx_root_info: hash_version at offset 28, indirect_levels at 30.
         let indirect_levels = root_buf[30];
-        let (hash, _minor) = htree::half_md4_hash(name);
+        let hash = self.dir_hash_for_index(root_buf[28], name)?;
 
         // Walk dx_root's dx_entry table to pick the child (leaf or
         // dx_node, depending on indirect_levels).
