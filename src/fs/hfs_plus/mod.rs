@@ -2517,11 +2517,8 @@ mod tests {
         // concerned. We rely on JournalLog::load tolerating a missing
         // checksum recompute because replay only reads start/end.
         let rewound_start: u64 = u64::from(super::journal::JHDR_SIZE);
-        // Patch the header in-place.
-        let mut hdr = [0u8; 24];
-        dev.read_at(jbuf_off, &mut hdr).unwrap();
-        hdr[8..16].copy_from_slice(&rewound_start.to_be_bytes());
-        dev.write_at(jbuf_off, &hdr).unwrap();
+        // Patch the header in-place (keeping its checksum valid).
+        super::journal::rewind_start_for_test(&mut dev, jbuf_off, rewound_start).unwrap();
 
         // Reopen and open the file for writing. The replay should fire
         // and re-apply the transaction. We then close without writing
@@ -2647,11 +2644,8 @@ mod tests {
         // 3. Zero the user-data block on disk, and rewind start so
         //    the journal looks dirty again.
         dev.write_at(dev_off_block0, &[0u8; 4096]).unwrap();
-        let mut hdr = [0u8; 24];
-        dev.read_at(jbuf_off, &mut hdr).unwrap();
         let rewound: u64 = u64::from(super::journal::JHDR_SIZE);
-        hdr[8..16].copy_from_slice(&rewound.to_be_bytes());
-        dev.write_at(jbuf_off, &hdr).unwrap();
+        super::journal::rewind_start_for_test(&mut dev, jbuf_off, rewound).unwrap();
         let _ = sealed_end;
 
         // 4. Reopen — replay should restore the 0xBB pattern.
@@ -3011,11 +3005,8 @@ mod tests {
         let zeros_bm = vec![0u8; bm_len as usize];
         dev.write_at(bm_off, &zeros_bm).unwrap();
         // Rewind start.
-        let mut hdr = [0u8; 24];
-        dev.read_at(jbuf_off, &mut hdr).unwrap();
         let rewound: u64 = u64::from(journal::JHDR_SIZE);
-        hdr[8..16].copy_from_slice(&rewound.to_be_bytes());
-        dev.write_at(jbuf_off, &hdr).unwrap();
+        journal::rewind_start_for_test(&mut dev, jbuf_off, rewound).unwrap();
 
         // Without replay, the catalog is unreadable. With replay, the
         // bytes come back and the catalog opens normally.

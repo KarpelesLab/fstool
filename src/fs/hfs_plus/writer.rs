@@ -2551,7 +2551,7 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
         let info_off = u64::from(writer.journal_info_block) * bs;
         let info = encode_journal_info_block(jbuf_offset, jbuf_size);
         sink.write_at(info_off, &info)?;
-        let hdr = encode_journal_header(jbuf_size);
+        let hdr = super::journal::fresh_journal_header(jbuf_size);
         sink.write_at(jbuf_offset, &hdr)?;
         // Mark the journaled attribute in the volume header.
         vh.attributes |= VOL_ATTR_JOURNALED;
@@ -2654,62 +2654,6 @@ fn encode_journal_info_block(buf_offset: u64, buf_size: u64) -> [u8; 512] {
     b[44..52].copy_from_slice(&buf_size.to_be_bytes());
     // ext_jnl_uuid + machine_serial_num + reserved: zeroed.
     b
-}
-
-/// Encode the journal header that lives at the start of the journal
-/// buffer. With `start == end == jhdr_size` and no transactions queued,
-/// the kernel concludes there is nothing to replay.
-///
-/// TN1150 / Apple `journal.h`:
-///
-/// ```text
-/// 0    4   magic       0x4a4e4c78 "JNLx"
-/// 4    4   endian      0x12345678
-/// 8    8   start       (= jhdr_size, no transactions)
-/// 16   8   end         (= start)
-/// 24   8   size        journal buffer size in bytes
-/// 32   4   blhdr_size  block-list-header size (== sector size, 512)
-/// 36   4   checksum    CRC over the header w/ this field 0
-/// 40   4   jhdr_size   size of this header (== 512)
-/// ```
-fn encode_journal_header(buf_size: u64) -> [u8; 512] {
-    let mut b = [0u8; 512];
-    let jhdr_size: u32 = 512;
-    b[0..4].copy_from_slice(&JOURNAL_HEADER_MAGIC.to_be_bytes());
-    b[4..8].copy_from_slice(&JOURNAL_HEADER_ENDIAN.to_be_bytes());
-    b[8..16].copy_from_slice(&u64::from(jhdr_size).to_be_bytes());
-    b[16..24].copy_from_slice(&u64::from(jhdr_size).to_be_bytes());
-    b[24..32].copy_from_slice(&buf_size.to_be_bytes());
-    b[32..36].copy_from_slice(&jhdr_size.to_be_bytes()); // blhdr_size (use jhdr_size)
-    // Checksum over the header with the checksum field zeroed.
-    b[36..40].copy_from_slice(&0u32.to_be_bytes());
-    b[40..44].copy_from_slice(&jhdr_size.to_be_bytes());
-    let csum = journal_header_checksum(&b);
-    b[36..40].copy_from_slice(&csum.to_be_bytes());
-    b
-}
-
-/// CRC-32 over the journal header bytes with the checksum field
-/// zeroed. We use Apple's variant (CRC-32 with reflected polynomial
-/// 0xEDB88320, initial 0xFFFFFFFF, finalise without XOR) — that's
-/// the same algorithm zlib calls "CRC32" minus the final XOR.
-fn journal_header_checksum(buf: &[u8]) -> u32 {
-    // Compute over the entire 512-byte header. Apple's journal code
-    // only covers the journal-header struct (jhdr_size bytes), which is
-    // exactly the 512-byte sector we built.
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &byte in buf {
-        let mut c = (crc ^ u32::from(byte)) & 0xff;
-        for _ in 0..8 {
-            c = if c & 1 != 0 {
-                (c >> 1) ^ 0xEDB8_8320
-            } else {
-                c >> 1
-            };
-        }
-        crc = (crc >> 8) ^ c;
-    }
-    crc
 }
 
 /// Write a sequence of pre-encoded B-tree nodes into the fork's first

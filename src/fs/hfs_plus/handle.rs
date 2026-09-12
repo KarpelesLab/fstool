@@ -187,17 +187,14 @@ impl<'a> HfsPlusFileHandle<'a> {
                     buf[idx..idx + take].copy_from_slice(&data[inside..inside + take]);
                     idx += take;
                 } else {
-                    // Read from disk up to the next pending byte.
-                    let mut stretch = buf.len() - idx;
-                    for j in 0..stretch {
-                        if journal.lookup(cur + j as u64).is_some() {
-                            stretch = j;
-                            break;
-                        }
-                    }
-                    if stretch == 0 {
-                        continue;
-                    }
+                    // Read from disk up to the next pending block (the
+                    // journal keeps its entries sorted, so this is one
+                    // map probe, not a byte-by-byte scan).
+                    let remaining = buf.len() - idx;
+                    let stretch = match journal.next_pending_from(cur) {
+                        Some(next) => ((next - cur) as usize).min(remaining),
+                        None => remaining,
+                    };
                     self.dev.read_at(cur, &mut buf[idx..idx + stretch])?;
                     idx += stretch;
                 }
@@ -213,21 +210,21 @@ impl<'a> HfsPlusFileHandle<'a> {
     /// volumes we still go straight to disk.
     ///
     /// Journal commits must describe each block as a whole multiple of
-    /// the journal sector size (512 B). A partial-sector write would
-    /// be padded with zeros at commit time, clobbering the original
-    /// surrounding bytes. To avoid that, we expand sub-sector writes
-    /// here by reading the affected sector(s) from disk (or from
+    /// the journal sector size (`jhdr_size`, 512 B on every volume
+    /// this writer formats). A partial-sector write would be padded
+    /// with zeros at commit time, clobbering the original surrounding
+    /// bytes. To avoid that, we expand sub-sector writes here by
+    /// reading the affected sector(s) from disk (or from
     /// previously-pending journal entries) and patching them in
     /// memory, then handing the sector-aligned merged buffer to the
     /// journal.
     fn dev_write_at(&mut self, off: u64, data: &[u8]) -> Result<()> {
-        if self.journal.is_none() {
+        let Some(sector) = self.journal.as_ref().map(|j| j.sector()) else {
             return self.dev.write_at(off, data);
-        }
-        const SECTOR: u64 = super::journal::JOURNAL_SECTOR;
+        };
         let end = off + data.len() as u64;
-        let aligned_start = off / SECTOR * SECTOR;
-        let aligned_end = end.div_ceil(SECTOR) * SECTOR;
+        let aligned_start = off / sector * sector;
+        let aligned_end = end.div_ceil(sector) * sector;
         let aligned_len = (aligned_end - aligned_start) as usize;
 
         let merged = if aligned_start == off && aligned_len == data.len() {
@@ -286,12 +283,20 @@ impl<'a> HfsPlusFileHandle<'a> {
         for run in staged {
             // Zero the freshly-allocated run so reads of holes return
             // zero. (A block freed by `remove` and re-handed-out may
-            // still carry stale bytes.) On a journaled volume the
-            // zero-fill is buffered into the journal alongside the
-            // user write — replay will re-zero on recovery.
-            let zero = vec![0u8; (u64::from(run.block_count) * bs) as usize];
+            // still carry stale bytes.) The zero-fill goes straight to
+            // disk, never through the journal: nothing references these
+            // blocks until the metadata flush commits, so there is no
+            // consistency to protect and journaling it would only bloat
+            // every transaction by the size of the allocation. Any
+            // pending journal write for the range (a block freed and
+            // re-handed-out within this session) is dropped so it can't
+            // resurrect stale bytes on top of the zeros.
+            let len = u64::from(run.block_count) * bs;
             let off = u64::from(run.start_block) * bs;
-            self.dev_write_at(off, &zero)?;
+            if let Some(journal) = self.journal.as_mut() {
+                journal.remove_range(off, off + len);
+            }
+            self.dev.write_at(off, &vec![0u8; len as usize])?;
             self.runs.push(run);
         }
         Ok(())
@@ -580,15 +585,16 @@ impl<'a> FileHandle for HfsPlusFileHandle<'a> {
 impl<'a> Drop for HfsPlusFileHandle<'a> {
     fn drop(&mut self) {
         // Best-effort: persist on drop so the file is durable even when
-        // the caller forgets to `sync`. Drop can't return errors, so we
-        // swallow them. Tests should `sync()` explicitly to surface I/O
-        // failures.
+        // the caller forgets to `sync`. Drop can't return errors, so the
+        // failure is reported on stderr instead of vanishing — callers
+        // that need to act on it must `sync()` explicitly.
         if self.dirty {
-            if let Some(journal) = self.journal.as_mut() {
-                let _ = journal.commit(self.dev);
+            if let Err(e) = self.sync_inner() {
+                eprintln!(
+                    "hfs+: failed to persist file {:?} on close: {e}",
+                    self.cat_key.name.to_display_name()
+                );
             }
-            let _ = self.refresh_catalog_body();
-            let _ = self.fs.flush(self.dev);
             self.dirty = false;
         }
     }

@@ -8,7 +8,7 @@
 //! required native tool is missing, mirroring the policy used by
 //! `tests/ext4_external.rs`.
 
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -56,7 +56,67 @@ fn find_fsck_hfs() -> Option<(PathBuf, &'static str)> {
             }
         }
     }
+    // macOS ships Apple's checker as `fsck_hfs`. It refuses plain files
+    // ("Can't get device block size"), so `assert_fsck_clean` attaches
+    // the image read-only through `hdiutil` first — only offer it when
+    // both tools are present.
+    if cfg!(target_os = "macos")
+        && which("hdiutil").is_some()
+        && let Some(p) = which("fsck_hfs")
+    {
+        return Some((p, "fsck_hfs"));
+    }
     None
+}
+
+/// Scrape the whole-disk `/dev/diskN` node out of `hdiutil attach
+/// -plist` output (same trick as `tests/apfs_external.rs`).
+fn parse_hdiutil_whole_disk(plist: &str) -> Option<String> {
+    let mut rest = plist;
+    while let Some(i) = rest.find("<string>/dev/disk") {
+        let after = &rest[i + "<string>".len()..];
+        let j = after.find("</string>")?;
+        let dev = after[..j].trim();
+        if !dev.trim_start_matches("/dev/disk").contains('s') {
+            return Some(dev.to_string());
+        }
+        rest = &after[j..];
+    }
+    None
+}
+
+/// Run Apple's `fsck_hfs -nf` against `image` by attaching it read-only
+/// (no mount) with `hdiutil`, checking the device node, and detaching.
+/// Returns the process output of the fsck run.
+fn fsck_hfs_via_hdiutil(fsck: &std::path::Path, image: &std::path::Path) -> std::process::Output {
+    let attach = Command::new("hdiutil")
+        .args(["attach", "-nomount", "-readonly", "-plist"])
+        .args(["-imagekey", "diskimage-class=CRawDiskImage"])
+        .arg(image)
+        .output()
+        .expect("hdiutil attach");
+    assert!(
+        attach.status.success(),
+        "hdiutil attach failed on {}:\n{}",
+        image.display(),
+        String::from_utf8_lossy(&attach.stderr)
+    );
+    let plist = String::from_utf8_lossy(&attach.stdout);
+    let dev = parse_hdiutil_whole_disk(&plist).expect("no /dev/diskN in hdiutil output");
+    let out = Command::new(fsck).arg("-nf").arg(&dev).output().unwrap();
+    let detach = Command::new("hdiutil")
+        .args(["detach", "-force"])
+        .arg(&dev)
+        .output();
+    if let Ok(d) = detach
+        && !d.status.success()
+    {
+        eprintln!(
+            "warn: hdiutil detach {dev} failed: {}",
+            String::from_utf8_lossy(&d.stderr)
+        );
+    }
+    out
 }
 
 /// Build an empty fstool-formatted HFS+ image in `tmp` and return the
@@ -72,7 +132,11 @@ fn fresh_image(tmp: &NamedTempFile, opts: &FormatOpts) -> (FileBackend, HfsPlus)
 /// when the volume already looks clean. The combined flag is what
 /// Apple's tool, the macports port, and `hfsprogs` all support.
 fn assert_fsck_clean(fsck: &std::path::Path, label: &str, image: &std::path::Path) {
-    let out = Command::new(fsck).arg("-nf").arg(image).output().unwrap();
+    let out = if label == "fsck_hfs" {
+        fsck_hfs_via_hdiutil(fsck, image)
+    } else {
+        Command::new(fsck).arg("-nf").arg(image).output().unwrap()
+    };
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -583,4 +647,299 @@ fn writer_large_directory_grows_catalog_passes_fsck() {
         .filter(|e| e.name != "." && e.name != "..")
         .count();
     assert_eq!(files, 6000, "listed {files} of 6000 files in /big");
+}
+
+/// xnu's journal checksum (`calc_checksum` in `vfs_journal.c`): the
+/// test needs it to re-seal a journal header after rewinding `start`.
+fn journal_checksum(buf: &[u8]) -> u32 {
+    let mut c: u32 = 0;
+    for &b in buf {
+        c = (c << 8) ^ c.wrapping_add(u32::from(b));
+    }
+    !c
+}
+
+/// A journaled HFS+ image made by macOS itself (`hdiutil create -fs
+/// "Journaled HFS+"`) must open and list. Apple writes the journal header
+/// and block lists little-endian with an 8 KiB `blhdr_size` and xnu's
+/// byte-wise checksum, none of which matched the writer's own
+/// big-endian / CRC assumptions before the fix. The second half forces
+/// a replay of the transaction hdiutil left sealed in the ring: rewind
+/// `start`, scribble over the blocks it describes, reopen, and check the
+/// journal copy came back — then hand the result to `fsck_hfs`.
+#[test]
+fn hdiutil_journaled_image_opens_and_replays() {
+    if !cfg!(target_os = "macos") || which("hdiutil").is_none() {
+        eprintln!("skipping: needs macOS hdiutil");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("jhfs.dmg");
+    let out = Command::new("hdiutil")
+        .args([
+            "create",
+            "-fs",
+            "Journaled HFS+",
+            "-layout",
+            "NONE",
+            "-size",
+            "8m",
+        ])
+        .args(["-volname", "JTest"])
+        .arg(&img)
+        .output()
+        .unwrap();
+    if !out.status.success() || !img.exists() {
+        eprintln!(
+            "skipping: hdiutil create failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+
+    // 1. Plain open + list.
+    {
+        let mut dev = FileBackend::open(&img).unwrap();
+        let hfs = HfsPlus::open(&mut dev).expect("open hdiutil journaled image");
+        let entries = hfs.list_path(&mut dev, "/").unwrap();
+        // macOS leaves only its housekeeping entries (.journal,
+        // .journal_info_block, the private directories) in the root.
+        for e in &entries {
+            assert!(
+                e.name.starts_with('.') || e.name.contains("HFS+ Private"),
+                "unexpected root entry {e:?}"
+            );
+        }
+        assert!(
+            entries.iter().any(|e| e.name == ".journal"),
+            "expected the .journal file in {entries:?}"
+        );
+    }
+
+    // 2. Locate the journal and decode its header in whatever byte
+    //    order the Mac used.
+    let mut bytes = std::fs::read(&img).unwrap();
+    let be32 = |b: &[u8], o: usize| u32::from_be_bytes(b[o..o + 4].try_into().unwrap());
+    let be64 = |b: &[u8], o: usize| u64::from_be_bytes(b[o..o + 8].try_into().unwrap());
+    let bs = be32(&bytes[1024..], 40) as usize;
+    let jib = be32(&bytes[1024..], 12) as usize;
+    let jbuf = be64(&bytes[jib * bs..], 36) as usize;
+    let little = &bytes[jbuf..jbuf + 4] == b"xLNJ";
+    assert!(
+        little || &bytes[jbuf..jbuf + 4] == b"JNLx",
+        "journal magic {:02x?}",
+        &bytes[jbuf..jbuf + 4]
+    );
+    let rd16 = |b: &[u8], o: usize| {
+        let a: [u8; 2] = b[o..o + 2].try_into().unwrap();
+        if little {
+            u16::from_le_bytes(a)
+        } else {
+            u16::from_be_bytes(a)
+        }
+    };
+    let rd32 = |b: &[u8], o: usize| {
+        let a: [u8; 4] = b[o..o + 4].try_into().unwrap();
+        if little {
+            u32::from_le_bytes(a)
+        } else {
+            u32::from_be_bytes(a)
+        }
+    };
+    let rd64 = |b: &[u8], o: usize| {
+        let a: [u8; 8] = b[o..o + 8].try_into().unwrap();
+        if little {
+            u64::from_le_bytes(a)
+        } else {
+            u64::from_be_bytes(a)
+        }
+    };
+    let hdr = bytes[jbuf..jbuf + 48].to_vec();
+    let (start, end) = (rd64(&hdr, 8), rd64(&hdr, 16));
+    let blhdr = rd32(&hdr, 32) as usize;
+    let jhdr = rd32(&hdr, 40) as usize;
+    assert_eq!(start, end, "hdiutil leaves the journal sealed");
+    if end as usize == jhdr {
+        eprintln!("journal ring is empty on this macOS; replay half skipped");
+        return;
+    }
+
+    // 3. Walk the block lists in [jhdr, end) and remember every target.
+    let mut targets: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut pos = jhdr;
+    while pos < end as usize {
+        let bl = &bytes[jbuf + pos..];
+        let num = rd16(bl, 2) as usize;
+        let used = rd32(bl, 4) as usize;
+        assert!(
+            num >= 1 && used >= blhdr,
+            "block list at {pos}: num {num} used {used}"
+        );
+        let mut data = pos + blhdr;
+        for i in 1..num {
+            let slot = 16 + i * 16;
+            let bnum = rd64(bl, slot);
+            let bsize = rd32(bl, slot + 8) as usize;
+            if bnum != u64::MAX {
+                let off = bnum as usize * jhdr;
+                targets.push((off, bytes[jbuf + data..jbuf + data + bsize].to_vec()));
+            }
+            data += bsize;
+        }
+        pos += used;
+    }
+    assert!(
+        !targets.is_empty(),
+        "sealed transaction describes no blocks"
+    );
+
+    // 4. Scribble over every described block except the primary volume
+    //    header (replay needs it to find the journal), then rewind
+    //    `start` with a valid checksum so the journal looks unreplayed.
+    let mut scribbled = 0;
+    for (off, data) in &targets {
+        if *off == 1024 {
+            continue;
+        }
+        bytes[*off..*off + data.len()].fill(0xEE);
+        scribbled += 1;
+    }
+    let mut h = hdr.clone();
+    let start_bytes = if little {
+        (jhdr as u64).to_le_bytes()
+    } else {
+        (jhdr as u64).to_be_bytes()
+    };
+    h[8..16].copy_from_slice(&start_bytes);
+    h[36..40].fill(0);
+    let ck = journal_checksum(&h[..44]);
+    h[36..40].copy_from_slice(&if little {
+        ck.to_le_bytes()
+    } else {
+        ck.to_be_bytes()
+    });
+    bytes[jbuf..jbuf + 48].copy_from_slice(&h);
+    std::fs::write(&img, &bytes).unwrap();
+
+    // 5. Reopen: `HfsPlus::open` replays the ring before reading the
+    //    catalog; every scribbled block must carry the journal's copy.
+    {
+        let mut dev = FileBackend::open(&img).unwrap();
+        let hfs = HfsPlus::open(&mut dev).expect("open with a dirty Apple journal");
+        assert!(
+            hfs.list_path(&mut dev, "/")
+                .unwrap()
+                .iter()
+                .any(|e| e.name == ".journal")
+        );
+    }
+    let after = std::fs::read(&img).unwrap();
+    for (off, data) in &targets {
+        assert_eq!(
+            &after[*off..*off + data.len()],
+            &data[..],
+            "block at byte {off} restored"
+        );
+    }
+    let hdr2 = &after[jbuf..jbuf + 48];
+    assert_eq!(&hdr2[0..4], &hdr[0..4], "byte order preserved");
+    assert_eq!(rd64(hdr2, 8), rd64(hdr2, 16), "journal sealed after replay");
+    assert_eq!(rd64(hdr2, 16), end, "end untouched by replay");
+    let mut z = hdr2[..44].to_vec();
+    z[36..40].fill(0);
+    assert_eq!(
+        rd32(hdr2, 36),
+        journal_checksum(&z),
+        "rewritten header checksum"
+    );
+    eprintln!(
+        "replayed {scribbled} scribbled blocks out of {}",
+        targets.len()
+    );
+
+    // 6. Apple's own checker agrees.
+    if let Some((fsck, label)) = find_fsck_hfs() {
+        assert_fsck_clean(&fsck, label, &img);
+    } else {
+        eprintln!("skipping fsck oracle: not installed");
+    }
+}
+
+/// A reopened journaled volume routes its metadata flush through the
+/// journal. The format-time ring is only 64 KiB, so a catalog rewrite of
+/// a few hundred entries cannot fit in one transaction — the log must
+/// split it into several sealed transactions instead of refusing (or
+/// silently dropping the flush from `Drop`). Every file must survive and
+/// `fsck_hfs` must stay clean.
+#[test]
+fn writer_journaled_reopen_multi_transaction_flush() {
+    let tmp = NamedTempFile::new().unwrap();
+    let opts = FormatOpts {
+        volume_name: "FstoolJrnl2".into(),
+        journaled: true,
+        ..FormatOpts::default()
+    };
+    let (mut dev, mut hfs) = fresh_image(&tmp, &opts);
+    hfs.create_dir(&mut dev, "/d", 0o755, 0, 0, 0).unwrap();
+    hfs.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    // Second session: the on-disk journal header exists now, so this
+    // flush is journaled. 400 files need ~30+ catalog nodes plus the
+    // bitmap and both volume headers — well over one 56 KiB transaction.
+    let mut dev = FileBackend::open(tmp.path()).unwrap();
+    let mut hfs = HfsPlus::open(&mut dev).unwrap();
+    for i in 0..400 {
+        let body = format!("file {i}\n");
+        let mut src = Cursor::new(body.as_bytes());
+        hfs.create_file(
+            &mut dev,
+            &format!("/d/file-with-a-longish-name-{i:04}.txt"),
+            &mut src,
+            body.len() as u64,
+            0o644,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+    }
+    hfs.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    let mut dev = FileBackend::open(tmp.path()).unwrap();
+    let hfs = HfsPlus::open(&mut dev).unwrap();
+    let entries = hfs.list_path(&mut dev, "/d").unwrap();
+    assert_eq!(entries.len(), 400, "listed {} of 400 files", entries.len());
+    let mut got = Vec::new();
+    hfs.open_file_reader(&mut dev, "/d/file-with-a-longish-name-0399.txt")
+        .unwrap()
+        .read_to_end(&mut got)
+        .unwrap();
+    assert_eq!(got, b"file 399\n");
+    // The journal header's sequence_num counts transactions: it starts
+    // at 1 on format, so anything above 2 proves the flush was split.
+    let mut vh = [0u8; 512];
+    dev.read_at(1024, &mut vh).unwrap();
+    let bs = u64::from(u32::from_be_bytes(vh[40..44].try_into().unwrap()));
+    let jib = u64::from(u32::from_be_bytes(vh[12..16].try_into().unwrap()));
+    let mut info = [0u8; 52];
+    dev.read_at(jib * bs, &mut info).unwrap();
+    let jbuf = u64::from_be_bytes(info[36..44].try_into().unwrap());
+    let mut hdr = [0u8; 48];
+    dev.read_at(jbuf, &mut hdr).unwrap();
+    let seq = u32::from_be_bytes(hdr[44..48].try_into().unwrap());
+    assert!(
+        seq > 2,
+        "expected several transactions, sequence_num is {seq}"
+    );
+    drop(dev);
+
+    if let Some((fsck, label)) = find_fsck_hfs() {
+        assert_fsck_clean(&fsck, label, tmp.path());
+    } else {
+        eprintln!("skipping fsck oracle: not installed");
+    }
 }
