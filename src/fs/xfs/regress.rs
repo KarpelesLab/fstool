@@ -490,3 +490,161 @@ fn extent_encode_rejects_out_of_range_fields() {
         .is_err()
     );
 }
+
+// ---------------------------------------------------------------------
+// Finding 27 — a file that does not fit one contiguous run must be
+// written as several extents instead of failing "out of space".
+// ---------------------------------------------------------------------
+
+/// How many extents inode `ino` records in its data fork.
+fn nextents_of(xfs: &Xfs, dev: &mut MemoryBackend, ino: u64) -> u32 {
+    let off = xfs.ino_byte_offset(ino).unwrap();
+    let mut buf = vec![0u8; xfs.inode_size() as usize];
+    dev.read_at(off, &mut buf).unwrap();
+    u32::from_be_bytes(buf[76..80].try_into().unwrap())
+}
+
+/// Chop the free pool of a small single-AG image into equal-sized islands:
+/// fill it with `chunk`-byte files until the allocator runs dry, then delete
+/// every other one. Returns the island size in bytes.
+fn fragment_free_space(dev: &mut MemoryBackend, xfs: &mut Xfs, chunk: u64) -> u64 {
+    let root = xfs.superblock().rootino;
+    let mut names = Vec::new();
+    for i in 0.. {
+        let name = format!("fill{i}");
+        let mut src = std::io::Cursor::new(vec![b'0' + (i as u8 % 10); chunk as usize]);
+        match xfs.add_file(
+            &mut *dev,
+            root,
+            &name,
+            EntryMeta::default(),
+            chunk,
+            &mut src,
+        ) {
+            Ok(_) => names.push(name),
+            Err(_) => break,
+        }
+    }
+    assert!(names.len() > 8, "test image too small to fragment");
+    xfs.flush_writes(dev).unwrap();
+    for name in names.iter().step_by(2) {
+        xfs.remove(&mut *dev, root, name).unwrap();
+    }
+    xfs.flush_writes(dev).unwrap();
+    chunk
+}
+
+#[test]
+fn file_larger_than_the_longest_free_run_spans_several_extents() {
+    // Small single-AG image: 16 MiB / 4 KiB blocks.
+    let (mut dev, mut xfs) = fresh(16 * 1024 * 1024);
+    let chunk = 256 * 1024u64; // 64 blocks per island
+    let island = fragment_free_space(&mut dev, &mut xfs, chunk);
+
+    // Ask for three islands' worth. No single free run is that long, so
+    // the old single-extent allocator returned "out of space".
+    let want = island * 3;
+    let body: Vec<u8> = (0..want).map(|i| (i % 251) as u8).collect();
+    let root = xfs.superblock().rootino;
+    let mut src = std::io::Cursor::new(body.clone());
+    let ino = xfs
+        .add_file(&mut dev, root, "big", EntryMeta::default(), want, &mut src)
+        .unwrap();
+    xfs.flush_writes(&mut dev).unwrap();
+    assert!(
+        nextents_of(&xfs, &mut dev, ino) > 1,
+        "expected the multi-extent path to be exercised"
+    );
+
+    // And it must read back byte for byte.
+    let xfs = Xfs::open(&mut dev).unwrap();
+    let mut out = Vec::new();
+    {
+        let mut r = xfs.open_file_reader(&mut dev, "/big").unwrap();
+        std::io::Read::read_to_end(&mut r, &mut out).unwrap();
+    }
+    assert_eq!(out.len(), body.len());
+    assert!(out == body, "multi-extent file did not round-trip");
+}
+
+/// `sb_fdblocks` as last stamped by `flush_writes`.
+fn free_blocks(dev: &mut MemoryBackend) -> u64 {
+    let mut sb = [0u8; 512];
+    dev.read_at(0, &mut sb).unwrap();
+    u64::from_be_bytes(sb[144..152].try_into().unwrap())
+}
+
+#[test]
+fn file_too_fragmented_for_the_inline_fork_reports_the_limit() {
+    let (mut dev, mut xfs) = fresh(16 * 1024 * 1024);
+    let bs = xfs.block_size() as u64;
+    let root = xfs.superblock().rootino;
+    let islands = super::rw::MAX_INLINE_EXTENTS + 5;
+
+    // Lay down `islands * 2` small files so that deleting every other one
+    // leaves that many 8-block holes, then hog whatever tail is left so no
+    // long run remains.
+    let small = 8 * bs;
+    let mut names = Vec::new();
+    for i in 0..islands * 2 {
+        let name = format!("s{i}");
+        let mut src = std::io::Cursor::new(vec![b'a'; small as usize]);
+        xfs.add_file(&mut dev, root, &name, EntryMeta::default(), small, &mut src)
+            .unwrap();
+        names.push(name);
+    }
+    xfs.flush_writes(&mut dev).unwrap();
+    let mut hog = free_blocks(&mut dev);
+    loop {
+        assert!(hog > 0, "could not hog the AG tail");
+        let bytes = hog * bs;
+        let mut src = std::io::Cursor::new(vec![b'h'; bytes as usize]);
+        if xfs
+            .add_file(&mut dev, root, "hog", EntryMeta::default(), bytes, &mut src)
+            .is_ok()
+        {
+            break;
+        }
+        hog = hog * 9 / 10;
+    }
+    xfs.flush_writes(&mut dev).unwrap();
+    for name in names.iter().step_by(2) {
+        xfs.remove(&mut dev, root, name).unwrap();
+    }
+    xfs.flush_writes(&mut dev).unwrap();
+
+    // Now ask for more islands than the inline data fork can describe.
+    let want = 8 * bs * (islands as u64 - 1);
+    let mut src = std::io::Cursor::new(vec![b'z'; want as usize]);
+    let err = xfs
+        .add_file(
+            &mut dev,
+            root,
+            "toobig",
+            EntryMeta::default(),
+            want,
+            &mut src,
+        )
+        .unwrap_err();
+    match &err {
+        crate::Error::Unsupported(m) => assert!(
+            m.contains(&super::rw::MAX_INLINE_EXTENTS.to_string()),
+            "error should name the extent limit, got: {m}"
+        ),
+        other => panic!("expected Unsupported naming the extent limit, got {other:?}"),
+    }
+    // The rolled-back allocation must not have leaked: the same request
+    // fails the same way rather than progressively shrinking the pool.
+    let mut src = std::io::Cursor::new(vec![b'z'; want as usize]);
+    assert!(matches!(
+        xfs.add_file(
+            &mut dev,
+            root,
+            "toobig2",
+            EntryMeta::default(),
+            want,
+            &mut src
+        ),
+        Err(crate::Error::Unsupported(_))
+    ));
+}

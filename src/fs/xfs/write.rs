@@ -76,6 +76,7 @@ use super::inode::{
     stamp_v3_inode_crc,
 };
 use super::journal::DEFAULT_LOG_BLOCKS;
+use super::rw::MAX_INLINE_EXTENTS;
 use super::symlink::XFS_SYMLINK_HDR_SIZE;
 
 /// Streaming-write scratch buffer size — never grow this above 64 KiB.
@@ -616,7 +617,147 @@ impl Xfs {
     /// which AG was picked.
     pub(super) fn alloc_blocks_fsb(&mut self, n: u32) -> Result<u64> {
         let (ag, agblk) = self.alloc_blocks_in_any_ag(n)?;
-        Ok(((ag as u64) << self.sb.agblklog as u32) | (agblk as u64))
+        Ok(self.ag_agblock_to_fsb(ag, agblk))
+    }
+
+    /// `(ag, agblock)` → FSB.
+    fn ag_agblock_to_fsb(&self, ag: u32, agblk: u32) -> u64 {
+        ((ag as u64) << self.sb.agblklog as u32) | (agblk as u64)
+    }
+
+    /// Real block count of AG `ag` — the last AG is usually short of
+    /// `sb_agblocks`, and handing out blocks past `sb_dblocks` would
+    /// address bytes beyond the end of the volume.
+    fn ag_block_count(&self, ag: u32) -> u32 {
+        let agblocks = self.sb.agblocks as u64;
+        let start = (ag as u64) * agblocks;
+        self.sb.dblocks.saturating_sub(start).min(agblocks) as u32
+    }
+
+    /// Allocate **up to** `want` contiguous blocks for file data, and
+    /// report how many were actually taken. Tries for the whole run
+    /// first (so a file that fits stays a single extent, and the
+    /// freed-extent reuse in [`alloc_blocks_in_any_ag`] still applies);
+    /// otherwise falls back to the largest contiguous run any AG can
+    /// offer. Never returns zero blocks — it errors instead.
+    ///
+    /// This is what lets a file larger than one AG's longest free run
+    /// be written as several extents rather than failing with
+    /// "out of space".
+    pub(super) fn alloc_file_blocks_fsb(&mut self, want: u32) -> Result<(u64, u32)> {
+        let want = want.clamp(1, super::bmbt::MAX_EXTENT_BLOCKS);
+        if let Ok((ag, agblk)) = self.alloc_blocks_in_any_ag(want) {
+            return Ok((self.ag_agblock_to_fsb(ag, agblk), want));
+        }
+        let (ag, agblk, got) = self.alloc_largest_run(want)?;
+        Ok((self.ag_agblock_to_fsb(ag, agblk), got))
+    }
+
+    /// Take the longest contiguous free run available across every AG,
+    /// clamped to `want` blocks. Returns `(ag, agblock, count)`.
+    fn alloc_largest_run(&mut self, want: u32) -> Result<(u32, u32, u32)> {
+        let agcount = self.ws_mut()?.ags.len() as u32;
+        // Per-AG usable size, computed before the mutable borrow below.
+        let ag_sizes: Vec<u32> = (0..agcount).map(|ag| self.ag_block_count(ag)).collect();
+        let ws = self.ws_mut()?;
+        // (ag, index into freed_extents or None for the bump region,
+        //  start agblock, run length)
+        let mut best: Option<(u32, Option<usize>, u32, u32)> = None;
+        for offset in 0..agcount {
+            let ag = (ws.next_block_ag + offset) % agcount;
+            let st = &ws.ags[ag as usize];
+            for (i, (start, len)) in st.freed_extents.iter().enumerate() {
+                if best.is_none_or(|b| b.3 < *len) {
+                    best = Some((ag, Some(i), *start, *len));
+                }
+            }
+            let tail = ag_sizes[ag as usize].saturating_sub(st.next_agblock);
+            if tail > 0 && best.is_none_or(|b| b.3 < tail) {
+                best = Some((ag, None, st.next_agblock, tail));
+            }
+        }
+        let (ag, freed_idx, start, len) = best.ok_or_else(|| {
+            crate::Error::InvalidArgument(format!(
+                "xfs: out of space across all {agcount} AGs (requested {want} blocks)"
+            ))
+        })?;
+        let take = len.min(want);
+        let st = &mut ws.ags[ag as usize];
+        match freed_idx {
+            Some(i) => {
+                st.freed_extents.swap_remove(i);
+                if len > take {
+                    st.freed_extents.push((start + take, len - take));
+                }
+            }
+            None => st.next_agblock = start + take,
+        }
+        ws.next_block_ag = (ag + 1) % agcount;
+        Ok((ag, start, take))
+    }
+
+    /// Allocate `nblocks` blocks of file data as a list of extents,
+    /// merging runs that happen to be physically adjacent. Rolls the
+    /// whole allocation back when the extent list outgrows what the
+    /// inline data fork can describe (bmbt promotion is not
+    /// implemented), so a failure leaves no leaked blocks behind.
+    fn alloc_file_extents(&mut self, nblocks: u64) -> Result<Vec<Extent>> {
+        let mut extents: Vec<Extent> = Vec::new();
+        let mut remaining = nblocks;
+        let mut logical = 0u64;
+        while remaining > 0 {
+            let want = remaining.min(super::bmbt::MAX_EXTENT_BLOCKS as u64) as u32;
+            let got = match self.alloc_file_blocks_fsb(want) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.free_extent_list(&extents);
+                    return Err(e);
+                }
+            };
+            let (fsb, count) = got;
+            // Merge with the previous run when the allocator happened to
+            // hand back the physically-next blocks.
+            let merged = match extents.last_mut() {
+                Some(tail)
+                    if tail.startblock + tail.blockcount as u64 == fsb
+                        && tail.offset + tail.blockcount as u64 == logical
+                        && (tail.blockcount as u64) + (count as u64)
+                            <= super::bmbt::MAX_EXTENT_BLOCKS as u64 =>
+                {
+                    tail.blockcount += count;
+                    true
+                }
+                _ => false,
+            };
+            if !merged {
+                extents.push(Extent {
+                    offset: logical,
+                    startblock: fsb,
+                    blockcount: count,
+                    unwritten: false,
+                });
+                if extents.len() > MAX_INLINE_EXTENTS {
+                    self.free_extent_list(&extents);
+                    return Err(crate::Error::Unsupported(format!(
+                        "xfs: file needs more than {MAX_INLINE_EXTENTS} extents \
+                         (free space is too fragmented, or the file spans too many \
+                         allocation groups) — bmbt promotion is not implemented"
+                    )));
+                }
+            }
+            logical += count as u64;
+            remaining -= count as u64;
+        }
+        Ok(extents)
+    }
+
+    /// Give every extent in `list` back to the allocator. Used to roll a
+    /// partial file allocation back; errors are swallowed because the
+    /// caller is already returning one.
+    fn free_extent_list(&mut self, list: &[Extent]) {
+        for e in list {
+            let _ = self.free_blocks_fsb(e.startblock, e.blockcount);
+        }
     }
 
     /// Allocate one inode. Tries existing chunks across AGs in
@@ -1280,43 +1421,43 @@ impl Xfs {
         src: &mut R,
     ) -> Result<u64> {
         let bs = self.sb.blocksize as u64;
-        let nblocks = if size == 0 { 0 } else { size.div_ceil(bs) } as u32;
+        let nblocks = if size == 0 { 0 } else { size.div_ceil(bs) };
 
-        // Allocate the file data extent first.
-        let startblock = if nblocks > 0 {
-            self.alloc_blocks_fsb(nblocks)?
-        } else {
-            0
-        };
-        // Stream bytes through a fixed 64 KiB buffer.
+        // Allocate the file's data blocks. A file that does not fit in
+        // one contiguous run inside one AG is spread over several
+        // extents rather than refused.
+        let extents = self.alloc_file_extents(nblocks)?;
+
+        // Stream bytes through a fixed 64 KiB buffer, extent by extent.
         if nblocks > 0 {
             let mut scratch = [0u8; SCRATCH_SIZE];
             let mut remaining = size;
-            let mut dev_offset = self.fsb_to_byte(startblock);
-            while remaining > 0 {
-                let want = (remaining.min(SCRATCH_SIZE as u64)) as usize;
-                let n = read_exact_or_eof(src, &mut scratch[..want])?;
-                if n == 0 {
-                    return Err(crate::Error::InvalidArgument(format!(
-                        "xfs: source for {name:?} returned EOF before {size} bytes (short by {remaining})"
-                    )));
+            for ext in &extents {
+                if remaining == 0 {
+                    break;
                 }
-                dev.write_at(dev_offset, &scratch[..n])?;
-                // Zero-pad the tail of the last write if it didn't
-                // cover a full FS block — keeps unallocated tail bytes
-                // deterministically zero.
-                dev_offset += n as u64;
-                remaining -= n as u64;
-            }
-            // Pad up to the next FS-block boundary so the trailing
-            // partial block reads back as the user's bytes followed by
-            // zeros.
-            let tail = (size % bs) as usize;
-            if tail != 0 {
-                let pad = (bs as usize) - tail;
-                let zero = [0u8; SCRATCH_SIZE];
-                let n = pad.min(SCRATCH_SIZE);
-                dev.write_at(dev_offset, &zero[..n])?;
+                let mut dev_offset = self.fsb_to_byte(ext.startblock);
+                let mut ext_left = (ext.blockcount as u64) * bs;
+                while remaining > 0 && ext_left > 0 {
+                    let want = remaining.min(ext_left).min(SCRATCH_SIZE as u64) as usize;
+                    let n = read_exact_or_eof(src, &mut scratch[..want])?;
+                    if n == 0 {
+                        self.free_extent_list(&extents);
+                        return Err(crate::Error::InvalidArgument(format!(
+                            "xfs: source for {name:?} returned EOF before {size} bytes (short by {remaining})"
+                        )));
+                    }
+                    dev.write_at(dev_offset, &scratch[..n])?;
+                    dev_offset += n as u64;
+                    ext_left -= n as u64;
+                    remaining -= n as u64;
+                }
+                // Pad the rest of this extent so blocks we allocated but
+                // did not fill read back as zeros rather than as whatever
+                // the device held before.
+                if ext_left > 0 {
+                    dev.zero_range(dev_offset, ext_left)?;
+                }
             }
         }
         // Allocate + write inode.
@@ -1334,9 +1475,9 @@ impl Xfs {
             ctime,
             crtime: mtime,
             size,
-            nblocks: nblocks as u64,
+            nblocks,
             extsize: 0,
-            nextents: if nblocks > 0 { 1 } else { 0 },
+            nextents: extents.len() as u32,
             anextents: 0,
             forkoff: 0,
             aformat: 2,
@@ -1346,17 +1487,10 @@ impl Xfs {
             uuid: self.uuid_for_writes(),
             flags2: 0,
         };
-        let lit = if nblocks > 0 {
-            let ext = Extent {
-                offset: 0,
-                startblock,
-                blockcount: nblocks,
-                unwritten: false,
-            };
-            ext.encode()?.to_vec()
-        } else {
-            Vec::new()
-        };
+        let mut lit = Vec::with_capacity(extents.len() * 16);
+        for ext in &extents {
+            lit.extend_from_slice(&ext.encode()?);
+        }
         self.write_inode(dev, ino, builder, &lit)?;
         self.append_dir_entry(dev, parent_ino, name, ino, XFS_DIR3_FT_REG_FILE)?;
         Ok(ino)

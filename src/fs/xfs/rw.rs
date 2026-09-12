@@ -49,7 +49,7 @@ use crate::block::BlockDevice;
 use crate::fs::FileHandle;
 
 use super::Xfs;
-use super::bmbt::Extent;
+use super::bmbt::{Extent, MAX_EXTENT_BLOCKS};
 use super::format::{XFS_INODESIZE, stamp_v5_superblock_crc};
 use super::inode::{DiFormat, S_IFREG, V3DinodeBuilder, XfsTimestamp, stamp_v3_inode_crc};
 use super::journal::{
@@ -62,7 +62,7 @@ use super::write::EntryMeta;
 
 /// Maximum extent count we can store inline in a v3 inode's literal area
 /// when no xattr fork is present: 336 / 16 = 21. Stay conservative.
-const MAX_INLINE_EXTENTS: usize = 20;
+pub(super) const MAX_INLINE_EXTENTS: usize = 20;
 
 /// Prepare the log for read+write access.
 ///
@@ -263,9 +263,11 @@ impl<'a> XfsFileHandle<'a> {
     fn grow_alloc(&mut self, need_blocks: u64) -> Result<()> {
         let mut have = self.nblocks();
         while have < need_blocks {
-            let want_u64 = (need_blocks - have).min((1u64 << 21) - 1);
-            let want = want_u64 as u32;
-            let fsb = self.fs.alloc_blocks_fsb(want)?;
+            let want_u64 = (need_blocks - have).min(MAX_EXTENT_BLOCKS as u64);
+            // Take whatever contiguous run is available rather than
+            // insisting on the whole remainder in one piece; the loop
+            // comes back for the rest as a further extent.
+            let (fsb, want) = self.fs.alloc_file_blocks_fsb(want_u64 as u32)?;
             let byte = self.fsb_to_byte(fsb);
             let total = (want as u64) * self.blocksize();
             self.dev.zero_range(byte, total)?;
