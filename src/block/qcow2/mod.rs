@@ -173,6 +173,19 @@ impl Qcow2Backend {
         let (header, head) = Self::read_header(&mut file)?;
         let cluster_size = header.cluster_size();
 
+        // Internal snapshots share clusters with the active layer; every
+        // shared cluster has refcount > 1 and must be copied before it is
+        // written (qemu's COW-on-`!COPIED`). The write path here rewrites
+        // clusters in place, which would silently corrupt the snapshots —
+        // so such an image is only opened read-only.
+        if !read_only && header.nb_snapshots != 0 {
+            return Err(crate::Error::Unsupported(format!(
+                "qcow2: image has {} internal snapshot(s); writing to it would modify \
+                 clusters the snapshots share — open it read-only",
+                header.nb_snapshots
+            )));
+        }
+
         let backing_file = Self::backing_name(&header, &head)?;
         let backing_format = header
             .extensions
@@ -496,13 +509,26 @@ impl Qcow2Backend {
         // Compute L1 size: one L2 cluster covers (cs/8) clusters, which
         // covers (cs/8) * cs virtual bytes. l1 entries needed:
         let l2_coverage = (cs / 8) * cs;
-        let l1_size = virtual_size.div_ceil(l2_coverage) as u32;
+        let l1_needed = virtual_size.div_ceil(l2_coverage);
         // L1 size must be a power of two? No — but it does need to fit
         // in some number of clusters. Round up `l1_size` to a multiple
         // of (cs / 8) so the L1 table is a whole number of clusters.
-        let l1_per_cluster = (cs / 8) as u32;
-        let l1_clusters = l1_size.div_ceil(l1_per_cluster);
-        let l1_size = l1_clusters * l1_per_cluster;
+        // qemu caps the table at `QCOW_MAX_L1_SIZE`, which is also what
+        // keeps the entry count inside the header's u32.
+        let l1_per_cluster = cs / 8;
+        let l1_clusters = l1_needed.div_ceil(l1_per_cluster);
+        let l1_size = l1_clusters
+            .checked_mul(l1_per_cluster)
+            .filter(|&n| n * 8 <= header::MAX_L1_BYTES)
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| {
+                crate::Error::InvalidArgument(format!(
+                    "qcow2: a {virtual_size}-byte disk at cluster_size {cluster_size} needs \
+                     {l1_needed} L1 entries, past the format's {} maximum — use a larger \
+                     cluster size",
+                    header::MAX_L1_BYTES / 8
+                ))
+            })?;
 
         // Layout (in clusters):
         //   0:                header
@@ -512,7 +538,7 @@ impl Qcow2Backend {
         let refcount_table_cluster = 1u64;
         let refcount_block_cluster = 2u64;
         let l1_first_cluster = 3u64;
-        let next_free_cluster = l1_first_cluster + l1_clusters as u64;
+        let next_free_cluster = l1_first_cluster + l1_clusters;
 
         // An encrypted image reserves whole clusters for its embedded
         // LUKS header, right after the L1 table — the same place qemu
@@ -542,7 +568,7 @@ impl Qcow2Backend {
             v.push(0); // header
             v.push(refcount_table_cluster);
             v.push(refcount_block_cluster);
-            for i in 0..l1_clusters as u64 {
+            for i in 0..l1_clusters {
                 v.push(l1_first_cluster + i);
             }
             for i in 0..crypto_clusters {
@@ -641,6 +667,7 @@ impl Qcow2Backend {
             l2_entries: (cs / 8) as usize,
             l1: vec![0u64; l1_size as usize],
             l1_table_offset: l1_first_cluster * cs,
+            l1_dirty: true,
             l2_cache: std::collections::HashMap::new(),
             l2_cache_cap: 32,
             zero_flag: true,
@@ -949,7 +976,15 @@ impl Qcow2Backend {
     /// physical byte offset of the cluster.
     fn ensure_mapping(&mut self, vaddr: u64) -> Result<u64> {
         let (l1_idx, l2_idx, _) = self.l1l2.split_addr(vaddr);
-        let l1_entry = self.l1l2.l1[l1_idx];
+        // The header validation guarantees the L1 table covers the virtual
+        // size, and `write_virtual` bounds `vaddr` by it; this is the
+        // backstop that turns any gap between the two into an error.
+        let l1_entry = *self.l1l2.l1.get(l1_idx).ok_or_else(|| {
+            crate::Error::InvalidImage(format!(
+                "qcow2: virtual offset {vaddr:#x} lies past the {}-entry L1 table",
+                self.l1l2.l1.len()
+            ))
+        })?;
         let l2_off = l1_entry & l1l2::OFFSET_MASK;
         let (l2_off, _) = if l2_off == 0 {
             // Allocate an L2 cluster.
@@ -1210,10 +1245,29 @@ impl Write for Qcow2Backend {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        // The qcow2 layer flushes its metadata on `sync`; the std
-        // `Write::flush` contract just says "drain buffered data", and
-        // we have no internal buffer.
-        Ok(())
+        // The L1/L2 and refcount caches *are* buffered data as far as a
+        // `Write` user is concerned: until they land, the clusters just
+        // written are unreachable from the on-disk tables.
+        self.sync().map_err(io::Error::other)
+    }
+}
+
+impl Drop for Qcow2Backend {
+    /// Best-effort metadata write-back for a backend dropped without
+    /// [`sync`](BlockDevice::sync): data clusters are written straight
+    /// through, but the L1/L2 and refcount updates that make them
+    /// reachable live in caches until flushed. Errors are ignored —
+    /// there is nobody to report them to — and a caller that wants to
+    /// know should call `sync` and check.
+    fn drop(&mut self) {
+        if self.read_only {
+            return;
+        }
+        // Both flushes only write what is still dirty, so a backend that
+        // was synced is a no-op here. No `sync_data`: the OS will write
+        // the pages out, and blocking a drop on fsync is a surprise.
+        let _ = self.l1l2.flush(&mut self.file);
+        let _ = self.refcount.flush(&mut self.file);
     }
 }
 
@@ -1342,20 +1396,15 @@ impl BlockDevice for Qcow2Backend {
 mod tests {
     use super::*;
 
-    /// Smoke test using a hand-rolled minimal qcow2 image: header, an
-    /// empty L1 entry, and a small refcount table. The reader should
-    /// return zeros for every offset (everything unallocated).
-    #[test]
-    fn read_returns_zeros_on_fresh_image() {
-        // Generate a minimal v3 image in a tempfile and read it back.
-        // Cluster size 64 KiB, virtual size 64 MiB, one L1 entry pointing
-        // at nothing (everything unallocated).
+    /// Write a hand-rolled minimal qcow2 v3 image with 64 KiB clusters:
+    /// header, an all-zero refcount table and block, and an all-zero L1
+    /// table of `l1_size` entries (everything unallocated). The header
+    /// carries `nb_snapshots` verbatim so tests can poke the snapshot
+    /// guard.
+    fn write_minimal_image(path: &Path, virtual_size: u64, l1_size: u32, nb_snapshots: u32) {
         use std::io::Write;
-        use tempfile::NamedTempFile;
 
-        let tmp = NamedTempFile::new().unwrap();
         let cluster_size = 65536u64;
-        let virtual_size = 64u64 * 1024 * 1024;
         let h = Header {
             version: header::VERSION_V3,
             backing_file_offset: 0,
@@ -1363,13 +1412,11 @@ mod tests {
             cluster_bits: 16,
             size: virtual_size,
             crypt_method: 0,
-            // virtual_size / cluster_size = 1024 clusters; one L2 cluster
-            // (8192 entries) covers 8192 clusters, so l1_size = 1.
-            l1_size: 1,
+            l1_size,
             l1_table_offset: 3 * cluster_size,
             refcount_table_offset: cluster_size,
             refcount_table_clusters: 1,
-            nb_snapshots: 0,
+            nb_snapshots,
             snapshots_offset: 0,
             incompatible_features: 0,
             compatible_features: 0,
@@ -1379,7 +1426,7 @@ mod tests {
             compression_type: 0,
             extensions: Vec::new(),
         };
-        let mut f = std::fs::File::create(tmp.path()).unwrap();
+        let mut f = std::fs::File::create(path).unwrap();
         // Cluster 0: header padded to a cluster.
         let mut c0 = vec![0u8; cluster_size as usize];
         c0[..header::V3_HEADER_LEN].copy_from_slice(&h.encode_v3());
@@ -1389,10 +1436,24 @@ mod tests {
         f.write_all(&vec![0u8; cluster_size as usize]).unwrap();
         // Cluster 2: refcount block, all-zero.
         f.write_all(&vec![0u8; cluster_size as usize]).unwrap();
-        // Cluster 3: L1 table, one entry == 0 (unallocated).
+        // Cluster 3: L1 table, every entry == 0 (unallocated).
         f.write_all(&vec![0u8; cluster_size as usize]).unwrap();
         f.sync_all().unwrap();
-        drop(f);
+    }
+
+    /// Smoke test using a hand-rolled minimal qcow2 image: header, an
+    /// empty L1 entry, and a small refcount table. The reader should
+    /// return zeros for every offset (everything unallocated).
+    #[test]
+    fn read_returns_zeros_on_fresh_image() {
+        use tempfile::NamedTempFile;
+
+        let tmp = NamedTempFile::new().unwrap();
+        let cluster_size = 65536u64;
+        let virtual_size = 64u64 * 1024 * 1024;
+        // virtual_size / cluster_size = 1024 clusters; one L2 cluster
+        // (8192 entries) covers 8192 clusters, so l1_size = 1.
+        write_minimal_image(tmp.path(), virtual_size, 1, 0);
 
         let mut back = Qcow2Backend::open(tmp.path()).unwrap();
         assert_eq!(back.total_size(), virtual_size);
@@ -1418,5 +1479,86 @@ mod tests {
         let n = back.read(&mut chunk).unwrap();
         assert_eq!(n, 1024);
         assert!(chunk.iter().all(|&b| b == 0));
+    }
+
+    /// An L1 table that stops short of the virtual size used to be
+    /// accepted, and the first non-zero write past its coverage indexed
+    /// `l1[l1_idx]` out of bounds. qemu refuses the image; so do we.
+    #[test]
+    fn refuses_an_l1_table_that_does_not_cover_the_disk() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // 1 GiB needs two L2 tables at 64 KiB clusters; give it one.
+        write_minimal_image(tmp.path(), 1024 * 1024 * 1024, 1, 0);
+        let err = Qcow2Backend::open(tmp.path()).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidImage(_)), "{err}");
+        let err = Qcow2Backend::open_read_only(tmp.path()).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidImage(_)), "{err}");
+
+        // Two entries is exactly enough, and a write into the second
+        // half lands.
+        write_minimal_image(tmp.path(), 1024 * 1024 * 1024, 2, 0);
+        let mut back = Qcow2Backend::open(tmp.path()).unwrap();
+        back.write_at(600 * 1024 * 1024, b"hello").unwrap();
+        let mut got = [0u8; 5];
+        back.read_at(600 * 1024 * 1024, &mut got).unwrap();
+        assert_eq!(&got, b"hello");
+    }
+
+    /// `create` sizes the L1 table with checked arithmetic: a disk too
+    /// large for the format's L1 maximum at the chosen cluster size is
+    /// an error, not a truncated `as u32`.
+    #[test]
+    fn create_refuses_a_disk_past_the_l1_maximum() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // 512-byte clusters: one L2 table covers 64 × 512 B = 32 KiB, so a
+        // 1 TiB disk needs 2^25 entries — past the 2^22 maximum.
+        let err = Qcow2Backend::create(tmp.path(), 1 << 40, 512).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidArgument(_)), "{err}");
+        // 256 MiB at 512-byte clusters is 8192 entries: fine.
+        Qcow2Backend::create(tmp.path(), 1 << 28, 512).unwrap();
+    }
+
+    /// An image with internal snapshots opens read-only but not for
+    /// writing: the write path rewrites clusters in place, and a cluster
+    /// a snapshot shares would be changed under it.
+    #[test]
+    fn refuses_to_write_an_image_with_internal_snapshots() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_minimal_image(tmp.path(), 64 * 1024 * 1024, 1, 1);
+        let err = Qcow2Backend::open(tmp.path()).unwrap_err();
+        assert!(matches!(err, crate::Error::Unsupported(_)), "{err}");
+
+        let mut back = Qcow2Backend::open_read_only(tmp.path()).unwrap();
+        let mut buf = [0xffu8; 512];
+        back.read_at(0, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0));
+        assert!(back.write_at(0, b"x").is_err());
+    }
+
+    /// Dropping a backend without `sync` must not lose the L1/L2 and
+    /// refcount updates that make freshly written clusters reachable;
+    /// `Write::flush` must persist them too.
+    #[test]
+    fn metadata_survives_drop_and_flush_without_sync() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut back = Qcow2Backend::create(tmp.path(), 64 * 1024 * 1024, 65536).unwrap();
+            back.write_at(1024 * 1024, b"dropped without sync").unwrap();
+            // No sync(): Drop has to write the tables back.
+        }
+        {
+            let mut back = Qcow2Backend::open(tmp.path()).unwrap();
+            let mut got = [0u8; 20];
+            back.read_at(1024 * 1024, &mut got).unwrap();
+            assert_eq!(&got, b"dropped without sync");
+
+            back.write_at(8 * 1024 * 1024, b"flushed").unwrap();
+            std::io::Write::flush(&mut back).unwrap();
+            // Peek through a second handle before this one is dropped.
+            let mut peek = Qcow2Backend::open_read_only(tmp.path()).unwrap();
+            let mut got = [0u8; 7];
+            peek.read_at(8 * 1024 * 1024, &mut got).unwrap();
+            assert_eq!(&got, b"flushed");
+        }
     }
 }

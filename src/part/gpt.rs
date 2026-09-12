@@ -247,6 +247,14 @@ impl PartitionTable for Gpt {
             if p.kind == PartitionKind::Empty {
                 continue;
             }
+            // `build` refuses these, but `partitions` is public: an empty
+            // entry has no meaningful ending LBA to encode.
+            if p.size_lba == 0 {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "partition at LBA {} has zero size",
+                    p.start_lba
+                )));
+            }
             if p.start_lba < FIRST_USABLE_LBA {
                 return Err(crate::Error::InvalidArgument(format!(
                     "partition starts at LBA {} (before first usable LBA {FIRST_USABLE_LBA})",
@@ -530,6 +538,23 @@ mod tests {
             assert_eq!(a.name, b.name);
             assert_eq!(a.uuid, b.uuid);
         }
+    }
+
+    /// A zero-length partition slipped in past `build` (the field is
+    /// public) is refused by `write` rather than encoded with a wrapped
+    /// ending LBA.
+    #[test]
+    fn write_rejects_zero_size_partition() {
+        let mut dev = MemoryBackend::new(mb(64));
+        let mut gpt = build(vec![Partition::new(
+            2048,
+            1024,
+            PartitionKind::LinuxFilesystem,
+        )])
+        .unwrap();
+        gpt.partitions[0].size_lba = 0;
+        let err = gpt.write(&mut dev).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidArgument(_)), "{err}");
     }
 
     #[test]

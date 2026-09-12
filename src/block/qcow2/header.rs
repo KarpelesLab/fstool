@@ -48,6 +48,10 @@ pub const VERSION_V3: u32 = 3;
 pub const V2_HEADER_LEN: usize = 72;
 pub const V3_HEADER_LEN: usize = 104;
 
+/// Largest L1 table qemu accepts, in bytes (`QCOW_MAX_L1_SIZE`): 32 MiB,
+/// i.e. 4 M entries.
+pub const MAX_L1_BYTES: u64 = 0x0200_0000;
+
 /// Header-extension type tags (qcow2 spec §"Header extensions").
 pub mod ext_type {
     /// Terminates the extension chain.
@@ -185,6 +189,14 @@ impl Header {
         1u64 << self.cluster_bits
     }
 
+    /// How many L1 entries it takes to map `size` bytes: one per L2 table,
+    /// each of which covers `(cluster_size / 8) * cluster_size` bytes.
+    pub fn l1_entries_needed(&self) -> u64 {
+        let cs = self.cluster_size();
+        let l2_coverage = (cs / 8) * cs;
+        self.size.div_ceil(l2_coverage)
+    }
+
     /// Number of L2 entries per L2 cluster (`cluster_size / 8`).
     pub fn l2_entries_per_cluster(&self) -> u64 {
         self.cluster_size() / 8
@@ -290,6 +302,26 @@ impl Header {
             return Err(crate::Error::Unsupported(format!(
                 "qcow2: only refcount_order=4 (16-bit) is supported (got {})",
                 self.refcount_order
+            )));
+        }
+        // The L1 table has to cover the whole virtual disk: every write path
+        // indexes it by `virtual offset / (entries per L2 * cluster size)`.
+        // qemu refuses such an image too ("L1 table is too small"), so this
+        // is not a legitimate layout — and it is capped at `QCOW_MAX_L1_SIZE`
+        // just like there.
+        if (self.l1_size as u64) * 8 > MAX_L1_BYTES {
+            return Err(crate::Error::InvalidImage(format!(
+                "qcow2: l1_size {} exceeds the {} entry maximum",
+                self.l1_size,
+                MAX_L1_BYTES / 8
+            )));
+        }
+        let needed = self.l1_entries_needed();
+        if (self.l1_size as u64) < needed {
+            return Err(crate::Error::InvalidImage(format!(
+                "qcow2: L1 table is too small ({} entries; the {}-byte virtual disk \
+                 needs {needed} at cluster_bits {})",
+                self.l1_size, self.size, self.cluster_bits
             )));
         }
         // Compression is supported (zlib + zstd). The `COMPRESSION_TYPE`
@@ -427,6 +459,33 @@ mod tests {
             Header::decode(&bytes),
             Err(crate::Error::InvalidImage(_))
         ));
+    }
+
+    /// An L1 table that does not reach the end of the virtual disk is
+    /// refused at decode time (qemu: "L1 table is too small") — the write
+    /// paths index it by virtual offset and used to panic past its end.
+    #[test]
+    fn rejects_l1_table_too_small_for_the_virtual_size() {
+        // 64 KiB clusters: one L2 table covers 8192 × 64 KiB = 512 MiB.
+        let mut h = sample_v3_header();
+        h.size = 1024 * 1024 * 1024;
+        h.l1_size = 1;
+        assert_eq!(h.l1_entries_needed(), 2);
+        let err = Header::decode(&h.encode_v3()).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidImage(_)), "{err}");
+        h.l1_size = 2;
+        Header::decode(&h.encode_v3()).expect("two entries cover 1 GiB");
+        // Over-provisioning is fine (our own writer rounds up to clusters).
+        h.l1_size = 8192;
+        Header::decode(&h.encode_v3()).expect("a whole cluster of entries");
+    }
+
+    #[test]
+    fn rejects_l1_table_past_qemu_maximum() {
+        let mut h = sample_v3_header();
+        h.l1_size = (MAX_L1_BYTES / 8) as u32 + 1;
+        let err = Header::decode(&h.encode_v3()).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidImage(_)), "{err}");
     }
 
     #[test]
