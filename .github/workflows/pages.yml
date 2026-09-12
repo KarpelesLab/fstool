@@ -48,9 +48,11 @@ jobs:
         with:
           tool: wasm-bindgen-cli@0.2.121
 
+      # The crate is an rlib by default so that a `no_std` build needs no
+      # panic handler; the cdylib wasm-bindgen consumes is asked for here.
       - name: Build wasm (fstool cdylib)
         run: |
-          cargo build --release --lib \
+          cargo rustc --release --lib --crate-type cdylib \
             --target wasm32-unknown-unknown \
             --no-default-features --features "$WASM_FEATURES"
 

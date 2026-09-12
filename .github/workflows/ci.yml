@@ -150,30 +150,35 @@ jobs:
 
       # The embedded core: `#![no_std]` + `alloc`, the block / partition /
       # filesystem traits with FAT, exFAT and littlefs, compiled for a
-      # Cortex-M4F. The `cdylib` crate type (for wasm-bindgen) can't exist
-      # without std, so the check names `rlib` explicitly. The same set is
-      # unit-tested on the host in its no_std configuration, and a `uuid`
-      # resolve without `getrandom` proves nothing pulled in an OS.
+      # Cortex-M4F. The same set is unit-tested on the host in its no_std
+      # configuration, and a `uuid` resolve without `getrandom` proves
+      # nothing pulled in an OS.
+      #
+      # These are plain `cargo build`s: the library is an rlib, so a
+      # `no_std` configuration needs no panic handler and no allocator.
+      # If that ever regresses — by declaring a `cdylib` again, say — the
+      # first of these fails rather than some consumer's firmware build.
       - name: no_std core (thumbv7em-none-eabihf)
         run: |
           set -euo pipefail
           rustup target add thumbv7em-none-eabihf
           for feats in fat exfat littlefs fat,exfat,littlefs; do
             echo "::group::no_std --features $feats"
-            cargo rustc --lib --crate-type rlib --no-default-features --features "$feats" \
-              --target thumbv7em-none-eabihf -- -D warnings
+            cargo build --lib --no-default-features --features "$feats" \
+              --target thumbv7em-none-eabihf
             echo "::endgroup::"
           done
-          # Clippy through the cross target: the host build would trip over
-          # the `cdylib` crate type (no allocator without std), the cross
-          # build just drops it.
+          # And on the host, where a linked artifact would be the thing
+          # demanding an allocator.
+          cargo build --lib --no-default-features --features fat,exfat,littlefs
           cargo clippy --lib --no-default-features --features fat,exfat,littlefs \
             --target thumbv7em-none-eabihf -- -D warnings
           cargo test --lib --no-default-features --features fat,exfat,littlefs
-          # And the floor below that: `fat` on its own, with no allocator
-          # at all — the configuration `fs::fat` is built for.
-          cargo rustc --lib --crate-type rlib --no-default-features --features fat \
-            --target thumbv7em-none-eabihf -- -D warnings
+          # The floor below that: `fat` on its own, with no allocator at
+          # all — the configuration `fs::fat`'s driver is built for.
+          cargo build --lib --no-default-features --features fat \
+            --target thumbv7em-none-eabihf
+          cargo build --lib --no-default-features --features fat
           cargo clippy --lib --no-default-features --features fat \
             --target thumbv7em-none-eabihf -- -D warnings
           cargo test --lib --no-default-features --features fat

@@ -20,10 +20,19 @@ exclude = ["/web", "/.github", "/examples/embedded-cortex-m"]
 
 [lib]
 name = "fstool"
-# `cdylib` is what wasm-bindgen consumes to build the browser bundle (see the
-# `wasm` feature + src/wasm.rs); `rlib` is what the CLI and other Rust crates
-# link against. Native builds emit both — the cdylib is a small extra artifact.
-crate-type = ["cdylib", "rlib"]
+# `rlib` only. wasm-bindgen needs a `cdylib`, but declaring one here makes
+# *every* build produce one, and a `cdylib` is a linked artifact: in a
+# `no_std` configuration it demands a `#[global_allocator]` and a
+# `#[panic_handler]` the library has no business providing, so
+# `cargo build --no-default-features --features fat` would fail for a
+# reason that has nothing to do with the code. (On a firmware target cargo
+# drops the crate type with a warning instead, which is no better — a
+# warning on every build.) The browser bundle asks for the cdylib on the
+# command line instead; see the `wasm` job in .github/workflows/pages.yml:
+#
+#     cargo rustc --release --lib --crate-type cdylib \
+#         --target wasm32-unknown-unknown --features wasm,…
+crate-type = ["rlib"]
 path = "src/lib.rs"
 
 [[bin]]

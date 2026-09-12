@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- *(build)* the library declared a `cdylib` alongside its `rlib`, which
+  made every build produce a linked artifact. In a `no_std` configuration
+  that artifact demands a `#[global_allocator]` and a `#[panic_handler]`
+  the library has no business providing, so
+  `cargo build --no-default-features --features fat` failed for a reason
+  unrelated to the code, and a firmware target only avoided it because
+  cargo dropped the crate type with a warning on every build. The crate
+  is an `rlib` now; the browser bundle asks for a `cdylib` on the command
+  line (`cargo rustc --crate-type cdylib`).
+
 ### Changed
 
 - **breaking** *(fat)* the allocation-free driver moved from
