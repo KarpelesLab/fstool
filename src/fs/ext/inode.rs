@@ -1,14 +1,45 @@
 //! ext inode — typed view + encode/decode.
 //!
-//! Inode size is fixed at 128 bytes for the v1 writer (matches both
-//! `mke2fs -t ext2 -I 128` and good-old-rev). When inode_size > 128 the
-//! extra bytes are zeroed by the writer.
+//! The typed struct models the classic 128-byte layout. When
+//! `s_inode_size > 128` the extended area (`i_extra_isize` and what it
+//! covers, then in-inode xattrs) is handled as raw bytes by the writer:
+//! freshly created inodes get `i_extra_isize = 32` and zeros, inodes
+//! staged from disk keep whatever the slot already holds.
 
 use super::constants::{N_BLOCKS, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK};
 
 /// Size on disk of the typed-fields portion of an inode (the classic ext2
-/// 128-byte layout). Larger inode sizes simply append zeros.
+/// 128-byte layout). Larger inode sizes append an extended area.
 pub const INODE_BASE_SIZE: usize = 128;
+
+/// `i_extra_isize` the writer stamps on every inode it creates when
+/// `inode_size > 128`: 32 bytes covers `i_checksum_hi`, the
+/// nanosecond timestamp extensions, `i_crtime` and `i_projid` — what
+/// mke2fs / the kernel use for 256-byte inodes.
+pub const EXTRA_ISIZE_DEFAULT: u16 = 32;
+
+/// Offset of `l_i_checksum_lo` (inside `osd2`) in the 128-byte base.
+pub const CHECKSUM_LO_OFF: usize = 0x7C;
+
+/// Offset of `i_checksum_hi` in the extended area (`i_extra_isize`
+/// must be at least 4 for it to exist).
+pub const CHECKSUM_HI_OFF: usize = 0x82;
+
+/// Whether a full on-disk inode slot has room for `i_checksum_hi`: the
+/// slot is larger than 128 bytes and its `i_extra_isize` (the first
+/// u16 of the extended area) reaches past the field. Mirrors the
+/// kernel's `EXT4_FITS_IN_INODE(raw, ei, i_checksum_hi)`.
+pub fn extra_isize_covers_checksum_hi(slot: &[u8]) -> bool {
+    if slot.len() < CHECKSUM_HI_OFF + 2 {
+        return false;
+    }
+    let extra = u16::from_le_bytes(
+        slot[INODE_BASE_SIZE..INODE_BASE_SIZE + 2]
+            .try_into()
+            .unwrap(),
+    );
+    INODE_BASE_SIZE + extra as usize >= CHECKSUM_HI_OFF + 2
+}
 
 /// Decoded inode.
 #[derive(Debug, Clone, Copy, Default)]

@@ -51,6 +51,14 @@ use crate::block::BlockDevice;
 use crate::fs::rootdevs::{RootDevs, device_table};
 use crate::fs::{DeviceKind, FileMeta, FileSource};
 
+/// Name of the xattr that marks (and, past 60 bytes, holds the tail of)
+/// an `EXT4_INLINE_DATA_FL` file's body.
+const INLINE_DATA_XATTR: &str = "system.data";
+
+/// Bytes of an inline-data file that live in `i_block` before the
+/// `system.data` xattr value takes over.
+const INLINE_DATA_IBLOCK_BYTES: usize = 60;
+
 /// Hard cap on ext4 extent-tree depth. Real ext4 trees never exceed depth 5
 /// (the inline root plus on-disk index levels); a larger declared `eh_depth`
 /// is a forged image and would drive recursive descent/append to overflow
@@ -166,6 +174,14 @@ pub struct FormatOpts {
     /// kernel reject. Flip it on only when you know the destination is
     /// zero.
     pub prezeroed: bool,
+    /// On-disk inode size (`s_inode_size`): a power of two in
+    /// `128..=block_size`. 128 (the default) is the classic ext2 layout
+    /// and keeps the output byte-identical with genext2fs; 256 is what
+    /// mke2fs uses for ext4 and gives every inode a 32-byte extended
+    /// area (`i_extra_isize`, nanosecond timestamps, `i_checksum_hi`)
+    /// plus room for in-inode xattrs — which `inline_data` needs for
+    /// its `system.data` marker.
+    pub inode_size: u16,
 }
 
 impl Default for FormatOpts {
@@ -189,6 +205,7 @@ impl Default for FormatOpts {
             inline_data: false,
             metadata_csum_seed: false,
             prezeroed: false,
+            inode_size: constants::INODE_SIZE_DYNAMIC,
         }
     }
 }
@@ -219,6 +236,7 @@ impl FormatOpts {
     /// - `log_groups_per_flex` (u8, 0..=5)
     /// - `inline_data` (bool)
     /// - `metadata_csum_seed` (bool, ext4 only)
+    /// - `inode_size` (u16, power of two in 128..=block_size)
     /// - `volume_label` (string, ≤ 16 bytes; longer is rejected)
     /// - `create_lost_found` (bool)
     ///
@@ -266,6 +284,11 @@ impl FormatOpts {
         }
         if let Some(v) = map.take_bool("metadata_csum_seed")? {
             self.metadata_csum_seed = v;
+        }
+        if let Some(v) = map.take_u32("inode_size")? {
+            self.inode_size = u16::try_from(v).map_err(|_| {
+                crate::Error::InvalidArgument(format!("ext: inode_size {v} out of range"))
+            })?;
         }
         if let Some(v) = map.take_bool("create_lost_found")? {
             self.create_lost_found = v;
@@ -355,6 +378,13 @@ pub struct Ext {
     /// many-files build O(n²)). Maintained at every `inodes` mutation;
     /// `inodes` is never cleared at flush, so neither is this.
     inode_idx: std::collections::HashMap<u32, usize>,
+    /// Bytes `128..inode_size` of the on-disk slot for inodes this
+    /// session *created* (or freed): `i_extra_isize` plus the extended
+    /// fields and the in-inode xattr area. Inodes staged from disk have
+    /// no entry, so the flush-time read-modify-write leaves their tail
+    /// (nanosecond timestamps, project id, in-inode xattrs written by
+    /// mke2fs / the kernel) untouched. Empty when `inode_size == 128`.
+    inode_tails: std::collections::HashMap<u32, Vec<u8>>,
     /// `block number -> index in `data_blocks``, same rationale. Cleared
     /// with `data_blocks` at each flush.
     data_block_idx: std::collections::HashMap<u32, usize>,
@@ -397,13 +427,14 @@ impl Ext {
         // the real mode if sparse_super2 is on.
         let (sparse_mode, backup_bgs) = if opts.sparse_super2 {
             // First pass: just need group count.
-            let probe = layout::plan_layout(
+            let probe = layout::plan_layout_sized(
                 opts.block_size,
                 opts.blocks_count,
                 opts.inodes_count,
                 layout::SparseSuperMode::All,
                 opts.log_groups_per_flex,
                 opts.use_64bit,
+                opts.inode_size,
             )?;
             let last = probe.num_groups().saturating_sub(1);
             // For a single-group FS use [0, 0] — group 0 always carries
@@ -419,14 +450,26 @@ impl Ext {
         } else {
             (layout::SparseSuperMode::All, [0, 0])
         };
-        let layout = layout::plan_layout(
+        let layout = layout::plan_layout_sized(
             opts.block_size,
             opts.blocks_count,
             opts.inodes_count,
             sparse_mode,
             opts.log_groups_per_flex,
             opts.use_64bit,
+            opts.inode_size,
         )?;
+        // `inline_data` needs the `system.data` marker xattr *inside* the
+        // inode: the kernel's inline-data probe (`ext4_find_inline_data_nolock`)
+        // only looks at the in-inode xattr area, so with 128-byte inodes
+        // (no extended area) an inline file is unreadable on Linux.
+        if opts.inline_data && layout.inode_size < 2 * inode::INODE_BASE_SIZE as u16 {
+            return Err(crate::Error::InvalidArgument(format!(
+                "ext: inline_data requires inode_size >= 256 (got {}) so the \
+                 system.data marker xattr fits inside the inode",
+                layout.inode_size
+            )));
+        }
         let total_bytes = layout.blocks_count as u64 * layout.block_size as u64;
         if dev.total_size() < total_bytes {
             return Err(crate::Error::InvalidArgument(format!(
@@ -465,6 +508,15 @@ impl Ext {
         sb.r_blocks_count =
             (layout.blocks_count as u64 * opts.reserved_blocks_percent as u64 / 100) as u32;
         sb.lastcheck = opts.mtime;
+        sb.inode_size = layout.inode_size;
+        if layout.inode_size > inode::INODE_BASE_SIZE as u16 {
+            // Every inode we write carries the 32-byte extended area
+            // (`i_extra_isize = 32`, what mke2fs uses for 256-byte
+            // inodes); advertise it so the kernel and e2fsck expect it.
+            sb.feature_ro_compat |= constants::feature::RO_COMPAT_EXTRA_ISIZE;
+            sb.min_extra_isize = inode::EXTRA_ISIZE_DEFAULT;
+            sb.want_extra_isize = inode::EXTRA_ISIZE_DEFAULT;
+        }
 
         // Initialise per-group bitmaps with metadata blocks already marked
         // as used, plus padding-bit-as-used tails for short groups and small
@@ -526,6 +578,7 @@ impl Ext {
             dx_root_blocks: Vec::new(),
             dx_node_blocks: Vec::new(),
             inode_idx: std::collections::HashMap::new(),
+            inode_tails: std::collections::HashMap::new(),
             data_block_idx: std::collections::HashMap::new(),
             dir_block_set: std::collections::HashSet::new(),
             // During format the journal SB is staged in `data_blocks`
@@ -926,7 +979,7 @@ impl Ext {
         let jsb = build_jbd2_superblock(bs, blocks);
         self.push_data_block(data[0], jsb);
 
-        self.push_inode(ino, inode);
+        self.push_new_inode(ino, inode);
         Ok(())
     }
 
@@ -947,7 +1000,7 @@ impl Ext {
         inode.blocks_512 = self.layout.block_size / 512;
 
         self.bump_used_dirs(ino);
-        self.push_inode(ino, inode);
+        self.push_new_inode(ino, inode);
         self.push_data_block(blk, block_bytes);
         self.track_dir_block(blk, ino);
         Ok(())
@@ -988,7 +1041,7 @@ impl Ext {
         }
 
         self.bump_used_dirs(ino);
-        self.push_inode(ino, inode);
+        self.push_new_inode(ino, inode);
 
         // Add to root dir + bump root's link count (a new subdir's ".." is
         // a fresh link to the parent).
@@ -1010,10 +1063,97 @@ impl Ext {
     /// extends the inode's block-pointer storage, and writes into the
     /// fresh block.
     /// Push a staged inode and keep [`inode_idx`](Self::inode_idx) in
-    /// sync. All `inodes` growth must go through here.
+    /// sync. All `inodes` growth must go through here. Used for inodes
+    /// staged *from disk*: their extended area is left to the
+    /// read-modify-write at flush. Newly created inodes go through
+    /// [`Self::push_new_inode`] so their tail is initialised.
     fn push_inode(&mut self, ino: u32, inode: Inode) {
         self.inode_idx.insert(ino, self.inodes.len());
         self.inodes.push((ino, inode));
+    }
+
+    /// Stage a freshly-created inode: like [`Self::push_inode`] but also
+    /// records a fresh extended area (`i_extra_isize = 32`, everything
+    /// else zero) so the on-disk slot never inherits stale bytes from a
+    /// previous occupant.
+    fn push_new_inode(&mut self, ino: u32, inode: Inode) {
+        self.push_inode(ino, inode);
+        self.set_inode_tail(ino, self.fresh_inode_tail());
+    }
+
+    /// Bytes `128..inode_size` for a brand-new inode. Empty for
+    /// 128-byte inodes; otherwise `i_extra_isize = 32` followed by zeros.
+    fn fresh_inode_tail(&self) -> Vec<u8> {
+        let inode_size = self.layout.inode_size as usize;
+        if inode_size <= inode::INODE_BASE_SIZE {
+            return Vec::new();
+        }
+        let mut tail = vec![0u8; inode_size - inode::INODE_BASE_SIZE];
+        tail[0..2].copy_from_slice(&inode::EXTRA_ISIZE_DEFAULT.to_le_bytes());
+        tail
+    }
+
+    /// Record the extended-area bytes to write for `ino` at flush. A
+    /// no-op for 128-byte inodes (the tail is empty).
+    fn set_inode_tail(&mut self, ino: u32, tail: Vec<u8>) {
+        if !tail.is_empty() {
+            self.inode_tails.insert(ino, tail);
+        }
+    }
+
+    /// Stage an all-zero inode (base *and* extended area) for a slot that
+    /// was just freed, so the on-disk slot no longer looks live.
+    fn stage_freed_inode(&mut self, ino: u32) {
+        self.push_inode(ino, Inode::default());
+        let inode_size = self.layout.inode_size as usize;
+        if inode_size > inode::INODE_BASE_SIZE {
+            self.inode_tails
+                .insert(ino, vec![0u8; inode_size - inode::INODE_BASE_SIZE]);
+        }
+    }
+
+    /// Build the extended area of a fresh inode that carries a single
+    /// in-inode xattr `(name_index, suffix, value)`. Layout after
+    /// `i_extra_isize` (which we always make 32): the 4-byte
+    /// `0xEA020000` magic, one `ext4_xattr_entry` (16-byte header +
+    /// name padded to 4), the 4-byte zero terminator, and the value
+    /// packed at the end of the inode — `e_value_offs` is relative to
+    /// the first entry (right after the magic), as the kernel and
+    /// e2fsck expect for in-inode attributes.
+    fn inode_tail_with_xattr(&self, name_index: u8, suffix: &str, value: &[u8]) -> Result<Vec<u8>> {
+        let mut tail = self.fresh_inode_tail();
+        let inode_size = self.layout.inode_size as usize;
+        let area_start = inode::EXTRA_ISIZE_DEFAULT as usize; // relative to tail
+        let entries_start = area_start + 4;
+        let entry_len = (xattr::ENTRY_HEADER_SIZE + suffix.len()).next_multiple_of(xattr::PAD);
+        let value_pad = value.len().next_multiple_of(xattr::PAD);
+        let area_len = inode_size - inode::INODE_BASE_SIZE - entries_start;
+        if suffix.len() > 255 || entry_len + 4 + value_pad > area_len {
+            return Err(crate::Error::Unsupported(format!(
+                "ext: in-inode xattr {suffix:?} ({} bytes) does not fit in a {inode_size}-byte inode",
+                value.len()
+            )));
+        }
+        tail[area_start..area_start + 4].copy_from_slice(&xattr::MAGIC.to_le_bytes());
+        // Value sits at the very end of the inode; the offset is measured
+        // from the first entry.
+        let value_off_in_tail = tail.len() - value_pad;
+        let value_offs = if value.is_empty() {
+            0
+        } else {
+            (value_off_in_tail - entries_start) as u16
+        };
+        let e = entries_start;
+        tail[e] = suffix.len() as u8;
+        tail[e + 1] = name_index;
+        tail[e + 2..e + 4].copy_from_slice(&value_offs.to_le_bytes());
+        // e_value_inum (e+4..e+8) = 0: value lives in the inode.
+        tail[e + 8..e + 12].copy_from_slice(&(value.len() as u32).to_le_bytes());
+        tail[e + 12..e + 16].copy_from_slice(&xattr::entry_hash(suffix, value).to_le_bytes());
+        tail[e + 16..e + 16 + suffix.len()].copy_from_slice(suffix.as_bytes());
+        // Terminator (4 zero bytes) already zero after the entry.
+        tail[value_off_in_tail..value_off_in_tail + value.len()].copy_from_slice(value);
+        Ok(tail)
     }
 
     /// Rebuild `inode_idx` from scratch after a structural edit (e.g. a
@@ -2161,12 +2301,9 @@ impl Ext {
             for (ino, inode) in slots {
                 let (_, idx_in_group) = self.inode_location(ino);
                 let inblock_idx = idx_in_group % inodes_per_block;
-                let off = inblock_idx as u64 * inode_size;
-                let encoded = self.encode_inode(ino, inode);
-                let body_len = encoded.len().min(inode_size as usize);
-                buf[off as usize..off as usize + body_len].copy_from_slice(&encoded[..body_len]);
-                // Tail bytes (i_extra_isize region of large inodes, if any)
-                // are left as their on-disk values.
+                let off = (inblock_idx as u64 * inode_size) as usize;
+                let slot = &mut buf[off..off + inode_size as usize];
+                self.encode_inode_into(ino, inode, slot);
             }
             out.push((blk, buf));
         }
@@ -2329,21 +2466,26 @@ impl Ext {
             && self.sb.feature_incompat & constants::feature::INCOMPAT_JOURNAL_DEV == 0
     }
 
-    /// Encode an inode, stamping its CRC32C checksum (`l_i_checksum_lo` at
-    /// offset 124) when `metadata_csum` is set. With 128-byte inodes there
-    /// is no room for `i_checksum_hi`, so only the low 16 bits are stored —
-    /// the kernel handles a 16-bit inode checksum for small inodes.
-    fn encode_inode(&self, ino: u32, inode: &Inode) -> [u8; inode::INODE_BASE_SIZE] {
-        let mut buf = inode.encode();
-        if self.has_metadata_csum() {
-            // Zero the checksum field before summing — an inode read back
-            // from disk (modify-after-open) carries its previous checksum
-            // in osd2, which must not feed into the recomputed value.
-            buf[124..126].fill(0);
-            let c = csum::inode(self.csum_seed(), ino, inode.generation, &buf);
-            buf[124..126].copy_from_slice(&((c & 0xffff) as u16).to_le_bytes());
+    /// Encode an inode into its full on-disk slot (`inode_size` bytes,
+    /// pre-filled with the current on-disk contents): the 128-byte base
+    /// is always rewritten; bytes `128..` come from the recorded tail for
+    /// inodes created this session and are otherwise left as read from
+    /// disk. With `metadata_csum` the CRC32C is then computed the way
+    /// the kernel's `ext4_inode_csum` does — over the *whole* slot with
+    /// `i_checksum_lo` (0x7C) zeroed and, when `i_extra_isize` covers it,
+    /// `i_checksum_hi` (0x82) zeroed too — and stored in both halves.
+    /// Summing only the first 128 bytes, as this used to, produced a
+    /// checksum the kernel rejects on every image with 256-byte inodes.
+    fn encode_inode_into(&self, ino: u32, inode: &Inode, slot: &mut [u8]) {
+        let base = inode.encode();
+        slot[..inode::INODE_BASE_SIZE].copy_from_slice(&base);
+        if let Some(tail) = self.inode_tails.get(&ino) {
+            let n = tail.len().min(slot.len() - inode::INODE_BASE_SIZE);
+            slot[inode::INODE_BASE_SIZE..inode::INODE_BASE_SIZE + n].copy_from_slice(&tail[..n]);
         }
-        buf
+        if self.has_metadata_csum() {
+            stamp_inode_checksum(self.csum_seed(), ino, inode.generation, slot);
+        }
     }
 
     /// Encode a superblock, stamping the CRC32C `s_checksum` field when the
@@ -2454,13 +2596,19 @@ impl Ext {
                 let off = i * 4;
                 *slot = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
             }
-            self.push_inode(ino, inode);
+            self.push_new_inode(ino, inode);
+            // Stamp the marker xattr *inside* the inode's extended area
+            // (`format_with` guarantees `inode_size >= 256`). The kernel's
+            // inline-data probe only looks at in-inode xattrs, so an
+            // external xattr block would leave the file unreadable on
+            // Linux. Value is empty for files that fit entirely in
+            // i_block; for > 60 bytes (deferred — see the cap above) it
+            // would hold bytes 60..end.
+            let (idx, suffix) = xattr::name_index_and_suffix(INLINE_DATA_XATTR);
+            let tail = self.inode_tail_with_xattr(idx, suffix, &[])?;
+            self.set_inode_tail(ino, tail);
+            self.sb.feature_compat |= constants::feature::COMPAT_EXT_ATTR;
             self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_REG)?;
-            // Stamp the marker xattr. Value is empty for files that
-            // fit entirely in i_block; for > 60 bytes (deferred — see
-            // the cap above) it would hold bytes 60..end.
-            let marker = xattr::Xattr::new("system.data", Vec::<u8>::new());
-            self.set_xattrs(dev, ino, &[marker])?;
             return Ok(ino);
         }
 
@@ -2504,7 +2652,7 @@ impl Ext {
         let allocated_meta_blocks = self.fill_block_pointers(ino, &mut inode, &data_blocks)?;
         inode.blocks_512 = (allocated_data + allocated_meta_blocks) * (bs / 512);
 
-        self.push_inode(ino, inode);
+        self.push_new_inode(ino, inode);
         self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_REG)?;
         Ok(ino)
     }
@@ -2536,7 +2684,7 @@ impl Ext {
             dir::make_initial_dir_block(ino, parent_ino, bs, with_filetype, csum_tail);
         self.push_data_block(blk, block_bytes);
         self.track_dir_block(blk, ino);
-        self.push_inode(ino, inode);
+        self.push_new_inode(ino, inode);
         self.bump_used_dirs(ino);
 
         self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_DIR)?;
@@ -2603,7 +2751,7 @@ impl Ext {
                 .push((blk, dir::make_empty_dir_block(bs, csum_tail)));
             self.track_dir_block(blk, ino);
         }
-        self.push_inode(ino, inode);
+        self.push_new_inode(ino, inode);
         self.bump_used_dirs(ino);
 
         self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_DIR)?;
@@ -2822,7 +2970,7 @@ impl Ext {
             self.track_dir_block(blk, ino);
         }
 
-        self.push_inode(ino, inode);
+        self.push_new_inode(ino, inode);
         self.bump_used_dirs(ino);
 
         self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_DIR)?;
@@ -2940,7 +3088,7 @@ impl Ext {
             dev.write_at(blk as u64 * bs as u64, &buf)?;
         }
 
-        self.push_inode(ino, inode);
+        self.push_new_inode(ino, inode);
         self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_LNK)?;
         Ok(ino)
     }
@@ -2980,7 +3128,7 @@ impl Ext {
             DeviceKind::Fifo => constants::DENT_FIFO,
             DeviceKind::Socket => constants::DENT_SOCK,
         };
-        self.push_inode(ino, inode);
+        self.push_new_inode(ino, inode);
         self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, ft)?;
         Ok(ino)
     }
@@ -3081,7 +3229,7 @@ impl Ext {
             self.inodes.retain(|(i, _)| *i != target_ino);
             // `retain` shifted positions; rebuild before re-staging.
             self.rebuild_inode_idx();
-            self.push_inode(target_ino, Inode::default());
+            self.stage_freed_inode(target_ino);
             self.patch_inode(dev, parent_ino, |i| {
                 i.links_count = i.links_count.saturating_sub(1);
             })?;
@@ -3101,7 +3249,7 @@ impl Ext {
             self.inodes.retain(|(i, _)| *i != target_ino);
             // `retain` shifted positions; rebuild before re-staging.
             self.rebuild_inode_idx();
-            self.push_inode(target_ino, Inode::default());
+            self.stage_freed_inode(target_ino);
         }
         Ok(())
     }
@@ -3185,6 +3333,9 @@ impl Ext {
                 inode.mode
             )));
         }
+        // `i_block` holds file bytes, not block pointers, for inline-data
+        // inodes; walking it as a block map would free foreign blocks.
+        rw::reject_inline_data(&inode, ino)?;
         let old_blocks = inode.file_size().div_ceil(bs as u64) as u32;
         let new_blocks = new_blocks_u64 as u32;
         // Shrink path: free everything past the new end.
@@ -3791,6 +3942,7 @@ impl Ext {
             dx_root_blocks: Vec::new(),
             dx_node_blocks: Vec::new(),
             inode_idx: std::collections::HashMap::new(),
+            inode_tails: std::collections::HashMap::new(),
             data_block_idx: std::collections::HashMap::new(),
             dir_block_set: std::collections::HashSet::new(),
             // Opened (vs. just-formatted) images go through the journal
@@ -4309,6 +4461,7 @@ impl Ext {
             pos: 0,
             block_buf: vec![0u8; self.layout.block_size as usize],
             cached_block: u32::MAX,
+            inline: None,
         };
         let mut buf = Vec::with_capacity(size);
         let mut r = reader;
@@ -4328,6 +4481,14 @@ impl Ext {
                 "ext: inode {ino} is not a regular file"
             )));
         }
+        // Inline-data files: the body is the first 60 bytes of `i_block`
+        // followed by the `system.data` xattr value. Assemble it once
+        // here so `read` never indexes `i_block` past its 60 bytes.
+        let inline = if inode.flags & constants::EXT4_INLINE_DATA_FL != 0 {
+            Some(self.inline_data_body(dev, ino, &inode)?)
+        } else {
+            None
+        };
         Ok(FileReader {
             ext: self,
             dev,
@@ -4335,7 +4496,43 @@ impl Ext {
             pos: 0,
             block_buf: vec![0u8; self.layout.block_size as usize],
             cached_block: u32::MAX,
+            inline,
         })
+    }
+
+    /// Assemble the full body of an `EXT4_INLINE_DATA_FL` inode:
+    /// `i_block[..min(size, 60)]` followed by the `system.data` xattr
+    /// value. Errors when the inode claims more bytes than the two
+    /// locations hold (a forged or unsupported layout) instead of
+    /// reading past `i_block`.
+    fn inline_data_body(
+        &self,
+        dev: &mut dyn BlockDevice,
+        ino: u32,
+        inode: &Inode,
+    ) -> Result<Vec<u8>> {
+        let size = inode.file_size();
+        let iblock = extent::iblock_to_bytes(&inode.block);
+        let head = (size as usize).min(INLINE_DATA_IBLOCK_BYTES);
+        let mut body = iblock[..head].to_vec();
+        if size as usize > head {
+            let tail = self
+                .read_xattrs(dev, ino)?
+                .into_iter()
+                .find(|x| x.name == INLINE_DATA_XATTR)
+                .map(|x| x.value)
+                .unwrap_or_default();
+            let need = size as usize - head;
+            if tail.len() < need {
+                return Err(crate::Error::InvalidImage(format!(
+                    "ext: inline-data inode {ino} claims {size} bytes but i_block + \
+                     system.data hold only {}",
+                    head + tail.len()
+                )));
+            }
+            body.extend_from_slice(&tail[..need]);
+        }
+        Ok(body)
     }
 }
 
@@ -4350,6 +4547,9 @@ pub struct FileReader<'a> {
     block_buf: Vec<u8>,
     /// Block number currently in `block_buf`, or `u32::MAX` if empty.
     cached_block: u32,
+    /// The whole body of an inline-data inode (`i_block` + `system.data`),
+    /// assembled at open; `None` for block-mapped files.
+    inline: Option<Vec<u8>>,
 }
 
 impl<'a> Read for FileReader<'a> {
@@ -4358,13 +4558,11 @@ impl<'a> Read for FileReader<'a> {
         if self.pos >= total {
             return Ok(0);
         }
-        // Inline-data fast path: the file's body lives inside i_block
-        // (the 60-byte block-pointer array). No data block to walk.
-        if self.inode.flags & constants::EXT4_INLINE_DATA_FL != 0 {
-            let inline_bytes = extent::iblock_to_bytes(&self.inode.block);
-            let remaining_in_file = (total - self.pos) as usize;
-            let n = out.len().min(remaining_in_file);
-            out[..n].copy_from_slice(&inline_bytes[self.pos as usize..self.pos as usize + n]);
+        // Inline-data fast path: the body was assembled at open.
+        if let Some(inline) = &self.inline {
+            let pos = (self.pos as usize).min(inline.len());
+            let n = out.len().min(inline.len() - pos);
+            out[..n].copy_from_slice(&inline[pos..pos + n]);
             self.pos += n as u64;
             return Ok(n);
         }
@@ -4415,7 +4613,30 @@ impl<'a> std::io::Seek for FileReader<'a> {
 
 impl<'a> crate::fs::FileReadHandle for FileReader<'a> {
     fn len(&self) -> u64 {
-        self.inode.size as u64
+        // `i_size_high` counts too: a > 4 GiB file used to report only
+        // the low 32 bits here while `read` served the full body.
+        self.inode.file_size()
+    }
+}
+
+/// Stamp the `metadata_csum` inode checksum into a full on-disk inode
+/// slot. Mirrors the kernel's `ext4_inode_csum`: chain the filesystem
+/// seed, the inode number and generation, then the slot with
+/// `i_checksum_lo` zeroed and — when `i_extra_isize` reaches past
+/// `i_checksum_hi` — that field zeroed too. The low 16 bits land in
+/// `i_checksum_lo`; the high 16 bits in `i_checksum_hi` when it fits.
+pub(crate) fn stamp_inode_checksum(seed: u32, ino: u32, generation: u32, slot: &mut [u8]) {
+    let has_hi = inode::extra_isize_covers_checksum_hi(slot);
+    slot[inode::CHECKSUM_LO_OFF..inode::CHECKSUM_LO_OFF + 2].fill(0);
+    if has_hi {
+        slot[inode::CHECKSUM_HI_OFF..inode::CHECKSUM_HI_OFF + 2].fill(0);
+    }
+    let c = csum::inode(seed, ino, generation, slot);
+    slot[inode::CHECKSUM_LO_OFF..inode::CHECKSUM_LO_OFF + 2]
+        .copy_from_slice(&((c & 0xffff) as u16).to_le_bytes());
+    if has_hi {
+        slot[inode::CHECKSUM_HI_OFF..inode::CHECKSUM_HI_OFF + 2]
+            .copy_from_slice(&((c >> 16) as u16).to_le_bytes());
     }
 }
 

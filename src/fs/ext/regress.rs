@@ -146,6 +146,227 @@ fn alloc_inode_respects_bitmaps_of_later_groups() {
     }
 }
 
+// ─────────────── finding 3: inode checksum over the full slot ───────────────
+
+/// Read the raw on-disk inode slot (`inode_size` bytes) of `ino`.
+fn raw_inode_slot(ext: &Ext, dev: &mut MemoryBackend, ino: u32) -> Vec<u8> {
+    let ipg = ext.layout.inodes_per_group;
+    let g = ((ino - 1) / ipg) as usize;
+    let idx = (ino - 1) % ipg;
+    let bs = ext.layout.block_size as u64;
+    let isz = ext.layout.inode_size as u64;
+    let off = ext.layout.groups[g].inode_table as u64 * bs + idx as u64 * isz;
+    let mut slot = vec![0u8; isz as usize];
+    dev.read_at(off, &mut slot).unwrap();
+    slot
+}
+
+/// Independent re-implementation of the kernel's `ext4_inode_csum`:
+/// crc32c chained over seed → ino (le32) → generation (le32) → the
+/// first 128 bytes → the rest of the slot, with `i_checksum_lo` and
+/// (when `i_extra_isize` covers it) `i_checksum_hi` zeroed.
+fn kernel_inode_csum(uuid: &[u8; 16], ino: u32, slot: &[u8]) -> u32 {
+    let raw = |c: u32, d: &[u8]| crate::crc::crc32c_append(c ^ !0, d) ^ !0;
+    let mut s = slot.to_vec();
+    let generation = u32::from_le_bytes(s[100..104].try_into().unwrap());
+    s[0x7C..0x7E].fill(0);
+    let extra = if s.len() > 128 {
+        u16::from_le_bytes(s[128..130].try_into().unwrap()) as usize
+    } else {
+        0
+    };
+    let has_hi = s.len() > 128 && 128 + extra >= 0x84;
+    if has_hi {
+        s[0x82..0x84].fill(0);
+    }
+    let seed = raw(!0, uuid);
+    let c = raw(seed, &ino.to_le_bytes());
+    let c = raw(c, &generation.to_le_bytes());
+    let c = raw(c, &s[..128]);
+    if s.len() > 128 { raw(c, &s[128..]) } else { c }
+}
+
+#[test]
+fn inode_checksum_covers_full_256_byte_inode() {
+    let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+    let opts = FormatOpts {
+        inode_size: 256,
+        uuid: [0x3C; 16],
+        ..ext4_opts()
+    };
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    assert_eq!(ext.sb.inode_size, 256);
+    assert_ne!(
+        ext.sb.feature_ro_compat & constants::feature::RO_COMPAT_EXTRA_ISIZE,
+        0
+    );
+    let ino = add_file(&mut ext, &mut dev, INO_ROOT_DIR, b"f", b"hello");
+    ext.flush(&mut dev).unwrap();
+
+    for check in [ino, INO_ROOT_DIR] {
+        let slot = raw_inode_slot(&ext, &mut dev, check);
+        assert_eq!(slot.len(), 256);
+        let extra = u16::from_le_bytes(slot[128..130].try_into().unwrap());
+        assert_eq!(extra, 32, "fresh inodes carry i_extra_isize = 32");
+        let want = kernel_inode_csum(&opts.uuid, check, &slot);
+        let lo = u16::from_le_bytes(slot[0x7C..0x7E].try_into().unwrap());
+        let hi = u16::from_le_bytes(slot[0x82..0x84].try_into().unwrap());
+        assert_eq!(lo, (want & 0xffff) as u16, "inode {check}: i_checksum_lo");
+        assert_eq!(hi, (want >> 16) as u16, "inode {check}: i_checksum_hi");
+    }
+    // The image still round-trips through open + read.
+    let re = Ext::open(&mut dev).unwrap();
+    assert_eq!(read_path(&re, &mut dev, "/f"), b"hello");
+}
+
+#[test]
+fn inode_checksum_128_byte_inode_matches_kernel() {
+    let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+    let opts = FormatOpts {
+        uuid: [0x71; 16],
+        ..ext4_opts()
+    };
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    let ino = add_file(&mut ext, &mut dev, INO_ROOT_DIR, b"f", b"hello");
+    ext.flush(&mut dev).unwrap();
+    let slot = raw_inode_slot(&ext, &mut dev, ino);
+    assert_eq!(slot.len(), 128);
+    let want = kernel_inode_csum(&opts.uuid, ino, &slot);
+    let lo = u16::from_le_bytes(slot[0x7C..0x7E].try_into().unwrap());
+    assert_eq!(lo, (want & 0xffff) as u16);
+}
+
+/// A 256-byte inode staged from disk (patch_inode path) must keep the
+/// extended-area bytes it had — nanosecond timestamps, project id,
+/// in-inode xattrs written by mke2fs or the kernel.
+#[test]
+fn disk_resident_inode_tail_survives_patch_and_flush() {
+    let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+    // ext2 (no metadata_csum) so the patched slot needs no re-stamp.
+    let opts = FormatOpts {
+        kind: FsKind::Ext2,
+        inode_size: 256,
+        ..ext4_opts()
+    };
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    let ino = add_file(&mut ext, &mut dev, INO_ROOT_DIR, b"f", b"hello");
+    ext.flush(&mut dev).unwrap();
+
+    // Scribble a marker into the inode's extended area (past the 32
+    // bytes of i_extra_isize fields) directly on disk.
+    let ipg = ext.layout.inodes_per_group;
+    let off = ext.layout.groups[((ino - 1) / ipg) as usize].inode_table as u64 * 4096
+        + ((ino - 1) % ipg) as u64 * 256;
+    dev.write_at(off + 160, &[0xC7; 64]).unwrap();
+
+    let mut re = Ext::open(&mut dev).unwrap();
+    re.chmod(&mut dev, ino, 0o600).unwrap();
+    re.flush(&mut dev).unwrap();
+
+    let slot = raw_inode_slot(&re, &mut dev, ino);
+    assert_eq!(
+        u16::from_le_bytes(slot[0..2].try_into().unwrap()) & 0o7777,
+        0o600
+    );
+    assert_eq!(&slot[160..224], &[0xC7; 64], "extended area was clobbered");
+    assert_eq!(
+        u16::from_le_bytes(slot[128..130].try_into().unwrap()),
+        32,
+        "i_extra_isize preserved"
+    );
+}
+
+// ────────────── findings 8 / 9 / 13: inline_data handling ──────────────
+
+#[test]
+fn inline_data_requires_256_byte_inodes() {
+    let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+    let opts = FormatOpts {
+        inline_data: true,
+        ..ext4_opts()
+    };
+    let err = Ext::format_with(&mut dev, &opts).unwrap_err();
+    assert!(matches!(err, crate::Error::InvalidArgument(_)), "{err:?}");
+}
+
+/// With 256-byte inodes the `system.data` marker must live in the
+/// in-inode xattr area (no external xattr block, no data block), the
+/// body reads back, and the rw / truncate paths refuse the inode.
+#[test]
+fn inline_data_marker_lives_in_inode_and_rw_is_refused() {
+    use crate::fs::{Filesystem, OpenFlags};
+    let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+    let opts = FormatOpts {
+        inline_data: true,
+        inode_size: 256,
+        ..ext4_opts()
+    };
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    let body = b"forty bytes of inline payload go here!!!";
+    assert!(body.len() <= 60);
+    let ino = add_file(&mut ext, &mut dev, INO_ROOT_DIR, b"small", body);
+    ext.flush(&mut dev).unwrap();
+
+    let mut re = Ext::open(&mut dev).unwrap();
+    let inode = re.read_inode(&mut dev, ino).unwrap();
+    assert_ne!(inode.flags & constants::EXT4_INLINE_DATA_FL, 0);
+    assert_eq!(
+        inode.file_acl, 0,
+        "marker must not use an external xattr block"
+    );
+    assert_eq!(inode.blocks_512, 0);
+    let xs = re.read_xattrs(&mut dev, ino).unwrap();
+    assert_eq!(xs.len(), 1);
+    assert_eq!(xs[0].name, "system.data");
+    assert!(xs[0].value.is_empty());
+    assert_eq!(read_path(&re, &mut dev, "/small"), body);
+
+    let err = re
+        .open_file_rw(
+            &mut dev,
+            std::path::Path::new("/small"),
+            OpenFlags::default(),
+            None,
+        )
+        .err()
+        .expect("rw on inline-data inode must be refused");
+    assert!(matches!(err, crate::Error::Unsupported(_)), "{err:?}");
+    let err = re.truncate(&mut dev, ino, 3).unwrap_err();
+    assert!(matches!(err, crate::Error::Unsupported(_)), "{err:?}");
+    // Nothing above corrupted the image.
+    assert_eq!(read_path(&re, &mut dev, "/small"), body);
+}
+
+/// An inline-data inode whose `i_size` exceeds what `i_block` plus the
+/// `system.data` value hold used to index past the 60-byte array and
+/// panic; it must now be a clean error.
+#[test]
+fn inline_data_oversized_claim_is_an_error_not_a_panic() {
+    let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+    // ext2 flavour: no metadata_csum, so the forged inode needs no CRC.
+    let opts = FormatOpts {
+        kind: FsKind::Ext2,
+        inline_data: true,
+        inode_size: 256,
+        ..ext4_opts()
+    };
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    let ino = add_file(&mut ext, &mut dev, INO_ROOT_DIR, b"small", b"tiny");
+    ext.flush(&mut dev).unwrap();
+    let ipg = ext.layout.inodes_per_group;
+    let off = ext.layout.groups[((ino - 1) / ipg) as usize].inode_table as u64 * 4096
+        + ((ino - 1) % ipg) as u64 * 256;
+    // i_size_lo at offset 4 → 100 bytes, more than i_block (60) + the
+    // empty marker value can provide.
+    dev.write_at(off + 4, &100u32.to_le_bytes()).unwrap();
+    let re = Ext::open(&mut dev).unwrap();
+    let err = re
+        .open_file_reader(&mut dev, ino)
+        .err()
+        .expect("must error");
+    assert!(matches!(err, crate::Error::InvalidImage(_)), "{err:?}");
+}
+
 // ─────────────────── finding 2: superblock raw carry ───────────────────
 
 /// Patch unmodelled superblock fields directly on the device, open,

@@ -201,6 +201,30 @@ pub fn plan_layout(
     log_groups_per_flex: u8,
     use_64bit: bool,
 ) -> crate::Result<Layout> {
+    plan_layout_sized(
+        block_size,
+        blocks_count,
+        inodes_count,
+        sparse_super_mode,
+        log_groups_per_flex,
+        use_64bit,
+        INODE_SIZE_DYNAMIC,
+    )
+}
+
+/// [`plan_layout`] with an explicit on-disk inode size. `inode_size`
+/// must be a power of two in `128..=block_size` (the kernel's rule);
+/// larger inodes widen every inode table and give each inode an
+/// extended area (`i_extra_isize` + in-inode xattrs).
+pub fn plan_layout_sized(
+    block_size: u32,
+    blocks_count: u32,
+    inodes_count: u32,
+    sparse_super_mode: SparseSuperMode,
+    log_groups_per_flex: u8,
+    use_64bit: bool,
+    inode_size: u16,
+) -> crate::Result<Layout> {
     if !block_size.is_power_of_two() || block_size < 1024 {
         return Err(crate::Error::InvalidArgument(format!(
             "ext: block_size must be a power of two ≥ 1024, got {block_size}"
@@ -219,6 +243,14 @@ pub fn plan_layout(
     if log_groups_per_flex > 5 {
         return Err(crate::Error::InvalidArgument(format!(
             "ext: log_groups_per_flex {log_groups_per_flex} > 5 (max flex unit = 32 groups)"
+        )));
+    }
+    if inode_size < INODE_SIZE_DYNAMIC
+        || inode_size as u32 > block_size
+        || !inode_size.is_power_of_two()
+    {
+        return Err(crate::Error::InvalidArgument(format!(
+            "ext: inode_size must be a power of two in 128..={block_size}, got {inode_size}"
         )));
     }
 
@@ -269,7 +301,6 @@ pub fn plan_layout(
     // bitmaps are exactly full.
     let inodes_count = inodes_per_group * num_groups;
 
-    let inode_size = INODE_SIZE_DYNAMIC;
     let inode_table_bytes = inodes_per_group as u64 * inode_size as u64;
     let inode_table_blocks = inode_table_bytes.div_ceil(block_size as u64) as u32;
 

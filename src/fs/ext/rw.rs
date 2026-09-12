@@ -1240,6 +1240,7 @@ pub(crate) fn open_file_rw_ext<'a>(
     };
 
     let inode = ext.read_inode(dev, ino)?;
+    reject_inline_data(&inode, ino)?;
     let mut len = inode.file_size();
 
     let mut handle = Ext2FileHandle::new(ext, dev, ino, len)?;
@@ -1283,8 +1284,23 @@ pub fn open_file_rw_ext_by_inode<'a>(
             inode.mode
         )));
     }
+    reject_inline_data(&inode, ino)?;
     let len = inode.file_size();
     Ext2FileHandle::new(ext, dev, ino, len)
+}
+
+/// The rw handle addresses file bytes through `i_block` as block
+/// pointers / an extent tree. On an `EXT4_INLINE_DATA_FL` inode those 60
+/// bytes *are* the file body, so a write would treat file contents as
+/// block numbers and scribble over unrelated blocks. Refuse cleanly.
+pub(crate) fn reject_inline_data(inode: &super::Inode, ino: u32) -> Result<()> {
+    if inode.flags & constants::EXT4_INLINE_DATA_FL != 0 {
+        return Err(crate::Error::Unsupported(format!(
+            "ext: inode {ino} stores its data inline (EXT4_INLINE_DATA_FL); in-place \
+             writes and truncation of inline-data files are not supported"
+        )));
+    }
+    Ok(())
 }
 
 #[inline]

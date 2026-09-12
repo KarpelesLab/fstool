@@ -1661,6 +1661,9 @@ fn ext4_inline_data_stores_small_files_in_inode() {
         inodes_count: 64,
         journal_blocks: 1024,
         inline_data: true,
+        // inline_data needs the in-inode xattr area for its
+        // `system.data` marker, so 256-byte inodes are mandatory.
+        inode_size: 256,
         ..FormatOpts::default()
     };
     let tmp = NamedTempFile::new().unwrap();
@@ -1696,11 +1699,11 @@ fn ext4_inline_data_stores_small_files_in_inode() {
         "EXT4_INLINE_DATA_FL must be set on inline inodes, flags={:#x}",
         inode.flags
     );
-    // The data itself sits in i_block (no file data block). With our
-    // default inode_size = 128, the kernel-required `system.data`
-    // marker xattr still costs an external 1-block xattr region; once
-    // inode_size is bumped to 256+ the marker would fit inline and
-    // `blocks_512` could drop to zero.
+    // The data sits in i_block and the kernel-required `system.data`
+    // marker xattr lives in the inode's extended area: no data block,
+    // no external xattr block.
+    assert_eq!(inode.blocks_512, 0, "inline file must not own any block");
+    assert_eq!(inode.file_acl, 0, "marker xattr must be in-inode");
 
     let mut got = Vec::new();
     ext.open_file_reader(&mut dev, ino)
