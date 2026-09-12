@@ -89,6 +89,12 @@ const INOBT_RECS_PER_LEAF: usize = (XFS_BLOCKSIZE as usize - XFS_BTREE_SBLOCK_V5
 /// 4 B pointer. The pointer array begins at `header + maxrecs * 4`.
 const INOBT_PTRS_PER_NODE: usize = (XFS_BLOCKSIZE as usize - XFS_BTREE_SBLOCK_V5_SIZE) / 8;
 
+/// Free-space B+tree fan-out: each BNO / CNT leaf record is a 4-byte
+/// start block plus a 4-byte length, so one leaf holds 505 records at
+/// the writer's 4 KiB block size. The writer emits single-leaf
+/// free-space trees only, which caps how fragmented an AG may get.
+const ABT_RECS_PER_LEAF: usize = (XFS_BLOCKSIZE as usize - XFS_BTREE_SBLOCK_V5_SIZE) / 8;
+
 /// Special-file kind for [`Xfs::add_device`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceKind {
@@ -252,6 +258,36 @@ struct AgState {
     /// a fresh allocation tries the most recently freed extent before
     /// bumping the pointer.
     freed_extents: Vec<(u32, u32)>,
+    /// AG-relative blocks reserved for the INOBT's leaf blocks when the
+    /// tree needs two levels (block 6 becomes the root node). Held in
+    /// the persistent state — and therefore excluded from the free-space
+    /// B+trees and from further allocation — so a flush cannot hand the
+    /// same blocks out twice. Empty for a single-leaf INOBT, whose leaf
+    /// is the pre-reserved block 6.
+    inobt_leaves: Vec<u32>,
+}
+
+/// The AG's free space as BNO/CNT leaf records: every explicitly freed
+/// extent plus whatever the bump pointer has not handed out yet, sorted
+/// by start block and coalesced.
+fn coalesce_free_extents(st: &AgState, this_ag_blocks: u32) -> Vec<(u32, u32)> {
+    let mut extents: Vec<(u32, u32)> = st.freed_extents.clone();
+    let tail = this_ag_blocks.saturating_sub(st.next_agblock);
+    if tail > 0 {
+        extents.push((st.next_agblock, tail));
+    }
+    extents.sort_by_key(|(s, _)| *s);
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(extents.len());
+    for (s, c) in extents {
+        if let Some((ls, lc)) = out.last_mut()
+            && *ls + *lc == s
+        {
+            *lc += c;
+            continue;
+        }
+        out.push((s, c));
+    }
+    out
 }
 
 impl AgState {
@@ -322,6 +358,7 @@ impl WriteState {
                 next_agblock,
                 chunks,
                 freed_extents: Vec::new(),
+                inobt_leaves: Vec::new(),
             });
         }
         Self {
@@ -525,6 +562,7 @@ impl Xfs {
                 next_agblock,
                 chunks,
                 freed_extents,
+                inobt_leaves: Vec::new(),
             });
         }
 
@@ -2249,6 +2287,68 @@ impl Xfs {
             + agblk * (self.sb.blocksize as u64)
     }
 
+    /// Planning pass for [`flush_writes`](Self::flush_writes): reserve
+    /// the blocks the flush is about to consume and reject anything the
+    /// writer cannot express — all of it **before** the first device
+    /// write, so a rejected flush leaves the image exactly as it was
+    /// rather than half-rewritten.
+    ///
+    /// Two things happen here:
+    ///
+    /// * A two-level INOBT needs its leaf blocks carved out of the AG.
+    ///   They are taken through the persistent allocator and remembered
+    ///   in `AgState::inobt_leaves`, so a later `add_*` cannot be handed
+    ///   the same blocks and a repeated flush reuses the reservation
+    ///   instead of leaking a fresh one.
+    /// * The writer emits single-leaf BNO / CNT trees, which hold at
+    ///   most [`ABT_RECS_PER_LEAF`] free-space records per AG. Past that
+    ///   the flush is refused up front.
+    fn plan_flush(&mut self) -> Result<()> {
+        let agcount = self.ws_mut()?.ags.len() as u32;
+        let ag_sizes: Vec<u32> = (0..agcount)
+            .map(|ag| self.ag_block_count(ag).max(1))
+            .collect();
+        let ws = self.ws_mut()?;
+        for ag in 0..agcount {
+            let this_ag_blocks = ag_sizes[ag as usize];
+            let st = &mut ws.ags[ag as usize];
+            let n_chunks = st.chunks.len();
+            let n_leaves = n_chunks.div_ceil(INOBT_RECS_PER_LEAF).max(1);
+            if n_leaves > INOBT_PTRS_PER_NODE {
+                return Err(crate::Error::Unsupported(format!(
+                    "xfs: ag {ag}: INOBT would need more than 2 levels                      ({n_chunks} inode chunks, {INOBT_PTRS_PER_NODE} leaves per node)"
+                )));
+            }
+            // Only a multi-leaf tree needs blocks beyond the reserved
+            // root at AG block 6.
+            let need = if n_leaves > 1 { n_leaves as u32 } else { 0 };
+            if st.inobt_leaves.len() as u32 != need {
+                // Hand any stale reservation back before taking a fresh
+                // contiguous run (the leaves are chained siblings).
+                for b in std::mem::take(&mut st.inobt_leaves) {
+                    st.freed_extents.push((b, 1));
+                }
+                if need > 0 {
+                    let start = st.next_agblock;
+                    if start.checked_add(need).is_none_or(|e| e > this_ag_blocks) {
+                        return Err(crate::Error::InvalidArgument(format!(
+                            "xfs: ag {ag} has no room for {need} INOBT leaf blocks                              (bump pointer at {start} of {this_ag_blocks})"
+                        )));
+                    }
+                    st.next_agblock = start + need;
+                    st.inobt_leaves = (start..start + need).collect();
+                }
+            }
+            let records = coalesce_free_extents(st, this_ag_blocks).len();
+            if records > ABT_RECS_PER_LEAF {
+                return Err(crate::Error::Unsupported(format!(
+                    "xfs: ag {ag} free space is split into {records} extents but a                      single-leaf BNO/CNT holds at most {ABT_RECS_PER_LEAF};                      multi-level free-space B+trees are not implemented"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Flush in-memory allocator state to disk: rewrite the AGF / AGI /
     /// BNO / CNT / INOBT roots + the superblock counters to reflect the
     /// current `WriteState`. Multi-AG safe: every AG's headers and
@@ -2268,8 +2368,10 @@ impl Xfs {
         // Serialize any pending directory batches first, so the AG
         // free-space / inode accounting below reflects the final state.
         self.flush_dir_batches(dev)?;
+        // Reserve blocks + reject what we cannot express BEFORE writing
+        // anything, so a failure never leaves a half-rewritten image.
+        self.plan_flush()?;
         let agblocks = self.sb.agblocks;
-        let total_blocks = self.sb.dblocks as u32;
         let uuid = self.uuid_for_writes();
         let ws = self
             .write_state
@@ -2282,6 +2384,9 @@ impl Xfs {
             .clone();
         let bs = XFS_BLOCKSIZE as u64;
         let agcount = ws.ags.len() as u32;
+        let ag_sizes: Vec<u32> = (0..agcount)
+            .map(|ag| self.ag_block_count(ag).max(1))
+            .collect();
 
         let mut total_free_blocks_u64: u64 = 0;
 
@@ -2289,48 +2394,19 @@ impl Xfs {
             let ag = ag_idx as u32;
             let ag_byte = (ag as u64) * (agblocks as u64) * bs;
             // The last AG can be short; quote the real block count.
-            let this_ag_blocks = if ag == agcount - 1 {
-                total_blocks.saturating_sub(ag * agblocks).max(1)
-            } else {
-                agblocks
-            };
-            // Plan the INOBT. A single leaf (≤ INOBT_RECS_PER_LEAF chunks)
-            // lives at the pre-reserved block 6 (level 0, AGI level 1).
-            // More chunks need a 2-level tree: block 6 becomes the root
-            // node (level 1) and the leaves are carved off the AG tail so
-            // they're excluded from the free-space btrees below.
+            let this_ag_blocks = ag_sizes[ag_idx];
+            // The INOBT shape was decided (and its leaf blocks reserved)
+            // by `plan_flush`. A single leaf (≤ INOBT_RECS_PER_LEAF
+            // chunks) lives at the pre-reserved block 6 (level 0, AGI
+            // level 1); more chunks make block 6 the root node (level 1)
+            // over the reserved leaves.
             let n_chunks = ag_state.chunks.len();
-            let n_leaves = n_chunks.div_ceil(INOBT_RECS_PER_LEAF).max(1);
-            if n_leaves > INOBT_PTRS_PER_NODE {
-                return Err(crate::Error::Unsupported(
-                    "xfs: INOBT needs >2 levels (too many inode chunks)".into(),
-                ));
-            }
-            let inobt_multi = n_leaves > 1;
-            let inobt_leaf_start = ag_state.next_agblock;
-            let inobt_extra = if inobt_multi { n_leaves as u32 } else { 0 };
-            let effective_next = ag_state.next_agblock + inobt_extra;
+            let inobt_multi = !ag_state.inobt_leaves.is_empty();
+            let n_leaves = ag_state.inobt_leaves.len();
 
             // Collect this AG's free-space extents: the trailing
-            // bump-pointer region (after any INOBT leaves) plus any
-            // explicitly freed extents.
-            let mut extents: Vec<(u32, u32)> = ag_state.freed_extents.clone();
-            let tail_free = this_ag_blocks.saturating_sub(effective_next);
-            if tail_free > 0 {
-                extents.push((effective_next, tail_free));
-            }
-            // Sort by start-block, then coalesce adjacent extents.
-            extents.sort_by_key(|(s, _)| *s);
-            let mut coalesced: Vec<(u32, u32)> = Vec::with_capacity(extents.len());
-            for (s, c) in extents {
-                if let Some((ls, lc)) = coalesced.last_mut()
-                    && *ls + *lc == s
-                {
-                    *lc += c;
-                    continue;
-                }
-                coalesced.push((s, c));
-            }
+            // bump-pointer region plus any explicitly freed extents.
+            let coalesced = coalesce_free_extents(ag_state, this_ag_blocks);
             let total_free_in_ag: u32 = coalesced.iter().map(|(_, c)| *c).sum();
             let longest = coalesced.iter().map(|(_, c)| *c).max().unwrap_or(0);
             total_free_blocks_u64 += total_free_in_ag as u64;
@@ -2427,10 +2503,14 @@ impl Xfs {
                     let lo = j * per_leaf;
                     let hi = ((j + 1) * per_leaf).min(n_chunks);
                     let recs = &ag_state.chunks[lo..hi];
-                    let leaf_agblk = inobt_leaf_start + j as u32;
-                    let leftsib = if j > 0 { leaf_agblk - 1 } else { u32::MAX };
+                    let leaf_agblk = ag_state.inobt_leaves[j];
+                    let leftsib = if j > 0 {
+                        ag_state.inobt_leaves[j - 1]
+                    } else {
+                        u32::MAX
+                    };
                     let rightsib = if j + 1 < n_leaves {
-                        leaf_agblk + 1
+                        ag_state.inobt_leaves[j + 1]
                     } else {
                         u32::MAX
                     };
@@ -3674,5 +3754,105 @@ mod tests {
             std::io::Read::read_to_string(&mut r, &mut got).unwrap();
             assert_eq!(got, format!("contents-of-file-{i:03}"));
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Findings 29 / 30 — flush_writes must reserve the INOBT leaf
+    // blocks it carves, and must refuse an over-fragmented AG before it
+    // has written anything.
+    // -----------------------------------------------------------------
+
+    fn snapshot(dev: &mut MemoryBackend) -> Vec<u8> {
+        let mut all = vec![0u8; dev.total_size() as usize];
+        dev.read_at(0, &mut all).unwrap();
+        all
+    }
+
+    fn fresh_16m() -> (MemoryBackend, super::super::Xfs) {
+        let mut dev = MemoryBackend::new(16 * 1024 * 1024);
+        let opts = super::super::FormatOpts::default();
+        let mut xfs = super::super::format(&mut dev, &opts).unwrap();
+        xfs.begin_writes([0u8; 16]);
+        (dev, xfs)
+    }
+
+    #[test]
+    fn flush_reserves_inobt_leaf_blocks_instead_of_handing_them_out_twice() {
+        let (mut dev, mut xfs) = fresh_16m();
+        // Force a two-level INOBT: one more chunk than a single leaf holds.
+        let want_chunks = INOBT_RECS_PER_LEAF + 1;
+        while xfs.write_state.as_ref().unwrap().ags[0].chunks.len() < want_chunks {
+            xfs.alloc_inode(&mut dev).unwrap();
+        }
+        xfs.flush_writes(&mut dev).unwrap();
+
+        let leaves = xfs.write_state.as_ref().unwrap().ags[0]
+            .inobt_leaves
+            .clone();
+        assert_eq!(
+            leaves.len(),
+            want_chunks.div_ceil(INOBT_RECS_PER_LEAF),
+            "expected a multi-leaf INOBT reservation"
+        );
+        // Every leaf block must carry the INOBT magic on disk.
+        let bs = XFS_BLOCKSIZE as u64;
+        for &b in &leaves {
+            let mut blk = vec![0u8; 4];
+            dev.read_at((b as u64) * bs, &mut blk).unwrap();
+            assert_eq!(
+                u32::from_be_bytes(blk.try_into().unwrap()),
+                XFS_IBT_CRC_MAGIC,
+                "ag block {b} is not an INOBT leaf"
+            );
+        }
+
+        // A later allocation must not be handed those same blocks
+        // (single AG, so FSB == AG block).
+        let mut handed = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            handed.insert(xfs.alloc_blocks_fsb(1).unwrap() as u32);
+        }
+        for b in &leaves {
+            assert!(
+                !handed.contains(b),
+                "INOBT leaf block {b} was allocated a second time"
+            );
+        }
+
+        // A repeated flush reuses the reservation rather than leaking a
+        // fresh set of blocks, and the leaves still read back as INOBT.
+        xfs.flush_writes(&mut dev).unwrap();
+        assert_eq!(
+            xfs.write_state.as_ref().unwrap().ags[0].inobt_leaves,
+            leaves
+        );
+    }
+
+    #[test]
+    fn flush_refuses_overfragmented_ag_without_writing_anything() {
+        let (mut dev, mut xfs) = fresh_16m();
+        xfs.flush_writes(&mut dev).unwrap();
+
+        // Carve a run, then hand back every other block so the AG's free
+        // list needs more records than one BNO/CNT leaf can hold.
+        let holes = ABT_RECS_PER_LEAF as u32 + 8;
+        let base = xfs.alloc_blocks_fsb(2 * holes).unwrap();
+        for i in 0..holes as u64 {
+            xfs.free_blocks_fsb(base + 2 * i, 1).unwrap();
+        }
+
+        let before = snapshot(&mut dev);
+        let err = xfs.flush_writes(&mut dev).unwrap_err();
+        match &err {
+            crate::Error::Unsupported(m) => assert!(
+                m.contains(&ABT_RECS_PER_LEAF.to_string()),
+                "error should name the per-leaf record limit, got: {m}"
+            ),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+        assert!(
+            snapshot(&mut dev) == before,
+            "flush_writes modified the image before reporting the failure"
+        );
     }
 }
