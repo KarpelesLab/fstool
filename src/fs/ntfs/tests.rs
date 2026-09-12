@@ -1047,6 +1047,127 @@ fn writer_format_then_open_reads_boot_sector() {
     assert_eq!(ntfs2.mft_record_size(), 1024);
 }
 
+/// The USA fixup stride is 512 bytes on every NTFS volume, whatever the
+/// logical sector size — a 4 KiB-sector volume still protects each 512-byte
+/// block of its 1 KiB records (ntfs-3g `NTFS_BLOCK_SIZE`, ntfs3
+/// `SECTOR_SIZE`). Format with 4 KiB sectors, then make sure the record
+/// shape is right and a cold reopen can walk and mutate the volume.
+#[test]
+fn writer_format_with_4k_sectors_uses_512_byte_fixup_stride() {
+    use crate::fs::{Filesystem, OpenFlags};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::path::Path;
+
+    let mut dev = MemoryBackend::new(16 * 1024 * 1024);
+    let opts = FormatOpts {
+        bytes_per_sector: 4096,
+        sectors_per_cluster: 1,
+        volume_label: "4K".to_string(),
+        ..Default::default()
+    };
+    let mut ntfs = Ntfs::format(&mut dev, &opts).unwrap();
+    assert_eq!(ntfs.bytes_per_sector(), 4096);
+    assert_eq!(ntfs.cluster_size(), 4096);
+    ntfs.create_dir(&mut dev, "/d", FileMeta::default())
+        .unwrap();
+    ntfs.create_file(
+        &mut dev,
+        "/d/f.txt",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"four-k".to_vec())),
+            len: 6,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+
+    // Record 0 on disk: 1024 / 512 + 1 = 3 USA entries, not 1024 / 4096 + 1.
+    let mft_off = ntfs.writer.as_ref().unwrap().mft_offset(0).unwrap();
+    let mut raw = vec![0u8; 1024];
+    dev.read_at(mft_off, &mut raw).unwrap();
+    assert_eq!(u16::from_le_bytes([raw[6], raw[7]]), 3, "usa_size");
+    mft::apply_fixup(&mut raw, mft::NTFS_BLOCK_SIZE).unwrap();
+
+    // Cold reopen: read path (records + INDX blocks) and the write path
+    // (writer reconstruction, journal, record rewrite) must all agree on
+    // the stride.
+    let mut ro = Ntfs::open(&mut dev).unwrap();
+    let names: Vec<String> = ro
+        .list_path(&mut dev, "/d")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(names, vec!["f.txt".to_string()]);
+    let mut r = ro.open_file_reader(&mut dev, "/d/f.txt").unwrap();
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"four-k");
+    drop(r);
+    {
+        let mut h = ro
+            .open_file_rw(&mut dev, Path::new("/d/f.txt"), OpenFlags::default(), None)
+            .unwrap();
+        h.seek(SeekFrom::End(0)).unwrap();
+        h.write_all(b"!").unwrap();
+        h.sync().unwrap();
+    }
+    let mut again = Ntfs::open(&mut dev).unwrap();
+    let mut r = again.open_file_reader(&mut dev, "/d/f.txt").unwrap();
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"four-k!");
+}
+
+/// The cluster count comes from the BPB (`total_sectors / spc`), not the
+/// device size: the BPB excludes the last sector (backup boot sector), so
+/// the cluster overlapping it must never be allocatable — and a reopened
+/// volume must size its bitmap the same way the formatter did.
+#[test]
+fn cluster_count_follows_bpb_not_device_size() {
+    let size = 8 * 1024 * 1024u64;
+    let (mut dev, mut ntfs) = fresh_volume(size);
+    let sectors = size / 512;
+    assert_eq!(ntfs.boot_sector().total_sectors, sectors - 1);
+    let expect_clusters = (sectors - 1) / 8;
+    assert_eq!(expect_clusters, 2047);
+    {
+        let w = ntfs.writer.as_ref().unwrap();
+        assert_eq!(w.layout.total_clusters, expect_clusters);
+        assert_eq!(w.layout.bitmap.total, expect_clusters);
+        // Cluster 2047 (the one holding the backup boot sector) is
+        // outside the volume: the allocator reports it as unavailable.
+        assert!(w.layout.bitmap.is_set(2047));
+    }
+    ntfs.flush(&mut dev).unwrap();
+    // The backup boot sector sits in the BPB's last sector.
+    let mut primary = vec![0u8; 512];
+    let mut backup = vec![0u8; 512];
+    dev.read_at(0, &mut primary).unwrap();
+    dev.read_at((sectors - 1) * 512, &mut backup).unwrap();
+    assert_eq!(primary, backup);
+
+    // Reopen on a *larger* device: the reconstructed writer must still
+    // size everything from the BPB.
+    let mut big = MemoryBackend::new(size * 2);
+    big.write_at(0, dev.as_slice()).unwrap();
+    let mut ro = Ntfs::open(&mut big).unwrap();
+    ro.create_file(
+        &mut big,
+        "/x",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"x".to_vec())),
+            len: 1,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    let w = ro.writer.as_ref().unwrap();
+    assert_eq!(w.layout.total_clusters, expect_clusters);
+    assert_eq!(w.layout.bitmap.total, expect_clusters);
+}
+
 #[test]
 fn writer_format_volume_has_root_directory() {
     let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);

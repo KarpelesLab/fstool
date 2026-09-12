@@ -263,7 +263,7 @@ impl Ntfs {
             // Record 0 is at the very start of the MFT — its index times
             // record_size is zero, so the read offset is just `base`.
             dev.read_at(base, out)?;
-            mft::apply_fixup(out, self.boot.bytes_per_sector as usize)?;
+            mft::apply_fixup(out, mft::NTFS_BLOCK_SIZE)?;
             // Now decode record 0's attributes to find $DATA's run list.
             let header = mft::RecordHeader::parse(out)?;
             for attr_res in AttributeIter::new(out, header.first_attribute_offset as usize) {
@@ -338,7 +338,7 @@ impl Ntfs {
                 "ntfs: MFT record {rec} is past the end of $MFT"
             )));
         }
-        mft::apply_fixup(out, self.boot.bytes_per_sector as usize)?;
+        mft::apply_fixup(out, mft::NTFS_BLOCK_SIZE)?;
         Ok(())
     }
 
@@ -588,7 +588,7 @@ impl Ntfs {
                 crate::Error::InvalidImage(format!("ntfs: index VCN {vcn} not in run list"))
             })?;
             dev.read_at(phys, &mut block_buf)?;
-            mft::apply_fixup(&mut block_buf, self.boot.bytes_per_sector as usize)?;
+            mft::apply_fixup(&mut block_buf, mft::NTFS_BLOCK_SIZE)?;
             let blk_hdr = index::IndexBlockHeader::parse(&block_buf)?;
             let entries_start = blk_hdr.entries_start();
             let entries_len = blk_hdr.entries_byte_len();
@@ -1274,8 +1274,7 @@ impl Ntfs {
                         if visited.insert(phys) {
                             let mut blk = vec![0u8; block_size];
                             if dev.read_at(phys, &mut blk).is_ok()
-                                && mft::apply_fixup(&mut blk, self.boot.bytes_per_sector as usize)
-                                    .is_ok()
+                                && mft::apply_fixup(&mut blk, mft::NTFS_BLOCK_SIZE).is_ok()
                                 && let Ok(blk_hdr) = index::IndexBlockHeader::parse(&blk)
                             {
                                 let s = blk_hdr.entries_start();
@@ -1974,16 +1973,13 @@ impl crate::fs::Filesystem for Ntfs {
 
         let rec_no = self.lookup_path(dev, s)?;
 
-        let (rec_size, sector_size) = {
-            let w = self
-                .writer
-                .as_ref()
-                .ok_or_else(|| crate::Error::Unsupported("ntfs: writer not initialised".into()))?;
-            (
-                w.layout.mft_record_size as usize,
-                w.layout.bytes_per_sector as usize,
-            )
-        };
+        let rec_size = self
+            .writer
+            .as_ref()
+            .ok_or_else(|| crate::Error::Unsupported("ntfs: writer not initialised".into()))?
+            .layout
+            .mft_record_size as usize;
+        let sector_size = mft::NTFS_BLOCK_SIZE;
         let mft_off = self
             .writer
             .as_ref()

@@ -56,7 +56,7 @@ pub struct NtfsFileHandle<'a> {
     rec_no: u64,
     /// MFT record byte size (cached).
     rec_size: usize,
-    /// Logical sector size (used for USA fixup install).
+    /// USA fixup stride — always [`mft::NTFS_BLOCK_SIZE`].
     sector_size: usize,
     /// Cluster size in bytes.
     cluster_size: u64,
@@ -749,7 +749,7 @@ fn locate_logfile(fs: &mut super::Ntfs, dev: &mut dyn BlockDevice) -> Result<(u6
         let w = fs.writer.as_ref().expect("writer present");
         (
             w.layout.mft_record_size as usize,
-            w.layout.bytes_per_sector as usize,
+            mft::NTFS_BLOCK_SIZE,
             w.cluster_size,
         )
     };
@@ -993,7 +993,7 @@ impl super::Ntfs {
             let w = self.writer.as_ref().expect("writer present");
             (
                 w.layout.mft_record_size as usize,
-                w.layout.bytes_per_sector as usize,
+                mft::NTFS_BLOCK_SIZE,
                 w.cluster_size,
             )
         };

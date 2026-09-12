@@ -244,10 +244,7 @@ impl super::Ntfs {
         ];
         let (rec_size, sector_size) = {
             let w = self.writer.as_ref().expect("writer present");
-            (
-                w.layout.mft_record_size as usize,
-                w.layout.bytes_per_sector as usize,
-            )
+            (w.layout.mft_record_size as usize, mft::NTFS_BLOCK_SIZE)
         };
         for &rec_no in SYSTEM_RECS {
             let off = self
@@ -423,7 +420,7 @@ impl super::Ntfs {
             rec_no,
             mft::RecordHeader::FLAG_IN_USE,
             &[si, fn_attr, data_attr],
-            writer.layout.bytes_per_sector as usize,
+            mft::NTFS_BLOCK_SIZE,
             1,
         )?;
         let off = writer.mft_offset(rec_no)?;
@@ -489,7 +486,7 @@ impl super::Ntfs {
             rec_no,
             mft::RecordHeader::FLAG_IN_USE | mft::RecordHeader::FLAG_DIRECTORY,
             &[si, fn_attr, idx_root],
-            writer.layout.bytes_per_sector as usize,
+            mft::NTFS_BLOCK_SIZE,
             1,
         )?;
         let off = writer.mft_offset(rec_no)?;
@@ -590,7 +587,7 @@ impl super::Ntfs {
             rec_no,
             mft::RecordHeader::FLAG_IN_USE,
             &[si, fn_attr, empty_data, reparse_attr],
-            writer.layout.bytes_per_sector as usize,
+            mft::NTFS_BLOCK_SIZE,
             1,
         )?;
         let off = writer.mft_offset(rec_no)?;
@@ -763,13 +760,7 @@ impl super::Ntfs {
                 .as_ref()
                 .expect("writer present")
                 .mft_offset(target_rec)?;
-            let sector_size = self
-                .writer
-                .as_ref()
-                .expect("writer present")
-                .layout
-                .bytes_per_sector as usize;
-            mft::install_fixup(&mut rec_buf, sector_size, 1);
+            mft::install_fixup(&mut rec_buf, mft::NTFS_BLOCK_SIZE, 1);
             dev.write_at(off, &rec_buf)?;
         } else {
             // 2) Free clusters from every non-resident stream.
@@ -800,10 +791,7 @@ impl super::Ntfs {
     ) -> Result<()> {
         let (rec_size, sector_size) = {
             let w = self.writer.as_ref().expect("writer present");
-            (
-                w.layout.mft_record_size as usize,
-                w.layout.bytes_per_sector as usize,
-            )
+            (w.layout.mft_record_size as usize, mft::NTFS_BLOCK_SIZE)
         };
         let off = self
             .writer
@@ -844,7 +832,7 @@ impl super::Ntfs {
     ) -> Result<()> {
         let writer = self.writer.as_mut().expect("writer present");
         let rec_size = writer.layout.mft_record_size as usize;
-        let sector_size = writer.layout.bytes_per_sector as usize;
+        let sector_size = mft::NTFS_BLOCK_SIZE;
         let cluster_size = writer.cluster_size;
         let block_size = writer.layout.index_record_size as usize;
 
@@ -929,7 +917,7 @@ impl super::Ntfs {
         mut rec_bytes: Vec<u8>,
     ) -> Result<()> {
         let writer = self.writer.as_mut().expect("writer present");
-        let sector_size = writer.layout.bytes_per_sector as usize;
+        let sector_size = mft::NTFS_BLOCK_SIZE;
         let off = writer.mft_offset(target_rec)?;
 
         // Header: flags at 0x16 (u16), seq at 0x10 (u16).
@@ -979,7 +967,10 @@ impl super::Ntfs {
         let bytes_per_sector = self.boot.bytes_per_sector;
         let sectors_per_cluster = self.boot.sectors_per_cluster;
         let index_record_size = self.boot.index_record_size();
-        let total_clusters = dev.total_size() / cluster_size;
+        // Cluster count from the BPB (`total_sectors` excludes the backup
+        // boot sector), as ntfs-3g / ntfs3 compute it — the device may be
+        // larger than the volume, and $Bitmap is sized to the volume.
+        let total_clusters = self.boot.total_sectors / u64::from(sectors_per_cluster);
 
         // --- $MFT (record 0): $DATA extents + $BITMAP ---
         let mft_set = self.load_record_set(dev, 0)?;
@@ -1123,6 +1114,11 @@ impl super::Ntfs {
         let cluster_size = w.cluster_size;
         let rec_size = w.layout.mft_record_size as usize;
         let bps = w.layout.bytes_per_sector as usize;
+        // Sector count / backup-boot-sector position come from the BPB,
+        // not the device size: the volume may be smaller than its
+        // container, and the BPB's `total_sectors` already excludes the
+        // last sector (where the backup boot sector lives).
+        let bpb_total_sectors = self.boot.total_sectors;
 
         // 1) Restamp $Bitmap data.
         {
@@ -1160,7 +1156,7 @@ impl super::Ntfs {
                 w.layout.mft_bitmap_clusters,
                 filetime,
                 cluster_size,
-                bps,
+                mft::NTFS_BLOCK_SIZE,
             );
             // First extent's start is record 0's home.
             let off = w.layout.mft_extents[0].0 * cluster_size;
@@ -1183,8 +1179,7 @@ impl super::Ntfs {
         {
             let mut boot_buf = vec![0u8; bps];
             dev.read_at(0, &mut boot_buf)?;
-            let last_lba_offset =
-                (w.layout.total_clusters * (cluster_size / bps as u64) - 1) * bps as u64;
+            let last_lba_offset = bpb_total_sectors * bps as u64;
             dev.write_at(last_lba_offset, &boot_buf)?;
         }
         w.dirty = false;
@@ -1255,7 +1250,7 @@ impl super::Ntfs {
         }
         let writer = self.writer.as_mut().expect("writer present");
         let rec_size = writer.layout.mft_record_size as usize;
-        let sector_size = writer.layout.bytes_per_sector as usize;
+        let sector_size = mft::NTFS_BLOCK_SIZE;
         // Read the directory record.
         let off = writer.mft_offset(dir_rec)?;
         let mut rec = vec![0u8; rec_size];
@@ -1302,7 +1297,7 @@ impl super::Ntfs {
     ) -> Result<()> {
         let writer = self.writer.as_mut().expect("writer present");
         let rec_size = writer.layout.mft_record_size as usize;
-        let sector_size = writer.layout.bytes_per_sector as usize;
+        let sector_size = mft::NTFS_BLOCK_SIZE;
         let cluster_size = writer.cluster_size;
         let block_size = writer.layout.index_record_size as usize;
 
@@ -1372,7 +1367,7 @@ impl super::Ntfs {
     ) -> Result<()> {
         let writer = self.writer.as_mut().expect("writer present");
         let rec_size = writer.layout.mft_record_size as usize;
-        let sector_size = writer.layout.bytes_per_sector as usize;
+        let sector_size = mft::NTFS_BLOCK_SIZE;
         let cluster_size = writer.cluster_size;
         let index_block_size = writer.layout.index_record_size as u64;
         let blocks_per_cluster = cluster_size / index_block_size;

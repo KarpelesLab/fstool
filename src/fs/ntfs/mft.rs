@@ -14,6 +14,14 @@
 use crate::Result;
 
 pub(crate) const FILE_RECORD_MAGIC: &[u8; 4] = b"FILE";
+
+/// Stride of the update-sequence-array fixup. NTFS protects every
+/// 512-byte block of a multi-sector record (`FILE`, `INDX`, `RSTR`,
+/// `RCRD`) regardless of the volume's logical sector size — ntfs-3g's
+/// `NTFS_BLOCK_SIZE` and the kernel's `SECTOR_SIZE` are both fixed at
+/// 512 in the fixup code. A 4 KiB-sector volume still carries
+/// `record_size / 512 + 1` USA entries.
+pub const NTFS_BLOCK_SIZE: usize = 512;
 pub(crate) const BAAD_RECORD_MAGIC: &[u8; 4] = b"BAAD";
 
 /// Apply the NTFS update-sequence-array fixup to an in-place record buffer.
@@ -22,6 +30,10 @@ pub(crate) const BAAD_RECORD_MAGIC: &[u8; 4] = b"BAAD";
 ///   - `usa_offset` at offset 4 (u16)
 ///   - `usa_size`   at offset 6 (u16; number of u16 entries = 1 USN + N
 ///     sector tails, so total sectors covered = usa_size - 1)
+///
+/// `sector_size` is the fixup stride; on-disk NTFS always uses
+/// [`NTFS_BLOCK_SIZE`] here (callers pass that constant), the parameter
+/// only exists so synthetic test fixtures can exercise other strides.
 ///
 /// The first entry is the USN. The remaining entries hold the original
 /// values that were displaced into the last two bytes of each

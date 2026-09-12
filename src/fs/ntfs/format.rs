@@ -263,7 +263,8 @@ pub fn build_boot_sector(
     // Sectors per track / heads / hidden sectors: harmless filler.
     b[24..26].copy_from_slice(&63u16.to_le_bytes());
     b[26..28].copy_from_slice(&255u16.to_le_bytes());
-    // Total sectors (-1 of volume sectors per NTFS convention).
+    // Total sectors (-1 of volume sectors per NTFS convention). Kept in
+    // step with `format_volume`'s `bpb_total_sectors`.
     let bpb_total = total_sectors.saturating_sub(1);
     b[0x28..0x30].copy_from_slice(&bpb_total.to_le_bytes());
     b[0x30..0x38].copy_from_slice(&mft_lcn.to_le_bytes());
@@ -896,6 +897,7 @@ pub fn build_boot_record(
     parent_ref: u64,
     total_bytes: u64,
     filetime: u64,
+    boot_bytes: u64,
     sector_size: usize,
 ) {
     let si = build_resident_attr(
@@ -906,13 +908,7 @@ pub fn build_boot_record(
         0,
     );
     let fn_value = build_file_name_value(
-        parent_ref,
-        "$Boot",
-        0x06,
-        sector_size as u64,
-        sector_size as u64,
-        filetime,
-        1,
+        parent_ref, "$Boot", 0x06, boot_bytes, boot_bytes, filetime, 1,
     );
     let fname = build_resident_attr(TYPE_FILE_NAME, &[], &fn_value, 0, 0);
     // $Boot's $DATA covers the boot sector (one cluster). LCN 0.
@@ -923,9 +919,9 @@ pub fn build_boot_record(
         &runs,
         0,
         0,
-        sector_size as u64,
-        sector_size as u64,
-        sector_size as u64,
+        boot_bytes,
+        boot_bytes,
+        boot_bytes,
         0,
         0,
     );
@@ -2141,7 +2137,13 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
         // It still works for other multiples, but we standardise here.
     }
     let total_sectors = total_size / bps as u64;
-    let total_clusters = total_size / cluster_size as u64;
+    // The BPB's `total_sectors` is one less than the sector count (the
+    // last sector holds the backup boot sector, outside the volume), and
+    // the cluster count every NTFS driver derives is `bpb_total / spc` —
+    // so the cluster overlapping that backup sector is never handed out
+    // by $Bitmap.
+    let bpb_total_sectors = total_sectors.saturating_sub(1);
+    let total_clusters = bpb_total_sectors / spc as u64;
 
     let rec_size = DEFAULT_MFT_RECORD_SIZE;
     let mft_record_field: i8 = -10; // 1 << 10 = 1024
@@ -2236,7 +2238,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             mft_bitmap_clusters,
             filetime,
             cluster_size as u64,
-            bps as usize,
+            mft::NTFS_BLOCK_SIZE,
         );
     }
     // Record 1: $MFTMirr
@@ -2251,7 +2253,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             mirror_clusters_n,
             filetime,
             cluster_size as u64,
-            bps as usize,
+            mft::NTFS_BLOCK_SIZE,
         );
     }
     // Record 2: $LogFile
@@ -2266,7 +2268,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             logfile_clusters,
             filetime,
             cluster_size as u64,
-            bps as usize,
+            mft::NTFS_BLOCK_SIZE,
         );
     }
     // Record 3: $Volume
@@ -2279,7 +2281,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             parent_root_ref,
             &opts.volume_label,
             filetime,
-            bps as usize,
+            mft::NTFS_BLOCK_SIZE,
         );
     }
     // Record 4: $AttrDef
@@ -2296,7 +2298,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             attrdef_clusters,
             filetime,
             cluster_size as u64,
-            bps as usize,
+            mft::NTFS_BLOCK_SIZE,
             "$AttrDef",
         );
     }
@@ -2304,7 +2306,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
     {
         let r = &mut mft_buf
             [(REC_ROOT as usize) * rec_size as usize..(REC_ROOT as usize + 1) * rec_size as usize];
-        build_root_record(r, rec_size as usize, filetime, bps as usize);
+        build_root_record(r, rec_size as usize, filetime, mft::NTFS_BLOCK_SIZE);
     }
     // Record 6: $Bitmap
     {
@@ -2319,7 +2321,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             bitmap_clusters,
             filetime,
             cluster_size as u64,
-            bps as usize,
+            mft::NTFS_BLOCK_SIZE,
         );
     }
     // Record 7: $Boot
@@ -2332,7 +2334,8 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             parent_root_ref,
             total_size,
             filetime,
-            bps as usize,
+            bps as u64,
+            mft::NTFS_BLOCK_SIZE,
         );
     }
     // Record 8: $BadClus
@@ -2346,7 +2349,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             total_clusters,
             filetime,
             cluster_size as u64,
-            bps as usize,
+            mft::NTFS_BLOCK_SIZE,
         );
     }
     // Record 9: $Secure
@@ -2363,7 +2366,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             sds_used,
             &sds_layouts,
             cluster_size as u64,
-            bps as usize,
+            mft::NTFS_BLOCK_SIZE,
         );
     }
     // Record 10: $UpCase
@@ -2379,7 +2382,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             upcase_clusters,
             filetime,
             cluster_size as u64,
-            bps as usize,
+            mft::NTFS_BLOCK_SIZE,
         );
     }
     // Record 11: $Extend
@@ -2391,7 +2394,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             rec_size as usize,
             parent_root_ref,
             filetime,
-            bps as usize,
+            mft::NTFS_BLOCK_SIZE,
         );
     }
     // Records 12..15: reserved placeholders.
@@ -2407,7 +2410,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             parent_root_ref,
             name,
             filetime,
-            bps as usize,
+            mft::NTFS_BLOCK_SIZE,
         );
     }
 
