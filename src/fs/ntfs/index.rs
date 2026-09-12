@@ -19,6 +19,24 @@ pub(crate) const INDX_RECORD_MAGIC: &[u8; 4] = b"INDX";
 pub const ENTRY_FLAG_HAS_CHILD: u32 = 0x01;
 pub const ENTRY_FLAG_LAST: u32 = 0x02;
 
+/// Byte size of one `$INDEX_ALLOCATION` VCN unit — what a child pointer
+/// (and an INDX block's own `vcn` field) is scaled by to reach a byte
+/// offset inside the allocation.
+///
+/// When an index block is at least a cluster, VCNs count clusters. When
+/// the cluster is *larger* than the index block, NTFS numbers index
+/// blocks in 512-byte units instead (ntfs-3g `vcn_size_bits`, ntfs3
+/// `indx->vbn2vbo_bits`), so consecutive blocks are
+/// `index_block_size / 512` VCNs apart. `clusters_per_index_block` in
+/// `$INDEX_ROOT` is the block size in the same unit.
+pub fn vcn_unit_bytes(cluster_size: u64, index_block_size: u64) -> u64 {
+    if cluster_size <= index_block_size {
+        cluster_size
+    } else {
+        super::mft::NTFS_BLOCK_SIZE as u64
+    }
+}
+
 /// Decoded $INDEX_ROOT header.
 #[derive(Debug, Clone)]
 pub struct IndexRootHeader {

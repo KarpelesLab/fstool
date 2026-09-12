@@ -45,6 +45,7 @@ use super::attribute::{AttributeIter, AttributeKind, FileName, TYPE_DATA, TYPE_F
 use super::format::{
     self, build_file_name_value, build_non_resident_attr, build_resident_attr, encode_run_list,
 };
+use super::index;
 use super::mft;
 use super::run_list::Extent;
 
@@ -492,9 +493,7 @@ impl<'a> NtfsFileHandle<'a> {
             redo_bytes: rec_buf.clone(),
             undo_bytes: old_rec,
         });
-        if let Some(entry) = self.build_index_entry_redo()? {
-            txn.push(entry);
-        }
+        txn.extend(self.build_index_entry_redo()?);
 
         // Commit through the journal: write LFS records, stamp restart
         // pages dirty, apply the in-place writes, stamp restart pages
@@ -505,10 +504,12 @@ impl<'a> NtfsFileHandle<'a> {
         Ok(())
     }
 
-    /// Build a `RedoEntry` for the parent directory's `$I30` size patch.
-    /// Returns `Ok(None)` if no patch applies (no matching entry, or the
-    /// bytes are already correct).
-    fn build_index_entry_redo(&mut self) -> Result<Option<super::logfile::RedoEntry>> {
+    /// Build the `RedoEntry`s for the parent directory's `$I30` size patch:
+    /// every node holding an entry for this record — the resident
+    /// `$INDEX_ROOT` and, for a promoted directory, each INDX block
+    /// reachable from it — gets its `$FILE_NAME` size pair refreshed.
+    /// Returns an empty vector when nothing changes.
+    fn build_index_entry_redo(&mut self) -> Result<Vec<super::logfile::RedoEntry>> {
         let parent_rec_no = self.parent_ref & 0x0000_FFFF_FFFF_FFFF;
         let off = self
             .fs
@@ -520,7 +521,7 @@ impl<'a> NtfsFileHandle<'a> {
         self.dev.read_at(off, &mut rec)?;
         let old_rec = rec.clone();
         if mft::apply_fixup(&mut rec, self.sector_size).is_err() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let hdr = mft::RecordHeader::parse(&rec)?;
         // `(value_start, value_end)` of the resident `$INDEX_ROOT:$I30`
@@ -558,62 +559,128 @@ impl<'a> NtfsFileHandle<'a> {
             }
         }
         let Some((root_v_start, root_v_end)) = root_range else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
-        let root_val = &mut rec[root_v_start..root_v_end];
-        if root_val.len() < 32 {
-            return Ok(None);
-        }
-        let index_flags = root_val[28];
-        let large_index = index_flags & 0x01 != 0;
-        if !large_index {
-            if patch_entries_for_record(root_val, 16, self.rec_no, self.len) {
-                mft::install_fixup(&mut rec, self.sector_size, 1);
-                if rec != old_rec {
-                    return Ok(Some(super::logfile::RedoEntry {
-                        target_offset: off,
-                        redo_bytes: rec,
-                        undo_bytes: old_rec,
-                    }));
-                }
+        let mut out = Vec::new();
+
+        // The root's own entries (a small index keeps everything here; a
+        // large one may still carry real entries next to its child
+        // pointers), plus the VCNs of its children.
+        let Ok(root_hdr) = index::IndexRootHeader::parse(&rec[root_v_start..root_v_end]) else {
+            return Ok(Vec::new());
+        };
+        let entries_start = root_hdr.header_offset + root_hdr.first_entry_offset as usize;
+        let entries_len =
+            (root_hdr.bytes_in_use as usize).saturating_sub(root_hdr.first_entry_offset as usize);
+        let children = index::walk_index_node(
+            &rec[root_v_start..root_v_end],
+            entries_start,
+            entries_len,
+            |_| {},
+        )
+        .unwrap_or_default();
+        let large_index = root_hdr.has_index_allocation();
+        let block_size = match root_hdr.index_block_size {
+            0 => self
+                .fs
+                .writer
+                .as_ref()
+                .map(|w| w.layout.index_record_size as usize)
+                .unwrap_or(4096),
+            n => n as usize,
+        };
+        if patch_entries_for_record(
+            &mut rec[root_v_start..root_v_end],
+            entries_start,
+            self.rec_no,
+            self.len,
+            self.cluster_size,
+        ) {
+            mft::install_fixup(&mut rec, self.sector_size, 1);
+            if rec != old_rec {
+                out.push(super::logfile::RedoEntry {
+                    target_offset: off,
+                    redo_bytes: rec,
+                    undo_bytes: old_rec,
+                });
             }
-            return Ok(None);
+        }
+        if !large_index {
+            return Ok(out);
         }
         let Some(runs) = alloc_runs else {
-            return Ok(None);
+            return Ok(out);
         };
-        let Some(first_run_lcn) = runs.first().and_then(|r| r.lcn) else {
-            return Ok(None);
-        };
-        let block_size = self
-            .fs
-            .writer
-            .as_ref()
-            .map(|w| w.layout.index_record_size as usize)
-            .unwrap_or(4096);
-        let block_off = first_run_lcn * self.cluster_size;
+
+        // Descend every INDX block. Child VCNs are in clusters, or in
+        // 512-byte units when the cluster is larger than a block.
+        let vcn_unit = index::vcn_unit_bytes(self.cluster_size, block_size as u64);
         let mut block = vec![0u8; block_size];
-        self.dev.read_at(block_off, &mut block)?;
-        let old_block = block.clone();
-        if mft::apply_fixup(&mut block, self.sector_size).is_err() {
-            return Ok(None);
-        }
-        if block.len() < 0x20 {
-            return Ok(None);
-        }
-        let first_entry_offset = u32::from_le_bytes(block[0x18..0x1C].try_into().unwrap()) as usize;
-        let entries_start = 0x18 + first_entry_offset;
-        if patch_entries_for_record(&mut block, entries_start, self.rec_no, self.len) {
-            mft::install_fixup(&mut block, self.sector_size, 1);
-            if block != old_block {
-                return Ok(Some(super::logfile::RedoEntry {
-                    target_offset: block_off,
-                    redo_bytes: block,
-                    undo_bytes: old_block,
-                }));
+        let mut stack = children;
+        let mut visited = std::collections::HashSet::<u64>::new();
+        while let Some(vcn) = stack.pop() {
+            if !visited.insert(vcn) {
+                break;
+            }
+            let byte_off = vcn * vcn_unit;
+            if super::writer::read_alloc_bytes(
+                self.dev,
+                &runs,
+                self.cluster_size,
+                byte_off,
+                &mut block,
+            )
+            .is_err()
+            {
+                break;
+            }
+            let old_block = block.clone();
+            if mft::apply_fixup(&mut block, self.sector_size).is_err() {
+                break;
+            }
+            let Ok(blk_hdr) = index::IndexBlockHeader::parse(&block) else {
+                break;
+            };
+            let entries_start = blk_hdr.entries_start();
+            let entries_len = blk_hdr.entries_byte_len();
+            if let Ok(kids) = index::walk_index_node(&block, entries_start, entries_len, |_| {}) {
+                stack.extend(kids);
+            }
+            if patch_entries_for_record(
+                &mut block,
+                entries_start,
+                self.rec_no,
+                self.len,
+                self.cluster_size,
+            ) {
+                mft::install_fixup(&mut block, self.sector_size, 1);
+                if block != old_block {
+                    match super::writer::alloc_byte_to_disk(&runs, self.cluster_size, byte_off) {
+                        // The block lies inside one extent (always true for
+                        // this writer's allocations): journal it as one
+                        // contiguous redo/undo pair.
+                        Some((disk, left)) if left >= block_size as u64 => {
+                            out.push(super::logfile::RedoEntry {
+                                target_offset: disk,
+                                redo_bytes: block.clone(),
+                                undo_bytes: old_block,
+                            });
+                        }
+                        // A foreign allocation whose block straddles two
+                        // extents: apply the patch directly, unjournaled.
+                        Some(_) => super::writer::write_alloc_bytes(
+                            self.dev,
+                            &runs,
+                            self.cluster_size,
+                            byte_off,
+                            &block,
+                        )?,
+                        None => break,
+                    }
+                }
             }
         }
-        Ok(None)
+        Ok(out)
     }
 
     /// Run a commit-time protocol:
@@ -804,9 +871,15 @@ fn replay_and_clean(
 /// Walk index entries starting at `start_off` in `buf`, looking for one
 /// whose `file_ref` lower-48 bits equal `rec_no`. When found, patch the
 /// embedded $FILE_NAME key's `real_size` (offset 48..56) and
-/// `allocated_size` (offset 40..48) to `new_len` / `new_len ceil'd to
-/// cluster`. Returns `true` if a patch was applied.
-fn patch_entries_for_record(buf: &mut [u8], start_off: usize, rec_no: u64, new_len: u64) -> bool {
+/// `allocated_size` (offset 40..48) to `new_len` / `new_len` rounded up
+/// to `cluster_size`. Returns `true` if a patch was applied.
+fn patch_entries_for_record(
+    buf: &mut [u8],
+    start_off: usize,
+    rec_no: u64,
+    new_len: u64,
+    cluster_size: u64,
+) -> bool {
     let mut cursor = start_off;
     let mut changed = false;
     while cursor + 16 <= buf.len() {
@@ -826,9 +899,9 @@ fn patch_entries_for_record(buf: &mut [u8], start_off: usize, rec_no: u64, new_l
         if !is_last && key_len >= 66 && entry_len >= 16 + key_len && key_off + 56 <= buf.len() {
             let file_ref = u64::from_le_bytes(buf[cursor..cursor + 8].try_into().unwrap());
             if (file_ref & 0x0000_FFFF_FFFF_FFFF) == rec_no {
-                // Patch allocated_size / real_size (rounded to next 4 KiB
-                // for the allocated value — matches what create_file emits).
-                let allocated = (new_len + 4095) & !4095;
+                // Patch allocated_size / real_size (the allocated value
+                // rounded up to a cluster — matches what create_file emits).
+                let allocated = new_len.div_ceil(cluster_size.max(1)) * cluster_size.max(1);
                 buf[key_off + 40..key_off + 48].copy_from_slice(&allocated.to_le_bytes());
                 buf[key_off + 48..key_off + 56].copy_from_slice(&new_len.to_le_bytes());
                 changed = true;

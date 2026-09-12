@@ -250,6 +250,26 @@ impl Ntfs {
         }
         let out = &mut out[..rec_size];
 
+        // A live writer may have grown $MFT (`WriterState::extend_mft`)
+        // since the run list was cached from record 0; its extents are
+        // authoritative until `flush` re-stamps record 0, so mirror them.
+        if let Some(w) = self.writer.as_ref()
+            && !w.layout.mft_extents.is_empty()
+        {
+            let live: Vec<Extent> = w
+                .layout
+                .mft_extents
+                .iter()
+                .map(|&(lcn, length)| Extent {
+                    lcn: Some(lcn),
+                    length,
+                })
+                .collect();
+            if live != self.mft_runs {
+                self.mft_runs = live;
+            }
+        }
+
         // Bootstrap: read record 0 from the BPB-anchored MFT LCN. From
         // record 0 we extract $MFT's $DATA run list and cache it.
         if self.mft_runs.is_empty() {
@@ -537,6 +557,9 @@ impl Ntfs {
     ) -> Result<()> {
         let cluster_size = u64::from(self.boot.cluster_size());
         let block_len = checked_alloc_len(block_size as u64, dev.total_size(), "index block")?;
+        // Child VCNs are in clusters, or in 512-byte units when the
+        // cluster is larger than an index block (see `vcn_unit_bytes`).
+        let vcn_unit = index::vcn_unit_bytes(cluster_size, block_size as u64);
         let mut block_buf = vec![0u8; block_len];
         // Explicit work-list instead of recursion: a long (non-cyclic) INDX
         // chain would otherwise overflow the stack. `visited` doubles as the
@@ -548,7 +571,7 @@ impl Ntfs {
                     "ntfs: cycle in $INDEX_ALLOCATION tree".into(),
                 ));
             }
-            let target_bytes = vcn.checked_mul(cluster_size).ok_or_else(|| {
+            let target_bytes = vcn.checked_mul(vcn_unit).ok_or_else(|| {
                 crate::Error::InvalidImage("ntfs: index VCN byte offset overflow".into())
             })?;
             let mut walked: u64 = 0;

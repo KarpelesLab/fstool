@@ -1380,6 +1380,261 @@ fn writer_dir_promotes_to_index_allocation() {
     }
 }
 
+/// Byte size of a directory's `$INDEX_ALLOCATION:$I30` (0 when the index
+/// is still root-resident) and its `$INDEX_ROOT`'s `index_block_size`.
+fn index_allocation_shape(ntfs: &mut Ntfs, dev: &mut MemoryBackend, path: &str) -> (u64, u32) {
+    let rec = ntfs.lookup_path(dev, path).unwrap();
+    let records = ntfs.load_record_set(dev, rec).unwrap();
+    let mut alloc = 0u64;
+    let mut block = 0u32;
+    for (_, buf) in &records {
+        let h = mft::RecordHeader::parse(buf).unwrap();
+        for attr in AttributeIter::new(buf, h.first_attribute_offset as usize) {
+            let attr = attr.unwrap();
+            if attr.name != "$I30" {
+                continue;
+            }
+            match (attr.type_code, attr.kind) {
+                (TYPE_INDEX_ALLOCATION, AttributeKind::NonResident { real_size, .. }) => {
+                    alloc = real_size;
+                }
+                (TYPE_INDEX_ROOT, AttributeKind::Resident { value, .. }) => {
+                    block = index::IndexRootHeader::parse(value)
+                        .unwrap()
+                        .index_block_size;
+                }
+                _ => {}
+            }
+        }
+    }
+    (alloc, block)
+}
+
+/// Sorted names under `path` from a cold reopen of `dev`.
+fn names_after_reopen(dev: &mut MemoryBackend, path: &str) -> Vec<String> {
+    let mut ro = Ntfs::open(dev).unwrap();
+    let mut v: Vec<String> = ro
+        .list_path(dev, path)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    v.sort();
+    v
+}
+
+/// Inserts and removes on a directory whose `$I30` spans several INDX
+/// blocks (a real B-tree with an internal root). The old writer treated
+/// VCN 0 — the leftmost *leaf* — as "the" block: later batches were
+/// appended to that leaf and re-serialised without its siblings' parent
+/// pointers, orphaning most of the directory. Every batch now rebuilds
+/// the tree from all reachable entries. Exercised at three cluster sizes
+/// so the VCN unit (cluster, or 512 bytes when the cluster is larger
+/// than an index block — `vcn_unit_bytes`) is covered on both sides.
+#[test]
+fn multi_block_index_survives_batched_inserts_and_removes() {
+    use crate::fs::{Filesystem, OpenFlags};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::path::Path;
+
+    for spc in [2u8, 8, 16] {
+        let mut dev = MemoryBackend::new(32 * 1024 * 1024);
+        let opts = FormatOpts {
+            sectors_per_cluster: spc,
+            volume_label: "BTREE".into(),
+            ..Default::default()
+        };
+        let mut ntfs = Ntfs::format(&mut dev, &opts).unwrap();
+        ntfs.create_dir(&mut dev, "/big", FileMeta::default())
+            .unwrap();
+        let mk = |ntfs: &mut Ntfs, dev: &mut MemoryBackend, i: usize| {
+            ntfs.create_file(
+                dev,
+                &format!("/big/entry_number_{i:04}.dat"),
+                FileSource::Reader {
+                    reader: Box::new(std::io::Cursor::new(vec![b'x'; 3])),
+                    len: 3,
+                },
+                FileMeta::default(),
+            )
+            .unwrap();
+        };
+        // Batch 1: enough entries for several leaves (≈ 38 per 4 KiB block).
+        for i in 0..200 {
+            mk(&mut ntfs, &mut dev, i);
+        }
+        ntfs.flush(&mut dev).unwrap();
+        let (alloc, block) = index_allocation_shape(&mut ntfs, &mut dev, "/big");
+        assert!(
+            alloc > block as u64 * 2,
+            "spc={spc}: expected a multi-block tree, got alloc={alloc} block={block}"
+        );
+        // Batch 2 lands in an already-promoted, multi-block directory.
+        for i in 200..260 {
+            mk(&mut ntfs, &mut dev, i);
+        }
+        ntfs.flush(&mut dev).unwrap();
+        let mut expect: Vec<String> = (0..260)
+            .map(|i| format!("entry_number_{i:04}.dat"))
+            .collect();
+        expect.sort();
+        assert_eq!(
+            names_after_reopen(&mut dev, "/big"),
+            expect,
+            "spc={spc} after inserts"
+        );
+
+        // Remove entries from what were different leaves.
+        for i in [0usize, 77, 150, 259] {
+            ntfs.remove(&mut dev, &format!("/big/entry_number_{i:04}.dat"))
+                .unwrap();
+        }
+        ntfs.flush(&mut dev).unwrap();
+        expect.retain(|n| {
+            ![0usize, 77, 150, 259]
+                .iter()
+                .any(|i| *n == format!("entry_number_{i:04}.dat"))
+        });
+        assert_eq!(
+            names_after_reopen(&mut dev, "/big"),
+            expect,
+            "spc={spc} after removes"
+        );
+
+        // Path lookups (which descend the tree) still resolve, and a
+        // size change made through open_file_rw is patched into
+        // whichever block holds the entry.
+        let mut ro = Ntfs::open(&mut dev).unwrap();
+        // Removed above: must not resolve any more.
+        assert!(
+            ro.open_file_rw(
+                &mut dev,
+                Path::new("/big/entry_number_0150.dat"),
+                OpenFlags::default(),
+                None,
+            )
+            .is_err()
+        );
+        {
+            let mut h = ro
+                .open_file_rw(
+                    &mut dev,
+                    Path::new("/big/entry_number_0151.dat"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .unwrap();
+            h.seek(SeekFrom::End(0)).unwrap();
+            h.write_all(&vec![b'y'; 5000]).unwrap();
+            h.sync().unwrap();
+        }
+        let mut again = Ntfs::open(&mut dev).unwrap();
+        let a = again
+            .getattr(&mut dev, Path::new("/big/entry_number_0151.dat"))
+            .unwrap();
+        assert_eq!(a.size, 5003, "spc={spc}: index entry size after rw extend");
+        let mut r = again
+            .open_file_reader(&mut dev, "/big/entry_number_0151.dat")
+            .unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf.len(), 5003);
+        assert_eq!(&buf[..3], b"xxx");
+    }
+}
+
+/// Extending a file through `open_file_rw` must update the size stored in
+/// the parent's `$I30` entry — that is what `list` / `getattr` report.
+/// For a small (root-resident) directory the patch used to start at the
+/// index header instead of the first entry and never landed.
+#[test]
+fn rw_extend_updates_size_in_root_resident_index() {
+    use crate::fs::{Filesystem, OpenFlags};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::path::Path;
+
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    ntfs_create_small(&mut ntfs, &mut dev, "/d", "/d/grow.txt");
+    ntfs.flush(&mut dev).unwrap();
+    let (alloc, _) = index_allocation_shape(&mut ntfs, &mut dev, "/d");
+    assert_eq!(alloc, 0, "directory must still be root-resident");
+
+    let mut ro = Ntfs::open(&mut dev).unwrap();
+    {
+        let mut h = ro
+            .open_file_rw(
+                &mut dev,
+                Path::new("/d/grow.txt"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+        h.seek(SeekFrom::End(0)).unwrap();
+        h.write_all(&vec![0u8; 9000]).unwrap();
+        h.sync().unwrap();
+    }
+    let listed = ro
+        .list_path(&mut dev, "/d")
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "grow.txt")
+        .unwrap();
+    assert_eq!(listed.size, 9002);
+    let mut again = Ntfs::open(&mut dev).unwrap();
+    let a = again.getattr(&mut dev, Path::new("/d/grow.txt")).unwrap();
+    assert_eq!(a.size, 9002);
+}
+
+/// The writer grows `$MFT` past its initial 64 records; the read path on
+/// the *same* handle (lookups, remove, getattr) must follow that growth
+/// instead of serving the run list it cached from record 0 at open.
+#[test]
+fn reader_follows_mft_growth_on_live_handle() {
+    use crate::fs::Filesystem;
+    use std::path::Path;
+
+    let (mut dev, mut ntfs) = fresh_volume(32 * 1024 * 1024);
+    let initial_records = ntfs.writer.as_ref().unwrap().layout.mft_records;
+    let n = initial_records as usize + 20;
+    for i in 0..n {
+        ntfs.create_file(
+            &mut dev,
+            &format!("/f{i}"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(vec![b'.'; 1])),
+                len: 1,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+    }
+    assert!(ntfs.writer.as_ref().unwrap().layout.mft_records > initial_records);
+    let last = format!("/f{}", n - 1);
+    let rec = ntfs.lookup_path(&mut dev, &last).unwrap();
+    assert!(
+        rec >= initial_records,
+        "record {rec} should sit in the grown region"
+    );
+    assert_eq!(ntfs.getattr(&mut dev, Path::new(&last)).unwrap().size, 1);
+    ntfs.remove(&mut dev, &last).unwrap();
+    ntfs.flush(&mut dev).unwrap();
+    assert!(!names_after_reopen(&mut dev, "/").contains(&format!("f{}", n - 1)));
+}
+
+fn ntfs_create_small(ntfs: &mut Ntfs, dev: &mut MemoryBackend, dir: &str, file: &str) {
+    ntfs.create_dir(dev, dir, FileMeta::default()).unwrap();
+    ntfs.create_file(
+        dev,
+        file,
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"hi".to_vec())),
+            len: 2,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn writer_streams_large_file_through_scratch_buffer() {
     // 200 KiB file forces multiple scratch buffers worth of streaming.

@@ -581,12 +581,12 @@ fn min_signed_bytes(v: i64) -> usize {
 /// Build an empty `$INDEX_ROOT` value with name `$I30` indexed by
 /// `$FILE_NAME`. The root carries only a "terminator" entry (no real
 /// children) so a directory created this way is initially empty.
-pub fn build_empty_index_root() -> Vec<u8> {
-    let index_block_size = DEFAULT_INDEX_RECORD_SIZE;
-    // Cpib: bytes-per-index-block encoded the same way as MFT record size.
-    // Positive: clusters; negative: 1<<(-v). With 4 KiB clusters / 4 KiB
-    // index blocks, value = 1.
-    let cpib: i8 = 1;
+/// `index_block_size` / `cluster_size` fix the `clusters_per_index_block`
+/// byte: blocks in clusters, or in 512-byte units when the cluster is
+/// larger than a block (see [`super::index::vcn_unit_bytes`]).
+pub fn build_empty_index_root(index_block_size: u32, cluster_size: u32) -> Vec<u8> {
+    let cpib = u64::from(index_block_size)
+        / super::index::vcn_unit_bytes(u64::from(cluster_size), u64::from(index_block_size));
     let mut v = Vec::with_capacity(0x20);
     v.extend_from_slice(&TYPE_FILE_NAME.to_le_bytes());
     v.extend_from_slice(&1u32.to_le_bytes()); // collation = filename
@@ -807,7 +807,14 @@ pub fn build_volume_record(
 
 /// Build the root directory's MFT record (record 5). The index is empty
 /// initially — `Writer::add_entry_to_dir` mutates it as files are added.
-pub fn build_root_record(rec_buf: &mut [u8], rec_size: usize, filetime: u64, sector_size: usize) {
+pub fn build_root_record(
+    rec_buf: &mut [u8],
+    rec_size: usize,
+    filetime: u64,
+    index_block_size: u32,
+    cluster_size: u32,
+    sector_size: usize,
+) {
     // Root carries the User-class SD (everyone full access) — it is the
     // user-visible top-level directory, not a system file.
     let root_si =
@@ -821,7 +828,13 @@ pub fn build_root_record(rec_buf: &mut [u8], rec_size: usize, filetime: u64, sec
         .encode_utf16()
         .flat_map(|u| u.to_le_bytes())
         .collect();
-    let idx_root = build_resident_attr(TYPE_INDEX_ROOT, &i30_name, &build_empty_index_root(), 0, 0);
+    let idx_root = build_resident_attr(
+        TYPE_INDEX_ROOT,
+        &i30_name,
+        &build_empty_index_root(index_block_size, cluster_size),
+        0,
+        0,
+    );
     emit_record(
         rec_buf,
         rec_size,
@@ -1451,6 +1464,8 @@ pub fn build_extend_record(
     rec_size: usize,
     parent_ref: u64,
     filetime: u64,
+    index_block_size: u32,
+    cluster_size: u32,
     sector_size: usize,
 ) {
     let si = build_resident_attr(
@@ -1466,7 +1481,13 @@ pub fn build_extend_record(
         .encode_utf16()
         .flat_map(|u| u.to_le_bytes())
         .collect();
-    let idx_root = build_resident_attr(TYPE_INDEX_ROOT, &i30_name, &build_empty_index_root(), 0, 0);
+    let idx_root = build_resident_attr(
+        TYPE_INDEX_ROOT,
+        &i30_name,
+        &build_empty_index_root(index_block_size, cluster_size),
+        0,
+        0,
+    );
     emit_record(
         rec_buf,
         rec_size,
@@ -2306,7 +2327,14 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
     {
         let r = &mut mft_buf
             [(REC_ROOT as usize) * rec_size as usize..(REC_ROOT as usize + 1) * rec_size as usize];
-        build_root_record(r, rec_size as usize, filetime, mft::NTFS_BLOCK_SIZE);
+        build_root_record(
+            r,
+            rec_size as usize,
+            filetime,
+            DEFAULT_INDEX_RECORD_SIZE,
+            cluster_size,
+            mft::NTFS_BLOCK_SIZE,
+        );
     }
     // Record 6: $Bitmap
     {
@@ -2394,6 +2422,8 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             rec_size as usize,
             parent_root_ref,
             filetime,
+            DEFAULT_INDEX_RECORD_SIZE,
+            cluster_size,
             mft::NTFS_BLOCK_SIZE,
         );
     }
