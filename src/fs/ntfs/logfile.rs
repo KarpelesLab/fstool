@@ -390,9 +390,21 @@ pub fn build_record_page(
     Ok((page, last_lsn))
 }
 
-/// Parse the records out of one RCRD page. Returns the redo entries in
-/// LSN order, or `None` if the page fails validation.
-pub fn parse_record_page(bytes: &[u8]) -> Option<Vec<RedoEntry>> {
+/// One parsed RCRD page: its `last_lsn` header field plus the redo
+/// entries it carries.
+#[derive(Debug, Clone)]
+pub struct RecordPage {
+    /// `last_lsn_or_file_offset` at +0x08 — the highest LSN on the page.
+    /// Strictly increasing across the pages of a live log, which is how
+    /// replay tells a freshly written page from a leftover one.
+    pub last_lsn: u64,
+    pub entries: Vec<RedoEntry>,
+}
+
+/// Parse the records out of one RCRD page. Returns the page's `last_lsn`
+/// and its redo entries in LSN order, or `None` if the page fails
+/// validation.
+pub fn parse_record_page(bytes: &[u8]) -> Option<RecordPage> {
     if bytes.len() < LOG_PAGE_SIZE {
         return None;
     }
@@ -402,6 +414,7 @@ pub fn parse_record_page(bytes: &[u8]) -> Option<Vec<RedoEntry>> {
         return None;
     }
     mft::apply_fixup(&mut buf, SECTOR_SIZE).ok()?;
+    let last_lsn = u64::from_le_bytes(buf[0x08..0x10].try_into().unwrap());
     let next_record_offset = u16::from_le_bytes(buf[0x18..0x1A].try_into().unwrap()) as usize;
     if next_record_offset < 0x40 || next_record_offset > buf.len() {
         return None;
@@ -440,7 +453,10 @@ pub fn parse_record_page(bytes: &[u8]) -> Option<Vec<RedoEntry>> {
         let cd_padded = (cd_len + 7) & !7;
         cursor += 0x30 + cd_padded;
     }
-    Some(out)
+    Some(RecordPage {
+        last_lsn,
+        entries: out,
+    })
 }
 
 /// Write a freshly-formatted, clean-shutdown $LogFile to disk.
@@ -493,9 +509,18 @@ pub fn read_current_restart(
     Ok(out)
 }
 
-/// Walk every record page in `[logfile_offset + 2·LOG_PAGE_SIZE, end)`
-/// and return the redo entries in on-disk order. Stops on the first
-/// page that fails to parse.
+/// Walk the record pages in `[logfile_offset + 2·LOG_PAGE_SIZE, end)`
+/// and return the redo entries of the *last* transaction, in on-disk
+/// order.
+///
+/// Stops on the first page that fails to parse, and — crucially — on the
+/// first page whose `last_lsn` does not advance. Each transaction
+/// restarts at page 0, so a transaction shorter than its predecessor
+/// leaves that predecessor's trailing pages in place, still carrying a
+/// valid RCRD magic and their old (lower) LSNs. Replaying those would
+/// write bytes from an already-superseded transaction over the current
+/// ones. The LSN test drops them; `rw::commit_txn` additionally zeroes
+/// the page just past the chain it wrote.
 pub fn walk_records(
     dev: &mut dyn BlockDevice,
     logfile_offset: u64,
@@ -506,6 +531,7 @@ pub fn walk_records(
     let end = logfile_offset + log_size;
     let mut p = start;
     let mut buf = vec![0u8; LOG_PAGE_SIZE];
+    let mut prev_lsn: Option<u64> = None;
     while p + LOG_PAGE_SIZE as u64 <= end {
         dev.read_at(p, &mut buf)?;
         // Stop at the first non-RCRD (e.g. zero) page — that's "end of
@@ -513,10 +539,14 @@ pub fn walk_records(
         if &buf[0..4] != RCRD_MAGIC {
             break;
         }
-        match parse_record_page(&buf) {
-            Some(entries) => out.extend(entries),
-            None => break,
+        let Some(page) = parse_record_page(&buf) else {
+            break;
+        };
+        if prev_lsn.is_some_and(|prev| page.last_lsn <= prev) {
+            break;
         }
+        prev_lsn = Some(page.last_lsn);
+        out.extend(page.entries);
         p += LOG_PAGE_SIZE as u64;
     }
     Ok(out)
@@ -554,10 +584,11 @@ mod tests {
         let (page, last_lsn) = build_record_page(&entries, 10).unwrap();
         assert_eq!(last_lsn, 10);
         let parsed = parse_record_page(&page).expect("must parse");
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].target_offset, 4096);
-        assert_eq!(parsed[0].redo_bytes, b"new bytes");
-        assert_eq!(parsed[0].undo_bytes, b"old bytes");
+        assert_eq!(parsed.last_lsn, 10);
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].target_offset, 4096);
+        assert_eq!(parsed.entries[0].redo_bytes, b"new bytes");
+        assert_eq!(parsed.entries[0].undo_bytes, b"old bytes");
     }
 
     #[test]
@@ -577,9 +608,45 @@ mod tests {
         let (page, last_lsn) = build_record_page(&entries, 100).unwrap();
         assert_eq!(last_lsn, 101);
         let parsed = parse_record_page(&page).expect("must parse");
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].redo_bytes, vec![1, 2, 3]);
-        assert_eq!(parsed[1].undo_bytes, vec![8; 32]);
+        assert_eq!(parsed.last_lsn, 101);
+        assert_eq!(parsed.entries.len(), 2);
+        assert_eq!(parsed.entries[0].redo_bytes, vec![1, 2, 3]);
+        assert_eq!(parsed.entries[1].undo_bytes, vec![8; 32]);
+    }
+
+    /// Replay must not pick up pages left behind by an older, longer
+    /// transaction. Each transaction restarts at record page 0, so after
+    /// a two-page txn a one-page txn leaves page 1 intact — valid RCRD
+    /// magic, stale contents. `walk_records` stops as soon as `last_lsn`
+    /// fails to advance.
+    #[test]
+    fn walk_records_stops_at_a_stale_trailing_page() {
+        use crate::block::MemoryBackend;
+        let page_size = LOG_PAGE_SIZE as u64;
+        let log_size = 6 * page_size;
+        let mut dev = MemoryBackend::new(log_size);
+        let entry = |off: u64, byte: u8| RedoEntry {
+            target_offset: off,
+            redo_bytes: vec![byte; 8],
+            undo_bytes: vec![0; 8],
+        };
+        // Older transaction: LSNs 100..=101 on page 0, 102 on page 1.
+        let (old0, _) =
+            build_record_page(&[entry(0x1000, 0xAA), entry(0x2000, 0xAA)], 100).unwrap();
+        let (old1, _) = build_record_page(&[entry(0x3000, 0xAA)], 102).unwrap();
+        dev.write_at(2 * page_size, &old0).unwrap();
+        dev.write_at(3 * page_size, &old1).unwrap();
+        // Sanity: both pages are picked up while the LSNs do advance.
+        let all = walk_records(&mut dev, 0, log_size).unwrap();
+        assert_eq!(all.len(), 3);
+
+        // Newer, shorter transaction overwrites page 0 only.
+        let (new0, _) = build_record_page(&[entry(0x4000, 0xBB)], 200).unwrap();
+        dev.write_at(2 * page_size, &new0).unwrap();
+        let replayed = walk_records(&mut dev, 0, log_size).unwrap();
+        assert_eq!(replayed.len(), 1, "stale page must not be replayed");
+        assert_eq!(replayed[0].target_offset, 0x4000);
+        assert_eq!(replayed[0].redo_bytes, vec![0xBB; 8]);
     }
 
     #[test]

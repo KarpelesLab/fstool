@@ -136,6 +136,7 @@ impl F2fs {
                 sit_ver_bitmap_bytesize: 64,
                 cur_nat_pack: 0,
                 cur_sit_pack: 0,
+                nat_bitmap: Vec::new(),
                 nat_journal: Vec::new(),
                 cur_node_segno: [0, 1, 2],
                 cur_node_blkoff: [0, 0, 0],
@@ -537,10 +538,19 @@ impl crate::fs::Filesystem for F2fs {
             c::S_IFSOCK => crate::fs::EntryKind::Socket,
             _ => crate::fs::EntryKind::Regular,
         };
-        // Device nodes store their dev_t in the first block pointer,
-        // Linux-encoded — same convention ext uses.
+        // Device nodes store their dev_t in the inode's first block
+        // pointers, exactly as __get_inode_rdev() reads it: i_addr[0]
+        // holds old_encode_dev() when the numbers fit 8+8 bits,
+        // otherwise it is zero and i_addr[1] holds new_encode_dev().
+        // The two encodings agree whenever the old one is usable, so
+        // either slot yields the same packed value we report.
         let rdev = match kind {
-            crate::fs::EntryKind::Char | crate::fs::EntryKind::Block => inode.i_addr[0],
+            crate::fs::EntryKind::Char | crate::fs::EntryKind::Block => {
+                match inode.i_addr.first().copied().unwrap_or(0) {
+                    0 => inode.i_addr.get(1).copied().unwrap_or(0),
+                    old => old,
+                }
+            }
             _ => 0,
         };
         Ok(crate::fs::FileAttrs {
@@ -593,8 +603,9 @@ mod tests {
         Checkpoint, NatJournalEntry, encode_cp_head, encode_nat_journal_block,
     };
     use super::constants::{
-        ADDRS_PER_BLOCK, ADDRS_PER_INODE, F2FS_BLKSIZE, F2FS_FT_DIR, F2FS_FT_REG_FILE,
-        F2FS_INLINE_DATA, F2FS_INLINE_DENTRY, NR_DENTRY_IN_BLOCK, S_IFDIR, S_IFREG,
+        ADDRS_PER_BLOCK, ADDRS_PER_INODE, F2FS_BLKSIZE, F2FS_DATA_EXIST, F2FS_FT_DIR,
+        F2FS_FT_REG_FILE, F2FS_INLINE_DATA, F2FS_INLINE_DENTRY, NR_DENTRY_IN_BLOCK, S_IFDIR,
+        S_IFREG,
     };
     use super::dir::{RawDentry, encode_dentry_block, encode_inline_dentries_payload};
     use super::inode::{F2fsInode, encode_direct_node, encode_indirect_node, encode_inode_block};
@@ -827,6 +838,7 @@ mod tests {
             sit_ver_bitmap_bytesize: 64,
             cur_nat_pack: 0,
             cur_sit_pack: 0,
+            nat_bitmap: Vec::new(),
             nat_journal: Vec::new(),
             cur_node_segno: [0, 1, 2],
             cur_node_blkoff: [0, 0, 0],
@@ -1020,6 +1032,7 @@ mod tests {
             sit_ver_bitmap_bytesize: 0,
             cur_nat_pack: 1,
             cur_sit_pack: 1,
+            nat_bitmap: Vec::new(),
             nat_journal: Vec::new(),
             cur_node_segno: [0, 1, 2],
             cur_node_blkoff: [0, 0, 0],
@@ -1309,6 +1322,7 @@ mod tests {
             sit_ver_bitmap_bytesize: 64,
             cur_nat_pack: 0,
             cur_sit_pack: 0,
+            nat_bitmap: Vec::new(),
             nat_journal: Vec::new(),
             cur_node_segno: [0, 1, 2],
             cur_node_blkoff: [0, 0, 0],
@@ -1688,6 +1702,172 @@ mod tests {
         // i_links == 2 on the shared inode.
         let (_, ino) = fs2.read_inode(&mut dev, a.inode).unwrap();
         assert_eq!(ino.links, 2);
+    }
+
+    /// Removing one name of a hard-linked file keeps the inode (and its
+    /// data) alive for the surviving name, and unlinking a plain file
+    /// must not touch the parent's link count — only `rmdir` does, for
+    /// the vanished ".." back-pointer (kernel `f2fs_rmdir`).
+    #[test]
+    fn remove_respects_link_counts() {
+        use crate::fs::Filesystem as _;
+        let mut dev = MemoryBackend::new(2 * 1024 * 1024);
+        let opts = super::FormatOpts {
+            log_blocks_per_seg: 2,
+            ..super::FormatOpts::default()
+        };
+        let mut fs = F2fs::format(&mut dev, &opts).unwrap();
+        let payload = b"two names, one inode";
+        fs.create_file(
+            &mut dev,
+            std::path::Path::new("/a.txt"),
+            crate::fs::FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(payload.to_vec())),
+                len: payload.len() as u64,
+            },
+            crate::fs::FileMeta::default(),
+        )
+        .unwrap();
+        fs.create_hardlink(
+            &mut dev,
+            std::path::Path::new("/a.txt"),
+            std::path::Path::new("/b.txt"),
+        )
+        .unwrap();
+        for d in ["/d", "/e"] {
+            fs.create_dir(
+                &mut dev,
+                std::path::Path::new(d),
+                crate::fs::FileMeta::default(),
+            )
+            .unwrap();
+        }
+        // Root links: 2 ("." + "..") + one per child directory = 4.
+        fs.remove(&mut dev, std::path::Path::new("/a.txt")).unwrap();
+        fs.remove(&mut dev, std::path::Path::new("/e")).unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        let mut ro = F2fs::open(&mut dev).unwrap();
+        let names: Vec<String> = ro
+            .list_path(&mut dev, "/")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(!names.contains(&"a.txt".to_string()));
+        assert!(!names.contains(&"e".to_string()));
+        assert!(names.contains(&"b.txt".to_string()));
+        // The surviving name still reads the payload back, and the inode
+        // is down to a single link.
+        let mut got = Vec::new();
+        {
+            let mut r = ro.open_file_reader(&mut dev, "/b.txt").unwrap();
+            r.read_to_end(&mut got).unwrap();
+        }
+        assert_eq!(got, payload);
+        assert_eq!(
+            ro.getattr(&mut dev, std::path::Path::new("/b.txt"))
+                .unwrap()
+                .nlink,
+            1
+        );
+        // 4 - 1 for the removed directory; unlinking a.txt changed nothing.
+        assert_eq!(
+            ro.getattr(&mut dev, std::path::Path::new("/"))
+                .unwrap()
+                .nlink,
+            3
+        );
+    }
+
+    /// Device nodes keep their dev_t where `__get_inode_rdev()` looks for
+    /// it — `i_addr[0]` for an 8+8 number, `i_addr[1]` for a wide one —
+    /// and never claim inline data, which the kernel only allows on
+    /// regular files.
+    #[test]
+    fn device_nodes_encode_rdev_in_i_addr() {
+        use crate::fs::Filesystem as _;
+        let mut dev = MemoryBackend::new(2 * 1024 * 1024);
+        let opts = super::FormatOpts {
+            log_blocks_per_seg: 2,
+            ..super::FormatOpts::default()
+        };
+        let mut fs = F2fs::format(&mut dev, &opts).unwrap();
+        // /dev/null (1,3) fits the old encoding; (259, 1048575) does not.
+        let cases: [(&str, crate::fs::DeviceKind, u32, u32); 4] = [
+            ("/null", crate::fs::DeviceKind::Char, 1, 3),
+            ("/sda", crate::fs::DeviceKind::Block, 8, 0),
+            ("/wide", crate::fs::DeviceKind::Char, 259, 1_048_575),
+            ("/minor-wide", crate::fs::DeviceKind::Block, 7, 300),
+        ];
+        for (path, kind, major, minor) in cases {
+            fs.create_device(
+                &mut dev,
+                std::path::Path::new(path),
+                kind,
+                major,
+                minor,
+                crate::fs::FileMeta::default(),
+            )
+            .unwrap();
+        }
+        fs.create_device(
+            &mut dev,
+            std::path::Path::new("/pipe"),
+            crate::fs::DeviceKind::Fifo,
+            0,
+            0,
+            crate::fs::FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        let mut ro = F2fs::open(&mut dev).unwrap();
+        for (path, _kind, major, minor) in cases {
+            let a = ro.getattr(&mut dev, std::path::Path::new(path)).unwrap();
+            // Linux packed dev_t, the encoding `FileAttrs::rdev` carries.
+            let want = (minor & 0xFF) | (major << 8) | ((minor & !0xFF) << 12);
+            assert_eq!(a.rdev, want, "rdev for {path}");
+            let ino = ro.resolve_path(&mut dev, path).unwrap();
+            let (_, raw) = ro.read_inode(&mut dev, ino).unwrap();
+            // The narrow cases use i_addr[0]; the wide ones leave it zero
+            // so __get_inode_rdev() falls through to i_addr[1].
+            let narrow = major < 256 && minor < 256;
+            assert_eq!(raw.i_addr[0] != 0, narrow, "slot choice for {path}");
+            assert_eq!(
+                raw.inline_flags & (F2FS_INLINE_DATA | F2FS_DATA_EXIST),
+                0,
+                "{path} must not claim inline data"
+            );
+        }
+        let pipe = ro.getattr(&mut dev, std::path::Path::new("/pipe")).unwrap();
+        assert_eq!(pipe.kind, crate::fs::EntryKind::Fifo);
+        assert_eq!(pipe.rdev, 0);
+    }
+
+    /// `cp_payload` lives at 0x680, after the volume name and the
+    /// extension list. It used to be read and written at 0x3F8, which is
+    /// inside `volume_name[512]` — a label longer than 446 characters
+    /// therefore turned into a nonzero `cp_payload` on reopen.
+    #[test]
+    fn cp_payload_is_not_inside_the_volume_name() {
+        let mut dev = MemoryBackend::new(2 * 1024 * 1024);
+        let opts = super::FormatOpts {
+            log_blocks_per_seg: 2,
+            volume_label: "L".repeat(500),
+            ..super::FormatOpts::default()
+        };
+        let mut fs = F2fs::format(&mut dev, &opts).unwrap();
+        fs.flush(&mut dev).unwrap();
+        // The label really does cover the old offset.
+        let mut probe = [0u8; 4];
+        dev.read_at(SB_OFFSET_PRIMARY + 0x3F8, &mut probe).unwrap();
+        assert_eq!(probe, [b'L', 0, b'L', 0]);
+        let sb = superblock::load(&mut dev).unwrap();
+        assert_eq!(sb.cp_payload, 0);
+        assert!(sb.volume_name.starts_with("LLLL"));
+        // Reopening is what actually breaks when cp_payload is garbage.
+        F2fs::open(&mut dev).unwrap();
     }
 
     /// Hard-linking a directory is forbidden by POSIX; the writer must say

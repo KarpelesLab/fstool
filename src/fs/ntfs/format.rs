@@ -263,7 +263,8 @@ pub fn build_boot_sector(
     // Sectors per track / heads / hidden sectors: harmless filler.
     b[24..26].copy_from_slice(&63u16.to_le_bytes());
     b[26..28].copy_from_slice(&255u16.to_le_bytes());
-    // Total sectors (-1 of volume sectors per NTFS convention).
+    // Total sectors (-1 of volume sectors per NTFS convention). Kept in
+    // step with `format_volume`'s `bpb_total_sectors`.
     let bpb_total = total_sectors.saturating_sub(1);
     b[0x28..0x30].copy_from_slice(&bpb_total.to_le_bytes());
     b[0x30..0x38].copy_from_slice(&mft_lcn.to_le_bytes());
@@ -580,12 +581,12 @@ fn min_signed_bytes(v: i64) -> usize {
 /// Build an empty `$INDEX_ROOT` value with name `$I30` indexed by
 /// `$FILE_NAME`. The root carries only a "terminator" entry (no real
 /// children) so a directory created this way is initially empty.
-pub fn build_empty_index_root() -> Vec<u8> {
-    let index_block_size = DEFAULT_INDEX_RECORD_SIZE;
-    // Cpib: bytes-per-index-block encoded the same way as MFT record size.
-    // Positive: clusters; negative: 1<<(-v). With 4 KiB clusters / 4 KiB
-    // index blocks, value = 1.
-    let cpib: i8 = 1;
+/// `index_block_size` / `cluster_size` fix the `clusters_per_index_block`
+/// byte: blocks in clusters, or in 512-byte units when the cluster is
+/// larger than a block (see [`super::index::vcn_unit_bytes`]).
+pub fn build_empty_index_root(index_block_size: u32, cluster_size: u32) -> Vec<u8> {
+    let cpib = u64::from(index_block_size)
+        / super::index::vcn_unit_bytes(u64::from(cluster_size), u64::from(index_block_size));
     let mut v = Vec::with_capacity(0x20);
     v.extend_from_slice(&TYPE_FILE_NAME.to_le_bytes());
     v.extend_from_slice(&1u32.to_le_bytes()); // collation = filename
@@ -806,7 +807,14 @@ pub fn build_volume_record(
 
 /// Build the root directory's MFT record (record 5). The index is empty
 /// initially — `Writer::add_entry_to_dir` mutates it as files are added.
-pub fn build_root_record(rec_buf: &mut [u8], rec_size: usize, filetime: u64, sector_size: usize) {
+pub fn build_root_record(
+    rec_buf: &mut [u8],
+    rec_size: usize,
+    filetime: u64,
+    index_block_size: u32,
+    cluster_size: u32,
+    sector_size: usize,
+) {
     // Root carries the User-class SD (everyone full access) — it is the
     // user-visible top-level directory, not a system file.
     let root_si =
@@ -820,7 +828,13 @@ pub fn build_root_record(rec_buf: &mut [u8], rec_size: usize, filetime: u64, sec
         .encode_utf16()
         .flat_map(|u| u.to_le_bytes())
         .collect();
-    let idx_root = build_resident_attr(TYPE_INDEX_ROOT, &i30_name, &build_empty_index_root(), 0, 0);
+    let idx_root = build_resident_attr(
+        TYPE_INDEX_ROOT,
+        &i30_name,
+        &build_empty_index_root(index_block_size, cluster_size),
+        0,
+        0,
+    );
     emit_record(
         rec_buf,
         rec_size,
@@ -896,6 +910,7 @@ pub fn build_boot_record(
     parent_ref: u64,
     total_bytes: u64,
     filetime: u64,
+    boot_bytes: u64,
     sector_size: usize,
 ) {
     let si = build_resident_attr(
@@ -906,13 +921,7 @@ pub fn build_boot_record(
         0,
     );
     let fn_value = build_file_name_value(
-        parent_ref,
-        "$Boot",
-        0x06,
-        sector_size as u64,
-        sector_size as u64,
-        filetime,
-        1,
+        parent_ref, "$Boot", 0x06, boot_bytes, boot_bytes, filetime, 1,
     );
     let fname = build_resident_attr(TYPE_FILE_NAME, &[], &fn_value, 0, 0);
     // $Boot's $DATA covers the boot sector (one cluster). LCN 0.
@@ -923,9 +932,9 @@ pub fn build_boot_record(
         &runs,
         0,
         0,
-        sector_size as u64,
-        sector_size as u64,
-        sector_size as u64,
+        boot_bytes,
+        boot_bytes,
+        boot_bytes,
         0,
         0,
     );
@@ -1455,6 +1464,8 @@ pub fn build_extend_record(
     rec_size: usize,
     parent_ref: u64,
     filetime: u64,
+    index_block_size: u32,
+    cluster_size: u32,
     sector_size: usize,
 ) {
     let si = build_resident_attr(
@@ -1470,7 +1481,13 @@ pub fn build_extend_record(
         .encode_utf16()
         .flat_map(|u| u.to_le_bytes())
         .collect();
-    let idx_root = build_resident_attr(TYPE_INDEX_ROOT, &i30_name, &build_empty_index_root(), 0, 0);
+    let idx_root = build_resident_attr(
+        TYPE_INDEX_ROOT,
+        &i30_name,
+        &build_empty_index_root(index_block_size, cluster_size),
+        0,
+        0,
+    );
     emit_record(
         rec_buf,
         rec_size,
@@ -1690,21 +1707,21 @@ pub fn build_mftmirr_record(
 
 // ----- INDEX_ROOT mutation helpers used by the writer -------------------
 
-/// Insert (or update) a single index entry in a small $INDEX_ROOT that
-/// currently uses only the SMALL_INDEX layout. Returns the new value bytes
-/// (with terminator entry preserved at the end).
-///
-/// Returns `Err(Unsupported)` if the resulting root would exceed the
-/// `max_resident_bytes` budget — the caller should promote the directory
-/// to $INDEX_ALLOCATION at that point.
+/// The upcase table the formatter writes into `$UpCase`, decoded once.
+/// `$I30` collation (`COLLATION_FILE_NAME`) compares names folded through
+/// this exact table, so the writer must sort with it too — anything else
+/// puts a non-ASCII name out of order for the binary search ntfs-3g and
+/// the kernel run over the index.
+fn writer_upcase() -> &'static secure::UpcaseTable {
+    static TABLE: std::sync::OnceLock<secure::UpcaseTable> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| secure::UpcaseTable::from_bytes(&build_upcase_blob()))
+}
+
 /// Extract the NTFS-collation sort key from an `$I30` index entry: the
-/// UTF-16LE name from the embedded `$FILE_NAME` attribute, ASCII-folded
-/// to upper case. For pure-ASCII names (everything fstool's own writer
-/// emits) this matches the canonical `$UpCase` collation byte-for-byte;
-/// for non-ASCII code units we leave them as-is — the result is still a
-/// total order, so user-provided non-ASCII names sort consistently
-/// among themselves even if the exact key isn't strictly identical to
-/// what a Windows-installed `$UpCase` table would produce.
+/// UTF-16LE name from the embedded `$FILE_NAME` attribute, folded to
+/// upper case code unit by code unit through the volume's `$UpCase`
+/// table (the one [`build_upcase_blob`] emits at format time), which is
+/// how `COLLATION_FILE_NAME` orders entries.
 ///
 /// Returns the empty key for malformed entries — those sort first and
 /// surface in tests rather than corrupting the index.
@@ -1721,20 +1738,22 @@ pub fn entry_sort_key(entry: &[u8]) -> Vec<u16> {
     if entry.len() < NAME_OFF + name_chars * 2 {
         return Vec::new();
     }
+    let upcase = writer_upcase();
     let mut key = Vec::with_capacity(name_chars);
     for i in 0..name_chars {
         let cu = u16::from_le_bytes([entry[NAME_OFF + i * 2], entry[NAME_OFF + i * 2 + 1]]);
-        // ASCII-only uppercase fold (a..z -> A..Z); leave the rest alone.
-        let folded = if (b'a' as u16..=b'z' as u16).contains(&cu) {
-            cu - 0x20
-        } else {
-            cu
-        };
-        key.push(folded);
+        key.push(upcase.fold_unit(cu));
     }
     key
 }
 
+/// Insert (or update) a single index entry in a small $INDEX_ROOT that
+/// currently uses only the SMALL_INDEX layout. Returns the new value bytes
+/// (with terminator entry preserved at the end).
+///
+/// Returns `Err(Unsupported)` if the resulting root would exceed the
+/// `max_resident_bytes` budget — the caller should promote the directory
+/// to $INDEX_ALLOCATION at that point.
 pub fn insert_into_index_root(
     root_value: &[u8],
     new_entry: &[u8],
@@ -1982,11 +2001,12 @@ pub fn rewrite_resident_attr(
     new_value: &[u8],
 ) -> Result<()> {
     let hdr = mft::RecordHeader::parse(rec)?;
-    let bytes_in_use = hdr.bytes_in_use as usize;
+    // Clamp to the buffer: `bytes_in_use` is an on-disk field.
+    let bytes_in_use = (hdr.bytes_in_use as usize).min(rec.len()).min(rec_size);
     let first = hdr.first_attribute_offset as usize;
     let mut cursor = first;
     loop {
-        if cursor + 4 > bytes_in_use {
+        if cursor + 16 > bytes_in_use {
             return Err(crate::Error::InvalidImage(
                 "ntfs: attribute walk past bytes_in_use".into(),
             ));
@@ -1999,6 +2019,13 @@ pub fn rewrite_resident_attr(
             )));
         }
         let len = u32::from_le_bytes(rec[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+        // A zero / undersized length would loop forever; an oversized one
+        // would slice past the record.
+        if len < 16 || cursor + len > bytes_in_use {
+            return Err(crate::Error::InvalidImage(format!(
+                "ntfs: attribute length {len} oversteps record"
+            )));
+        }
         let non_resident = rec[cursor + 8] != 0;
         let name_len = rec[cursor + 9] as usize;
         let name_off =
@@ -2006,14 +2033,28 @@ pub fn rewrite_resident_attr(
         let attr_name = if name_len == 0 {
             String::new()
         } else {
-            super::attribute::decode_utf16le(
-                &rec[cursor + name_off..cursor + name_off + name_len * 2],
-            )
+            let name_end = name_off + name_len * 2;
+            if name_end > len {
+                return Err(crate::Error::InvalidImage(
+                    "ntfs: attribute name oversteps attribute".into(),
+                ));
+            }
+            super::attribute::decode_utf16le(&rec[cursor + name_off..cursor + name_end])
         };
         if tc == type_code && attr_name == name && !non_resident {
             // Resident value layout: 0x10 value_length(u32), 0x14 value_offset(u16), 0x16 indexed_flag
+            if len < 0x18 {
+                return Err(crate::Error::InvalidImage(
+                    "ntfs: resident attribute header too short".into(),
+                ));
+            }
             let value_off =
                 u16::from_le_bytes(rec[cursor + 0x14..cursor + 0x16].try_into().unwrap()) as usize;
+            if value_off < 0x18 || value_off > len {
+                return Err(crate::Error::InvalidImage(
+                    "ntfs: resident value offset outside attribute".into(),
+                ));
+            }
             let header_block_len = value_off; // bytes up to value
             let new_total = (header_block_len + new_value.len() + 7) & !7;
             let old_total = len;
@@ -2119,7 +2160,13 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
         // It still works for other multiples, but we standardise here.
     }
     let total_sectors = total_size / bps as u64;
-    let total_clusters = total_size / cluster_size as u64;
+    // The BPB's `total_sectors` is one less than the sector count (the
+    // last sector holds the backup boot sector, outside the volume), and
+    // the cluster count every NTFS driver derives is `bpb_total / spc` —
+    // so the cluster overlapping that backup sector is never handed out
+    // by $Bitmap.
+    let bpb_total_sectors = total_sectors.saturating_sub(1);
+    let total_clusters = bpb_total_sectors / spc as u64;
 
     let rec_size = DEFAULT_MFT_RECORD_SIZE;
     let mft_record_field: i8 = -10; // 1 << 10 = 1024
@@ -2214,7 +2261,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             mft_bitmap_clusters,
             filetime,
             cluster_size as u64,
-            bps as usize,
+            mft::NTFS_BLOCK_SIZE,
         );
     }
     // Record 1: $MFTMirr
@@ -2229,7 +2276,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             mirror_clusters_n,
             filetime,
             cluster_size as u64,
-            bps as usize,
+            mft::NTFS_BLOCK_SIZE,
         );
     }
     // Record 2: $LogFile
@@ -2244,7 +2291,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             logfile_clusters,
             filetime,
             cluster_size as u64,
-            bps as usize,
+            mft::NTFS_BLOCK_SIZE,
         );
     }
     // Record 3: $Volume
@@ -2257,7 +2304,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             parent_root_ref,
             &opts.volume_label,
             filetime,
-            bps as usize,
+            mft::NTFS_BLOCK_SIZE,
         );
     }
     // Record 4: $AttrDef
@@ -2274,7 +2321,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             attrdef_clusters,
             filetime,
             cluster_size as u64,
-            bps as usize,
+            mft::NTFS_BLOCK_SIZE,
             "$AttrDef",
         );
     }
@@ -2282,7 +2329,14 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
     {
         let r = &mut mft_buf
             [(REC_ROOT as usize) * rec_size as usize..(REC_ROOT as usize + 1) * rec_size as usize];
-        build_root_record(r, rec_size as usize, filetime, bps as usize);
+        build_root_record(
+            r,
+            rec_size as usize,
+            filetime,
+            DEFAULT_INDEX_RECORD_SIZE,
+            cluster_size,
+            mft::NTFS_BLOCK_SIZE,
+        );
     }
     // Record 6: $Bitmap
     {
@@ -2297,7 +2351,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             bitmap_clusters,
             filetime,
             cluster_size as u64,
-            bps as usize,
+            mft::NTFS_BLOCK_SIZE,
         );
     }
     // Record 7: $Boot
@@ -2310,7 +2364,8 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             parent_root_ref,
             total_size,
             filetime,
-            bps as usize,
+            bps as u64,
+            mft::NTFS_BLOCK_SIZE,
         );
     }
     // Record 8: $BadClus
@@ -2324,7 +2379,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             total_clusters,
             filetime,
             cluster_size as u64,
-            bps as usize,
+            mft::NTFS_BLOCK_SIZE,
         );
     }
     // Record 9: $Secure
@@ -2341,7 +2396,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             sds_used,
             &sds_layouts,
             cluster_size as u64,
-            bps as usize,
+            mft::NTFS_BLOCK_SIZE,
         );
     }
     // Record 10: $UpCase
@@ -2357,7 +2412,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             upcase_clusters,
             filetime,
             cluster_size as u64,
-            bps as usize,
+            mft::NTFS_BLOCK_SIZE,
         );
     }
     // Record 11: $Extend
@@ -2369,7 +2424,9 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             rec_size as usize,
             parent_root_ref,
             filetime,
-            bps as usize,
+            DEFAULT_INDEX_RECORD_SIZE,
+            cluster_size,
+            mft::NTFS_BLOCK_SIZE,
         );
     }
     // Records 12..15: reserved placeholders.
@@ -2385,7 +2442,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             parent_root_ref,
             name,
             filetime,
-            bps as usize,
+            mft::NTFS_BLOCK_SIZE,
         );
     }
 
@@ -2579,6 +2636,27 @@ mod tests {
         // header low nibble = len_size = 2, high nibble = off_size = 1.
         assert_eq!(r[0] & 0x0f, 2);
         assert_eq!(&r[1..3], &[0x80, 0x00]);
+    }
+
+    /// `$I30` keys fold through `$UpCase`, not an ASCII-only table: `é`
+    /// (U+00E9 → U+00C9) must sort before `Ê` (U+00CA), and `ÿ` (U+00FF →
+    /// U+0178) after `Ā` (U+0100) — the opposite of a raw code-unit order.
+    #[test]
+    fn entry_sort_key_folds_through_upcase_table() {
+        let entry_for = |name: &str| {
+            let fn_value = build_file_name_value(0, name, 0, 0, 0, 0, 1);
+            let mut e = vec![0u8; 16];
+            e.extend_from_slice(&fn_value);
+            e
+        };
+        assert!(entry_sort_key(&entry_for("é.txt")) < entry_sort_key(&entry_for("Ê.txt")));
+        assert!(entry_sort_key(&entry_for("Ā")) < entry_sort_key(&entry_for("ÿ")));
+        // ASCII still folds as before, and the key is case-insensitive.
+        assert_eq!(
+            entry_sort_key(&entry_for("abc")),
+            entry_sort_key(&entry_for("ABC"))
+        );
+        assert!(entry_sort_key(&entry_for("B")) < entry_sort_key(&entry_for("c")));
     }
 
     #[test]

@@ -128,6 +128,11 @@ impl InodeRec {
 pub(crate) struct DirectNode {
     pub nid: u32,
     pub on_disk_block: u32,
+    /// The nid of the inode this node belongs to, recorded when the node
+    /// is allocated. The node footer needs it, and searching the whole
+    /// inode table for the parent (three times per node per flush) was
+    /// quadratic in the file count.
+    pub owner: u32,
     /// 1018 data-block pointers.
     pub addrs: [u32; ADDRS_PER_BLOCK],
 }
@@ -139,6 +144,8 @@ pub(crate) struct DirectNode {
 pub(crate) struct IndirectNode {
     pub nid: u32,
     pub on_disk_block: u32,
+    /// Owning inode nid — see [`DirectNode::owner`].
+    pub owner: u32,
     pub nids: [u32; NIDS_PER_BLOCK],
 }
 
@@ -588,7 +595,7 @@ impl Writer {
                 let outer = (rel / ADDRS_PER_BLOCK as u64) as usize;
                 let inner = (rel % ADDRS_PER_BLOCK as u64) as usize;
                 let ind_nid = self.ensure_indirect_node(nid, nid_slot)?;
-                let dnode_nid = self.ensure_dnode_under_indirect(ind_nid, outer)?;
+                let dnode_nid = self.ensure_dnode_under_indirect(nid, ind_nid, outer)?;
                 let d = self
                     .direct_nodes
                     .get_mut(&dnode_nid)
@@ -608,8 +615,8 @@ impl Writer {
             let mid = ((rel / (ADDRS_PER_BLOCK as u64)) % (NIDS_PER_BLOCK as u64)) as usize;
             let inner = (rel % (ADDRS_PER_BLOCK as u64)) as usize;
             let top_nid = self.ensure_indirect_node(nid, NID_TRIPLE_INDIRECT)?;
-            let mid_nid = self.ensure_indirect_under_indirect(top_nid, outer)?;
-            let dnode_nid = self.ensure_dnode_under_indirect(mid_nid, mid)?;
+            let mid_nid = self.ensure_indirect_under_indirect(nid, top_nid, outer)?;
+            let dnode_nid = self.ensure_dnode_under_indirect(nid, mid_nid, mid)?;
             let d = self
                 .direct_nodes
                 .get_mut(&dnode_nid)
@@ -627,7 +634,12 @@ impl Writer {
     /// `outer` slot. Symmetric to [`Self::ensure_dnode_under_indirect`] but
     /// for the top tier of the triple-indirect tree (where the child is an
     /// indirect node, not a direct node).
-    fn ensure_indirect_under_indirect(&mut self, parent: u32, outer: usize) -> Result<u32> {
+    fn ensure_indirect_under_indirect(
+        &mut self,
+        owner: u32,
+        parent: u32,
+        outer: usize,
+    ) -> Result<u32> {
         let ind = self
             .indirect_nodes
             .get_mut(&parent)
@@ -647,6 +659,7 @@ impl Writer {
             IndirectNode {
                 nid: inid,
                 on_disk_block: phys,
+                owner,
                 nids: [0; NIDS_PER_BLOCK],
             },
         );
@@ -676,6 +689,7 @@ impl Writer {
             DirectNode {
                 nid: dnid,
                 on_disk_block: phys,
+                owner: parent_nid,
                 addrs: [0; ADDRS_PER_BLOCK],
             },
         );
@@ -703,6 +717,7 @@ impl Writer {
             IndirectNode {
                 nid: inid,
                 on_disk_block: phys,
+                owner: parent_nid,
                 nids: [0; NIDS_PER_BLOCK],
             },
         );
@@ -711,7 +726,12 @@ impl Writer {
 
     /// Ensure a direct-node block exists at indirect `parent`'s `outer`
     /// slot.
-    fn ensure_dnode_under_indirect(&mut self, parent: u32, outer: usize) -> Result<u32> {
+    fn ensure_dnode_under_indirect(
+        &mut self,
+        owner: u32,
+        parent: u32,
+        outer: usize,
+    ) -> Result<u32> {
         let ind = self
             .indirect_nodes
             .get_mut(&parent)
@@ -731,6 +751,7 @@ impl Writer {
             DirectNode {
                 nid: dnid,
                 on_disk_block: phys,
+                owner,
                 addrs: [0; ADDRS_PER_BLOCK],
             },
         );
@@ -927,11 +948,28 @@ impl Writer {
         };
         let nid = self.alloc_nid();
         let inode_blk = self.alloc_node_block()?;
-        // Pack devt into the first 8 bytes of inline_payload.
-        let mut payload = vec![0u8; 8];
-        let devt =
-            ((major as u64) << 8) | (minor as u64 & 0xFF) | ((minor as u64 & 0xFFFFFF00) << 12);
-        payload[..8].copy_from_slice(&devt.to_le_bytes());
+        // Device number placement follows __set_inode_rdev() in the
+        // kernel's fs/f2fs/inode.c: a dev_t that fits the historic 8+8
+        // split goes into i_addr[0] as old_encode_dev(), anything wider
+        // leaves i_addr[0] zero and lands in i_addr[1] as
+        // new_encode_dev(). __get_inode_rdev() picks the slot by testing
+        // i_addr[0] for zero, so the two encodings must not both be set.
+        // Only char/block devices carry a dev_t; fifos and sockets have
+        // none. Nothing here may set F2FS_INLINE_DATA: f2fs_may_inline_data()
+        // refuses inline data on anything but a regular file, and fsck
+        // flags a special inode that claims it.
+        let mut i_addr = Vec::new();
+        if matches!(kind, DeviceKind::Char | DeviceKind::Block) {
+            if major < 256 && minor < 256 {
+                // old_encode_dev(): (major << 8) | minor.
+                i_addr.push((major << 8) | minor);
+            } else {
+                // new_encode_dev(): (minor & 0xff) | (major << 8) |
+                //                   ((minor & ~0xff) << 12).
+                i_addr.push(0);
+                i_addr.push((minor & 0xFF) | (major << 8) | ((minor & !0xFF) << 12));
+            }
+        }
 
         self.inodes.insert(
             nid,
@@ -947,10 +985,10 @@ impl Writer {
                 ctime: meta.ctime,
                 mtime: meta.mtime,
                 flags: 0,
-                inline_flags: F2FS_INLINE_DATA | F2FS_DATA_EXIST,
-                i_addr: Vec::new(),
+                inline_flags: 0,
+                i_addr,
                 i_nid: [0; NIDS_PER_INODE],
-                inline_payload: payload,
+                inline_payload: Vec::new(),
                 on_disk_block: inode_blk,
             },
         );
@@ -1109,14 +1147,37 @@ impl Writer {
         if let Some(idx) = self.child_index.get_mut(&parent_nid) {
             idx.remove(&leaf);
         }
-        // Drop bookkeeping for the child (its on-disk blocks become
-        // "abandoned" but that's fine for a fresh-image writer; the
-        // checkpoint will simply omit the nid from NAT).
-        self.inodes.remove(&child);
-        self.children.remove(&child);
-        self.child_index.remove(&child);
-        // If the removed entry was a directory, the parent loses a link.
-        if let Some(parent) = self.inodes.get_mut(&parent_nid)
+        // Drop one link from the child. A hard-linked file keeps its
+        // inode (and its data blocks) alive for the remaining dentries;
+        // only the last link frees it. `i_links` on a fresh directory is
+        // 2 ("." plus the parent's entry), so a directory always hits
+        // zero here — we only reach this point once it is empty.
+        let child_is_dir = self
+            .inodes
+            .get(&child)
+            .is_some_and(|i| i.mode & super::constants::S_IFMT == S_IFDIR);
+        let survives = match self.inodes.get_mut(&child) {
+            Some(rec) if !child_is_dir && rec.links > 1 => {
+                rec.links -= 1;
+                true
+            }
+            _ => false,
+        };
+        if !survives {
+            // Last link: drop the bookkeeping. The on-disk blocks become
+            // "abandoned" but that's fine for a fresh-image writer; the
+            // checkpoint will simply omit the nid from NAT.
+            self.inodes.remove(&child);
+            self.children.remove(&child);
+            self.child_index.remove(&child);
+        }
+        // Only a removed *directory* takes a link off the parent (its
+        // ".." entry). Unlinking a file or symlink leaves the parent's
+        // link count alone — see f2fs_unlink()/f2fs_rmdir() in the
+        // kernel, which calls f2fs_i_links_write(dir, false) from
+        // f2fs_drop_nlink() only on the rmdir path.
+        if child_is_dir
+            && let Some(parent) = self.inodes.get_mut(&parent_nid)
             && parent.links > 1
         {
             parent.links -= 1;
@@ -1259,13 +1320,13 @@ impl Writer {
 
         // 2) Write every direct-node block.
         for d in self.direct_nodes.values() {
-            let ino = find_owner_of_dnode(self, d.nid);
+            let ino = d.owner;
             let blk = encode_direct_node_with_crc(&d.addrs, d.nid, ino);
             dev.write_at(d.on_disk_block as u64 * bs, &blk)?;
         }
         // 3) Write every indirect-node block.
         for ind in self.indirect_nodes.values() {
-            let ino = find_owner_of_indirect(self, ind.nid);
+            let ino = ind.owner;
             let blk = encode_indirect_node_with_crc(&ind.nids, ind.nid, ino);
             dev.write_at(ind.on_disk_block as u64 * bs, &blk)?;
         }
@@ -1289,7 +1350,7 @@ impl Writer {
             blocks_for.insert(nid, count);
         }
         for d in self.direct_nodes.values() {
-            let owner = find_owner_of_dnode(self, d.nid);
+            let owner = d.owner;
             // The direct-node block itself.
             *blocks_for.entry(owner).or_insert(1) += 1;
             for a in d.addrs.iter() {
@@ -1299,7 +1360,7 @@ impl Writer {
             }
         }
         for ind in self.indirect_nodes.values() {
-            let owner = find_owner_of_indirect(self, ind.nid);
+            let owner = ind.owner;
             *blocks_for.entry(owner).or_insert(1) += 1;
         }
 
@@ -1317,8 +1378,10 @@ impl Writer {
             dev.write_at(ino.on_disk_block as u64 * bs, &blk)?;
         }
 
-        // 5) NAT — write both halves (we don't distinguish active/shadow
-        //    on a fresh image). Each pack maps nid → (version, ino, block).
+        // 5) NAT — write both copies of every page (a fresh image leaves
+        //    the NAT version bitmap all-zero, so the reader always takes
+        //    the first of each pair; the shadow just has to be valid
+        //    too). Each page maps nid → (version, ino, block).
         let nat_pages_per_pack =
             (self.geom.segment_count_nat * self.geom.blocks_per_seg) as usize / 2;
         let mut pages: Vec<Vec<(u8, u32, u32)>> = vec![Vec::new(); nat_pages_per_pack];
@@ -1328,14 +1391,10 @@ impl Writer {
             all_nodes.push((ino.nid, ino.nid, ino.on_disk_block));
         }
         for d in self.direct_nodes.values() {
-            all_nodes.push((d.nid, find_owner_of_dnode(self, d.nid), d.on_disk_block));
+            all_nodes.push((d.nid, d.owner, d.on_disk_block));
         }
         for ind in self.indirect_nodes.values() {
-            all_nodes.push((
-                ind.nid,
-                find_owner_of_indirect(self, ind.nid),
-                ind.on_disk_block,
-            ));
+            all_nodes.push((ind.nid, ind.owner, ind.on_disk_block));
         }
         // Special inodes nid=1 (node_ino) and nid=2 (meta_ino) must have
         // valid block_addr entries in the NAT — fsck.f2fs (Android fork)
@@ -1361,10 +1420,18 @@ impl Writer {
             // mkfs.f2fs uses version=0 across the board on a fresh image.
             pages[page_idx][slot] = (0, owner, blk);
         }
+        // Placement must match the kernel's `current_nat_addr()`: the two
+        // copies of a logical page interleave one segment at a time, so
+        // page `q * blocks_per_seg + r` sits at `2 * q * blocks_per_seg +
+        // r` with its shadow a segment later — not at `pidx` and
+        // `pidx + nat_pages_per_pack`, which only coincide while the NAT
+        // is exactly two segments.
+        let bps = self.geom.blocks_per_seg;
         for (pidx, slots) in pages.iter().enumerate() {
             let page = super::format::encode_nat_page(slots);
-            for half in [0u32, 1u32] {
-                let phys = self.geom.nat_blkaddr + half * (nat_pages_per_pack as u32) + pidx as u32;
+            let (q, r) = (pidx as u32 / bps, pidx as u32 % bps);
+            let first = self.geom.nat_blkaddr + 2 * q * bps + r;
+            for phys in [first, first + bps] {
                 dev.write_at(phys as u64 * bs, &page)?;
             }
         }
@@ -1592,6 +1659,7 @@ impl Writer {
             sit_ver_bitmap_bytesize,
             cur_nat_pack: 0,
             cur_sit_pack: 0,
+            nat_bitmap: Vec::new(),
             nat_journal: Vec::new(),
             cur_node_segno,
             cur_node_blkoff,
@@ -1626,44 +1694,6 @@ impl Writer {
         dev.sync()?;
         Ok(())
     }
-}
-
-fn find_owner_of_dnode(w: &Writer, dnid: u32) -> u32 {
-    for ino in w.inodes.values() {
-        for s in ino.i_nid.iter() {
-            if *s == dnid {
-                return ino.nid;
-            }
-        }
-    }
-    for ind in w.indirect_nodes.values() {
-        if ind.nids.contains(&dnid) {
-            return find_owner_of_indirect(w, ind.nid);
-        }
-    }
-    dnid
-}
-
-fn find_owner_of_indirect(w: &Writer, inid: u32) -> u32 {
-    // First check inodes — direct/indirect/triple slots.
-    for ino in w.inodes.values() {
-        for s in ino.i_nid.iter() {
-            if *s == inid {
-                return ino.nid;
-            }
-        }
-    }
-    // Triple-indirect: the indirect node may itself live under another
-    // (top-level) indirect node. Walk up the chain.
-    for parent in w.indirect_nodes.values() {
-        if parent.nid == inid {
-            continue;
-        }
-        if parent.nids.contains(&inid) {
-            return find_owner_of_indirect(w, parent.nid);
-        }
-    }
-    inid
 }
 
 /// True if a list of dentries still fits in the inline-dentry layout.
@@ -2140,12 +2170,16 @@ mod tests {
             .place_data_block(inode_nid, triple_base, phys)
             .unwrap();
 
-        // The mid-indirect (a child of the top-indirect) should report
-        // the inode as its owner, since the chain crosses the top.
+        // Every node of the chain records the inode as its owner, all
+        // the way down past the top-indirect.
         let ino = writer.inodes.get(&inode_nid).unwrap();
         let top_nid = ino.i_nid[NID_TRIPLE_INDIRECT];
         let top = writer.indirect_nodes.get(&top_nid).unwrap();
+        assert_eq!(top.owner, inode_nid);
         let mid_nid = top.nids[0];
-        assert_eq!(super::find_owner_of_indirect(writer, mid_nid), inode_nid);
+        let mid = writer.indirect_nodes.get(&mid_nid).unwrap();
+        assert_eq!(mid.owner, inode_nid);
+        let dnode = writer.direct_nodes.get(&mid.nids[0]).unwrap();
+        assert_eq!(dnode.owner, inode_nid);
     }
 }

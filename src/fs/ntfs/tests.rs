@@ -566,6 +566,23 @@ fn read_hello_txt() {
     assert_eq!(buf, b"hi\n");
 }
 
+/// A seek past the end of a resident `$DATA` followed by a read must
+/// report EOF (0 bytes), not underflow `bytes.len() - pos`.
+#[test]
+fn resident_reader_read_after_seek_past_eof_is_eof() {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut dev = build_tiny_image();
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    let mut r = ntfs.open_file_seekable(&mut dev, "/hello.txt").unwrap();
+    r.seek(SeekFrom::Start(100)).unwrap();
+    let mut buf = [0u8; 8];
+    assert_eq!(r.read(&mut buf).unwrap(), 0);
+    // Seeking back inside the value still works afterwards.
+    r.seek(SeekFrom::Start(1)).unwrap();
+    assert_eq!(r.read(&mut buf).unwrap(), 2);
+    assert_eq!(&buf[..2], b"i\n");
+}
+
 #[test]
 fn read_xattrs_includes_dos_attrs_and_ads() {
     let mut dev = build_tiny_image();
@@ -1030,6 +1047,127 @@ fn writer_format_then_open_reads_boot_sector() {
     assert_eq!(ntfs2.mft_record_size(), 1024);
 }
 
+/// The USA fixup stride is 512 bytes on every NTFS volume, whatever the
+/// logical sector size — a 4 KiB-sector volume still protects each 512-byte
+/// block of its 1 KiB records (ntfs-3g `NTFS_BLOCK_SIZE`, ntfs3
+/// `SECTOR_SIZE`). Format with 4 KiB sectors, then make sure the record
+/// shape is right and a cold reopen can walk and mutate the volume.
+#[test]
+fn writer_format_with_4k_sectors_uses_512_byte_fixup_stride() {
+    use crate::fs::{Filesystem, OpenFlags};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::path::Path;
+
+    let mut dev = MemoryBackend::new(16 * 1024 * 1024);
+    let opts = FormatOpts {
+        bytes_per_sector: 4096,
+        sectors_per_cluster: 1,
+        volume_label: "4K".to_string(),
+        ..Default::default()
+    };
+    let mut ntfs = Ntfs::format(&mut dev, &opts).unwrap();
+    assert_eq!(ntfs.bytes_per_sector(), 4096);
+    assert_eq!(ntfs.cluster_size(), 4096);
+    ntfs.create_dir(&mut dev, "/d", FileMeta::default())
+        .unwrap();
+    ntfs.create_file(
+        &mut dev,
+        "/d/f.txt",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"four-k".to_vec())),
+            len: 6,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+
+    // Record 0 on disk: 1024 / 512 + 1 = 3 USA entries, not 1024 / 4096 + 1.
+    let mft_off = ntfs.writer.as_ref().unwrap().mft_offset(0).unwrap();
+    let mut raw = vec![0u8; 1024];
+    dev.read_at(mft_off, &mut raw).unwrap();
+    assert_eq!(u16::from_le_bytes([raw[6], raw[7]]), 3, "usa_size");
+    mft::apply_fixup(&mut raw, mft::NTFS_BLOCK_SIZE).unwrap();
+
+    // Cold reopen: read path (records + INDX blocks) and the write path
+    // (writer reconstruction, journal, record rewrite) must all agree on
+    // the stride.
+    let mut ro = Ntfs::open(&mut dev).unwrap();
+    let names: Vec<String> = ro
+        .list_path(&mut dev, "/d")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(names, vec!["f.txt".to_string()]);
+    let mut r = ro.open_file_reader(&mut dev, "/d/f.txt").unwrap();
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"four-k");
+    drop(r);
+    {
+        let mut h = ro
+            .open_file_rw(&mut dev, Path::new("/d/f.txt"), OpenFlags::default(), None)
+            .unwrap();
+        h.seek(SeekFrom::End(0)).unwrap();
+        h.write_all(b"!").unwrap();
+        h.sync().unwrap();
+    }
+    let mut again = Ntfs::open(&mut dev).unwrap();
+    let mut r = again.open_file_reader(&mut dev, "/d/f.txt").unwrap();
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"four-k!");
+}
+
+/// The cluster count comes from the BPB (`total_sectors / spc`), not the
+/// device size: the BPB excludes the last sector (backup boot sector), so
+/// the cluster overlapping it must never be allocatable — and a reopened
+/// volume must size its bitmap the same way the formatter did.
+#[test]
+fn cluster_count_follows_bpb_not_device_size() {
+    let size = 8 * 1024 * 1024u64;
+    let (mut dev, mut ntfs) = fresh_volume(size);
+    let sectors = size / 512;
+    assert_eq!(ntfs.boot_sector().total_sectors, sectors - 1);
+    let expect_clusters = (sectors - 1) / 8;
+    assert_eq!(expect_clusters, 2047);
+    {
+        let w = ntfs.writer.as_ref().unwrap();
+        assert_eq!(w.layout.total_clusters, expect_clusters);
+        assert_eq!(w.layout.bitmap.total, expect_clusters);
+        // Cluster 2047 (the one holding the backup boot sector) is
+        // outside the volume: the allocator reports it as unavailable.
+        assert!(w.layout.bitmap.is_set(2047));
+    }
+    ntfs.flush(&mut dev).unwrap();
+    // The backup boot sector sits in the BPB's last sector.
+    let mut primary = vec![0u8; 512];
+    let mut backup = vec![0u8; 512];
+    dev.read_at(0, &mut primary).unwrap();
+    dev.read_at((sectors - 1) * 512, &mut backup).unwrap();
+    assert_eq!(primary, backup);
+
+    // Reopen on a *larger* device: the reconstructed writer must still
+    // size everything from the BPB.
+    let mut big = MemoryBackend::new(size * 2);
+    big.write_at(0, dev.as_slice()).unwrap();
+    let mut ro = Ntfs::open(&mut big).unwrap();
+    ro.create_file(
+        &mut big,
+        "/x",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"x".to_vec())),
+            len: 1,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    let w = ro.writer.as_ref().unwrap();
+    assert_eq!(w.layout.total_clusters, expect_clusters);
+    assert_eq!(w.layout.bitmap.total, expect_clusters);
+}
+
 #[test]
 fn writer_format_volume_has_root_directory() {
     let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
@@ -1240,6 +1378,293 @@ fn writer_dir_promotes_to_index_allocation() {
             "missing file_{i:02}.txt"
         );
     }
+}
+
+/// Byte size of a directory's `$INDEX_ALLOCATION:$I30` (0 when the index
+/// is still root-resident) and its `$INDEX_ROOT`'s `index_block_size`.
+fn index_allocation_shape(ntfs: &mut Ntfs, dev: &mut MemoryBackend, path: &str) -> (u64, u32) {
+    let rec = ntfs.lookup_path(dev, path).unwrap();
+    let records = ntfs.load_record_set(dev, rec).unwrap();
+    let mut alloc = 0u64;
+    let mut block = 0u32;
+    for (_, buf) in &records {
+        let h = mft::RecordHeader::parse(buf).unwrap();
+        for attr in AttributeIter::new(buf, h.first_attribute_offset as usize) {
+            let attr = attr.unwrap();
+            if attr.name != "$I30" {
+                continue;
+            }
+            match (attr.type_code, attr.kind) {
+                (TYPE_INDEX_ALLOCATION, AttributeKind::NonResident { real_size, .. }) => {
+                    alloc = real_size;
+                }
+                (TYPE_INDEX_ROOT, AttributeKind::Resident { value, .. }) => {
+                    block = index::IndexRootHeader::parse(value)
+                        .unwrap()
+                        .index_block_size;
+                }
+                _ => {}
+            }
+        }
+    }
+    (alloc, block)
+}
+
+/// Sorted names under `path` from a cold reopen of `dev`.
+fn names_after_reopen(dev: &mut MemoryBackend, path: &str) -> Vec<String> {
+    let mut ro = Ntfs::open(dev).unwrap();
+    let mut v: Vec<String> = ro
+        .list_path(dev, path)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    v.sort();
+    v
+}
+
+/// Inserts and removes on a directory whose `$I30` spans several INDX
+/// blocks (a real B-tree with an internal root). The old writer treated
+/// VCN 0 — the leftmost *leaf* — as "the" block: later batches were
+/// appended to that leaf and re-serialised without its siblings' parent
+/// pointers, orphaning most of the directory. Every batch now rebuilds
+/// the tree from all reachable entries. Exercised at three cluster sizes
+/// so the VCN unit (cluster, or 512 bytes when the cluster is larger
+/// than an index block — `vcn_unit_bytes`) is covered on both sides.
+#[test]
+fn multi_block_index_survives_batched_inserts_and_removes() {
+    use crate::fs::{Filesystem, OpenFlags};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::path::Path;
+
+    for spc in [2u8, 8, 16] {
+        let mut dev = MemoryBackend::new(32 * 1024 * 1024);
+        let opts = FormatOpts {
+            sectors_per_cluster: spc,
+            volume_label: "BTREE".into(),
+            ..Default::default()
+        };
+        let mut ntfs = Ntfs::format(&mut dev, &opts).unwrap();
+        ntfs.create_dir(&mut dev, "/big", FileMeta::default())
+            .unwrap();
+        let mk = |ntfs: &mut Ntfs, dev: &mut MemoryBackend, i: usize| {
+            ntfs.create_file(
+                dev,
+                &format!("/big/entry_number_{i:04}.dat"),
+                FileSource::Reader {
+                    reader: Box::new(std::io::Cursor::new(vec![b'x'; 3])),
+                    len: 3,
+                },
+                FileMeta::default(),
+            )
+            .unwrap();
+        };
+        // Batch 1: enough entries for several leaves (≈ 38 per 4 KiB block).
+        for i in 0..200 {
+            mk(&mut ntfs, &mut dev, i);
+        }
+        ntfs.flush(&mut dev).unwrap();
+        let (alloc, block) = index_allocation_shape(&mut ntfs, &mut dev, "/big");
+        assert!(
+            alloc > block as u64 * 2,
+            "spc={spc}: expected a multi-block tree, got alloc={alloc} block={block}"
+        );
+        // Batch 2 lands in an already-promoted, multi-block directory.
+        for i in 200..260 {
+            mk(&mut ntfs, &mut dev, i);
+        }
+        ntfs.flush(&mut dev).unwrap();
+        let mut expect: Vec<String> = (0..260)
+            .map(|i| format!("entry_number_{i:04}.dat"))
+            .collect();
+        expect.sort();
+        assert_eq!(
+            names_after_reopen(&mut dev, "/big"),
+            expect,
+            "spc={spc} after inserts"
+        );
+
+        // Remove entries from what were different leaves.
+        for i in [0usize, 77, 150, 259] {
+            ntfs.remove(&mut dev, &format!("/big/entry_number_{i:04}.dat"))
+                .unwrap();
+        }
+        ntfs.flush(&mut dev).unwrap();
+        expect.retain(|n| {
+            ![0usize, 77, 150, 259]
+                .iter()
+                .any(|i| *n == format!("entry_number_{i:04}.dat"))
+        });
+        assert_eq!(
+            names_after_reopen(&mut dev, "/big"),
+            expect,
+            "spc={spc} after removes"
+        );
+
+        // Path lookups (which descend the tree) still resolve, and a
+        // size change made through open_file_rw is patched into
+        // whichever block holds the entry.
+        let mut ro = Ntfs::open(&mut dev).unwrap();
+        // Removed above: must not resolve any more.
+        assert!(
+            ro.open_file_rw(
+                &mut dev,
+                Path::new("/big/entry_number_0150.dat"),
+                OpenFlags::default(),
+                None,
+            )
+            .is_err()
+        );
+        {
+            let mut h = ro
+                .open_file_rw(
+                    &mut dev,
+                    Path::new("/big/entry_number_0151.dat"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .unwrap();
+            h.seek(SeekFrom::End(0)).unwrap();
+            h.write_all(&vec![b'y'; 5000]).unwrap();
+            h.sync().unwrap();
+        }
+        let mut again = Ntfs::open(&mut dev).unwrap();
+        let a = again
+            .getattr(&mut dev, Path::new("/big/entry_number_0151.dat"))
+            .unwrap();
+        assert_eq!(a.size, 5003, "spc={spc}: index entry size after rw extend");
+        let mut r = again
+            .open_file_reader(&mut dev, "/big/entry_number_0151.dat")
+            .unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf.len(), 5003);
+        assert_eq!(&buf[..3], b"xxx");
+    }
+}
+
+/// Extending a file through `open_file_rw` must update the size stored in
+/// the parent's `$I30` entry — that is what `list` / `getattr` report.
+/// For a small (root-resident) directory the patch used to start at the
+/// index header instead of the first entry and never landed.
+#[test]
+fn rw_extend_updates_size_in_root_resident_index() {
+    use crate::fs::{Filesystem, OpenFlags};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::path::Path;
+
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    ntfs_create_small(&mut ntfs, &mut dev, "/d", "/d/grow.txt");
+    ntfs.flush(&mut dev).unwrap();
+    let (alloc, _) = index_allocation_shape(&mut ntfs, &mut dev, "/d");
+    assert_eq!(alloc, 0, "directory must still be root-resident");
+
+    let mut ro = Ntfs::open(&mut dev).unwrap();
+    {
+        let mut h = ro
+            .open_file_rw(
+                &mut dev,
+                Path::new("/d/grow.txt"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+        h.seek(SeekFrom::End(0)).unwrap();
+        h.write_all(&vec![0u8; 9000]).unwrap();
+        h.sync().unwrap();
+    }
+    let listed = ro
+        .list_path(&mut dev, "/d")
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "grow.txt")
+        .unwrap();
+    assert_eq!(listed.size, 9002);
+    let mut again = Ntfs::open(&mut dev).unwrap();
+    let a = again.getattr(&mut dev, Path::new("/d/grow.txt")).unwrap();
+    assert_eq!(a.size, 9002);
+}
+
+/// On-disk `$I30` order follows `$UpCase` collation, so ntfs-3g's binary
+/// search finds non-ASCII names. `é` folds to `É` (U+00C9) and so lands
+/// before `Ê` (U+00CA), even though its raw code unit (U+00E9) is the
+/// larger of the two; folded ASCII (`E`, `F`) still sorts ahead of both.
+/// `list_path` returns entries in on-disk order.
+#[test]
+fn writer_sorts_non_ascii_names_by_upcase_collation() {
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    ntfs.create_dir(&mut dev, "/u", FileMeta::default())
+        .unwrap();
+    for name in ["Ê.txt", "é.txt", "f.txt", "E.txt"] {
+        ntfs.create_file(
+            &mut dev,
+            &format!("/u/{name}"),
+            FileSource::Zero(0),
+            FileMeta::default(),
+        )
+        .unwrap();
+    }
+    ntfs.flush(&mut dev).unwrap();
+    let mut ro = Ntfs::open(&mut dev).unwrap();
+    let order: Vec<String> = ro
+        .list_path(&mut dev, "/u")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(order, ["E.txt", "f.txt", "é.txt", "Ê.txt"]);
+    // Case-insensitive lookup through the on-disk `$UpCase` still works.
+    assert!(ro.lookup_path(&mut dev, "/u/É.TXT").is_ok());
+}
+
+/// The writer grows `$MFT` past its initial 64 records; the read path on
+/// the *same* handle (lookups, remove, getattr) must follow that growth
+/// instead of serving the run list it cached from record 0 at open.
+#[test]
+fn reader_follows_mft_growth_on_live_handle() {
+    use crate::fs::Filesystem;
+    use std::path::Path;
+
+    let (mut dev, mut ntfs) = fresh_volume(32 * 1024 * 1024);
+    let initial_records = ntfs.writer.as_ref().unwrap().layout.mft_records;
+    let n = initial_records as usize + 20;
+    for i in 0..n {
+        ntfs.create_file(
+            &mut dev,
+            &format!("/f{i}"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(vec![b'.'; 1])),
+                len: 1,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+    }
+    assert!(ntfs.writer.as_ref().unwrap().layout.mft_records > initial_records);
+    let last = format!("/f{}", n - 1);
+    let rec = ntfs.lookup_path(&mut dev, &last).unwrap();
+    assert!(
+        rec >= initial_records,
+        "record {rec} should sit in the grown region"
+    );
+    assert_eq!(ntfs.getattr(&mut dev, Path::new(&last)).unwrap().size, 1);
+    ntfs.remove(&mut dev, &last).unwrap();
+    ntfs.flush(&mut dev).unwrap();
+    assert!(!names_after_reopen(&mut dev, "/").contains(&format!("f{}", n - 1)));
+}
+
+fn ntfs_create_small(ntfs: &mut Ntfs, dev: &mut MemoryBackend, dir: &str, file: &str) {
+    ntfs.create_dir(dev, dir, FileMeta::default()).unwrap();
+    ntfs.create_file(
+        dev,
+        file,
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"hi".to_vec())),
+            len: 2,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -1833,4 +2258,208 @@ fn set_attrs_chmod_roundtrips_readonly_bit() {
     let mut buf = Vec::new();
     r.read_to_end(&mut buf).unwrap();
     assert_eq!(buf, b"hi\n");
+}
+
+/// Once `$MFT` is fragmented enough that its run list stops fitting in
+/// record 0, NTFS spills the later `$DATA` segments into extension
+/// records named by record 0's `$ATTRIBUTE_LIST`. Taking only the first
+/// `$DATA` attribute truncated `$MFT`, so every record past the first
+/// fragment read back as "past the end of $MFT".
+///
+/// This rewrites a formatted volume's record 0 into that shape — same
+/// clusters, but described as two `$DATA` segments, the second living in
+/// an extension record — and checks a record in the tail segment still
+/// resolves.
+#[test]
+fn mft_bootstrap_follows_attribute_list_on_record_zero() {
+    use super::attribute::{TYPE_ATTRIBUTE_LIST, TYPE_DATA};
+    let (mut dev, _ntfs) = fresh_volume(8 * 1024 * 1024);
+    let (base_off, rec_size, cluster_size) = {
+        let ro = Ntfs::open(&mut dev).unwrap();
+        let b = ro.boot_sector();
+        (
+            b.mft_lcn * b.cluster_size() as u64,
+            b.mft_record_size() as usize,
+            b.cluster_size() as u64,
+        )
+    };
+    // Decode record 0: keep every attribute except $DATA verbatim, and
+    // pull $DATA's single extent apart.
+    let mut rec0 = vec![0u8; rec_size];
+    dev.read_at(base_off, &mut rec0).unwrap();
+    mft::apply_fixup(&mut rec0, mft::NTFS_BLOCK_SIZE).unwrap();
+    let hdr = mft::RecordHeader::parse(&rec0).unwrap();
+    let mut keep: Vec<Vec<u8>> = Vec::new();
+    let mut data: Option<(u64, u64, u64, u64, u64)> = None; // lcn, len, alloc, real, init
+    for a in AttributeIter::new(&rec0, hdr.first_attribute_offset as usize) {
+        let a = a.unwrap();
+        if a.type_code == TYPE_DATA {
+            match a.kind {
+                AttributeKind::NonResident {
+                    ref runs,
+                    allocated_size,
+                    real_size,
+                    initialized_size,
+                    ..
+                } => {
+                    assert_eq!(runs.len(), 1, "a fresh $MFT is one extent");
+                    data = Some((
+                        runs[0].lcn.unwrap(),
+                        runs[0].length,
+                        allocated_size,
+                        real_size,
+                        initialized_size,
+                    ));
+                }
+                _ => panic!("$MFT $DATA must be non-resident"),
+            }
+            continue;
+        }
+        keep.push(rec0[a.offset..a.offset + a.length as usize].to_vec());
+    }
+    let (lcn, clusters, allocated, real, initialized) = data.expect("$MFT has $DATA");
+    let records_per_cluster = cluster_size / rec_size as u64;
+    // Split three clusters off the tail. The extension record and every
+    // system record stay inside the leading segment; the marker record
+    // below lands in the tail one.
+    assert!(clusters > 4, "test needs a multi-cluster $MFT");
+    let split = clusters - 3;
+    let tail_first_record = split * records_per_cluster;
+    let marker_rec = tail_first_record + 1;
+    let ext_rec = tail_first_record - 4; // free, inside the head segment
+
+    // A recognisable record in the tail segment.
+    let mut marker = vec![0u8; rec_size];
+    format::emit_record(
+        &mut marker,
+        rec_size,
+        marker_rec,
+        mft::RecordHeader::FLAG_IN_USE,
+        &[format::build_resident_attr(
+            TYPE_DATA,
+            &[],
+            b"tail-segment marker",
+            0,
+            0,
+        )],
+        mft::NTFS_BLOCK_SIZE,
+        1,
+    )
+    .unwrap();
+    dev.write_at(base_off + marker_rec * rec_size as u64, &marker)
+        .unwrap();
+
+    // $DATA segment 0 (VCN 0..split) stays in record 0; segment 1 goes to
+    // the extension record.
+    let seg0 = format::build_non_resident_attr(
+        TYPE_DATA,
+        &[],
+        &format::encode_run_list(&[(lcn, split)]),
+        0,
+        split - 1,
+        allocated,
+        real,
+        initialized,
+        0,
+        0,
+    );
+    let seg1 = format::build_non_resident_attr(
+        TYPE_DATA,
+        &[],
+        &format::encode_run_list(&[(lcn + split, clusters - split)]),
+        split,
+        clusters - 1,
+        allocated,
+        real,
+        initialized,
+        0,
+        0,
+    );
+    // $ATTRIBUTE_LIST: one 0x20-byte row per segment.
+    let mut alist = Vec::new();
+    for (vcn, rec) in [(0u64, 0u64), (split, ext_rec)] {
+        alist.extend_from_slice(&TYPE_DATA.to_le_bytes());
+        alist.extend_from_slice(&0x20u16.to_le_bytes());
+        alist.push(0); // name_len
+        alist.push(0x1A); // name_off
+        alist.extend_from_slice(&vcn.to_le_bytes());
+        alist.extend_from_slice(&(rec | (1u64 << 48)).to_le_bytes());
+        alist.extend_from_slice(&0u16.to_le_bytes()); // attribute_id
+        alist.extend_from_slice(&[0u8; 6]);
+    }
+    let alist_attr = format::build_resident_attr(TYPE_ATTRIBUTE_LIST, &[], &alist, 0, 0);
+
+    let mut attrs = keep;
+    attrs.push(alist_attr);
+    attrs.push(seg0);
+    let mut new0 = vec![0u8; rec_size];
+    format::emit_record(
+        &mut new0,
+        rec_size,
+        0,
+        mft::RecordHeader::FLAG_IN_USE,
+        &attrs,
+        mft::NTFS_BLOCK_SIZE,
+        1,
+    )
+    .unwrap();
+    dev.write_at(base_off, &new0).unwrap();
+
+    let mut ext = vec![0u8; rec_size];
+    format::emit_record(
+        &mut ext,
+        rec_size,
+        ext_rec,
+        mft::RecordHeader::FLAG_IN_USE,
+        &[seg1],
+        mft::NTFS_BLOCK_SIZE,
+        1,
+    )
+    .unwrap();
+    dev.write_at(base_off + ext_rec * rec_size as u64, &ext)
+        .unwrap();
+
+    // The reopened volume must stitch both segments together.
+    let mut ro = Ntfs::open(&mut dev).unwrap();
+    let mut got = vec![0u8; rec_size];
+    ro.read_mft_record(&mut dev, marker_rec, &mut got).unwrap();
+    let hdr = mft::RecordHeader::parse(&got).unwrap();
+    let mut found = false;
+    for a in AttributeIter::new(&got, hdr.first_attribute_offset as usize) {
+        let a = a.unwrap();
+        if let AttributeKind::Resident { value, .. } = a.kind {
+            assert_eq!(value, b"tail-segment marker");
+            found = true;
+        }
+    }
+    assert!(found, "marker record in the tail segment must be readable");
+    // The root directory (in the head segment) still lists normally.
+    assert!(ro.list_path(&mut dev, "/").is_ok());
+}
+
+/// A `FileSource::Reader` that hands over fewer bytes than it declared
+/// must be rejected, not padded with zeros: the declared length is
+/// already stamped into `$FILE_NAME` and the `$DATA` header, so padding
+/// invents file content.
+#[test]
+fn create_file_rejects_a_short_source() {
+    for declared in [64u64, 200_000] {
+        let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+        let err = ntfs
+            .create_file(
+                &mut dev,
+                "/short.bin",
+                FileSource::Reader {
+                    reader: Box::new(std::io::Cursor::new(vec![b'x'; 8])),
+                    len: declared,
+                },
+                FileMeta::default(),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("a {declared}-byte promise with 8 bytes must fail"));
+        match err {
+            crate::Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof),
+            other => panic!("expected UnexpectedEof, got {other:?}"),
+        }
+    }
 }

@@ -132,20 +132,27 @@ pub fn walk_sii_node(buf: &[u8]) -> Result<Vec<SiiEntry>> {
         if entry_len < 16 || cursor + entry_len > buf.len() {
             break;
         }
+        let entry_end = cursor + entry_len;
         let is_last = flags & 0x02 != 0;
-        if !is_last && key_len >= 4 && data_size >= 0x14 {
+        // A real entry must be long enough to hold the 4-byte security-id
+        // key past the 16-byte header, and its data block must sit wholly
+        // inside the entry — both fields are attacker-controlled.
+        if !is_last && entry_len >= 20 && key_len >= 4 && data_size >= 0x14 {
             let key_start = cursor + 16;
             let security_id = u32::from_le_bytes(buf[key_start..key_start + 4].try_into().unwrap());
-            let data_start = cursor + data_offset;
-            if data_start + data_size <= buf.len() {
+            let data_range = cursor
+                .checked_add(data_offset)
+                .and_then(|s| s.checked_add(data_size).map(|e| (s, e)));
+            if let Some((data_start, data_end)) = data_range
+                && data_end <= entry_end
+            {
                 // Layout of the data portion mirrors the SDS entry header.
-                let hdr = SdsEntryHeader::parse(&buf[data_start..data_start + data_size])?;
+                let hdr = SdsEntryHeader::parse(&buf[data_start..data_end])?;
                 out.push(SiiEntry {
                     security_id,
                     sds_offset: hdr.offset_in_sds,
                     sds_size: hdr.size,
                 });
-                let _ = security_id;
             }
         }
         cursor += entry_len;
@@ -256,6 +263,44 @@ mod tests {
         assert_eq!(t.fold_unit(b'a' as u16), b'A' as u16);
         assert!(t.equals_ignore_case("HELLO.TXT", "hello.txt"));
         assert!(!t.equals_ignore_case("hello", "world"));
+    }
+
+    /// Build one raw `$SII` index entry with the given geometry fields.
+    fn sii_entry(entry_len: u16, key_len: u16, data_offset: u16, data_size: u16) -> Vec<u8> {
+        let mut e = vec![0u8; entry_len as usize];
+        e[0..2].copy_from_slice(&data_offset.to_le_bytes());
+        e[2..4].copy_from_slice(&data_size.to_le_bytes());
+        e[8..10].copy_from_slice(&entry_len.to_le_bytes());
+        e[10..12].copy_from_slice(&key_len.to_le_bytes());
+        e
+    }
+
+    /// A 16-byte entry that claims a 4-byte key (so the key would sit
+    /// past its own end) must be skipped, not read out of bounds.
+    #[test]
+    fn sii_walk_skips_entry_too_short_for_its_key() {
+        let buf = sii_entry(16, 4, 0x14, 20);
+        let rows = walk_sii_node(&buf).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    /// The data block must lie inside the entry: an entry whose
+    /// `data_offset + data_size` overruns it is skipped, and a later
+    /// well-formed entry in the same node is still decoded.
+    #[test]
+    fn sii_walk_rejects_data_block_outside_entry() {
+        let mut buf = sii_entry(40, 4, 0x14, 0xFFFF);
+        // Well-formed entry: key = id 7, data mirrors an SDS header.
+        let mut good = sii_entry(40, 4, 0x14, 20);
+        good[16..20].copy_from_slice(&7u32.to_le_bytes());
+        good[28..36].copy_from_slice(&0x4000u64.to_le_bytes());
+        good[36..40].copy_from_slice(&0x100u32.to_le_bytes());
+        buf.extend_from_slice(&good);
+        let rows = walk_sii_node(&buf).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].security_id, 7);
+        assert_eq!(rows[0].sds_offset, 0x4000);
+        assert_eq!(rows[0].sds_size, 0x100);
     }
 
     #[test]

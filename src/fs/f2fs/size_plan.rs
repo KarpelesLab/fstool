@@ -6,7 +6,7 @@
 //! blocks for large files — and data blocks for files past the 3672-byte inline
 //! limit and directories past 182 inline dentries. The main area is measured in
 //! 2 MiB segments and needs at least the 6 active-log segments (hot/warm/cold ×
-//! node/data), which is F2FS's practical floor (~27 MiB).
+//! node/data) plus one free segment, which is the writer's floor (~28 MiB).
 //!
 //! Phase 1 accumulates node/data blocks; phase 2 ([`total_size`]) rounds the
 //! main area up to whole segments (with headroom for the 6 logs' partial
@@ -31,8 +31,9 @@ const META_BLOCKS: u64 = 2 + (2 + 2 + 2 + 1) * BLOCKS_PER_SEG;
 /// `MAX_INLINE_DATA`).
 const MAX_INLINE_DATA: u64 = 3672;
 /// The six active logs (hot/warm/cold × node/data) each hold a current
-/// segment, so the main area never has fewer than this many segments.
-const MIN_MAIN_SEGS: u64 = 6;
+/// segment, plus one free segment for the first spill-over allocation —
+/// the floor `format::plan_geometry` enforces.
+const MIN_MAIN_SEGS: u64 = super::format::MIN_MAIN_SEGMENTS as u64;
 
 /// Per-directory accumulator.
 #[derive(Default, Clone, Copy)]
@@ -131,7 +132,7 @@ impl FsSizePlan for F2fsSizePlan {
         let node_segs = self.node_blocks.div_ceil(BLOCKS_PER_SEG);
         let data_segs = (self.data_blocks + dir_data).div_ceil(BLOCKS_PER_SEG);
         // Node and data live in separate logs; +5 covers the idle logs' current
-        // segments (so tiny content lands on exactly the 6-segment floor).
+        // segments, and the floor adds the one free segment the writer needs.
         let main_segs = (node_segs + data_segs + 5).max(MIN_MAIN_SEGS);
         (META_BLOCKS + main_segs * BLOCKS_PER_SEG) * BLOCK
     }
@@ -144,7 +145,7 @@ mod tests {
     #[test]
     fn empty_is_meta_plus_floor() {
         let p = F2fsSizePlan::new();
-        // ~14 MiB meta + 6..7 main segments → ~27 MiB.
+        // ~14 MiB meta + 7 main segments → ~28 MiB.
         let mib = p.total_size() / (1024 * 1024);
         assert!((26..=30).contains(&mib), "got {mib} MiB");
     }

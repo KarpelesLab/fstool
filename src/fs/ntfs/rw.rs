@@ -41,12 +41,11 @@ use crate::Result;
 use crate::block::BlockDevice;
 use crate::fs::FileHandle;
 
-use super::attribute::{
-    AttributeIter, AttributeKind, FileName, TYPE_DATA, TYPE_FILE_NAME, decode_utf16le,
-};
+use super::attribute::{AttributeIter, AttributeKind, FileName, TYPE_DATA, TYPE_FILE_NAME};
 use super::format::{
     self, build_file_name_value, build_non_resident_attr, build_resident_attr, encode_run_list,
 };
+use super::index;
 use super::mft;
 use super::run_list::Extent;
 
@@ -58,7 +57,7 @@ pub struct NtfsFileHandle<'a> {
     rec_no: u64,
     /// MFT record byte size (cached).
     rec_size: usize,
-    /// Logical sector size (used for USA fixup install).
+    /// USA fixup stride — always [`mft::NTFS_BLOCK_SIZE`].
     sector_size: usize,
     /// Cluster size in bytes.
     cluster_size: u64,
@@ -494,9 +493,7 @@ impl<'a> NtfsFileHandle<'a> {
             redo_bytes: rec_buf.clone(),
             undo_bytes: old_rec,
         });
-        if let Some(entry) = self.build_index_entry_redo()? {
-            txn.push(entry);
-        }
+        txn.extend(self.build_index_entry_redo()?);
 
         // Commit through the journal: write LFS records, stamp restart
         // pages dirty, apply the in-place writes, stamp restart pages
@@ -507,10 +504,12 @@ impl<'a> NtfsFileHandle<'a> {
         Ok(())
     }
 
-    /// Build a `RedoEntry` for the parent directory's `$I30` size patch.
-    /// Returns `Ok(None)` if no patch applies (no matching entry, or the
-    /// bytes are already correct).
-    fn build_index_entry_redo(&mut self) -> Result<Option<super::logfile::RedoEntry>> {
+    /// Build the `RedoEntry`s for the parent directory's `$I30` size patch:
+    /// every node holding an entry for this record — the resident
+    /// `$INDEX_ROOT` and, for a promoted directory, each INDX block
+    /// reachable from it — gets its `$FILE_NAME` size pair refreshed.
+    /// Returns an empty vector when nothing changes.
+    fn build_index_entry_redo(&mut self) -> Result<Vec<super::logfile::RedoEntry>> {
         let parent_rec_no = self.parent_ref & 0x0000_FFFF_FFFF_FFFF;
         let off = self
             .fs
@@ -522,130 +521,166 @@ impl<'a> NtfsFileHandle<'a> {
         self.dev.read_at(off, &mut rec)?;
         let old_rec = rec.clone();
         if mft::apply_fixup(&mut rec, self.sector_size).is_err() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let hdr = mft::RecordHeader::parse(&rec)?;
-        let bytes_in_use = hdr.bytes_in_use as usize;
-        let first = hdr.first_attribute_offset as usize;
-        let mut cursor = first;
-        let mut root_off_in_rec: Option<(usize, usize, usize)> = None;
+        // `(value_start, value_end)` of the resident `$INDEX_ROOT:$I30`
+        // within `rec`, and the `$INDEX_ALLOCATION:$I30` run list. Every
+        // attribute length / offset is validated by `AttributeIter`, so a
+        // malformed record ends the scan instead of overrunning `rec`.
+        let mut root_range: Option<(usize, usize)> = None;
         let mut alloc_runs: Option<Vec<Extent>> = None;
-        // Clamp the scan bound to the record's real length: a malformed
-        // `bytes_in_use` must never push the cursor past `rec`.
-        let scan_end = bytes_in_use.min(rec.len());
-        while cursor + 16 <= scan_end {
-            let tc = u32::from_le_bytes(rec[cursor..cursor + 4].try_into().unwrap());
-            if tc == 0xFFFF_FFFF {
-                break;
+        for attr in
+            AttributeIter::new(&rec, hdr.first_attribute_offset as usize).map_while(Result::ok)
+        {
+            if attr.name != "$I30" {
+                continue;
             }
-            let len = u32::from_le_bytes(rec[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
-            // Reject degenerate / out-of-bounds attribute records: `len < 16`
-            // would loop forever; an overrun would slice past `rec`.
-            if len < 16 || cursor + len > scan_end {
-                break;
-            }
-            let non_resident = rec[cursor + 8] != 0;
-            let name_len = rec[cursor + 9] as usize;
-            let name_off =
-                u16::from_le_bytes(rec[cursor + 10..cursor + 12].try_into().unwrap()) as usize;
-            let name_end = cursor
-                .checked_add(name_off)
-                .and_then(|s| name_len.checked_mul(2).and_then(|n| s.checked_add(n)));
-            let attr_name = match name_end {
-                _ if name_len == 0 => String::new(),
-                Some(end) if end <= cursor + len => decode_utf16le(&rec[cursor + name_off..end]),
-                // Name field overruns the attribute — skip safely.
-                _ => {
-                    cursor += len;
-                    continue;
+            match (attr.type_code, attr.kind) {
+                (super::attribute::TYPE_INDEX_ROOT, AttributeKind::Resident { value, .. }) => {
+                    // Resident header: value_offset is a u16 at attr+0x14.
+                    // `AttributeIter` has already checked that the value
+                    // lies inside the attribute (and thus inside `rec`).
+                    let value_off = u16::from_le_bytes(
+                        rec[attr.offset + 0x14..attr.offset + 0x16]
+                            .try_into()
+                            .unwrap(),
+                    ) as usize;
+                    let start = attr.offset + value_off;
+                    root_range = Some((start, start + value.len()));
                 }
+                (
+                    super::attribute::TYPE_INDEX_ALLOCATION,
+                    AttributeKind::NonResident { runs, .. },
+                ) => {
+                    alloc_runs = Some(runs);
+                }
+                _ => {}
+            }
+        }
+        let Some((root_v_start, root_v_end)) = root_range else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+
+        // The root's own entries (a small index keeps everything here; a
+        // large one may still carry real entries next to its child
+        // pointers), plus the VCNs of its children.
+        let Ok(root_hdr) = index::IndexRootHeader::parse(&rec[root_v_start..root_v_end]) else {
+            return Ok(Vec::new());
+        };
+        let entries_start = root_hdr.header_offset + root_hdr.first_entry_offset as usize;
+        let entries_len =
+            (root_hdr.bytes_in_use as usize).saturating_sub(root_hdr.first_entry_offset as usize);
+        let children = index::walk_index_node(
+            &rec[root_v_start..root_v_end],
+            entries_start,
+            entries_len,
+            |_| {},
+        )
+        .unwrap_or_default();
+        let large_index = root_hdr.has_index_allocation();
+        let block_size = match root_hdr.index_block_size {
+            0 => self
+                .fs
+                .writer
+                .as_ref()
+                .map(|w| w.layout.index_record_size as usize)
+                .unwrap_or(4096),
+            n => n as usize,
+        };
+        if patch_entries_for_record(
+            &mut rec[root_v_start..root_v_end],
+            entries_start,
+            self.rec_no,
+            self.len,
+            self.cluster_size,
+        ) {
+            mft::install_fixup(&mut rec, self.sector_size, 1);
+            if rec != old_rec {
+                out.push(super::logfile::RedoEntry {
+                    target_offset: off,
+                    redo_bytes: rec,
+                    undo_bytes: old_rec,
+                });
+            }
+        }
+        if !large_index {
+            return Ok(out);
+        }
+        let Some(runs) = alloc_runs else {
+            return Ok(out);
+        };
+
+        // Descend every INDX block. Child VCNs are in clusters, or in
+        // 512-byte units when the cluster is larger than a block.
+        let vcn_unit = index::vcn_unit_bytes(self.cluster_size, block_size as u64);
+        let mut block = vec![0u8; block_size];
+        let mut stack = children;
+        let mut visited = std::collections::HashSet::<u64>::new();
+        while let Some(vcn) = stack.pop() {
+            if !visited.insert(vcn) {
+                break;
+            }
+            let byte_off = vcn * vcn_unit;
+            if super::writer::read_alloc_bytes(
+                self.dev,
+                &runs,
+                self.cluster_size,
+                byte_off,
+                &mut block,
+            )
+            .is_err()
+            {
+                break;
+            }
+            let old_block = block.clone();
+            if mft::apply_fixup(&mut block, self.sector_size).is_err() {
+                break;
+            }
+            let Ok(blk_hdr) = index::IndexBlockHeader::parse(&block) else {
+                break;
             };
-            if attr_name == "$I30" {
-                if tc == super::attribute::TYPE_INDEX_ROOT && !non_resident && len >= 0x16 {
-                    let value_off =
-                        u16::from_le_bytes(rec[cursor + 0x14..cursor + 0x16].try_into().unwrap())
-                            as usize;
-                    let value_len =
-                        u32::from_le_bytes(rec[cursor + 0x10..cursor + 0x14].try_into().unwrap())
-                            as usize;
-                    root_off_in_rec = Some((cursor, value_off, value_len));
-                } else if tc == super::attribute::TYPE_INDEX_ALLOCATION
-                    && non_resident
-                    && len >= 0x22
-                {
-                    let runs_off =
-                        u16::from_le_bytes(rec[cursor + 0x20..cursor + 0x22].try_into().unwrap())
-                            as usize;
-                    // Bounds-check the run-list slice against the attribute.
-                    if runs_off <= len && cursor + len <= rec.len() {
-                        let runs_bytes = &rec[cursor + runs_off..cursor + len];
-                        if let Ok(rs) = super::run_list::decode(runs_bytes) {
-                            alloc_runs = Some(rs);
+            let entries_start = blk_hdr.entries_start();
+            let entries_len = blk_hdr.entries_byte_len();
+            if let Ok(kids) = index::walk_index_node(&block, entries_start, entries_len, |_| {}) {
+                stack.extend(kids);
+            }
+            if patch_entries_for_record(
+                &mut block,
+                entries_start,
+                self.rec_no,
+                self.len,
+                self.cluster_size,
+            ) {
+                mft::install_fixup(&mut block, self.sector_size, 1);
+                if block != old_block {
+                    match super::writer::alloc_byte_to_disk(&runs, self.cluster_size, byte_off) {
+                        // The block lies inside one extent (always true for
+                        // this writer's allocations): journal it as one
+                        // contiguous redo/undo pair.
+                        Some((disk, left)) if left >= block_size as u64 => {
+                            out.push(super::logfile::RedoEntry {
+                                target_offset: disk,
+                                redo_bytes: block.clone(),
+                                undo_bytes: old_block,
+                            });
                         }
+                        // A foreign allocation whose block straddles two
+                        // extents: apply the patch directly, unjournaled.
+                        Some(_) => super::writer::write_alloc_bytes(
+                            self.dev,
+                            &runs,
+                            self.cluster_size,
+                            byte_off,
+                            &block,
+                        )?,
+                        None => break,
                     }
                 }
             }
-            cursor += len;
         }
-        let Some((attr_start, value_off, value_len)) = root_off_in_rec else {
-            return Ok(None);
-        };
-        let root_v_start = attr_start + value_off;
-        let root_v_end = root_v_start + value_len;
-        let root_val = &mut rec[root_v_start..root_v_end];
-        if root_val.len() < 32 {
-            return Ok(None);
-        }
-        let index_flags = root_val[28];
-        let large_index = index_flags & 0x01 != 0;
-        if !large_index {
-            if patch_entries_for_record(root_val, 16, self.rec_no, self.len) {
-                mft::install_fixup(&mut rec, self.sector_size, 1);
-                if rec != old_rec {
-                    return Ok(Some(super::logfile::RedoEntry {
-                        target_offset: off,
-                        redo_bytes: rec,
-                        undo_bytes: old_rec,
-                    }));
-                }
-            }
-            return Ok(None);
-        }
-        let Some(runs) = alloc_runs else {
-            return Ok(None);
-        };
-        let Some(first_run_lcn) = runs.first().and_then(|r| r.lcn) else {
-            return Ok(None);
-        };
-        let block_size = self
-            .fs
-            .writer
-            .as_ref()
-            .map(|w| w.layout.index_record_size as usize)
-            .unwrap_or(4096);
-        let block_off = first_run_lcn * self.cluster_size;
-        let mut block = vec![0u8; block_size];
-        self.dev.read_at(block_off, &mut block)?;
-        let old_block = block.clone();
-        if mft::apply_fixup(&mut block, self.sector_size).is_err() {
-            return Ok(None);
-        }
-        if block.len() < 0x20 {
-            return Ok(None);
-        }
-        let first_entry_offset = u32::from_le_bytes(block[0x18..0x1C].try_into().unwrap()) as usize;
-        let entries_start = 0x18 + first_entry_offset;
-        if patch_entries_for_record(&mut block, entries_start, self.rec_no, self.len) {
-            mft::install_fixup(&mut block, self.sector_size, 1);
-            if block != old_block {
-                return Ok(Some(super::logfile::RedoEntry {
-                    target_offset: block_off,
-                    redo_bytes: block,
-                    undo_bytes: old_block,
-                }));
-            }
-        }
-        Ok(None)
+        Ok(out)
     }
 
     /// Run a commit-time protocol:
@@ -730,6 +765,18 @@ pub(super) fn commit_txn(
             chunk_start = chunk_end;
         }
 
+        // Truncate the chain: a transaction always restarts at page 0, so
+        // a shorter one would otherwise leave the previous transaction's
+        // trailing pages in place for `walk_records` to replay. Zeroing
+        // the slot just past what we wrote ends the chain outright (the
+        // LSN check in `walk_records` is the backstop for the wrapped
+        // case, where this slot is a page we just wrote).
+        let page_size = super::logfile::LOG_PAGE_SIZE as u64;
+        let tail_delta = page_idx * page_size;
+        if tail_delta < rcrd_region_size {
+            dev.zero_range(rcrd_region_start + tail_delta, page_size)?;
+        }
+
         // Stamp restart pages: dirty, current_lsn = last_lsn.
         let dirty_page = super::logfile::build_restart_page(last_lsn, log_size, false);
         dev.write_at(logfile_offset, &dirty_page)?;
@@ -781,7 +828,7 @@ fn locate_logfile(fs: &mut super::Ntfs, dev: &mut dyn BlockDevice) -> Result<(u6
         let w = fs.writer.as_ref().expect("writer present");
         (
             w.layout.mft_record_size as usize,
-            w.layout.bytes_per_sector as usize,
+            mft::NTFS_BLOCK_SIZE,
             w.cluster_size,
         )
     };
@@ -836,9 +883,15 @@ fn replay_and_clean(
 /// Walk index entries starting at `start_off` in `buf`, looking for one
 /// whose `file_ref` lower-48 bits equal `rec_no`. When found, patch the
 /// embedded $FILE_NAME key's `real_size` (offset 48..56) and
-/// `allocated_size` (offset 40..48) to `new_len` / `new_len ceil'd to
-/// cluster`. Returns `true` if a patch was applied.
-fn patch_entries_for_record(buf: &mut [u8], start_off: usize, rec_no: u64, new_len: u64) -> bool {
+/// `allocated_size` (offset 40..48) to `new_len` / `new_len` rounded up
+/// to `cluster_size`. Returns `true` if a patch was applied.
+fn patch_entries_for_record(
+    buf: &mut [u8],
+    start_off: usize,
+    rec_no: u64,
+    new_len: u64,
+    cluster_size: u64,
+) -> bool {
     let mut cursor = start_off;
     let mut changed = false;
     while cursor + 16 <= buf.len() {
@@ -858,9 +911,9 @@ fn patch_entries_for_record(buf: &mut [u8], start_off: usize, rec_no: u64, new_l
         if !is_last && key_len >= 66 && entry_len >= 16 + key_len && key_off + 56 <= buf.len() {
             let file_ref = u64::from_le_bytes(buf[cursor..cursor + 8].try_into().unwrap());
             if (file_ref & 0x0000_FFFF_FFFF_FFFF) == rec_no {
-                // Patch allocated_size / real_size (rounded to next 4 KiB
-                // for the allocated value — matches what create_file emits).
-                let allocated = (new_len + 4095) & !4095;
+                // Patch allocated_size / real_size (the allocated value
+                // rounded up to a cluster — matches what create_file emits).
+                let allocated = new_len.div_ceil(cluster_size.max(1)) * cluster_size.max(1);
                 buf[key_off + 40..key_off + 48].copy_from_slice(&allocated.to_le_bytes());
                 buf[key_off + 48..key_off + 56].copy_from_slice(&new_len.to_le_bytes());
                 changed = true;
@@ -1025,7 +1078,7 @@ impl super::Ntfs {
             let w = self.writer.as_ref().expect("writer present");
             (
                 w.layout.mft_record_size as usize,
-                w.layout.bytes_per_sector as usize,
+                mft::NTFS_BLOCK_SIZE,
                 w.cluster_size,
             )
         };

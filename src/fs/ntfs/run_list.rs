@@ -23,6 +23,73 @@ pub struct Extent {
     pub length: u64,
 }
 
+/// A run list indexed for lookup by VCN.
+///
+/// A fragmented `$DATA` can run to thousands of extents, and the readers
+/// resolve one VCN per cluster read, so a linear walk per lookup made
+/// streaming quadratic in the fragment count. `starts` holds the prefix
+/// sums of the extent lengths — `starts[i]` is the first VCN of
+/// `runs[i]`, and the final element is the total cluster count — so a
+/// lookup is a binary search.
+#[derive(Debug, Clone, Default)]
+pub struct RunMap {
+    runs: Vec<Extent>,
+    starts: Vec<u64>,
+}
+
+impl RunMap {
+    /// Index `runs`. Lengths that overflow a `u64` in sum are rejected
+    /// here rather than at every lookup.
+    pub fn new(runs: Vec<Extent>) -> Result<Self> {
+        let mut starts = Vec::with_capacity(runs.len() + 1);
+        let mut acc: u64 = 0;
+        for ext in &runs {
+            starts.push(acc);
+            acc = acc.checked_add(ext.length).ok_or_else(|| {
+                crate::Error::InvalidImage("ntfs: run-list VCN length overflow".into())
+            })?;
+        }
+        starts.push(acc);
+        Ok(Self { runs, starts })
+    }
+
+    /// The extents, in VCN order.
+    pub fn runs(&self) -> &[Extent] {
+        &self.runs
+    }
+
+    /// Total clusters the list covers.
+    pub fn total_clusters(&self) -> u64 {
+        *self.starts.last().unwrap_or(&0)
+    }
+
+    /// The extent covering `vcn`, plus how far into it `vcn` sits.
+    /// `None` when `vcn` is past the end of the list.
+    pub fn lookup(&self, vcn: u64) -> Option<(Extent, u64)> {
+        if vcn >= self.total_clusters() {
+            return None;
+        }
+        // `starts` is sorted; find the last entry <= vcn.
+        let idx = match self.starts.binary_search(&vcn) {
+            Ok(i) => i,
+            Err(i) => i - 1,
+        };
+        // A zero-length extent can make several `starts` entries equal;
+        // step forward to the one that actually covers `vcn`.
+        let mut idx = idx;
+        while idx + 1 < self.runs.len() && self.starts[idx + 1] <= vcn {
+            idx += 1;
+        }
+        Some((self.runs[idx], vcn - self.starts[idx]))
+    }
+}
+
+impl From<RunMap> for Vec<Extent> {
+    fn from(m: RunMap) -> Self {
+        m.runs
+    }
+}
+
 /// Decode a run list from `buf`. Stops on the terminating 0x00 header or at
 /// the end of `buf`. Returns the parsed extents.
 pub fn decode(buf: &[u8]) -> Result<Vec<Extent>> {
@@ -175,5 +242,81 @@ mod tests {
             0x81, 0x04, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
         ]);
         assert!(matches!(runs, Err(crate::Error::InvalidImage(_))));
+    }
+
+    /// `RunMap` must agree with a linear walk over the same extents at
+    /// every VCN, including sparse runs and the one past the end.
+    #[test]
+    fn run_map_lookup_matches_a_linear_walk() {
+        let runs = vec![
+            Extent {
+                lcn: Some(100),
+                length: 3,
+            },
+            Extent {
+                lcn: None,
+                length: 2,
+            },
+            Extent {
+                lcn: Some(50),
+                length: 4,
+            },
+        ];
+        let map = RunMap::new(runs.clone()).unwrap();
+        assert_eq!(map.total_clusters(), 9);
+        assert_eq!(map.runs(), &runs[..]);
+        for vcn in 0..9u64 {
+            // Linear reference.
+            let mut walked = 0u64;
+            let mut want = None;
+            for ext in &runs {
+                if vcn < walked + ext.length {
+                    want = Some((*ext, vcn - walked));
+                    break;
+                }
+                walked += ext.length;
+            }
+            let got = map.lookup(vcn).unwrap();
+            let want = want.unwrap();
+            assert_eq!((got.0.lcn, got.1), (want.0.lcn, want.1), "vcn {vcn}");
+        }
+        assert!(map.lookup(9).is_none());
+        assert!(map.lookup(u64::MAX).is_none());
+    }
+
+    /// Zero-length extents must not make a lookup land on them.
+    #[test]
+    fn run_map_skips_zero_length_extents() {
+        let map = RunMap::new(vec![
+            Extent {
+                lcn: Some(7),
+                length: 0,
+            },
+            Extent {
+                lcn: Some(9),
+                length: 2,
+            },
+        ])
+        .unwrap();
+        assert_eq!(map.lookup(0).unwrap().0.lcn, Some(9));
+        assert_eq!(
+            map.lookup(1).unwrap(),
+            (
+                Extent {
+                    lcn: Some(9),
+                    length: 2
+                },
+                1
+            )
+        );
+        assert!(map.lookup(2).is_none());
+    }
+
+    /// An empty list maps nothing.
+    #[test]
+    fn run_map_empty() {
+        let map = RunMap::new(Vec::new()).unwrap();
+        assert_eq!(map.total_clusters(), 0);
+        assert!(map.lookup(0).is_none());
     }
 }

@@ -12,8 +12,10 @@
 //!
 //! * Small directories use only `$INDEX_ROOT` (no `$INDEX_ALLOCATION`). When
 //!   the root would overflow the resident attribute budget we promote the
-//!   directory to `$INDEX_ALLOCATION` by emitting an `INDX` block and
-//!   storing only a child pointer in the root.
+//!   directory to `$INDEX_ALLOCATION`: the entries are bulk-loaded into a
+//!   balanced B-tree of `INDX` blocks and the root keeps only a child
+//!   pointer. Later inserts / removes rebuild that tree from every entry
+//!   reachable from the root (see `rebuild_index_allocation`).
 //! * File data streams cluster-by-cluster through a 64 KiB scratch buffer
 //!   — never reads the whole file into memory.
 //! * Reparse points are written for symlinks (tag = IO_REPARSE_TAG_SYMLINK).
@@ -27,8 +29,8 @@ use crate::fs::dir_batch::{DEFAULT_CAPACITY, DirBatch};
 use crate::fs::{DeviceKind, FileMeta, FileSource};
 
 use super::attribute::{
-    FileName, TYPE_DATA, TYPE_FILE_NAME, TYPE_INDEX_ALLOCATION, TYPE_INDEX_ROOT,
-    TYPE_REPARSE_POINT, TYPE_STANDARD_INFORMATION,
+    AttributeIter, AttributeKind, FileName, TYPE_DATA, TYPE_FILE_NAME, TYPE_INDEX_ALLOCATION,
+    TYPE_INDEX_ROOT, TYPE_REPARSE_POINT, TYPE_STANDARD_INFORMATION,
 };
 use super::format::{
     self, FIRST_USER_RECORD, FormatOpts, LayoutResult, REC_ROOT, build_file_name_value,
@@ -36,6 +38,7 @@ use super::format::{
     encode_single_run, pack_mft_ref, rewrite_resident_attr, security_id_for, unix_to_filetime,
 };
 use super::mft;
+use super::run_list::Extent;
 use super::secure::SecurityClass;
 
 /// Maximum bytes a directory's $INDEX_ROOT may grow to before we promote
@@ -244,10 +247,7 @@ impl super::Ntfs {
         ];
         let (rec_size, sector_size) = {
             let w = self.writer.as_ref().expect("writer present");
-            (
-                w.layout.mft_record_size as usize,
-                w.layout.bytes_per_sector as usize,
-            )
+            (w.layout.mft_record_size as usize, mft::NTFS_BLOCK_SIZE)
         };
         for &rec_no in SYSTEM_RECS {
             let off = self
@@ -354,7 +354,7 @@ impl super::Ntfs {
                 let want = (remaining as usize).min(tmp.len());
                 let n = reader.read(&mut tmp[..want]).map_err(crate::Error::from)?;
                 if n == 0 {
-                    break;
+                    return Err(short_source(file_size, file_size - remaining));
                 }
                 buf.extend_from_slice(&tmp[..n]);
                 remaining -= n as u64;
@@ -380,10 +380,7 @@ impl super::Ntfs {
                     filled += n;
                 }
                 if filled < chunk {
-                    // Underflow — zero-pad and stop.
-                    for b in &mut scratch[filled..chunk] {
-                        *b = 0;
-                    }
+                    return Err(short_source(file_size, written + filled as u64));
                 }
                 let phys = data_lcn * cluster_size + written;
                 dev.write_at(phys, &scratch[..chunk])?;
@@ -423,7 +420,7 @@ impl super::Ntfs {
             rec_no,
             mft::RecordHeader::FLAG_IN_USE,
             &[si, fn_attr, data_attr],
-            writer.layout.bytes_per_sector as usize,
+            mft::NTFS_BLOCK_SIZE,
             1,
         )?;
         let off = writer.mft_offset(rec_no)?;
@@ -478,7 +475,10 @@ impl super::Ntfs {
         let idx_root = build_resident_attr(
             TYPE_INDEX_ROOT,
             &i30_name,
-            &format::build_empty_index_root(),
+            &format::build_empty_index_root(
+                writer.layout.index_record_size,
+                writer.layout.cluster_size,
+            ),
             0,
             0,
         );
@@ -489,7 +489,7 @@ impl super::Ntfs {
             rec_no,
             mft::RecordHeader::FLAG_IN_USE | mft::RecordHeader::FLAG_DIRECTORY,
             &[si, fn_attr, idx_root],
-            writer.layout.bytes_per_sector as usize,
+            mft::NTFS_BLOCK_SIZE,
             1,
         )?;
         let off = writer.mft_offset(rec_no)?;
@@ -590,7 +590,7 @@ impl super::Ntfs {
             rec_no,
             mft::RecordHeader::FLAG_IN_USE,
             &[si, fn_attr, empty_data, reparse_attr],
-            writer.layout.bytes_per_sector as usize,
+            mft::NTFS_BLOCK_SIZE,
             1,
         )?;
         let off = writer.mft_offset(rec_no)?;
@@ -659,8 +659,8 @@ impl super::Ntfs {
     /// of `create_file` / `create_dir` / `create_symlink`:
     ///
     /// 1. splice every parent `$I30` entry pointing at the target out of
-    ///    `$INDEX_ROOT` (or, for promoted dirs, out of the single
-    ///    `$INDEX_ALLOCATION` INDX block — no de-promotion);
+    ///    `$INDEX_ROOT` (or, for promoted dirs, out of the
+    ///    `$INDEX_ALLOCATION` B-tree, which is rebuilt — no de-promotion);
     /// 2. free every non-resident attribute's clusters in `$Bitmap`
     ///    (unnamed `$DATA`, named ADS, `$INDEX_ALLOCATION`,
     ///    non-resident `$BITMAP`);
@@ -763,13 +763,7 @@ impl super::Ntfs {
                 .as_ref()
                 .expect("writer present")
                 .mft_offset(target_rec)?;
-            let sector_size = self
-                .writer
-                .as_ref()
-                .expect("writer present")
-                .layout
-                .bytes_per_sector as usize;
-            mft::install_fixup(&mut rec_buf, sector_size, 1);
+            mft::install_fixup(&mut rec_buf, mft::NTFS_BLOCK_SIZE, 1);
             dev.write_at(off, &rec_buf)?;
         } else {
             // 2) Free clusters from every non-resident stream.
@@ -790,8 +784,8 @@ impl super::Ntfs {
 
     /// Splice every index entry whose `file_ref`'s low 48 bits equal
     /// `target_rec` out of the parent directory's `$I30`. Dispatches
-    /// between the resident `$INDEX_ROOT` (small) and the single-block
-    /// `$INDEX_ALLOCATION` (promoted) cases — never de-promotes.
+    /// between the resident `$INDEX_ROOT` (small) and the
+    /// `$INDEX_ALLOCATION` B-tree (promoted) cases — never de-promotes.
     fn remove_entries_from_parent(
         &mut self,
         dev: &mut dyn BlockDevice,
@@ -800,10 +794,7 @@ impl super::Ntfs {
     ) -> Result<()> {
         let (rec_size, sector_size) = {
             let w = self.writer.as_ref().expect("writer present");
-            (
-                w.layout.mft_record_size as usize,
-                w.layout.bytes_per_sector as usize,
-            )
+            (w.layout.mft_record_size as usize, mft::NTFS_BLOCK_SIZE)
         };
         let off = self
             .writer
@@ -821,7 +812,7 @@ impl super::Ntfs {
         // LARGE_INDEX flag lives at value offset 28 (index-header byte 12).
         let is_large_index = current.len() >= 29 && current[28] & 0x01 != 0;
         if is_large_index {
-            // Promoted: real entries live in the single INDX block.
+            // Promoted: real entries live in the INDX block tree.
             self.remove_entry_from_allocation_block(dev, parent_rec, target_rec)
         } else {
             // Small: rebuild $INDEX_ROOT with matching entries dropped.
@@ -833,71 +824,18 @@ impl super::Ntfs {
         }
     }
 
-    /// Inverse of `insert_into_allocation_block`: read the single INDX
-    /// block, drop entries whose `file_ref` low-48 == `target_rec`,
-    /// rebuild via `build_indx_block`, write back.
+    /// Inverse of `insert_into_allocation_block`: drop every entry whose
+    /// `file_ref` (low 48 bits) is `target_rec` from the directory's
+    /// `$INDEX_ALLOCATION` tree, rebuilding it from the remaining entries.
     fn remove_entry_from_allocation_block(
         &mut self,
         dev: &mut dyn BlockDevice,
         dir_rec: u64,
         target_rec: u64,
     ) -> Result<()> {
-        let writer = self.writer.as_mut().expect("writer present");
-        let rec_size = writer.layout.mft_record_size as usize;
-        let sector_size = writer.layout.bytes_per_sector as usize;
-        let cluster_size = writer.cluster_size;
-        let block_size = writer.layout.index_record_size as usize;
-
-        let off = writer.mft_offset(dir_rec)?;
-        let mut rec = vec![0u8; rec_size];
-        dev.read_at(off, &mut rec)?;
-        mft::apply_fixup(&mut rec, sector_size)?;
-
-        let alloc_runs = extract_non_resident_runs(&rec, TYPE_INDEX_ALLOCATION, "$I30")
-            .ok_or_else(|| {
-                crate::Error::InvalidImage(
-                    "ntfs: promoted directory missing $INDEX_ALLOCATION".into(),
-                )
-            })?;
-        let (alloc_lcn, _alloc_clusters) = alloc_runs[0];
-
-        let block_off = alloc_lcn * cluster_size;
-        let mut block = vec![0u8; block_size];
-        dev.read_at(block_off, &mut block)?;
-        mft::apply_fixup(&mut block, sector_size)?;
-
-        let first_entry_off = u32::from_le_bytes(block[0x18..0x1C].try_into().unwrap()) as usize;
-        let bytes_in_use = u32::from_le_bytes(block[0x1C..0x20].try_into().unwrap()) as usize;
-        let entries_start = 0x18 + first_entry_off;
-        let entries_end = 0x18 + bytes_in_use;
-        const FILE_REF_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
-
-        let mut kept_entries: Vec<Vec<u8>> = Vec::new();
-        let mut cursor = entries_start;
-        while cursor + 16 <= entries_end {
-            let entry_len =
-                u16::from_le_bytes(block[cursor + 8..cursor + 10].try_into().unwrap()) as usize;
-            if entry_len < 16 || cursor + entry_len > entries_end {
-                break;
-            }
-            let flags = u32::from_le_bytes(block[cursor + 12..cursor + 16].try_into().unwrap());
-            let is_last = flags & 0x02 != 0;
-            if is_last {
-                break;
-            }
-            let file_ref =
-                u64::from_le_bytes(block[cursor..cursor + 8].try_into().unwrap()) & FILE_REF_MASK;
-            if file_ref != target_rec {
-                kept_entries.push(block[cursor..cursor + entry_len].to_vec());
-            }
-            cursor += entry_len;
-        }
-
-        let mut new_block = build_indx_block(block_size, sector_size, 0, &kept_entries)?;
-        mft::install_fixup(&mut new_block, sector_size, 1);
-        dev.write_at(block_off, &new_block)?;
-        let _ = rec_size; // silence unused (mirrors insert path)
-        Ok(())
+        self.rebuild_index_allocation(dev, dir_rec, &mut |entries| {
+            entries.retain(|e| entry_file_ref(e) & FILE_REF_MASK != target_rec);
+        })
     }
 
     /// Free every cluster owned by the target record's non-resident
@@ -929,7 +867,7 @@ impl super::Ntfs {
         mut rec_bytes: Vec<u8>,
     ) -> Result<()> {
         let writer = self.writer.as_mut().expect("writer present");
-        let sector_size = writer.layout.bytes_per_sector as usize;
+        let sector_size = mft::NTFS_BLOCK_SIZE;
         let off = writer.mft_offset(target_rec)?;
 
         // Header: flags at 0x16 (u16), seq at 0x10 (u16).
@@ -979,7 +917,10 @@ impl super::Ntfs {
         let bytes_per_sector = self.boot.bytes_per_sector;
         let sectors_per_cluster = self.boot.sectors_per_cluster;
         let index_record_size = self.boot.index_record_size();
-        let total_clusters = dev.total_size() / cluster_size;
+        // Cluster count from the BPB (`total_sectors` excludes the backup
+        // boot sector), as ntfs-3g / ntfs3 compute it — the device may be
+        // larger than the volume, and $Bitmap is sized to the volume.
+        let total_clusters = self.boot.total_sectors / u64::from(sectors_per_cluster);
 
         // --- $MFT (record 0): $DATA extents + $BITMAP ---
         let mft_set = self.load_record_set(dev, 0)?;
@@ -1123,6 +1064,11 @@ impl super::Ntfs {
         let cluster_size = w.cluster_size;
         let rec_size = w.layout.mft_record_size as usize;
         let bps = w.layout.bytes_per_sector as usize;
+        // Sector count / backup-boot-sector position come from the BPB,
+        // not the device size: the volume may be smaller than its
+        // container, and the BPB's `total_sectors` already excludes the
+        // last sector (where the backup boot sector lives).
+        let bpb_total_sectors = self.boot.total_sectors;
 
         // 1) Restamp $Bitmap data.
         {
@@ -1160,7 +1106,7 @@ impl super::Ntfs {
                 w.layout.mft_bitmap_clusters,
                 filetime,
                 cluster_size,
-                bps,
+                mft::NTFS_BLOCK_SIZE,
             );
             // First extent's start is record 0's home.
             let off = w.layout.mft_extents[0].0 * cluster_size;
@@ -1183,8 +1129,7 @@ impl super::Ntfs {
         {
             let mut boot_buf = vec![0u8; bps];
             dev.read_at(0, &mut boot_buf)?;
-            let last_lba_offset =
-                (w.layout.total_clusters * (cluster_size / bps as u64) - 1) * bps as u64;
+            let last_lba_offset = bpb_total_sectors * bps as u64;
             dev.write_at(last_lba_offset, &boot_buf)?;
         }
         w.dirty = false;
@@ -1255,7 +1200,7 @@ impl super::Ntfs {
         }
         let writer = self.writer.as_mut().expect("writer present");
         let rec_size = writer.layout.mft_record_size as usize;
-        let sector_size = writer.layout.bytes_per_sector as usize;
+        let sector_size = mft::NTFS_BLOCK_SIZE;
         // Read the directory record.
         let off = writer.mft_offset(dir_rec)?;
         let mut rec = vec![0u8; rec_size];
@@ -1292,78 +1237,163 @@ impl super::Ntfs {
         }
     }
 
-    /// Read the INDX allocation block for a promoted directory, insert
-    /// every entry in `new_entries` into it, and write it back once.
+    /// Insert every entry in `new_entries` into a promoted directory's
+    /// `$INDEX_ALLOCATION` tree, rebuilding it from the union.
     fn insert_into_allocation_block(
         &mut self,
         dev: &mut dyn BlockDevice,
         dir_rec: u64,
         new_entries: &[Vec<u8>],
     ) -> Result<()> {
-        let writer = self.writer.as_mut().expect("writer present");
-        let rec_size = writer.layout.mft_record_size as usize;
-        let sector_size = writer.layout.bytes_per_sector as usize;
-        let cluster_size = writer.cluster_size;
-        let block_size = writer.layout.index_record_size as usize;
+        self.rebuild_index_allocation(dev, dir_rec, &mut |entries| {
+            entries.extend(new_entries.iter().cloned());
+        })
+    }
 
-        let off = writer.mft_offset(dir_rec)?;
+    /// Rewrite a promoted directory's whole `$I30` B-tree.
+    ///
+    /// Gathers every real entry from `$INDEX_ROOT` and from every INDX
+    /// block reachable from it (descending child pointers, so multi-level
+    /// trees are handled), lets `edit` add / drop entries, re-sorts in
+    /// NTFS collation order, bulk-loads a fresh balanced tree and writes
+    /// it back into the existing allocation — relocating the allocation
+    /// to a larger contiguous run when the tree needs more blocks.
+    /// `$INDEX_ROOT` ends up as a bare child pointer to the new root
+    /// block and `$BITMAP` marks exactly the blocks in use.
+    ///
+    /// Rebuilding is O(entries) per call; the directory batch cache
+    /// amortises that across a bulk insert. It replaces the old
+    /// "everything lives in VCN 0" shortcut, which appended to — and
+    /// re-serialised as a leaf — whichever block sat at VCN 0: the
+    /// leftmost *leaf* of a multi-block tree, whose siblings and parents
+    /// were then silently orphaned.
+    fn rebuild_index_allocation(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dir_rec: u64,
+        edit: &mut dyn FnMut(&mut Vec<Vec<u8>>),
+    ) -> Result<()> {
+        let (rec_size, cluster_size) = {
+            let w = self.writer.as_ref().expect("writer present");
+            (w.layout.mft_record_size as usize, w.cluster_size)
+        };
+        let sector_size = mft::NTFS_BLOCK_SIZE;
+        let off = self
+            .writer
+            .as_ref()
+            .expect("writer present")
+            .mft_offset(dir_rec)?;
         let mut rec = vec![0u8; rec_size];
         dev.read_at(off, &mut rec)?;
         mft::apply_fixup(&mut rec, sector_size)?;
 
-        // Find $INDEX_ALLOCATION $I30 runs.
-        let alloc_runs = extract_non_resident_runs(&rec, TYPE_INDEX_ALLOCATION, "$I30")
-            .ok_or_else(|| {
-                crate::Error::InvalidImage(
-                    "ntfs: promoted directory missing $INDEX_ALLOCATION".into(),
-                )
-            })?;
-        let (alloc_lcn, _alloc_clusters) = alloc_runs[0];
-
-        // Read the (sole) INDX block.
-        let block_off = alloc_lcn * cluster_size;
-        let mut block = vec![0u8; block_size];
-        dev.read_at(block_off, &mut block)?;
-        mft::apply_fixup(&mut block, sector_size)?;
-
-        // Extract existing entries from the block.
-        let first_entry_off = u32::from_le_bytes(block[0x18..0x1C].try_into().unwrap()) as usize;
-        let bytes_in_use = u32::from_le_bytes(block[0x1C..0x20].try_into().unwrap()) as usize;
-        let entries_start = 0x18 + first_entry_off;
-        let entries_end = 0x18 + bytes_in_use;
-        let mut existing_entries: Vec<Vec<u8>> = Vec::new();
-        let mut cursor = entries_start;
-        while cursor + 16 <= entries_end {
-            let entry_len =
-                u16::from_le_bytes(block[cursor + 8..cursor + 10].try_into().unwrap()) as usize;
-            if entry_len < 16 || cursor + entry_len > entries_end {
-                break;
-            }
-            let flags = u32::from_le_bytes(block[cursor + 12..cursor + 16].try_into().unwrap());
-            let is_last = flags & 0x02 != 0;
-            if is_last {
-                break;
-            }
-            existing_entries.push(block[cursor..cursor + entry_len].to_vec());
-            cursor += entry_len;
+        let root = extract_resident_attr_value(&rec, TYPE_INDEX_ROOT, "$I30").ok_or_else(|| {
+            crate::Error::InvalidImage("ntfs: promoted directory missing $INDEX_ROOT".into())
+        })?;
+        let runs = extract_attr_extents(&rec, TYPE_INDEX_ALLOCATION, "$I30").ok_or_else(|| {
+            crate::Error::InvalidImage("ntfs: promoted directory missing $INDEX_ALLOCATION".into())
+        })?;
+        if extract_resident_attr_value(&rec, super::attribute::TYPE_BITMAP, "$I30").is_none() {
+            return Err(crate::Error::Unsupported(
+                "ntfs: directory index with a non-resident $BITMAP is not supported".into(),
+            ));
         }
-        existing_entries.extend(new_entries.iter().cloned());
-        // Same rationale as `insert_into_index_root`: `ntfs-3g`'s
-        // path lookup binary-searches the INDX block, so the on-disk
-        // order must be the NTFS collation key.
-        existing_entries.sort_by_key(|e| format::entry_sort_key(e));
+        let geom = IndexGeom::from_root(&root, cluster_size)?;
 
-        // Rebuild and write.
-        let mut new_block = build_indx_block(block_size, sector_size, 0, &existing_entries)?;
-        mft::install_fixup(&mut new_block, sector_size, 1);
-        dev.write_at(block_off, &new_block)?;
-        let _ = rec_size;
+        // Every real entry: the root's own, then each reachable block's.
+        let root_hdr = super::index::IndexRootHeader::parse(&root)?;
+        let root_start = root_hdr.header_offset + root_hdr.first_entry_offset as usize;
+        let root_len =
+            (root_hdr.bytes_in_use as usize).saturating_sub(root_hdr.first_entry_offset as usize);
+        let (mut entries, mut stack) = split_node_entries(&root, root_start, root_len)?;
+        let mut block = vec![0u8; geom.block_size];
+        let mut visited = std::collections::HashSet::<u64>::new();
+        while let Some(vcn) = stack.pop() {
+            if !visited.insert(vcn) {
+                return Err(crate::Error::InvalidImage(
+                    "ntfs: cycle in $INDEX_ALLOCATION tree".into(),
+                ));
+            }
+            read_alloc_bytes(dev, &runs, cluster_size, vcn * geom.vcn_unit, &mut block)?;
+            mft::apply_fixup(&mut block, sector_size)?;
+            let hdr = super::index::IndexBlockHeader::parse(&block)?;
+            let (found, kids) =
+                split_node_entries(&block, hdr.entries_start(), hdr.entries_byte_len())?;
+            entries.extend(found);
+            stack.extend(kids);
+        }
+
+        edit(&mut entries);
+        entries.sort_by_key(|e| format::entry_sort_key(e));
+
+        let (root_vcn, blocks) =
+            build_index_btree(&entries, geom.block_size, sector_size, geom.vcn_stride)?;
+        let nblocks = blocks.len() as u64;
+        let needed = geom.clusters_for_blocks(nblocks);
+        let have: u64 = runs.iter().map(|r| r.length).sum();
+        let runs = if needed > have || runs.iter().any(|r| r.lcn.is_none()) {
+            // Relocate to one fresh contiguous run (allocate first so a
+            // failure leaves the old tree untouched), then release the
+            // old clusters. The new run is zeroed so the blocks past the
+            // tree read as free space rather than stale INDX headers.
+            let w = self.writer.as_mut().expect("writer present");
+            let lcn = w.alloc_clusters(needed)?;
+            for r in &runs {
+                if let Some(old) = r.lcn {
+                    for c in old..old.saturating_add(r.length) {
+                        w.layout.bitmap.clear(c);
+                    }
+                }
+            }
+            dev.zero_range(lcn * cluster_size, needed * cluster_size)?;
+            let alloc_bytes = needed * cluster_size;
+            let attr = build_non_resident_attr(
+                TYPE_INDEX_ALLOCATION,
+                &i30_name(),
+                &encode_single_run(lcn, needed),
+                0,
+                needed - 1,
+                alloc_bytes,
+                alloc_bytes,
+                alloc_bytes,
+                0,
+                0,
+            );
+            replace_attr_in_record(&mut rec, rec_size, TYPE_INDEX_ALLOCATION, "$I30", &attr)?;
+            vec![Extent {
+                lcn: Some(lcn),
+                length: needed,
+            }]
+        } else {
+            runs
+        };
+        for (vcn, bytes) in &blocks {
+            write_alloc_bytes(dev, &runs, cluster_size, vcn * geom.vcn_unit, bytes)?;
+        }
+
+        let capacity_blocks =
+            runs.iter().map(|r| r.length).sum::<u64>() * cluster_size / geom.block_size as u64;
+        let new_root =
+            build_large_index_root(root_vcn, geom.block_size as u32, geom.vcn_stride as u8);
+        rewrite_resident_attr(&mut rec, rec_size, TYPE_INDEX_ROOT, "$I30", &new_root)?;
+        let bm = build_index_bitmap(nblocks, capacity_blocks);
+        rewrite_resident_attr(
+            &mut rec,
+            rec_size,
+            super::attribute::TYPE_BITMAP,
+            "$I30",
+            &bm,
+        )?;
+        mft::install_fixup(&mut rec, sector_size, 1);
+        dev.write_at(off, &rec)?;
+        self.writer.as_mut().expect("writer present").dirty = true;
         Ok(())
     }
 
-    /// Promote a directory's index from "small" (root-only) to "large"
-    /// ($INDEX_ROOT pointing at a single $INDEX_ALLOCATION block holding
-    /// all entries).
+    /// Promote a directory's index from "small" (root-only) to "large":
+    /// `$INDEX_ROOT` becomes a bare child pointer at the root of a
+    /// bulk-loaded B-tree of INDX blocks held in a fresh
+    /// `$INDEX_ALLOCATION`, with a `$BITMAP` marking the blocks in use.
     fn promote_index_to_allocation(
         &mut self,
         dev: &mut dyn BlockDevice,
@@ -1372,15 +1402,9 @@ impl super::Ntfs {
     ) -> Result<()> {
         let writer = self.writer.as_mut().expect("writer present");
         let rec_size = writer.layout.mft_record_size as usize;
-        let sector_size = writer.layout.bytes_per_sector as usize;
+        let sector_size = mft::NTFS_BLOCK_SIZE;
         let cluster_size = writer.cluster_size;
-        let index_block_size = writer.layout.index_record_size as u64;
-        let blocks_per_cluster = cluster_size / index_block_size;
-        let clusters_per_block = if blocks_per_cluster == 0 {
-            index_block_size.div_ceil(cluster_size)
-        } else {
-            1
-        };
+        let geom = IndexGeom::new(cluster_size, writer.layout.index_record_size as usize)?;
 
         // Read current directory record.
         let off = writer.mft_offset(dir_rec)?;
@@ -1395,89 +1419,326 @@ impl super::Ntfs {
                     "ntfs: directory missing $INDEX_ROOT for promotion".into(),
                 )
             })?;
-        let mut existing_entries: Vec<Vec<u8>> = Vec::new();
-        let mut cursor = 16 + 16;
-        let bytes_in_use = u32::from_le_bytes(current[20..24].try_into().unwrap()) as usize;
-        let entries_end = 16 + bytes_in_use;
-        while cursor + 16 <= entries_end {
-            let entry_len =
-                u16::from_le_bytes(current[cursor + 8..cursor + 10].try_into().unwrap()) as usize;
-            let flags = u32::from_le_bytes(current[cursor + 12..cursor + 16].try_into().unwrap());
-            if entry_len < 16 || cursor + entry_len > entries_end {
-                break;
-            }
-            let is_last = flags & 0x02 != 0;
-            if !is_last {
-                existing_entries.push(current[cursor..cursor + entry_len].to_vec());
-            } else {
-                break;
-            }
-            cursor += entry_len;
-        }
-        existing_entries.extend(new_entries.iter().cloned());
-        // Sort into NTFS collation order. The old per-entry flow relied on
-        // a *following* `insert_into_allocation_block` to sort, but a
-        // batched promotion is the final write, so it must sort here —
-        // `ntfs-3g` binary-searches the INDX block.
-        existing_entries.sort_by_key(|e| format::entry_sort_key(e));
+        let root_hdr = super::index::IndexRootHeader::parse(&current)?;
+        let root_start = root_hdr.header_offset + root_hdr.first_entry_offset as usize;
+        let root_len =
+            (root_hdr.bytes_in_use as usize).saturating_sub(root_hdr.first_entry_offset as usize);
+        let (mut entries, _) = split_node_entries(&current, root_start, root_len)?;
+        entries.extend(new_entries.iter().cloned());
+        // Sort into NTFS collation order — `ntfs-3g` binary-searches the
+        // INDX blocks.
+        entries.sort_by_key(|e| format::entry_sort_key(e));
 
-        // Bulk-load a balanced B-tree of INDX blocks (one VCN each). A
-        // small directory yields a single leaf at VCN 0; a large one a
-        // multi-level tree whose root the $INDEX_ROOT points at.
+        // Bulk-load a balanced B-tree of INDX blocks. A small directory
+        // yields a single leaf; a large one a multi-level tree whose root
+        // the $INDEX_ROOT points at.
         let (root_vcn, blocks) =
-            build_index_btree(&existing_entries, index_block_size as usize, sector_size)?;
+            build_index_btree(&entries, geom.block_size, sector_size, geom.vcn_stride)?;
         let nblocks = blocks.len() as u64;
-
-        // One VCN per INDX block, `clusters_per_block` clusters each, in
-        // one contiguous run so VCN v → LCN base + v*cpb.
-        let total_clusters = nblocks * clusters_per_block;
-        let alloc_lcn = writer.alloc_clusters(total_clusters)?;
-        let block_span = (clusters_per_block * cluster_size) as usize;
-        for (vcn, block) in &blocks {
-            let off = (alloc_lcn + vcn * clusters_per_block) * cluster_size;
-            dev.write_at(off, block)?;
-            if block.len() < block_span {
-                let pad = vec![0u8; block_span - block.len()];
-                dev.write_at(off + block.len() as u64, &pad)?;
-            }
+        let needed = geom.clusters_for_blocks(nblocks);
+        let alloc_lcn = writer.alloc_clusters(needed)?;
+        let runs = vec![Extent {
+            lcn: Some(alloc_lcn),
+            length: needed,
+        }];
+        dev.zero_range(alloc_lcn * cluster_size, needed * cluster_size)?;
+        for (vcn, bytes) in &blocks {
+            write_alloc_bytes(dev, &runs, cluster_size, vcn * geom.vcn_unit, bytes)?;
         }
 
         // $INDEX_ROOT: LARGE_INDEX with a single child terminator pointing
         // at the tree root's VCN.
-        let new_root = build_large_index_root(root_vcn);
+        let new_root =
+            build_large_index_root(root_vcn, geom.block_size as u32, geom.vcn_stride as u8);
         rewrite_resident_attr(&mut rec, rec_size, TYPE_INDEX_ROOT, "$I30", &new_root)?;
 
-        // Add $INDEX_ALLOCATION attribute (named "$I30").
-        let i30_name: Vec<u8> = "$I30"
-            .encode_utf16()
-            .flat_map(|u| u.to_le_bytes())
-            .collect();
-        let runs = encode_single_run(alloc_lcn, total_clusters);
-        let alloc_size = total_clusters * cluster_size;
+        // Add $INDEX_ALLOCATION + $BITMAP (both named "$I30").
+        let alloc_bytes = needed * cluster_size;
         let alloc_attr = build_non_resident_attr(
             TYPE_INDEX_ALLOCATION,
-            &i30_name,
-            &runs,
+            &i30_name(),
+            &encode_single_run(alloc_lcn, needed),
             0,
-            total_clusters - 1,
-            alloc_size,
-            alloc_size,
-            alloc_size,
+            needed - 1,
+            alloc_bytes,
+            alloc_bytes,
+            alloc_bytes,
             0,
             0,
         );
-        // $BITMAP: one bit per INDX block (VCN), all in use.
-        let bm_value = build_index_bitmap(nblocks);
-        let bm_attr =
-            build_resident_attr(super::attribute::TYPE_BITMAP, &i30_name, &bm_value, 0, 0);
-
-        // Insert these new attributes before the terminator. Use
-        // `append_attrs` for that.
+        let capacity_blocks = alloc_bytes / geom.block_size as u64;
+        let bm_attr = build_resident_attr(
+            super::attribute::TYPE_BITMAP,
+            &i30_name(),
+            &build_index_bitmap(nblocks, capacity_blocks),
+            0,
+            0,
+        );
         append_attrs(&mut rec, rec_size, &[alloc_attr, bm_attr])?;
         mft::install_fixup(&mut rec, sector_size, 1);
         dev.write_at(off, &rec)?;
         Ok(())
     }
+}
+
+/// Low 48 bits of an MFT reference: the record number.
+const FILE_REF_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+
+/// `$I30` as UTF-16LE — the name of every directory-index attribute.
+fn i30_name() -> Vec<u8> {
+    "$I30"
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect()
+}
+
+/// The `file_ref` at the head of a raw `$I30` index entry.
+fn entry_file_ref(entry: &[u8]) -> u64 {
+    u64::from_le_bytes(entry[0..8].try_into().unwrap())
+}
+
+/// Geometry of a directory's `$INDEX_ALLOCATION`: how index VCNs map to
+/// bytes and how many clusters a given number of INDX blocks occupy.
+#[derive(Debug, Clone, Copy)]
+struct IndexGeom {
+    /// INDX block size in bytes (from `$INDEX_ROOT.index_block_size`).
+    block_size: usize,
+    /// Bytes per index VCN — see [`super::index::vcn_unit_bytes`].
+    vcn_unit: u64,
+    /// VCNs between consecutive INDX blocks (`block_size / vcn_unit`);
+    /// also the `clusters_per_index_block` byte stored in `$INDEX_ROOT`.
+    vcn_stride: u64,
+    cluster_size: u64,
+}
+
+impl IndexGeom {
+    fn new(cluster_size: u64, block_size: usize) -> Result<Self> {
+        let block_size_u64 = block_size as u64;
+        if block_size < 0x40
+            || block_size_u64 > u64::from(super::boot::MAX_RECORD_SIZE)
+            || !block_size.is_multiple_of(mft::NTFS_BLOCK_SIZE)
+        {
+            return Err(crate::Error::InvalidImage(format!(
+                "ntfs: implausible index block size {block_size}"
+            )));
+        }
+        let vcn_unit = super::index::vcn_unit_bytes(cluster_size, block_size_u64);
+        Ok(Self {
+            block_size,
+            vcn_unit,
+            vcn_stride: block_size_u64 / vcn_unit,
+            cluster_size,
+        })
+    }
+
+    /// Geometry from an existing `$INDEX_ROOT` value (block size at 8..12).
+    fn from_root(root: &[u8], cluster_size: u64) -> Result<Self> {
+        if root.len() < 16 {
+            return Err(crate::Error::InvalidImage(
+                "ntfs: $INDEX_ROOT too short".into(),
+            ));
+        }
+        let block_size = u32::from_le_bytes(root[8..12].try_into().unwrap()) as usize;
+        Self::new(cluster_size, block_size)
+    }
+
+    /// Clusters needed to hold `nblocks` INDX blocks.
+    fn clusters_for_blocks(&self, nblocks: u64) -> u64 {
+        (nblocks * self.block_size as u64)
+            .div_ceil(self.cluster_size)
+            .max(1)
+    }
+}
+
+/// Map `byte_off` inside a non-resident attribute onto the device through
+/// its run list. Returns `(disk_offset, bytes_left_in_that_extent)`, or
+/// `None` for a sparse extent or an offset past the last run.
+pub(super) fn alloc_byte_to_disk(
+    runs: &[Extent],
+    cluster_size: u64,
+    byte_off: u64,
+) -> Option<(u64, u64)> {
+    let mut walked: u64 = 0;
+    for ext in runs {
+        let span = ext.length.checked_mul(cluster_size)?;
+        let end = walked.checked_add(span)?;
+        if byte_off < end {
+            let local = byte_off - walked;
+            return ext
+                .lcn
+                .and_then(|lcn| lcn.checked_mul(cluster_size)?.checked_add(local))
+                .map(|disk| (disk, end - byte_off));
+        }
+        walked = end;
+    }
+    None
+}
+
+/// Read `buf.len()` bytes starting `byte_off` into a non-resident
+/// attribute, following extent boundaries.
+pub(super) fn read_alloc_bytes(
+    dev: &mut dyn BlockDevice,
+    runs: &[Extent],
+    cluster_size: u64,
+    byte_off: u64,
+    buf: &mut [u8],
+) -> Result<()> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let (disk, left) = alloc_byte_to_disk(runs, cluster_size, byte_off + done as u64)
+            .ok_or_else(|| {
+                crate::Error::InvalidImage(
+                    "ntfs: index block outside $INDEX_ALLOCATION run list".into(),
+                )
+            })?;
+        let n = (buf.len() - done).min(left as usize);
+        dev.read_at(disk, &mut buf[done..done + n])?;
+        done += n;
+    }
+    Ok(())
+}
+
+/// Write `data` starting `byte_off` into a non-resident attribute,
+/// following extent boundaries.
+pub(super) fn write_alloc_bytes(
+    dev: &mut dyn BlockDevice,
+    runs: &[Extent],
+    cluster_size: u64,
+    byte_off: u64,
+    data: &[u8],
+) -> Result<()> {
+    let mut done = 0usize;
+    while done < data.len() {
+        let (disk, left) = alloc_byte_to_disk(runs, cluster_size, byte_off + done as u64)
+            .ok_or_else(|| {
+                crate::Error::InvalidImage(
+                    "ntfs: index block outside $INDEX_ALLOCATION run list".into(),
+                )
+            })?;
+        let n = (data.len() - done).min(left as usize);
+        dev.write_at(disk, &data[done..done + n])?;
+        done += n;
+    }
+    Ok(())
+}
+
+/// Split one index node's entry stream (`buf[start..start + len]`) into
+/// its real entries — re-encoded as *leaf* entries, i.e. with any child
+/// pointer and `HAS_CHILD` flag stripped — and the child VCNs it points
+/// at (including the terminator's). Layout checks mirror
+/// [`super::index::walk_index_node`].
+fn split_node_entries(buf: &[u8], start: usize, len: usize) -> Result<(Vec<Vec<u8>>, Vec<u64>)> {
+    let end = start
+        .checked_add(len)
+        .filter(|&e| e <= buf.len())
+        .ok_or_else(|| crate::Error::InvalidImage("ntfs: index node oversteps buffer".into()))?;
+    let mut entries = Vec::new();
+    let mut children = Vec::new();
+    let mut cursor = start;
+    while cursor + 16 <= end {
+        let entry_len =
+            u16::from_le_bytes(buf[cursor + 8..cursor + 10].try_into().unwrap()) as usize;
+        let key_len =
+            u16::from_le_bytes(buf[cursor + 10..cursor + 12].try_into().unwrap()) as usize;
+        let flags = u32::from_le_bytes(buf[cursor + 12..cursor + 16].try_into().unwrap());
+        if entry_len < 16 || cursor + entry_len > end {
+            return Err(crate::Error::InvalidImage(format!(
+                "ntfs: index entry length {entry_len} oversteps node"
+            )));
+        }
+        let has_child = flags & super::index::ENTRY_FLAG_HAS_CHILD != 0;
+        let is_last = flags & super::index::ENTRY_FLAG_LAST != 0;
+        if has_child {
+            if entry_len < 24 {
+                return Err(crate::Error::InvalidImage(
+                    "ntfs: index entry with child but too short".into(),
+                ));
+            }
+            let vcn_off = cursor + entry_len - 8;
+            children.push(u64::from_le_bytes(
+                buf[vcn_off..vcn_off + 8].try_into().unwrap(),
+            ));
+        }
+        if !is_last {
+            let key_end = 16 + key_len;
+            let body_len = if has_child { entry_len - 8 } else { entry_len };
+            if key_end > body_len {
+                return Err(crate::Error::InvalidImage(
+                    "ntfs: index entry key oversteps entry".into(),
+                ));
+            }
+            let raw = &buf[cursor..cursor + entry_len];
+            entries.push(build_index_entry(
+                entry_file_ref(raw),
+                &raw[16..key_end],
+                flags & !(super::index::ENTRY_FLAG_HAS_CHILD | super::index::ENTRY_FLAG_LAST),
+                None,
+            ));
+        }
+        cursor += entry_len;
+        if is_last {
+            break;
+        }
+    }
+    Ok((entries, children))
+}
+
+/// Every extent (sparse ones included) of the non-resident attribute
+/// `(type_code, name)` in `rec`, in run-list order.
+fn extract_attr_extents(rec: &[u8], type_code: u32, name: &str) -> Option<Vec<Extent>> {
+    record_attrs(rec).find_map(|attr| {
+        if attr.type_code != type_code || attr.name != name {
+            return None;
+        }
+        match attr.kind {
+            AttributeKind::NonResident { runs, .. } => Some(runs),
+            AttributeKind::Resident { .. } => None,
+        }
+    })
+}
+
+/// Replace the whole attribute `(type_code, name)` in `rec` with
+/// `new_attr` (header + body), keeping its attribute id and shifting the
+/// attributes after it. Errors when the record cannot hold the result.
+fn replace_attr_in_record(
+    rec: &mut [u8],
+    rec_size: usize,
+    type_code: u32,
+    name: &str,
+    new_attr: &[u8],
+) -> Result<()> {
+    let hdr = mft::RecordHeader::parse(rec)?;
+    let bytes_in_use = (hdr.bytes_in_use as usize).min(rec_size).min(rec.len());
+    let (offset, old_len, attr_id) = record_attrs(rec)
+        .find(|a| a.type_code == type_code && a.name == name)
+        .map(|a| (a.offset, a.length as usize, a.attribute_id))
+        .ok_or_else(|| {
+            crate::Error::InvalidImage(format!(
+                "ntfs: attribute type 0x{type_code:x} {name:?} not found in record"
+            ))
+        })?;
+    let after = offset + old_len;
+    if after > bytes_in_use {
+        return Err(crate::Error::InvalidImage(
+            "ntfs: attribute extends past bytes_in_use".into(),
+        ));
+    }
+    let tail = rec[after..bytes_in_use].to_vec();
+    let new_after = offset + new_attr.len();
+    let new_bytes_in_use = new_after + tail.len();
+    if new_bytes_in_use > rec_size {
+        return Err(crate::Error::Unsupported(
+            "ntfs: attribute rewrite would overflow MFT record".into(),
+        ));
+    }
+    rec[offset..new_after].copy_from_slice(new_attr);
+    rec[offset + 14..offset + 16].copy_from_slice(&attr_id.to_le_bytes());
+    rec[new_after..new_bytes_in_use].copy_from_slice(&tail);
+    for b in &mut rec[new_bytes_in_use..rec_size] {
+        *b = 0;
+    }
+    rec[0x18..0x1C].copy_from_slice(&(new_bytes_in_use as u32).to_le_bytes());
+    Ok(())
 }
 
 /// Map a POSIX mode + isdir to an NTFS DOS-attrs / file_attributes word.
@@ -1531,43 +1792,34 @@ fn read_runs_prefix(
     Ok(out)
 }
 
+/// Iterate the attributes of an (already fixup-removed) MFT record
+/// through the validated [`AttributeIter`] — every length / offset field
+/// is bounds-checked there, so a malformed record (zero attribute
+/// length, name or value past the record, …) ends the walk instead of
+/// looping forever or slicing out of bounds. Decode errors simply end
+/// the iteration: the callers below treat "not found" and "malformed"
+/// the same way.
+fn record_attrs(rec: &[u8]) -> impl Iterator<Item = super::attribute::Attribute<'_>> {
+    let first = mft::RecordHeader::parse(rec)
+        .map(|h| h.first_attribute_offset as usize)
+        .unwrap_or(rec.len());
+    AttributeIter::new(rec, first).map_while(Result::ok)
+}
+
 fn extract_non_resident_runs(rec: &[u8], type_code: u32, name: &str) -> Option<Vec<(u64, u64)>> {
-    let hdr = mft::RecordHeader::parse(rec).ok()?;
-    let bytes_in_use = hdr.bytes_in_use as usize;
-    let first = hdr.first_attribute_offset as usize;
-    let mut cursor = first;
-    while cursor + 4 <= bytes_in_use {
-        let tc = u32::from_le_bytes(rec[cursor..cursor + 4].try_into().ok()?);
-        if tc == 0xFFFF_FFFF {
+    record_attrs(rec).find_map(|attr| {
+        if attr.type_code != type_code || attr.name != name {
             return None;
         }
-        let len = u32::from_le_bytes(rec[cursor + 4..cursor + 8].try_into().ok()?) as usize;
-        let non_resident = rec[cursor + 8] != 0;
-        let name_len = rec[cursor + 9] as usize;
-        let name_off = u16::from_le_bytes(rec[cursor + 10..cursor + 12].try_into().ok()?) as usize;
-        let attr_name = if name_len == 0 {
-            String::new()
-        } else {
-            super::attribute::decode_utf16le(
-                &rec[cursor + name_off..cursor + name_off + name_len * 2],
-            )
-        };
-        if tc == type_code && attr_name == name && non_resident {
-            let runs_off =
-                u16::from_le_bytes(rec[cursor + 0x20..cursor + 0x22].try_into().ok()?) as usize;
-            let runs_bytes = &rec[cursor + runs_off..cursor + len];
-            let extents = super::run_list::decode(runs_bytes).ok()?;
-            let mut out = Vec::new();
-            for e in extents {
-                if let Some(lcn) = e.lcn {
-                    out.push((lcn, e.length));
-                }
-            }
-            return Some(out);
+        match attr.kind {
+            AttributeKind::NonResident { runs, .. } => Some(
+                runs.into_iter()
+                    .filter_map(|e| e.lcn.map(|lcn| (lcn, e.length)))
+                    .collect(),
+            ),
+            AttributeKind::Resident { .. } => None,
         }
-        cursor += len;
-    }
-    None
+    })
 }
 
 /// `(type_code, attribute_name, runs)` — one entry per non-resident
@@ -1584,94 +1836,32 @@ type NonResidentAttrInfo = (u32, String, Vec<(u64, u64)>);
 /// directory's `$INDEX_ALLOCATION`, and a non-resident `$BITMAP` — all
 /// must be freed when the file is removed.
 fn for_each_non_resident_attr(rec: &[u8]) -> Vec<NonResidentAttrInfo> {
-    let mut out: Vec<NonResidentAttrInfo> = Vec::new();
-    let Ok(hdr) = mft::RecordHeader::parse(rec) else {
-        return out;
-    };
-    let bytes_in_use = hdr.bytes_in_use as usize;
-    let first = hdr.first_attribute_offset as usize;
-    let mut cursor = first;
-    while cursor + 4 <= bytes_in_use {
-        let Ok(tc_b) = rec[cursor..cursor + 4].try_into() else {
-            break;
-        };
-        let tc = u32::from_le_bytes(tc_b);
-        if tc == 0xFFFF_FFFF {
-            break;
-        }
-        let Ok(len_b) = rec[cursor + 4..cursor + 8].try_into() else {
-            break;
-        };
-        let len = u32::from_le_bytes(len_b) as usize;
-        if len == 0 || cursor + len > bytes_in_use {
-            break;
-        }
-        let non_resident = rec[cursor + 8] != 0;
-        let name_len = rec[cursor + 9] as usize;
-        let name_off =
-            u16::from_le_bytes(rec[cursor + 10..cursor + 12].try_into().unwrap_or([0; 2])) as usize;
-        let attr_name = if name_len == 0 {
-            String::new()
-        } else {
-            super::attribute::decode_utf16le(
-                &rec[cursor + name_off..cursor + name_off + name_len * 2],
-            )
-        };
-        if non_resident {
-            let runs_off = u16::from_le_bytes(
-                rec[cursor + 0x20..cursor + 0x22]
-                    .try_into()
-                    .unwrap_or([0; 2]),
-            ) as usize;
-            let runs_bytes = &rec[cursor + runs_off..cursor + len];
-            if let Ok(extents) = super::run_list::decode(runs_bytes) {
-                let runs: Vec<(u64, u64)> = extents
+    record_attrs(rec)
+        .filter_map(|attr| match attr.kind {
+            AttributeKind::NonResident { runs, .. } => {
+                let runs: Vec<(u64, u64)> = runs
                     .into_iter()
                     .filter_map(|e| e.lcn.map(|lcn| (lcn, e.length)))
                     .collect();
-                if !runs.is_empty() {
-                    out.push((tc, attr_name, runs));
-                }
+                (!runs.is_empty()).then_some((attr.type_code, attr.name, runs))
             }
-        }
-        cursor += len;
-    }
-    out
+            AttributeKind::Resident { .. } => None,
+        })
+        .collect()
 }
 
 /// Walk an MFT record looking for a resident attribute of `(type_code, name)`.
 /// Returns its value bytes.
 fn extract_resident_attr_value(rec: &[u8], type_code: u32, name: &str) -> Option<Vec<u8>> {
-    let hdr = mft::RecordHeader::parse(rec).ok()?;
-    let bytes_in_use = hdr.bytes_in_use as usize;
-    let first = hdr.first_attribute_offset as usize;
-    let mut cursor = first;
-    while cursor + 4 <= bytes_in_use {
-        let tc = u32::from_le_bytes(rec[cursor..cursor + 4].try_into().ok()?);
-        if tc == 0xFFFF_FFFF {
+    record_attrs(rec).find_map(|attr| {
+        if attr.type_code != type_code || attr.name != name {
             return None;
         }
-        let len = u32::from_le_bytes(rec[cursor + 4..cursor + 8].try_into().ok()?) as usize;
-        let non_resident = rec[cursor + 8] != 0;
-        let name_len = rec[cursor + 9] as usize;
-        let name_off = u16::from_le_bytes(rec[cursor + 10..cursor + 12].try_into().ok()?) as usize;
-        let attr_name = if name_len == 0 {
-            String::new()
-        } else {
-            super::attribute::decode_utf16le(
-                &rec[cursor + name_off..cursor + name_off + name_len * 2],
-            )
-        };
-        if tc == type_code && attr_name == name && !non_resident {
-            let value_len =
-                u32::from_le_bytes(rec[cursor + 0x10..cursor + 0x14].try_into().ok()?) as usize;
-            let value_off =
-                u16::from_le_bytes(rec[cursor + 0x14..cursor + 0x16].try_into().ok()?) as usize;
-            return Some(rec[cursor + value_off..cursor + value_off + value_len].to_vec());
+        match attr.kind {
+            AttributeKind::Resident { value, .. } => Some(value.to_vec()),
+            AttributeKind::NonResident { .. } => None,
         }
-        cursor += len;
-    }
-    None
+    })
 }
 
 /// Append the given attributes into `rec` just before the 0xFFFFFFFF
@@ -1708,7 +1898,11 @@ fn append_attrs(rec: &mut [u8], rec_size: usize, attrs: &[Vec<u8>]) -> Result<()
     Ok(())
 }
 
-/// Build a fresh INDX block carrying the given entries plus a terminator.
+/// Build one INDX block at `vcn` from already-encoded index entries, with
+/// a terminator that ends a leaf (`None`, flags LAST) or an internal node
+/// (`Some(child)`, flags HAS_CHILD|LAST + the rightmost child VCN). The
+/// header's INDEX_NODE flag (0x24) is set for internal nodes; the USA
+/// fixup is installed here.
 ///
 /// Block layout:
 ///   0x00..0x04   INDX magic
@@ -1721,62 +1915,6 @@ fn append_attrs(rec: &mut [u8], rec_size: usize, attrs: &[Vec<u8>]) -> Result<()
 ///   USA at 0x28..(0x28 + 2*usa_size)
 ///   first entry — chosen so it sits past the USA on an 8-byte boundary
 ///   so `first_entry_offset = entry_start - 0x18`.
-fn build_indx_block(
-    block_size: usize,
-    sector_size: usize,
-    vcn: u64,
-    entries: &[Vec<u8>],
-) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; block_size];
-    buf[0..4].copy_from_slice(b"INDX");
-    // usa_offset = 0x28
-    buf[4..6].copy_from_slice(&0x28u16.to_le_bytes());
-    let sectors = block_size / sector_size;
-    let usa_size = sectors + 1;
-    buf[6..8].copy_from_slice(&(usa_size as u16).to_le_bytes());
-    // LSN at 8..16 = 0
-    buf[16..24].copy_from_slice(&vcn.to_le_bytes());
-    // Align entries past the USA (at 0x28 + 2*usa_size).
-    let usa_end = 0x28 + 2 * usa_size;
-    let entries_start = (usa_end + 7) & !7;
-    // First entry offset is relative to the index header start at 0x18.
-    let first_entry_offset = (entries_start - 0x18) as u32;
-    let term_entry = {
-        let mut e = vec![0u8; 16];
-        e[8..10].copy_from_slice(&16u16.to_le_bytes());
-        e[12..16].copy_from_slice(&0x02u32.to_le_bytes());
-        e
-    };
-    let entries_total: usize = entries.iter().map(|e| e.len()).sum::<usize>() + term_entry.len();
-    if entries_start + entries_total > block_size {
-        return Err(crate::Error::Unsupported(
-            "ntfs: directory entry overflow in single INDX block".into(),
-        ));
-    }
-    // The index header's bytes_in_use counts from the index header start
-    // (0x18). It includes the 16-byte header + (any padding from header to
-    // entries) + entries.
-    let bytes_in_use = (entries_start - 0x18) as u32 + entries_total as u32;
-    let bytes_allocated = (block_size - 0x18) as u32;
-    let flags: u8 = 0;
-    buf[0x18..0x1C].copy_from_slice(&first_entry_offset.to_le_bytes());
-    buf[0x1C..0x20].copy_from_slice(&bytes_in_use.to_le_bytes());
-    buf[0x20..0x24].copy_from_slice(&bytes_allocated.to_le_bytes());
-    buf[0x24] = flags;
-    let mut cursor = entries_start;
-    for e in entries {
-        buf[cursor..cursor + e.len()].copy_from_slice(e);
-        cursor += e.len();
-    }
-    buf[cursor..cursor + term_entry.len()].copy_from_slice(&term_entry);
-    Ok(buf)
-}
-
-/// Build one INDX block at `vcn` from already-encoded index entries, with
-/// a terminator that ends a leaf (`None`, flags LAST) or an internal node
-/// (`Some(child)`, flags HAS_CHILD|LAST + the rightmost child VCN). The
-/// header's INDEX_NODE flag (0x24) is set for internal nodes; the USA
-/// fixup is installed here.
 fn build_indx_block_full(
     block_size: usize,
     sector_size: usize,
@@ -1815,6 +1953,9 @@ fn build_indx_block_full(
             "ntfs: INDX node entries overflow the block".into(),
         ));
     }
+    // The index header's bytes_in_use counts from the index header start
+    // (0x18). It includes the 16-byte header + (any padding from header to
+    // entries) + entries.
     let bytes_in_use = (entries_start - 0x18) as u32 + entries_total as u32;
     let bytes_allocated = (block_size - 0x18) as u32;
     buf[0x24] = if terminator_child.is_some() { 0x01 } else { 0 };
@@ -1861,18 +2002,21 @@ type IndxBlock = (u64, Vec<u8>);
 /// is pulled up into the parent (NTFS keeps real entries in internal
 /// nodes), carrying the left sibling's VCN; the parent's terminator points
 /// at the rightmost child. Repeats level by level until one node remains —
-/// the root. Returns `(root_vcn, [(vcn, block_bytes)])` (fixups installed).
+/// the root. Blocks are numbered `0, vcn_stride, 2·vcn_stride, …` (see
+/// [`IndexGeom::vcn_stride`]). Returns `(root_vcn, [(vcn, block_bytes)])`
+/// (fixups installed).
 fn build_index_btree(
     entries: &[Vec<u8>],
     block_size: usize,
     sector_size: usize,
+    vcn_stride: u64,
 ) -> Result<(u64, Vec<IndxBlock>)> {
     let sectors = block_size / sector_size;
     let usa_end = 0x28 + 2 * (sectors + 1);
     let entries_start = (usa_end + 7) & !7;
 
     let mut out: Vec<(u64, Vec<u8>)> = Vec::new();
-    let mut next_vcn = 0u64;
+    let mut next_block = 0u64;
     let mut items: Vec<BtreeItem> = entries
         .iter()
         .map(|e| BtreeItem {
@@ -1904,8 +2048,8 @@ fn build_index_btree(
                 ));
             }
             if !cur.is_empty() && cur_bytes + elen > usable {
-                let vcn = next_vcn;
-                next_vcn += 1;
+                let vcn = next_block * vcn_stride;
+                next_block += 1;
                 out.push((vcn, build_node(vcn, &cur, items[i].left_child)?));
                 parent.push(BtreeItem {
                     raw: items[i].raw.clone(),
@@ -1920,8 +2064,8 @@ fn build_index_btree(
                 i += 1;
             }
         }
-        let vcn = next_vcn;
-        next_vcn += 1;
+        let vcn = next_block * vcn_stride;
+        next_block += 1;
         out.push((vcn, build_node(vcn, &cur, rightmost)?));
         if parent.is_empty() {
             return Ok((vcn, out));
@@ -1931,29 +2075,42 @@ fn build_index_btree(
     }
 }
 
-/// Resident `$BITMAP` value marking the first `n` INDX blocks (VCNs) in
-/// use, rounded up to an 8-byte multiple.
-fn build_index_bitmap(n: u64) -> Vec<u8> {
-    let nbytes = ((n as usize).div_ceil(8)).max(1);
-    let nbytes = (nbytes + 7) & !7;
+/// Resident `$BITMAP` value for an index allocation holding
+/// `capacity_blocks` INDX blocks, with the first `in_use` marked. Sized to
+/// cover every block in the allocation, rounded up to an 8-byte multiple.
+/// A `FileSource` that promised `want` bytes and delivered `got`.
+///
+/// The declared length is already baked into `$FILE_NAME`, `$STANDARD_
+/// INFORMATION` and the `$DATA` header by the time the bytes are
+/// streamed, so silently zero-padding produced a file whose tail was
+/// fabricated. Refuse instead, the way the f2fs writer does.
+fn short_source(want: u64, got: u64) -> crate::Error {
+    crate::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        format!("ntfs: source ended early ({got} of {want} bytes)"),
+    ))
+}
+
+fn build_index_bitmap(in_use: u64, capacity_blocks: u64) -> Vec<u8> {
+    let bits = capacity_blocks.max(in_use).max(1) as usize;
+    let nbytes = (bits.div_ceil(8) + 7) & !7;
     let mut v = vec![0u8; nbytes];
-    for i in 0..n as usize {
+    for i in 0..in_use as usize {
         v[i / 8] |= 1u8 << (i % 8);
     }
     v
 }
 
 /// Build a LARGE-INDEX $INDEX_ROOT carrying only a terminator with a child
-/// pointer at `child_vcn`. Used when a directory has been promoted to
-/// $INDEX_ALLOCATION.
-fn build_large_index_root(child_vcn: u64) -> Vec<u8> {
-    let index_block_size = format::DEFAULT_INDEX_RECORD_SIZE;
-    let cpib: i8 = 1;
+/// pointer at `child_vcn`. `index_block_size` / `cpib` describe the
+/// allocation's blocks (`cpib` = blocks in clusters, or in 512-byte units
+/// when the cluster is larger than a block — [`IndexGeom::vcn_stride`]).
+fn build_large_index_root(child_vcn: u64, index_block_size: u32, cpib: u8) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(&TYPE_FILE_NAME.to_le_bytes());
     v.extend_from_slice(&1u32.to_le_bytes());
     v.extend_from_slice(&index_block_size.to_le_bytes());
-    v.push(cpib as u8);
+    v.push(cpib);
     v.extend_from_slice(&[0u8; 3]);
     let first_entry_offset = 16u32;
     // Terminator with child pointer = 24 bytes.
@@ -2034,4 +2191,51 @@ fn normalize_path(path: &str) -> String {
         return "/".to_string();
     }
     path.trim_end_matches('/').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fixup-free 1 KiB record whose first attribute header carries a
+    /// hostile `length` (zero → the old walkers looped forever; huge → they
+    /// sliced past the buffer) and, for the resident case, a value that
+    /// extends past the attribute.
+    fn hostile_record(attr_len: u32, value_len: u32) -> Vec<u8> {
+        let mut rec = vec![0u8; 1024];
+        rec[0..4].copy_from_slice(b"FILE");
+        rec[4..6].copy_from_slice(&0x30u16.to_le_bytes());
+        rec[6..8].copy_from_slice(&3u16.to_le_bytes());
+        let first = 0x38u16;
+        rec[0x14..0x16].copy_from_slice(&first.to_le_bytes());
+        rec[0x16..0x18].copy_from_slice(&mft::RecordHeader::FLAG_IN_USE.to_le_bytes());
+        rec[0x18..0x1C].copy_from_slice(&1024u32.to_le_bytes()); // bytes_in_use (lies)
+        rec[0x1C..0x20].copy_from_slice(&1024u32.to_le_bytes());
+        let a = first as usize;
+        rec[a..a + 4].copy_from_slice(&TYPE_INDEX_ROOT.to_le_bytes());
+        rec[a + 4..a + 8].copy_from_slice(&attr_len.to_le_bytes());
+        rec[a + 8] = 0; // resident
+        rec[a + 0x10..a + 0x14].copy_from_slice(&value_len.to_le_bytes());
+        rec[a + 0x14..a + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+        rec
+    }
+
+    #[test]
+    fn attribute_walkers_survive_zero_length_attribute() {
+        let rec = hostile_record(0, 0);
+        assert!(extract_resident_attr_value(&rec, TYPE_INDEX_ROOT, "").is_none());
+        assert!(extract_non_resident_runs(&rec, TYPE_DATA, "").is_none());
+        assert!(for_each_non_resident_attr(&rec).is_empty());
+    }
+
+    #[test]
+    fn attribute_walkers_survive_oversized_attribute_and_value() {
+        // Attribute claims to extend past the record.
+        let rec = hostile_record(0x10_0000, 8);
+        assert!(extract_resident_attr_value(&rec, TYPE_INDEX_ROOT, "").is_none());
+        assert!(for_each_non_resident_attr(&rec).is_empty());
+        // Attribute fits, but its resident value overruns it.
+        let rec = hostile_record(0x20, 0x1000);
+        assert!(extract_resident_attr_value(&rec, TYPE_INDEX_ROOT, "").is_none());
+    }
 }

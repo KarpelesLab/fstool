@@ -81,7 +81,7 @@ use attribute::{
 };
 use boot::BootSector;
 use index::IndexEntry;
-use run_list::Extent;
+use run_list::{Extent, RunMap};
 use secure::UpcaseTable;
 
 /// Hard-coded MFT record numbers reserved by NTFS.
@@ -145,7 +145,7 @@ pub struct Ntfs {
     boot: BootSector,
     /// Cached MFT run list: where to read MFT record N from. Empty before
     /// `load_mft_runs` has been called.
-    mft_runs: Vec<Extent>,
+    mft_runs: RunMap,
     /// Cached `$UpCase` table for case-insensitive directory lookups.
     /// `None` means "haven't tried yet"; `Some(identity)` means we tried
     /// and the image didn't expose one — names are compared exactly.
@@ -154,6 +154,10 @@ pub struct Ntfs {
     /// `None` means "haven't tried yet". An empty `Some(_)` means we tried
     /// and the image had no usable `$Secure`.
     sii_cache: Option<HashMap<u32, (u64, u32)>>,
+    /// `security_id` → the `$SDS` descriptor bytes (or `None` when the
+    /// id has no `$SII` row). Populated on demand; a directory listing
+    /// otherwise re-reads `$SDS` once per file.
+    sd_cache: HashMap<u32, Option<Vec<u8>>>,
     /// Writer state — populated only after `Ntfs::format` (or
     /// `Ntfs::open_for_write`). Read-only opens leave this `None`.
     writer: Option<writer::WriterState>,
@@ -195,9 +199,10 @@ impl Ntfs {
         }
         Ok(Self {
             boot,
-            mft_runs: Vec::new(),
+            mft_runs: RunMap::default(),
             upcase: None,
             sii_cache: None,
+            sd_cache: HashMap::new(),
             writer: None,
         })
     }
@@ -250,46 +255,30 @@ impl Ntfs {
         }
         let out = &mut out[..rec_size];
 
-        // Bootstrap: read record 0 from the BPB-anchored MFT LCN. From
-        // record 0 we extract $MFT's $DATA run list and cache it.
-        if self.mft_runs.is_empty() {
-            let base = self
-                .boot
-                .mft_lcn
-                .checked_mul(u64::from(self.boot.cluster_size()))
-                .ok_or_else(|| {
-                    crate::Error::InvalidImage("ntfs: $MFT LCN offset overflow".into())
-                })?;
-            // Record 0 is at the very start of the MFT — its index times
-            // record_size is zero, so the read offset is just `base`.
-            dev.read_at(base, out)?;
-            mft::apply_fixup(out, self.boot.bytes_per_sector as usize)?;
-            // Now decode record 0's attributes to find $DATA's run list.
-            let header = mft::RecordHeader::parse(out)?;
-            for attr_res in AttributeIter::new(out, header.first_attribute_offset as usize) {
-                let attr = attr_res?;
-                if attr.type_code == TYPE_DATA && attr.name.is_empty() {
-                    match attr.kind {
-                        AttributeKind::NonResident { runs, .. } => {
-                            self.mft_runs = runs;
-                        }
-                        AttributeKind::Resident { .. } => {
-                            return Err(crate::Error::InvalidImage(
-                                "ntfs: $MFT $DATA is resident — impossible".into(),
-                            ));
-                        }
-                    }
-                    break;
-                }
+        // A live writer may have grown $MFT (`WriterState::extend_mft`)
+        // since the run list was cached from record 0; its extents are
+        // authoritative until `flush` re-stamps record 0, so mirror them.
+        if let Some(w) = self.writer.as_ref()
+            && !w.layout.mft_extents.is_empty()
+        {
+            let live: Vec<Extent> = w
+                .layout
+                .mft_extents
+                .iter()
+                .map(|&(lcn, length)| Extent {
+                    lcn: Some(lcn),
+                    length,
+                })
+                .collect();
+            if live != self.mft_runs.runs() {
+                self.mft_runs = RunMap::new(live)?;
             }
-            if self.mft_runs.is_empty() {
-                return Err(crate::Error::InvalidImage(
-                    "ntfs: could not locate $MFT $DATA run list in record 0".into(),
-                ));
-            }
-            if rec == 0 {
-                return Ok(()); // already loaded
-            }
+        }
+
+        // Bootstrap: read record 0 from the BPB-anchored MFT LCN and
+        // reconstruct $MFT's own $DATA run list from it.
+        if self.mft_runs.runs().is_empty() {
+            self.bootstrap_mft_runs(dev)?;
         }
 
         // For all other records, map record `rec` through the MFT $DATA
@@ -299,47 +288,169 @@ impl Ntfs {
             .checked_mul(rec_size as u64)
             .ok_or_else(|| crate::Error::InvalidImage("ntfs: MFT offset overflow".into()))?;
         let cluster_size = u64::from(self.boot.cluster_size());
-        let mut vcn_bytes: u64 = 0;
-        let mut found = false;
-        for ext in &self.mft_runs {
-            let ext_bytes = ext.length.checked_mul(cluster_size).ok_or_else(|| {
-                crate::Error::InvalidImage("ntfs: MFT extent span overflow".into())
-            })?;
-            let vcn_end = vcn_bytes.checked_add(ext_bytes).ok_or_else(|| {
-                crate::Error::InvalidImage("ntfs: MFT run-list offset overflow".into())
-            })?;
-            if mft_byte_offset < vcn_end {
-                let local = mft_byte_offset - vcn_bytes;
-                match ext.lcn {
-                    Some(lcn) => {
-                        let phys = lcn
-                            .checked_mul(cluster_size)
-                            .and_then(|b| b.checked_add(local))
-                            .ok_or_else(|| {
-                                crate::Error::InvalidImage(
-                                    "ntfs: MFT record byte offset overflow".into(),
-                                )
-                            })?;
-                        dev.read_at(phys, out)?;
-                    }
-                    None => {
-                        return Err(crate::Error::InvalidImage(
-                            "ntfs: requested MFT record sits in a sparse run".into(),
-                        ));
-                    }
-                }
-                found = true;
-                break;
-            }
-            vcn_bytes = vcn_end;
-        }
-        if !found {
+        let vcn = mft_byte_offset / cluster_size;
+        let in_cluster = mft_byte_offset % cluster_size;
+        let Some((ext, local)) = self.mft_runs.lookup(vcn) else {
             return Err(crate::Error::InvalidImage(format!(
                 "ntfs: MFT record {rec} is past the end of $MFT"
             )));
-        }
-        mft::apply_fixup(out, self.boot.bytes_per_sector as usize)?;
+        };
+        let Some(lcn) = ext.lcn else {
+            return Err(crate::Error::InvalidImage(
+                "ntfs: requested MFT record sits in a sparse run".into(),
+            ));
+        };
+        let phys = lcn
+            .checked_add(local)
+            .and_then(|c| c.checked_mul(cluster_size))
+            .and_then(|b| b.checked_add(in_cluster))
+            .ok_or_else(|| {
+                crate::Error::InvalidImage("ntfs: MFT record byte offset overflow".into())
+            })?;
+        dev.read_at(phys, out)?;
+        mft::apply_fixup(out, mft::NTFS_BLOCK_SIZE)?;
         Ok(())
+    }
+
+    /// Collect every unnamed, non-resident `$DATA` segment of one MFT
+    /// record as `(starting_vcn, runs)`. A `$DATA` split across several
+    /// attribute instances (the `$ATTRIBUTE_LIST` case) contributes one
+    /// entry per instance.
+    fn data_segments(record: &[u8]) -> Result<Vec<(u64, Vec<Extent>)>> {
+        let header = mft::RecordHeader::parse(record)?;
+        let mut out = Vec::new();
+        for attr_res in AttributeIter::new(record, header.first_attribute_offset as usize) {
+            let attr = attr_res?;
+            if attr.type_code != TYPE_DATA || !attr.name.is_empty() {
+                continue;
+            }
+            match attr.kind {
+                AttributeKind::NonResident {
+                    starting_vcn, runs, ..
+                } => out.push((starting_vcn, runs)),
+                AttributeKind::Resident { .. } => {
+                    return Err(crate::Error::InvalidImage(
+                        "ntfs: $MFT $DATA is resident — impossible".into(),
+                    ));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reconstruct `$MFT`'s own `$DATA` run list and cache it in
+    /// `self.mft_runs`.
+    ///
+    /// Record 0 is read directly from the BPB-anchored `$MFT` LCN, since
+    /// mapping anything requires the very run list we are building. The
+    /// record may hold more than one `$DATA` instance, and once `$MFT` is
+    /// fragmented enough that its run list no longer fits one record,
+    /// NTFS spills the later segments into extension records and lists
+    /// them in record 0's `$ATTRIBUTE_LIST` (ntfs-3g
+    /// `ntfs_mft_load`/`ntfs_attrlist_need_expansion`, ntfs3
+    /// `ntfs_load_attr_list`). Taking only the first segment truncated
+    /// `$MFT` on any such volume, so every record past the first fragment
+    /// read back as "past the end of $MFT".
+    ///
+    /// The extension records themselves live inside `$MFT`, and the
+    /// segment starting at VCN 0 always covers them, so they are mapped
+    /// through the partial run list gathered from record 0.
+    fn bootstrap_mft_runs(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        let rec_size = self.boot.mft_record_size() as usize;
+        let base_off = self
+            .boot
+            .mft_lcn
+            .checked_mul(u64::from(self.boot.cluster_size()))
+            .ok_or_else(|| crate::Error::InvalidImage("ntfs: $MFT LCN offset overflow".into()))?;
+        let mut rec0 = vec![0u8; rec_size];
+        dev.read_at(base_off, &mut rec0)?;
+        mft::apply_fixup(&mut rec0, mft::NTFS_BLOCK_SIZE)?;
+
+        let mut segments = Self::data_segments(&rec0)?;
+        if segments.is_empty() {
+            return Err(crate::Error::InvalidImage(
+                "ntfs: could not locate $MFT $DATA run list in record 0".into(),
+            ));
+        }
+        // Publish what record 0 knows so the extension records — which
+        // sit inside $MFT itself — can be mapped.
+        self.mft_runs = RunMap::new(Self::concat_segments(&mut segments))?;
+
+        if let Some(alist) = self.read_attribute_list(dev, &rec0)? {
+            let mut seen = std::collections::HashSet::from([0u64]);
+            for entry in attribute_list::decode(&alist)? {
+                if entry.type_code != TYPE_DATA || !entry.name.is_empty() {
+                    continue;
+                }
+                let ext_rec = entry.record_number();
+                if !seen.insert(ext_rec) {
+                    continue;
+                }
+                let mut buf = vec![0u8; rec_size];
+                self.read_mft_record(dev, ext_rec, &mut buf)?;
+                segments.extend(Self::data_segments(&buf)?);
+            }
+            self.mft_runs = RunMap::new(Self::concat_segments(&mut segments))?;
+        }
+        Ok(())
+    }
+
+    /// Sort `(starting_vcn, runs)` segments by VCN, drop duplicates, and
+    /// splice their run lists into one.
+    fn concat_segments(segments: &mut [(u64, Vec<Extent>)]) -> Vec<Extent> {
+        segments.sort_by_key(|(vcn, _)| *vcn);
+        let mut out: Vec<Extent> = Vec::new();
+        let mut last_vcn: Option<u64> = None;
+        for (vcn, runs) in segments.iter() {
+            if last_vcn == Some(*vcn) {
+                continue;
+            }
+            last_vcn = Some(*vcn);
+            out.extend(runs.iter().cloned());
+        }
+        out
+    }
+
+    /// Decode `$ATTRIBUTE_LIST`'s value out of `record`, if it has one.
+    /// A non-resident list is read straight off the device through its
+    /// own run list (those clusters are ordinary volume clusters, not
+    /// `$MFT` ones, so this works during the `$MFT` bootstrap too).
+    fn read_attribute_list(
+        &self,
+        dev: &mut dyn BlockDevice,
+        record: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        let hdr = mft::RecordHeader::parse(record)?;
+        for attr_res in AttributeIter::new(record, hdr.first_attribute_offset as usize) {
+            let attr = attr_res?;
+            if attr.type_code != TYPE_ATTRIBUTE_LIST {
+                continue;
+            }
+            return match attr.kind {
+                AttributeKind::Resident { value, .. } => Ok(Some(value.to_vec())),
+                AttributeKind::NonResident {
+                    real_size, runs, ..
+                } => {
+                    let cap = checked_alloc_len(real_size, dev.total_size(), "$ATTRIBUTE_LIST")?;
+                    let cluster_size = self.boot.cluster_size() as u64;
+                    let mut reader = NonResidentReader {
+                        dev: &mut *dev,
+                        cluster_size,
+                        runs: RunMap::new(runs)?,
+                        real_size,
+                        initialized_size: real_size,
+                        pos: 0,
+                        cluster_buf: vec![0u8; cluster_size as usize],
+                        cached_vcn: u64::MAX,
+                        cached_cluster_filled: false,
+                    };
+                    let mut buf = Vec::with_capacity(cap);
+                    reader.read_to_end(&mut buf).map_err(crate::Error::from)?;
+                    Ok(Some(buf))
+                }
+            };
+        }
+        Ok(None)
     }
 
     /// Read the base record `rec_no` plus, if it has an `$ATTRIBUTE_LIST`,
@@ -357,44 +468,7 @@ impl Ntfs {
 
         // Look for $ATTRIBUTE_LIST in the base record.
         let base_bytes = records[0].1.clone();
-        let hdr = mft::RecordHeader::parse(&base_bytes)?;
-        let mut alist_bytes: Option<Vec<u8>> = None;
-        for attr_res in AttributeIter::new(&base_bytes, hdr.first_attribute_offset as usize) {
-            let attr = attr_res?;
-            if attr.type_code != TYPE_ATTRIBUTE_LIST {
-                continue;
-            }
-            match attr.kind {
-                AttributeKind::Resident { value, .. } => {
-                    alist_bytes = Some(value.to_vec());
-                }
-                AttributeKind::NonResident {
-                    real_size, runs, ..
-                } => {
-                    // Non-resident $ATTRIBUTE_LIST: stream it cluster by
-                    // cluster through a dedicated reader. This is uncommon
-                    // (the list rarely overflows a record) but legal.
-                    let cap = checked_alloc_len(real_size, dev.total_size(), "$ATTRIBUTE_LIST")?;
-                    let mut reader = NonResidentReader {
-                        dev: &mut *dev,
-                        cluster_size: self.boot.cluster_size() as u64,
-                        runs,
-                        real_size,
-                        initialized_size: real_size,
-                        pos: 0,
-                        cluster_buf: vec![0u8; self.boot.cluster_size() as usize],
-                        cached_vcn: u64::MAX,
-                        cached_cluster_filled: false,
-                    };
-                    let mut buf = Vec::with_capacity(cap);
-                    reader.read_to_end(&mut buf).map_err(crate::Error::from)?;
-                    alist_bytes = Some(buf);
-                }
-            }
-            break;
-        }
-
-        let Some(alist_bytes) = alist_bytes else {
+        let Some(alist_bytes) = self.read_attribute_list(dev, &base_bytes)? else {
             return Ok(records);
         };
         let entries = attribute_list::decode(&alist_bytes)?;
@@ -537,6 +611,9 @@ impl Ntfs {
     ) -> Result<()> {
         let cluster_size = u64::from(self.boot.cluster_size());
         let block_len = checked_alloc_len(block_size as u64, dev.total_size(), "index block")?;
+        // Child VCNs are in clusters, or in 512-byte units when the
+        // cluster is larger than an index block (see `vcn_unit_bytes`).
+        let vcn_unit = index::vcn_unit_bytes(cluster_size, block_size as u64);
         let mut block_buf = vec![0u8; block_len];
         // Explicit work-list instead of recursion: a long (non-cyclic) INDX
         // chain would otherwise overflow the stack. `visited` doubles as the
@@ -548,7 +625,7 @@ impl Ntfs {
                     "ntfs: cycle in $INDEX_ALLOCATION tree".into(),
                 ));
             }
-            let target_bytes = vcn.checked_mul(cluster_size).ok_or_else(|| {
+            let target_bytes = vcn.checked_mul(vcn_unit).ok_or_else(|| {
                 crate::Error::InvalidImage("ntfs: index VCN byte offset overflow".into())
             })?;
             let mut walked: u64 = 0;
@@ -588,7 +665,7 @@ impl Ntfs {
                 crate::Error::InvalidImage(format!("ntfs: index VCN {vcn} not in run list"))
             })?;
             dev.read_at(phys, &mut block_buf)?;
-            mft::apply_fixup(&mut block_buf, self.boot.bytes_per_sector as usize)?;
+            mft::apply_fixup(&mut block_buf, mft::NTFS_BLOCK_SIZE)?;
             let blk_hdr = index::IndexBlockHeader::parse(&block_buf)?;
             let entries_start = blk_hdr.entries_start();
             let entries_len = blk_hdr.entries_byte_len();
@@ -693,7 +770,7 @@ impl Ntfs {
         path: &str,
     ) -> Result<Box<dyn Read + 'a>> {
         let rec_no = self.lookup_path(dev, path)?;
-        self.open_stream_by_record(dev, rec_no, "")
+        Ok(Box::new(self.open_stream_by_record(dev, rec_no, "")?))
     }
 
     /// Open a named stream by MFT record + name. `""` means the default
@@ -706,12 +783,16 @@ impl Ntfs {
     /// Compressed `$DATA` (LZNT1) is decoded on the fly, one 16-cluster
     /// "compression unit" at a time. Encrypted `$DATA` (EFS) is refused
     /// with [`crate::Error::Unsupported`].
+    ///
+    /// The reader is seekable, so a caller after a byte range in the
+    /// middle of a big system stream (`$Secure:$SDS`) can jump straight
+    /// to it instead of reading and discarding the prefix.
     pub fn open_stream_by_record<'a>(
         &'a mut self,
         dev: &'a mut dyn BlockDevice,
         rec_no: u64,
         stream_name: &str,
-    ) -> Result<Box<dyn Read + 'a>> {
+    ) -> Result<NtfsSeekableReader<'a>> {
         let records = self.load_record_set(dev, rec_no)?;
         let hdr = mft::RecordHeader::parse(&records[0].1)?;
         if !hdr.is_in_use() {
@@ -779,7 +860,10 @@ impl Ntfs {
         }
 
         if let Some(bytes) = resident_bytes {
-            return Ok(Box::new(ResidentReader { bytes, pos: 0 }));
+            return Ok(NtfsSeekableReader::Resident(ResidentReader {
+                bytes,
+                pos: 0,
+            }));
         }
 
         if segments.is_empty() {
@@ -808,20 +892,20 @@ impl Ntfs {
                 crate::Error::InvalidImage("ntfs: compression-unit size overflow".into())
             })?;
             checked_alloc_len(cu_size, dev.total_size(), "compression unit")?;
-            return Ok(Box::new(CompressedReader::new(
+            return Ok(NtfsSeekableReader::Compressed(CompressedReader::new(
                 dev,
                 cluster_size,
                 cu_clusters,
-                runs,
+                RunMap::new(runs)?,
                 real_size,
                 initialized_size,
             )));
         }
 
-        Ok(Box::new(NonResidentReader {
+        Ok(NtfsSeekableReader::NonResident(NonResidentReader {
             dev,
             cluster_size,
-            runs,
+            runs: RunMap::new(runs)?,
             real_size,
             initialized_size,
             pos: 0,
@@ -938,7 +1022,7 @@ impl Ntfs {
                 dev,
                 cluster_size,
                 cu_clusters,
-                runs,
+                RunMap::new(runs)?,
                 real_size,
                 initialized_size,
             )));
@@ -946,7 +1030,7 @@ impl Ntfs {
         Ok(NtfsSeekableReader::NonResident(NonResidentReader {
             dev,
             cluster_size,
-            runs,
+            runs: RunMap::new(runs)?,
             real_size,
             initialized_size,
             pos: 0,
@@ -1141,6 +1225,23 @@ impl Ntfs {
         dev: &mut dyn BlockDevice,
         security_id: u32,
     ) -> Result<Option<Vec<u8>>> {
+        // A whole directory's worth of files usually shares a handful of
+        // security ids, and `getattr` asks for one per file, so memoise
+        // the answer — including the negative one.
+        if let Some(hit) = self.sd_cache.get(&security_id) {
+            return Ok(hit.clone());
+        }
+        let sd = self.load_security_descriptor(dev, security_id)?;
+        self.sd_cache.insert(security_id, sd.clone());
+        Ok(sd)
+    }
+
+    /// Uncached body of [`Self::resolve_security_descriptor`].
+    fn load_security_descriptor(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        security_id: u32,
+    ) -> Result<Option<Vec<u8>>> {
         // Build / reuse the $SII cache.
         if self.sii_cache.is_none() {
             let cache = self.build_sii_cache(dev).unwrap_or_default();
@@ -1154,18 +1255,18 @@ impl Ntfs {
             return Ok(None);
         }
 
-        // Read `size` bytes from $Secure:$SDS starting at `offset`.
+        // Read `size` bytes from $Secure:$SDS starting at `offset`. $SDS
+        // grows to megabytes on a real volume, so seek rather than read
+        // the prefix into a sink.
         let mut reader = self.open_stream_by_record(dev, MFT_RECORD_SECURE, "$SDS")?;
-        // Skip to `offset`.
-        let mut skipped: u64 = 0;
-        let mut sink = [0u8; 8192];
-        while skipped < offset {
-            let want = (offset - skipped).min(sink.len() as u64) as usize;
-            let n = reader.read(&mut sink[..want]).map_err(crate::Error::from)?;
-            if n == 0 {
+        {
+            use std::io::Seek as _;
+            let landed = reader
+                .seek(std::io::SeekFrom::Start(offset))
+                .map_err(crate::Error::from)?;
+            if landed != offset {
                 return Ok(None);
             }
-            skipped += n as u64;
         }
         let mut blob = vec![0u8; size as usize];
         let mut filled = 0;
@@ -1274,8 +1375,7 @@ impl Ntfs {
                         if visited.insert(phys) {
                             let mut blk = vec![0u8; block_size];
                             if dev.read_at(phys, &mut blk).is_ok()
-                                && mft::apply_fixup(&mut blk, self.boot.bytes_per_sector as usize)
-                                    .is_ok()
+                                && mft::apply_fixup(&mut blk, mft::NTFS_BLOCK_SIZE).is_ok()
                                 && let Ok(blk_hdr) = index::IndexBlockHeader::parse(&blk)
                             {
                                 let s = blk_hdr.entries_start();
@@ -1310,7 +1410,12 @@ pub struct ResidentReader {
 
 impl Read for ResidentReader {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        let n = (self.bytes.len() - self.pos).min(out.len());
+        // `seek` may legitimately leave `pos` past the end of the value;
+        // a read from there is EOF, not an underflow.
+        let n = self.bytes.len().saturating_sub(self.pos).min(out.len());
+        if n == 0 {
+            return Ok(0);
+        }
         out[..n].copy_from_slice(&self.bytes[self.pos..self.pos + n]);
         self.pos += n;
         Ok(n)
@@ -1343,7 +1448,7 @@ impl std::io::Seek for ResidentReader {
 pub struct NonResidentReader<'a> {
     dev: &'a mut dyn BlockDevice,
     cluster_size: u64,
-    runs: Vec<Extent>,
+    runs: RunMap,
     real_size: u64,
     initialized_size: u64,
     pos: u64,
@@ -1356,28 +1461,20 @@ impl<'a> NonResidentReader<'a> {
     /// Find the physical byte offset of VCN `vcn`. Returns `None` for
     /// sparse extents.
     fn map_vcn(&self, vcn: u64) -> std::io::Result<Option<u64>> {
-        let mut walked: u64 = 0;
-        for ext in &self.runs {
-            let walked_end = walked
-                .checked_add(ext.length)
-                .ok_or_else(|| std::io::Error::other("ntfs: run-list VCN length overflow"))?;
-            if vcn < walked_end {
-                let local = vcn - walked;
-                return match ext.lcn {
-                    Some(lcn) => lcn
-                        .checked_add(local)
-                        .and_then(|c| c.checked_mul(self.cluster_size))
-                        .map(Some)
-                        .ok_or_else(|| std::io::Error::other("ntfs: VCN byte offset overflow")),
-                    None => Ok(None),
-                };
-            }
-            walked = walked_end;
+        let Some((ext, local)) = self.runs.lookup(vcn) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("ntfs: VCN {vcn} past end of run list"),
+            ));
+        };
+        match ext.lcn {
+            Some(lcn) => lcn
+                .checked_add(local)
+                .and_then(|c| c.checked_mul(self.cluster_size))
+                .map(Some)
+                .ok_or_else(|| std::io::Error::other("ntfs: VCN byte offset overflow")),
+            None => Ok(None),
         }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            format!("ntfs: VCN {vcn} past end of run list"),
-        ))
     }
 }
 
@@ -1464,7 +1561,7 @@ pub struct CompressedReader<'a> {
     cluster_size: u64,
     cu_clusters: u64,
     cu_size: u64,
-    runs: Vec<Extent>,
+    runs: RunMap,
     real_size: u64,
     initialized_size: u64,
     pos: u64,
@@ -1484,7 +1581,7 @@ impl<'a> CompressedReader<'a> {
         dev: &'a mut dyn BlockDevice,
         cluster_size: u64,
         cu_clusters: u64,
-        runs: Vec<Extent>,
+        runs: RunMap,
         real_size: u64,
         initialized_size: u64,
     ) -> Self {
@@ -1507,28 +1604,20 @@ impl<'a> CompressedReader<'a> {
     /// Resolve the `i`th run-list cluster (counted as VCN) to its on-disk
     /// (lcn, length-remaining-in-run) tuple, or `None` for sparse.
     fn map_vcn(&self, vcn: u64) -> std::io::Result<Option<u64>> {
-        let mut walked: u64 = 0;
-        for ext in &self.runs {
-            let walked_end = walked
-                .checked_add(ext.length)
-                .ok_or_else(|| std::io::Error::other("ntfs: run-list VCN length overflow"))?;
-            if vcn < walked_end {
-                let local = vcn - walked;
-                return match ext.lcn {
-                    Some(lcn) => lcn
-                        .checked_add(local)
-                        .and_then(|c| c.checked_mul(self.cluster_size))
-                        .map(Some)
-                        .ok_or_else(|| std::io::Error::other("ntfs: VCN byte offset overflow")),
-                    None => Ok(None),
-                };
-            }
-            walked = walked_end;
+        let Some((ext, local)) = self.runs.lookup(vcn) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("ntfs: VCN {vcn} past end of run list"),
+            ));
+        };
+        match ext.lcn {
+            Some(lcn) => lcn
+                .checked_add(local)
+                .and_then(|c| c.checked_mul(self.cluster_size))
+                .map(Some)
+                .ok_or_else(|| std::io::Error::other("ntfs: VCN byte offset overflow")),
+            None => Ok(None),
         }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            format!("ntfs: VCN {vcn} past end of run list"),
-        ))
     }
 
     /// Walk `cu_clusters` consecutive VCNs and decide how many of them have
@@ -1969,16 +2058,13 @@ impl crate::fs::Filesystem for Ntfs {
 
         let rec_no = self.lookup_path(dev, s)?;
 
-        let (rec_size, sector_size) = {
-            let w = self
-                .writer
-                .as_ref()
-                .ok_or_else(|| crate::Error::Unsupported("ntfs: writer not initialised".into()))?;
-            (
-                w.layout.mft_record_size as usize,
-                w.layout.bytes_per_sector as usize,
-            )
-        };
+        let rec_size = self
+            .writer
+            .as_ref()
+            .ok_or_else(|| crate::Error::Unsupported("ntfs: writer not initialised".into()))?
+            .layout
+            .mft_record_size as usize;
+        let sector_size = mft::NTFS_BLOCK_SIZE;
         let mft_off = self
             .writer
             .as_ref()
