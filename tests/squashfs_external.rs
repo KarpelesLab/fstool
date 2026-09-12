@@ -60,6 +60,31 @@ fn trim_image_to(path: &Path, len: u64) {
 
 /// Allocate a fat, sparse FileBackend and run `builder` against it,
 /// then trim the file down to the superblock's `bytes_used`.
+/// A codec `unsquashfs` will actually open.
+///
+/// The writer emits uncompressed metablocks for `Unknown(0)`, but that
+/// also writes compression id 0 into the superblock, which is not one of
+/// the ids squashfs defines — squashfs-tools refuses the image with
+/// "Filesystem uses unknown compression" before it looks at anything
+/// else. So a test that shells out to `unsquashfs` has to name a real
+/// codec, and one of these is always compiled (`gzip` is a default
+/// feature, and the whole file is skipped without the tool anyway).
+fn unsquashfs_codec() -> Compression {
+    if cfg!(feature = "gzip") {
+        Compression::Gzip
+    } else if cfg!(feature = "zstd") {
+        Compression::Zstd
+    } else if cfg!(feature = "xz") {
+        Compression::Xz
+    } else if cfg!(feature = "lz4") {
+        Compression::Lz4
+    } else if cfg!(feature = "lzo") {
+        Compression::Lzo
+    } else {
+        Compression::Lzma
+    }
+}
+
 fn build_image<F: FnOnce(&mut FileBackend, &mut Squashfs)>(
     path: &Path,
     compression: Compression,
@@ -272,18 +297,7 @@ fn writer_image_passes_unsquashfs_round_trip() {
     let workdir = tempfile::tempdir().unwrap();
     let img = workdir.path().join("rich.sqfs");
 
-    // Pick whatever codec fstool was compiled with — gzip is the safest
-    // bet (default feature) and is universally supported by squashfs-tools.
-    let codec = if cfg!(feature = "gzip") {
-        Compression::Gzip
-    } else if cfg!(feature = "zstd") {
-        Compression::Zstd
-    } else {
-        // No codec compiled in: use Unknown(0) which the writer emits as
-        // uncompressed metablocks. unsquashfs handles uncompressed too.
-        Compression::Unknown(0)
-    };
-    build_image(&img, codec, populate_rich_tree);
+    build_image(&img, unsquashfs_codec(), populate_rich_tree);
 
     // ---- `unsquashfs -lc` lists every file + empty dir. ----
     let out = Command::new("unsquashfs")
@@ -394,7 +408,7 @@ fn writer_image_with_many_fragments_extracts() {
 
     let workdir = tempfile::tempdir().unwrap();
     let img = workdir.path().join("frags.sqfs");
-    build_image(&img, Compression::Unknown(0), |dev, sq| {
+    build_image(&img, unsquashfs_codec(), |dev, sq| {
         for i in 0..N {
             sq.create_file(
                 dev,

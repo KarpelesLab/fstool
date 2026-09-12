@@ -1518,7 +1518,12 @@ mod tests {
             insert_node(&mut root, Path::new(p), NodeKind::Dir).unwrap();
         }
         let dirs = collect_directories(&root);
-        let paths: Vec<&str> = dirs.iter().map(|(p, _)| p.to_str().unwrap()).collect();
+        // `PathBuf::join` uses the platform separator, so compare on a
+        // normalised form rather than assuming `/`.
+        let paths: Vec<String> = dirs
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().replace('\\', "/"))
+            .collect();
         assert_eq!(
             paths,
             ["/", "/a", "/b", "/a/x", "/a/y", "/b/z", "/b/z/deep"]
