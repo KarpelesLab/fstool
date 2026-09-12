@@ -33,9 +33,12 @@ use std::time::{Duration, Instant};
 use crate::Result;
 use crate::block::BlockDevice;
 use crate::compression::Algo;
-use crate::fs::ext::xattr::Xattr;
+#[cfg(feature = "ext")]
 use crate::fs::ext::{Ext, FsKind};
+#[cfg(feature = "tar")]
 use crate::fs::tar::{TarEntryMeta, TarStreamWriter};
+#[cfg(feature = "tar")]
+use crate::fs::xattr::Xattr;
 use crate::fs::{DeviceKind, FileMeta, Filesystem, XattrPair};
 
 /// Hard ceiling on directory-tree depth when walking a source image.
@@ -567,6 +570,7 @@ impl RepackMeta {
         }
     }
 
+    #[cfg(feature = "tar")]
     fn to_tar_meta(self) -> TarEntryMeta {
         TarEntryMeta {
             mode: self.mode,
@@ -641,6 +645,7 @@ pub trait RepackSink {
 
 /// Convert `XattrPair`s (the trait-surface xattr type) to the tar
 /// writer's `Xattr` type — a plain field rename.
+#[cfg(feature = "tar")]
 fn xattrs_to_tar(xattrs: &[XattrPair]) -> Vec<Xattr> {
     xattrs
         .iter()
@@ -825,10 +830,12 @@ impl RepackSink for FsSink<'_> {
 
 /// Sink that streams a tar archive (optionally codec-wrapped) to a
 /// `Write`. Hard links are materialised (tar copies the body).
+#[cfg(feature = "tar")]
 pub struct TarStreamSink {
     writer: TarStreamWriter<Box<dyn Write>>,
 }
 
+#[cfg(feature = "tar")]
 impl TarStreamSink {
     pub fn new(inner: Box<dyn Write>) -> Self {
         Self {
@@ -844,10 +851,12 @@ impl TarStreamSink {
 }
 
 /// Tar stores relative member names; the walker emits absolute paths.
+#[cfg(feature = "tar")]
 fn tar_name(path: &str) -> &str {
     path.trim_start_matches('/')
 }
 
+#[cfg(feature = "tar")]
 impl RepackSink for TarStreamSink {
     fn put_dir(&mut self, path: &str, meta: RepackMeta, xattrs: &[XattrPair]) -> Result<()> {
         self.writer
@@ -929,6 +938,7 @@ impl RepackSink for TarStreamSink {
 pub fn walk_source_into_sink(source: &Source, sink: &mut dyn RepackSink) -> Result<()> {
     match source {
         Source::HostDir(p) => walk_host_dir(p, sink),
+        #[cfg(feature = "tar")]
         Source::TarArchive { path, codec } => {
             // Stream the tar forward, whether compressed or not — a tar
             // is sequential, never seeked, so `Tar::open`'s upfront
@@ -938,6 +948,8 @@ pub fn walk_source_into_sink(source: &Source, sink: &mut dyn RepackSink) -> Resu
             let mut stream = crate::fs::tar::stream::TarArchiveStream::new(reader);
             walk_stream(&mut stream, sink)
         }
+        #[cfg(not(feature = "tar"))]
+        Source::TarArchive { .. } => Err(tar_feature_missing()),
         Source::Image(target) => walk_image(target, sink),
         Source::Layered(layers) => {
             // Build the merged tree in memory (metadata only) and drive
@@ -948,10 +960,22 @@ pub fn walk_source_into_sink(source: &Source, sink: &mut dyn RepackSink) -> Resu
     }
 }
 
+/// The error a tar-archive source produces in a build without the `tar`
+/// feature: `Source::detect` still recognises the extension so the
+/// caller gets a clear message instead of a mis-detected image.
+#[cfg(not(feature = "tar"))]
+fn tar_feature_missing() -> crate::Error {
+    crate::Error::Unsupported(
+        "tar archive source detected, but this build of fstool was compiled without the \
+         `tar` feature"
+            .into(),
+    )
+}
+
 /// Split a Linux-encoded `rdev` into `(major, minor)` — the inverse of
 /// the encoding ext (and tar's `getattr`) use.
 fn split_rdev(rdev: u32) -> (u32, u32) {
-    crate::fs::ext::inode::decode_devnum(rdev)
+    crate::fs::devnum::decode_devnum(rdev)
 }
 
 /// Open `target` as an image and walk its filesystem into `sink`.
@@ -960,6 +984,10 @@ fn walk_image(target: &crate::inspect::Target, sink: &mut dyn RepackSink) -> Res
         let mut src_fs = crate::inspect::AnyFs::open(src_dev)?;
         // Replay any pending ext journal so we read the post-recovery
         // state (anything still in the log would otherwise be lost).
+        // (Irrefutable when ext is the only filesystem compiled in — the
+        // `if let` is still the right shape for every other build.)
+        #[cfg(feature = "ext")]
+        #[allow(irrefutable_let_patterns)]
         if let crate::inspect::AnyFs::Ext(ext) = &mut src_fs {
             let _ = ext.replay_pending_journal(src_dev)?;
         }
@@ -1361,6 +1389,7 @@ pub fn walk_stream(stream: &mut dyn ArchiveStream, sink: &mut dyn RepackSink) ->
 }
 
 /// Stream a (decompressed) tar `reader` into `sink`.
+#[cfg(feature = "tar")]
 #[deprecated(
     since = "0.4.20",
     note = "use `walk_stream` with a format-specific `ArchiveStream` \
@@ -1462,6 +1491,7 @@ fn host_meta_to_repack(meta: &std::fs::Metadata) -> RepackMeta {
 
 /// Populate `dst` (a freshly formatted ext{2,3,4}) with the contents
 /// of `source`. The destination is assumed to already exist.
+#[cfg(feature = "ext")]
 pub fn populate_ext_from_source(
     dst_dev: &mut dyn crate::block::BlockDevice,
     dst: &mut Ext,
@@ -1475,6 +1505,7 @@ pub fn populate_ext_from_source(
 /// `source`. The destination is assumed to already exist. FAT can't
 /// hold symlinks / device nodes / POSIX metadata, so the sink runs in
 /// lossy mode (drop-with-warning).
+#[cfg(feature = "fat")]
 pub fn populate_fat32_from_source(
     dst_dev: &mut dyn crate::block::BlockDevice,
     dst: &mut crate::fs::fat::Fat32,
@@ -1488,6 +1519,7 @@ pub fn populate_fat32_from_source(
 /// source. Walks the source once and feeds entry counts + byte totals
 /// into the plan; the resulting `to_format_opts()` is ready to drive
 /// `Ext::format_with`.
+#[cfg(feature = "ext")]
 pub fn ext_build_plan_for_source(
     source: &Source,
     block_size: u32,
@@ -1496,6 +1528,7 @@ pub fn ext_build_plan_for_source(
     let mut plan = crate::fs::ext::BuildPlan::new(block_size, kind);
     match source {
         Source::HostDir(p) => plan.scan_host_path(p)?,
+        #[cfg(feature = "tar")]
         Source::TarArchive {
             path,
             codec: Some(algo),
@@ -1504,6 +1537,7 @@ pub fn ext_build_plan_for_source(
             let index = build_tar_stream_index(&spec, *algo)?;
             walk_tar_index_for_plan(&index, &mut plan)?;
         }
+        #[cfg(feature = "tar")]
         Source::TarArchive { path, codec: None } => {
             let target = crate::inspect::Target::parse(&path.to_string_lossy());
             crate::inspect::with_target_device(&target, |src_dev| {
@@ -1511,6 +1545,8 @@ pub fn ext_build_plan_for_source(
                 build_ext_plan_inner(src_dev, &mut src_fs, &mut plan)
             })?;
         }
+        #[cfg(not(feature = "tar"))]
+        Source::TarArchive { .. } => return Err(tar_feature_missing()),
         Source::Image(target) => {
             crate::inspect::with_target_device(target, |src_dev| {
                 let mut src_fs = crate::inspect::AnyFs::open(src_dev)?;
@@ -1594,6 +1630,7 @@ pub(crate) fn host_meta_to_fs(meta: &std::fs::Metadata) -> crate::fs::FileMeta {
 /// Bumps to the FAT32 cluster-count minimum + rounds up to a 512-byte
 /// sector boundary. Shorthand for [`fat_min_bytes_for_source`] with
 /// `"fat32"`.
+#[cfg(feature = "fat")]
 pub fn fat32_min_bytes_for_source(source: &Source) -> Result<u64> {
     fat_min_bytes_for_source(source, "fat32")
 }
@@ -1601,9 +1638,11 @@ pub fn fat32_min_bytes_for_source(source: &Source) -> Result<u64> {
 /// Compute the minimum byte capacity of FAT flavour `fs_type` (`"fat12"` /
 /// `"fat16"` / `"fat32"`) needed to fit `source`. Bumps to that flavour's
 /// cluster-count minimum + rounds up to a 512-byte sector boundary.
+#[cfg(feature = "fat")]
 pub fn fat_min_bytes_for_source(source: &Source, fs_type: &str) -> Result<u64> {
     let bytes = match source {
         Source::HostDir(p) => sum_host_dir_bytes(p)?,
+        #[cfg(feature = "tar")]
         Source::TarArchive {
             path,
             codec: Some(algo),
@@ -1613,6 +1652,9 @@ pub fn fat_min_bytes_for_source(source: &Source, fs_type: &str) -> Result<u64> {
             let (sz, _, _, _, _, _) = size_from_tar_index(&index, fs_type)?;
             return Ok(sz);
         }
+        #[cfg(not(feature = "tar"))]
+        Source::TarArchive { .. } => return Err(tar_feature_missing()),
+        #[cfg(feature = "tar")]
         Source::TarArchive { path, codec: None } => {
             let target = crate::inspect::Target::parse(&path.to_string_lossy());
             let mut sum = 0u64;
@@ -1645,6 +1687,7 @@ pub fn fat_min_bytes_for_source(source: &Source, fs_type: &str) -> Result<u64> {
     Ok(needed.div_ceil(512) * 512)
 }
 
+#[cfg(feature = "fat")]
 fn sum_host_dir_bytes(root: &Path) -> Result<u64> {
     let mut total = 0u64;
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
@@ -1667,6 +1710,7 @@ fn sum_host_dir_bytes(root: &Path) -> Result<u64> {
 /// [`crate::fs::Filesystem::list`], using `DirEntry::size` for files
 /// and [`crate::fs::Filesystem::read_symlink`] for each symlink's
 /// target length (so the long-symlink branch fires only when needed).
+#[cfg(feature = "ext")]
 fn build_ext_plan_inner(
     src_dev: &mut dyn crate::block::BlockDevice,
     src_fs: &mut crate::inspect::AnyFs,
@@ -1678,6 +1722,7 @@ fn build_ext_plan_inner(
 /// Public counterpart of `build_ext_plan_inner` for the binary
 /// crate's `build_ext_plan`. Walks the source through the
 /// [`crate::fs::Filesystem`] trait, no AnyFs match.
+#[cfg(feature = "ext")]
 pub fn build_ext_plan_through_trait(
     src_dev: &mut dyn crate::block::BlockDevice,
     src_fs: &mut crate::inspect::AnyFs,
@@ -1691,6 +1736,7 @@ pub fn build_ext_plan_through_trait(
 /// resolved via `Filesystem::read_symlink` (FSes that don't carry
 /// symlinks return `Unsupported`, which gets degraded to "assume
 /// long symlink — one block").
+#[cfg(feature = "ext")]
 pub(crate) fn scan_into_build_plan(
     dev: &mut dyn crate::block::BlockDevice,
     fs: &mut dyn crate::fs::Filesystem,
@@ -1756,6 +1802,7 @@ pub(crate) fn scan_into_build_plan(
 
 /// TarStreamIndex variant of [`walk_tar_for_plan`] — adds one entry
 /// of each kind to the build plan for every record in the index.
+#[cfg(all(feature = "ext", feature = "tar"))]
 fn walk_tar_index_for_plan(
     index: &crate::fs::tar::TarStreamIndex,
     plan: &mut crate::fs::ext::BuildPlan,
@@ -1821,6 +1868,7 @@ pub(crate) fn tar_input_codec(path: &str) -> Option<crate::compression::Algo> {
 /// tar source. Bodies are NOT consumed: the underlying reader skips
 /// past each body's bytes during `next_entry`, so the only buffered
 /// data is the per-entry metadata.
+#[cfg(all(feature = "tar", any(feature = "ext", feature = "fat")))]
 pub(crate) fn build_tar_stream_index(
     src: &str,
     algo: crate::compression::Algo,
@@ -1832,6 +1880,7 @@ pub(crate) fn build_tar_stream_index(
 /// Aggregate the size-relevant counters from a built [`TarStreamIndex`]
 /// and return `(size_estimate, files, dirs, symlinks, devices, bytes)`.
 /// `target_lower` tunes the size estimate per destination FS.
+#[cfg(all(feature = "tar", feature = "fat"))]
 pub(crate) fn size_from_tar_index(
     index: &crate::fs::tar::TarStreamIndex,
     target_lower: &str,
@@ -1882,6 +1931,7 @@ pub(crate) fn size_from_tar_index(
 }
 
 /// Open a (possibly codec-wrapped) tar archive as a streaming reader.
+#[cfg(feature = "tar")]
 pub(crate) fn open_tar_stream_reader(
     path: &str,
     algo: Option<crate::compression::Algo>,
@@ -1909,6 +1959,7 @@ pub(crate) fn open_tar_stream_reader(
 /// Open the tar source (optionally codec-wrapped) and build a
 /// random-access index over it. Shared entry point for the
 /// streaming-tar inspector commands.
+#[cfg(feature = "tar")]
 pub fn open_tar_stream_index(
     image: &str,
     algo: Option<crate::compression::Algo>,
@@ -1941,6 +1992,7 @@ pub(crate) fn join_fs_path(parent: &str, leaf: &str) -> String {
 
 /// Sum the size of every regular file in the source filesystem — used
 /// by FAT32 shrink sizing.
+#[cfg(feature = "fat")]
 pub(crate) fn sum_source_file_bytes(
     src_dev: &mut dyn crate::block::BlockDevice,
     src_fs: &mut crate::inspect::AnyFs,
@@ -2028,7 +2080,7 @@ mod ticker_layout_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ext"))]
 mod cycle_guard_tests {
     use super::scan_into_build_plan;
     use crate::block::MemoryBackend;

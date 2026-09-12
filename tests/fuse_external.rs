@@ -16,7 +16,12 @@
 //! no `fusermount3` on `PATH`, or the user can't open the device
 //! (which catches sandboxed CI runners that don't expose FUSE).
 
-#![cfg(all(target_os = "linux", feature = "fuse"))]
+#![cfg(all(
+    target_os = "linux",
+    feature = "fuse",
+    feature = "ext",
+    feature = "ramfs"
+))]
 
 use std::io::Write;
 use std::path::Path;

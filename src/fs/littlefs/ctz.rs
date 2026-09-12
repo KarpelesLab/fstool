@@ -26,7 +26,9 @@
 //! Reaching index 0 from index 7 is then three hops (7 → 6 → 4 → 0)
 //! rather than seven.
 
-use std::io::Read;
+use crate::io::Read;
+use alloc::format;
+use alloc::vec;
 
 use crate::block::BlockDevice;
 use crate::{Error, Result};

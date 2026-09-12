@@ -64,6 +64,10 @@
 //! (where the SetChecksum field itself lives). Each byte rotates the
 //! accumulator right by one bit and adds the byte (mod 2^16).
 
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+
 /// Bytes per on-disk directory entry.
 pub const ENTRY_SIZE: usize = 32;
 

@@ -11,7 +11,7 @@
 //! tools downgrade the test to a no-op `eprintln!("skipping ...")` to
 //! match the policy used by `tests/ext4_external.rs`.
 
-#![cfg(unix)]
+#![cfg(all(unix, feature = "xfs"))]
 
 #[cfg(unix)]
 use std::process::Command;

@@ -423,6 +423,7 @@ fn qemu_io_reads_payload_we_wrote() {
 /// The point of all this: put a real filesystem inside the encrypted
 /// volume, close the whole stack, and read it back through the LUKS
 /// layer from the container file.
+#[cfg(feature = "ext")]
 #[test]
 fn hosts_an_ext2_filesystem() {
     use fstool::fs::ext::{Ext, FormatOpts as ExtOpts};

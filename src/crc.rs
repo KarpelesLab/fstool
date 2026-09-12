@@ -146,6 +146,7 @@ pub fn crc32_ieee_raw(state: u32, data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     /// The CRC catalogue's check value: the CRC of the nine ASCII bytes
     /// `"123456789"`. Getting this right means polynomial, reflection,

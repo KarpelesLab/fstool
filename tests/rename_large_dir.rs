@@ -1,7 +1,7 @@
 //! Regression for GitHub #29: `Ext::rename` / `remove` must find entries in
 //! directory blocks past the first. `unlink_dir_entry` used to scan only the
 //! first 4 KiB block, so the ~101st entry onward could not be renamed/removed.
-#![cfg(unix)]
+#![cfg(all(unix, feature = "ext"))]
 
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;

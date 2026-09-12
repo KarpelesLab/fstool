@@ -22,7 +22,9 @@
 //!   sectors, floored at the flavour's minimum cluster count (~33 MiB for
 //!   FAT32).
 
-use std::collections::HashMap;
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 use super::dir::{ENTRY_SIZE, LFN_CHARS_PER_ENTRY, is_valid_83};
 use super::table::FatKind;
@@ -53,7 +55,7 @@ pub struct FatSizePlan {
     /// per-file cluster rounding can be recomputed at the chosen cluster size.
     file_lens: Vec<u64>,
     /// Directory path → number of 32-byte slots used (entries + end marker).
-    dir_slots: HashMap<String, u64>,
+    dir_slots: BTreeMap<String, u64>,
 }
 
 impl Default for FatSizePlan {
@@ -73,7 +75,7 @@ impl FatSizePlan {
     /// A fresh plan sized for `kind`.
     #[must_use]
     pub fn for_kind(kind: FatKind) -> Self {
-        let mut dir_slots = HashMap::new();
+        let mut dir_slots = BTreeMap::new();
         // Root has no `.`/`..`, but the writer stores a volume-label entry.
         dir_slots.insert("/".to_string(), 1u64);
         Self {
@@ -207,6 +209,7 @@ impl FsSizePlan for FatSizePlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::format;
 
     #[test]
     fn empty_tree_is_fat32_minimum() {
@@ -244,6 +247,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn estimated_size_actually_fits_and_reads_back() {
         // End-to-end: size a real tree, format at exactly that size, populate,
         // and read a file back — proving the estimate is sufficient (the build
@@ -282,7 +286,7 @@ mod tests {
         let fat = Fat32::open(&mut dev).unwrap();
         let mut out = Vec::new();
         let mut r = fat.open_file_reader(&mut dev, "/sub/file_3.txt").unwrap();
-        std::io::Read::read_to_end(&mut r, &mut out).unwrap();
+        crate::io::Read::read_to_end(&mut r, &mut out).unwrap();
         assert_eq!(out, b"contents of file 3\n");
     }
 

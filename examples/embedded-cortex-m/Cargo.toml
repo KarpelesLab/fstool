@@ -1,0 +1,22 @@
+# A standalone crate (not a workspace member): build it from this directory.
+[package]
+name = "fstool-embedded-cortex-m"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Bare-metal smoke test + size probe for fstool's no_std FAT core on a Cortex-M4F"
+
+[dependencies]
+fstool = { path = "../..", default-features = false, features = ["fat"] }
+
+# Size-optimised, the way an MCU firmware is built. `panic = "abort"` is
+# required: there is no unwinder without std.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[profile.dev]
+panic = "abort"

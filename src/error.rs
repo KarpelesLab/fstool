@@ -5,7 +5,10 @@
 //! added as later layers (partition tables, filesystems, spec parsing) come
 //! online.
 
-use std::io;
+use alloc::string::String;
+use core::fmt;
+
+use crate::io;
 
 /// Crate-wide error type.
 ///
@@ -62,8 +65,8 @@ pub enum Error {
     },
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Io(e) => write!(f, "io: {e}"),
             Error::OutOfBounds { offset, len, size } => write!(
@@ -85,8 +88,8 @@ impl std::fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for Error {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Error::Io(e) => Some(e),
             _ => None,
@@ -103,4 +106,4 @@ impl From<io::Error> for Error {
 }
 
 /// Convenience alias used throughout the crate.
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = core::result::Result<T, Error>;

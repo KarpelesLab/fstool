@@ -23,8 +23,13 @@
 //! want to compare against the UpcaseTable directory entry's
 //! `TableChecksum`.
 
+use alloc::format;
+use alloc::vec;
+use alloc::vec::Vec;
+
 /// A decoded up-case table. Indexable by u16 code unit; entries beyond
 /// `table.len()` map to themselves.
+
 #[derive(Debug, Clone, Default)]
 pub struct Upcase {
     table: Vec<u16>,

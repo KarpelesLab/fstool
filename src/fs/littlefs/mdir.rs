@@ -17,6 +17,9 @@
 
 use crate::block::BlockDevice;
 use crate::{Error, Result};
+use alloc::format;
+use alloc::vec;
+use alloc::vec::Vec;
 
 use super::tag::{self, Tag};
 

@@ -35,9 +35,26 @@
 //! # Ok::<(), fstool::Error>(())
 //! ```
 
-use crate::block::{BlockDevice, MemoryBackend};
+#[cfg(any(feature = "ext", feature = "fat"))]
+use crate::block::BlockDevice;
+use crate::block::MemoryBackend;
+#[cfg(any(
+    feature = "ext",
+    feature = "fat",
+    feature = "exfat",
+    feature = "ntfs",
+    feature = "xfs",
+    feature = "hfs-plus",
+    feature = "hfs",
+    feature = "affs",
+    feature = "littlefs",
+    feature = "f2fs",
+    feature = "grf"
+))]
 use crate::format_opts::OptionMap;
-use crate::fs::{FileMeta, FileSource, FilesystemFactory, MutationCapability};
+#[cfg(any(feature = "xfs", feature = "grf"))]
+use crate::fs::FilesystemFactory;
+use crate::fs::{FileMeta, FileSource, MutationCapability};
 use crate::inspect::AnyFs;
 use crate::part::{Gpt, Mbr, Partition, PartitionKind, PartitionTable};
 use crate::{Error, Result};
@@ -81,8 +98,11 @@ pub struct FsTypeInfo {
 /// conservative: each entry is exercised by
 /// `every_advertised_filesystem_formats_and_accepts_a_file`, so an id that
 /// appears here really does format blank and really does take a file.
+/// Only the backends compiled into this build (their Cargo feature on)
+/// are listed.
 pub fn creatable_filesystems() -> Vec<FsTypeInfo> {
     vec![
+        #[cfg(feature = "ext")]
         FsTypeInfo {
             id: "ext2",
             label: "ext2",
@@ -91,6 +111,7 @@ pub fn creatable_filesystems() -> Vec<FsTypeInfo> {
             editable: true,
             options: "block_size,volume_label,inodes_count",
         },
+        #[cfg(feature = "ext")]
         FsTypeInfo {
             id: "ext3",
             label: "ext3 (journalled)",
@@ -99,6 +120,7 @@ pub fn creatable_filesystems() -> Vec<FsTypeInfo> {
             editable: true,
             options: "block_size,volume_label,journal_blocks",
         },
+        #[cfg(feature = "ext")]
         FsTypeInfo {
             id: "ext4",
             label: "ext4",
@@ -107,6 +129,7 @@ pub fn creatable_filesystems() -> Vec<FsTypeInfo> {
             editable: true,
             options: "block_size,volume_label,journal_blocks",
         },
+        #[cfg(feature = "fat")]
         FsTypeInfo {
             id: "fat12",
             label: "FAT12",
@@ -115,6 +138,7 @@ pub fn creatable_filesystems() -> Vec<FsTypeInfo> {
             editable: true,
             options: "volume_label,volume_id,root_entries",
         },
+        #[cfg(feature = "fat")]
         FsTypeInfo {
             id: "fat16",
             label: "FAT16",
@@ -123,6 +147,7 @@ pub fn creatable_filesystems() -> Vec<FsTypeInfo> {
             editable: true,
             options: "volume_label,volume_id,root_entries",
         },
+        #[cfg(feature = "fat")]
         FsTypeInfo {
             id: "fat32",
             label: "FAT32",
@@ -131,6 +156,7 @@ pub fn creatable_filesystems() -> Vec<FsTypeInfo> {
             editable: true,
             options: "volume_label,volume_id",
         },
+        #[cfg(feature = "exfat")]
         FsTypeInfo {
             id: "exfat",
             label: "exFAT",
@@ -139,6 +165,7 @@ pub fn creatable_filesystems() -> Vec<FsTypeInfo> {
             editable: true,
             options: "volume_label",
         },
+        #[cfg(feature = "ntfs")]
         FsTypeInfo {
             id: "ntfs",
             label: "NTFS",
@@ -147,6 +174,7 @@ pub fn creatable_filesystems() -> Vec<FsTypeInfo> {
             editable: true,
             options: "volume_label",
         },
+        #[cfg(feature = "xfs")]
         FsTypeInfo {
             id: "xfs",
             label: "XFS",
@@ -155,6 +183,7 @@ pub fn creatable_filesystems() -> Vec<FsTypeInfo> {
             editable: true,
             options: "",
         },
+        #[cfg(feature = "hfs-plus")]
         FsTypeInfo {
             id: "hfs+",
             label: "HFS+",
@@ -163,6 +192,7 @@ pub fn creatable_filesystems() -> Vec<FsTypeInfo> {
             editable: true,
             options: "volume_name,journaled",
         },
+        #[cfg(feature = "hfs")]
         FsTypeInfo {
             id: "hfs",
             label: "HFS (Mac OS ≤ 8)",
@@ -171,6 +201,7 @@ pub fn creatable_filesystems() -> Vec<FsTypeInfo> {
             editable: true,
             options: "volume_name",
         },
+        #[cfg(feature = "affs")]
         FsTypeInfo {
             id: "affs",
             label: "Amiga OFS/FFS",
@@ -179,6 +210,7 @@ pub fn creatable_filesystems() -> Vec<FsTypeInfo> {
             editable: true,
             options: "fstype,intl,volume_name",
         },
+        #[cfg(feature = "littlefs")]
         FsTypeInfo {
             id: "littlefs",
             label: "littlefs",
@@ -187,6 +219,7 @@ pub fn creatable_filesystems() -> Vec<FsTypeInfo> {
             editable: true,
             options: "block_size,block_count,prog_size,version,name_max,inline_max",
         },
+        #[cfg(feature = "f2fs")]
         FsTypeInfo {
             id: "f2fs",
             label: "F2FS",
@@ -195,6 +228,7 @@ pub fn creatable_filesystems() -> Vec<FsTypeInfo> {
             editable: true,
             options: "",
         },
+        #[cfg(feature = "grf")]
         FsTypeInfo {
             id: "grf",
             label: "GRF (Ragnarok)",
@@ -238,16 +272,50 @@ fn canonical_fs_id(fs_type: &str) -> String {
 /// Returns the *live* handle, not a re-opened one. That matters for the
 /// build-once writers (F2FS most obviously): a freshly formatted handle
 /// accepts content, a re-opened one does not.
+///
+/// A filesystem whose writer is not compiled into this build (its Cargo
+/// feature is off) fails with [`Error::Unsupported`] naming the feature.
+#[cfg(any(
+    feature = "ext",
+    feature = "fat",
+    feature = "exfat",
+    feature = "ntfs",
+    feature = "xfs",
+    feature = "hfs-plus",
+    feature = "hfs",
+    feature = "affs",
+    feature = "littlefs",
+    feature = "f2fs",
+    feature = "grf"
+))]
 fn format_blank(fs_type: &str, dev: &mut MemoryBackend, options: &str) -> Result<AnyFs> {
     let id = canonical_fs_id(fs_type);
+    // Every arm but F2FS's takes knobs off the bag; F2FS only consumes it.
+    #[cfg_attr(
+        not(any(
+            feature = "ext",
+            feature = "fat",
+            feature = "exfat",
+            feature = "ntfs",
+            feature = "xfs",
+            feature = "hfs-plus",
+            feature = "hfs",
+            feature = "affs",
+            feature = "littlefs",
+            feature = "grf"
+        )),
+        allow(unused_mut)
+    )]
     let mut bag = if options.trim().is_empty() {
         OptionMap::new()
     } else {
         OptionMap::from_cli(options)?
     };
+    #[cfg(any(feature = "ext", feature = "fat"))]
     let size = dev.total_size();
 
     let fs = match id.as_str() {
+        #[cfg(feature = "ext")]
         "ext2" | "ext3" | "ext4" => {
             use crate::fs::ext::{Ext, FormatOpts, FsKind};
             let kind = match id.as_str() {
@@ -277,6 +345,7 @@ fn format_blank(fs_type: &str, dev: &mut MemoryBackend, options: &str) -> Result
             bag.check_empty(&id)?;
             AnyFs::Ext(Box::new(Ext::format_with(dev, &opts)?))
         }
+        #[cfg(feature = "fat")]
         "fat12" | "fat16" | "fat32" => {
             use crate::fs::fat::{Fat32, FatFormatOpts, parse_fat_kind};
             let total_sectors = u32::try_from(size / SECTOR).map_err(|_| {
@@ -292,6 +361,7 @@ fn format_blank(fs_type: &str, dev: &mut MemoryBackend, options: &str) -> Result
             bag.check_empty(&id)?;
             AnyFs::Fat32(Box::new(Fat32::format(dev, &opts)?))
         }
+        #[cfg(feature = "exfat")]
         "exfat" => {
             use crate::fs::exfat::{Exfat, FormatOpts};
             let mut opts = FormatOpts::default();
@@ -299,6 +369,7 @@ fn format_blank(fs_type: &str, dev: &mut MemoryBackend, options: &str) -> Result
             bag.check_empty(&id)?;
             AnyFs::Exfat(Box::new(Exfat::format(dev, &opts)?))
         }
+        #[cfg(feature = "ntfs")]
         "ntfs" => {
             use crate::fs::ntfs::{Ntfs, format::FormatOpts};
             let mut opts = FormatOpts::default();
@@ -306,6 +377,7 @@ fn format_blank(fs_type: &str, dev: &mut MemoryBackend, options: &str) -> Result
             bag.check_empty(&id)?;
             AnyFs::Ntfs(Box::new(Ntfs::format(dev, &opts)?))
         }
+        #[cfg(feature = "xfs")]
         "xfs" => {
             use crate::fs::xfs::{Xfs, format::FormatOpts};
             let mut opts = FormatOpts::default();
@@ -313,6 +385,7 @@ fn format_blank(fs_type: &str, dev: &mut MemoryBackend, options: &str) -> Result
             bag.check_empty(&id)?;
             AnyFs::Xfs(Box::new(Xfs::format(dev, &opts)?))
         }
+        #[cfg(feature = "hfs-plus")]
         "hfs+" => {
             use crate::fs::hfs_plus::{FormatOpts, HfsPlus};
             let mut opts = FormatOpts {
@@ -323,6 +396,7 @@ fn format_blank(fs_type: &str, dev: &mut MemoryBackend, options: &str) -> Result
             bag.check_empty(&id)?;
             AnyFs::HfsPlus(Box::new(HfsPlus::format(dev, &opts)?))
         }
+        #[cfg(feature = "hfs")]
         "hfs" => {
             use crate::fs::hfs::{Hfs, HfsFormatOpts};
             // Classic HFS has no `apply_options`; its two knobs are read
@@ -340,6 +414,7 @@ fn format_blank(fs_type: &str, dev: &mut MemoryBackend, options: &str) -> Result
             bag.check_empty(&id)?;
             AnyFs::Hfs(Box::new(Hfs::format(dev, &opts)?))
         }
+        #[cfg(feature = "affs")]
         "affs" => {
             use crate::fs::affs::{Affs, AffsFormatOpts};
             // Same knobs `spec::affs_format_opts` accepts.
@@ -367,6 +442,7 @@ fn format_blank(fs_type: &str, dev: &mut MemoryBackend, options: &str) -> Result
             bag.check_empty(&id)?;
             AnyFs::Affs(Box::new(Affs::format(dev, &opts)?))
         }
+        #[cfg(feature = "littlefs")]
         "littlefs" => {
             use crate::fs::littlefs::{LittleFs, LittleFsFormatOpts};
             // Same knobs `spec::littlefs_format_opts` accepts.
@@ -392,12 +468,14 @@ fn format_blank(fs_type: &str, dev: &mut MemoryBackend, options: &str) -> Result
             bag.check_empty(&id)?;
             AnyFs::LittleFs(Box::new(LittleFs::format(dev, &opts)?))
         }
+        #[cfg(feature = "f2fs")]
         "f2fs" => {
             use crate::fs::f2fs::{F2fs, FormatOpts};
             let opts = FormatOpts::default();
             bag.check_empty(&id)?;
             AnyFs::F2fs(Box::new(F2fs::format(dev, &opts)?))
         }
+        #[cfg(feature = "grf")]
         "grf" => {
             use crate::fs::grf::{FormatOpts, Grf};
             let mut opts = FormatOpts::default();
@@ -405,14 +483,64 @@ fn format_blank(fs_type: &str, dev: &mut MemoryBackend, options: &str) -> Result
             bag.check_empty(&id)?;
             AnyFs::Grf(Box::new(Grf::format(dev, &opts)?))
         }
-        other => {
-            return Err(Error::InvalidArgument(format!(
-                "cannot create a blank {other:?} filesystem — see \
-                 memedit::creatable_filesystems()"
-            )));
-        }
+        other => return Err(cannot_create(other)),
     };
     Ok(fs)
+}
+
+/// [`format_blank`] for a build with no blank-formatting backend compiled
+/// in at all: nothing can be created, so every id is refused.
+#[cfg(not(any(
+    feature = "ext",
+    feature = "fat",
+    feature = "exfat",
+    feature = "ntfs",
+    feature = "xfs",
+    feature = "hfs-plus",
+    feature = "hfs",
+    feature = "affs",
+    feature = "littlefs",
+    feature = "f2fs",
+    feature = "grf"
+)))]
+fn format_blank(fs_type: &str, _dev: &mut MemoryBackend, _options: &str) -> Result<AnyFs> {
+    Err(cannot_create(&canonical_fs_id(fs_type)))
+}
+
+/// The Cargo feature that compiles in blank-formatting of filesystem id
+/// `id` (already canonicalised), for every id [`format_blank`] knows.
+/// `None` for an id it has never heard of.
+fn fs_feature(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "ext2" | "ext3" | "ext4" => "ext",
+        "fat12" | "fat16" | "fat32" => "fat",
+        "exfat" => "exfat",
+        "ntfs" => "ntfs",
+        "xfs" => "xfs",
+        "hfs+" => "hfs-plus",
+        "hfs" => "hfs",
+        "affs" => "affs",
+        "littlefs" => "littlefs",
+        "f2fs" => "f2fs",
+        "grf" => "grf",
+        _ => return None,
+    })
+}
+
+/// The error for a filesystem [`format_blank`] can't create: a known id
+/// whose writer this build left out names the missing feature; anything
+/// else is simply not creatable.
+fn cannot_create(id: &str) -> Error {
+    match fs_feature(id) {
+        Some(feature) => Error::Unsupported(format!(
+            "cannot create a blank {id:?} filesystem: this build of fstool was compiled \
+             without the `{feature}` feature"
+        )),
+        None => Error::InvalidArgument(format!(
+            "cannot create a blank {id:?} filesystem — see \
+             memedit::creatable_filesystems()"
+        )),
+    }
 }
 
 // ======================================================================
@@ -1013,6 +1141,7 @@ mod tests {
     /// the content we put in — proving the workspace hands back a real
     /// image and not just its own scratch buffer.
     #[test]
+    #[cfg(feature = "ext")]
     fn exported_filesystem_reopens_with_its_content() {
         let mut ws = Workspace::new_filesystem("ext4", 32 << 20, "volume_label=WEB").unwrap();
         ws.mkdir("/etc").unwrap();
@@ -1038,6 +1167,7 @@ mod tests {
     /// Exporting twice with an edit in between must show the edit — the
     /// "download at any point" promise.
     #[test]
+    #[cfg(feature = "fat")]
     fn export_is_repeatable_and_reflects_later_edits() {
         let mut ws = Workspace::new_filesystem("fat16", 16 << 20, "").unwrap();
         ws.add_file("/first.txt", b"one\n".to_vec()).unwrap();
@@ -1061,6 +1191,7 @@ mod tests {
 
     /// Removing a file must be visible in the next export.
     #[test]
+    #[cfg(feature = "ext")]
     fn remove_is_reflected_in_the_export() {
         let mut ws = Workspace::new_filesystem("ext2", 8 << 20, "").unwrap();
         ws.add_file("/gone.txt", b"x".to_vec()).unwrap();
@@ -1081,6 +1212,7 @@ mod tests {
     /// detectable, both partitions must carry their filesystem, and edits
     /// made in one must survive opening the other.
     #[test]
+    #[cfg(all(feature = "fat", feature = "ext"))]
     fn gpt_disk_with_two_partitions_round_trips() {
         let mut ws = Workspace::new_disk(256 << 20, "gpt").unwrap();
         let esp = ws
@@ -1152,6 +1284,7 @@ mod tests {
     /// A format failure inside `add_partition` must roll the partition back
     /// rather than leaving an entry pointing at unformatted space.
     #[test]
+    #[cfg(feature = "fat")]
     fn a_failed_format_rolls_the_partition_back() {
         let mut ws = Workspace::new_disk(64 << 20, "gpt").unwrap();
         // 4 MiB is far below FAT32's ~34 MiB floor.
@@ -1170,6 +1303,7 @@ mod tests {
     /// Adopting an existing image must find its partitions and let us edit
     /// one, with the change visible on re-export.
     #[test]
+    #[cfg(feature = "ext")]
     fn from_bytes_adopts_a_disk_and_keeps_editing() {
         let mut ws = Workspace::new_disk(128 << 20, "mbr").unwrap();
         ws.add_partition(Some(64 << 20), "linux", None, "ext4", "")
@@ -1194,6 +1328,7 @@ mod tests {
     /// A bare filesystem below its writer's floor is refused up front with
     /// a message naming the minimum, rather than a format-internal error.
     #[test]
+    #[cfg(feature = "fat")]
     fn undersized_filesystem_is_refused_with_the_minimum() {
         let err = Workspace::new_filesystem("fat32", 1 << 20, "").unwrap_err();
         let msg = format!("{err}");
@@ -1203,6 +1338,7 @@ mod tests {
     /// Writing the same path twice replaces the file instead of erroring —
     /// the UI's "upload" and "save" are one operation.
     #[test]
+    #[cfg(feature = "ext")]
     fn writing_a_path_twice_replaces_it() {
         let mut ws = Workspace::new_filesystem("ext4", 16 << 20, "").unwrap();
         ws.add_file("/f.txt", b"first".to_vec()).unwrap();

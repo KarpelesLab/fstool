@@ -1,7 +1,7 @@
 //! `Filesystem::open_file_rw` for exFAT — eager-write file handle.
 //!
 //! The handle owns mutable borrows of both the [`super::Exfat`] state and
-//! the [`BlockDevice`] for its lifetime. Each [`std::io::Write::write`]
+//! the [`BlockDevice`] for its lifetime. Each [`crate::io::Write::write`]
 //! call writes through to disk immediately:
 //!
 //! - bytes that land in existing clusters patch them in place;
@@ -20,7 +20,11 @@
 //! small atomic store). A crash mid-grow leaves at most an orphan
 //! cluster, recoverable by `fsck.exfat`.
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use crate::io::{Read, Seek, SeekFrom, Write};
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::vec;
+use alloc::vec::Vec;
 
 use crate::Result;
 use crate::block::BlockDevice;
@@ -264,7 +268,7 @@ impl<'a> ExfatFileHandle<'a> {
 
     /// Read `buf.len()` bytes (or fewer at EOF) starting at the current
     /// position. Helper for `Read::read`.
-    fn read_internal(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read_internal(&mut self, buf: &mut [u8]) -> crate::io::Result<usize> {
         if self.pos >= self.len {
             return Ok(0);
         }
@@ -281,7 +285,7 @@ impl<'a> ExfatFileHandle<'a> {
         let disk_off = self.cluster_disk_offset(cluster) + cluster_off;
         self.dev
             .read_at(disk_off, &mut buf[..want])
-            .map_err(std::io::Error::other)?;
+            .map_err(crate::io::Error::other)?;
         self.pos += want as u64;
         Ok(want)
     }
@@ -334,17 +338,17 @@ impl<'a> ExfatFileHandle<'a> {
 }
 
 impl<'a> Read for ExfatFileHandle<'a> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> crate::io::Result<usize> {
         self.read_internal(buf)
     }
 }
 
 impl<'a> Write for ExfatFileHandle<'a> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.write_internal(buf).map_err(std::io::Error::other)
+    fn write(&mut self, buf: &[u8]) -> crate::io::Result<usize> {
+        self.write_internal(buf).map_err(crate::io::Error::other)
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> crate::io::Result<()> {
         // Defer the heavyweight FAT/bitmap persistence to `sync` —
         // `flush` per std::io is a no-op for streams whose `write`
         // already reached the device.
@@ -353,15 +357,15 @@ impl<'a> Write for ExfatFileHandle<'a> {
 }
 
 impl<'a> Seek for ExfatFileHandle<'a> {
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+    fn seek(&mut self, pos: SeekFrom) -> crate::io::Result<u64> {
         let new = match pos {
             SeekFrom::Start(n) => n as i128,
             SeekFrom::Current(n) => self.pos as i128 + n as i128,
             SeekFrom::End(n) => self.len as i128 + n as i128,
         };
         if new < 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+            return Err(crate::io::Error::new(
+                crate::io::ErrorKind::InvalidInput,
                 "exfat: seek to negative offset",
             ));
         }
@@ -499,7 +503,7 @@ impl Exfat {
                 // Create empty file via existing path; serialize it so its
                 // on-disk entry exists (the handle updates it in place).
                 let _ =
-                    self.create_file_in(dev, parent_cluster, leaf, &mut std::io::empty(), 0, ts)?;
+                    self.create_file_in(dev, parent_cluster, leaf, &mut crate::io::empty(), 0, ts)?;
                 self.flush_dir_batches(dev)?;
                 // Re-find the entry we just wrote — its position is the
                 // first free slot in the parent, but it's simplest to
@@ -632,13 +636,13 @@ pub struct ReadOnlyExfatHandle<'a> {
 }
 
 impl<'a> Read for ReadOnlyExfatHandle<'a> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> crate::io::Result<usize> {
         self.inner.read(buf)
     }
 }
 
 impl<'a> Seek for ReadOnlyExfatHandle<'a> {
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+    fn seek(&mut self, pos: SeekFrom) -> crate::io::Result<u64> {
         self.inner.seek(pos)
     }
 }

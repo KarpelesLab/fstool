@@ -16,6 +16,10 @@
 //! contiguously and the FAT entries are not required to be valid — the
 //! reader must follow the contiguous run instead of the FAT.
 
+use alloc::format;
+use alloc::vec;
+use alloc::vec::Vec;
+
 /// Free cluster.
 pub const FREE: u32 = 0x0000_0000;
 /// Bad-cluster marker.

@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(all(unix, feature = "f2fs"))]
 //! F2FS end-to-end validation against the native f2fs-tools userspace
 //! (`fsck.f2fs`, `mkfs.f2fs`, `dump.f2fs`). Each test silently skips when
 //! its required tool isn't on PATH so the suite stays green on hosts

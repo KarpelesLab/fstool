@@ -1,3 +1,4 @@
+#![cfg(all(feature = "cli", feature = "tar"))]
 //! End-to-end validation of `Source::Layered` flattening + whiteouts.
 //!
 //! Drives the public `fstool repack` CLI with `+`-separated layered

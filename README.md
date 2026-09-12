@@ -612,14 +612,46 @@ keeps the binary itself out of a library build. Depend on it like this:
 ```toml
 [dependencies]
 fstool = { version = "0.4", default-features = false,
-           features = ["codecs", "containers"] }
+           features = ["filesystems", "containers", "codecs"] }
 ```
 
-`codecs` is every compression codec, `containers` every encrypted
-container (LUKS, qcow2 encryption, encrypted DMG) — so that line keeps
-each supported format while dropping the CLI and its ~26 transitive
-crates. Take neither, or hand-pick individual features from the tables
-below, to trim further.
+`filesystems` is every filesystem backend, `containers` every disk-image
+container (qcow2, DMG, DiskCopy, LUKS and the encrypted variants), and
+`codecs` every compression codec — so that line keeps each supported
+format while dropping the CLI and its ~26 transitive crates. Take fewer,
+or hand-pick individual features from the tables below, to trim further.
+
+### One feature per format
+
+Every filesystem and container has its own feature, and each one pulls
+exactly what it needs. The default build turns them all on; a consumer
+that only ever mounts SD cards asks for `fat` and `exfat` and compiles
+none of the other 130 000 lines.
+
+| Feature | Backend | Notes |
+|---------|---------|-------|
+| `fat` | FAT12 / FAT16 / FAT32 | `no_std`-clean |
+| `exfat` | exFAT | `no_std`-clean; implies `fat` (shared allocation-table code) |
+| `littlefs` | littlefs 2.0 / 2.1 | `no_std`-clean |
+| `ext` | ext2 / ext3 / ext4 | |
+| `xfs`, `ntfs`, `f2fs`, `affs`, `iso9660`, `squashfs` | as named | |
+| `hfs`, `hfs-plus` | classic HFS, HFS+ / HFSX | |
+| `apfs` | APFS | pulls `intl` for the directory-record hash |
+| `grf` | GRF | pulls `charcode` for CP949 names |
+| `tar` | tar (streaming reader / writer, tar-as-filesystem) | |
+| `archive` | zip / cpio / ar, plus the per-format readers | pulls `charcode`; `cab`, `lha`, `arc`, `sit`, `sevenz`, `rar`, `amiga-lzx` each imply it |
+| `ramfs` | the in-memory scratch filesystem `repack` / `merge` / FUSE build on | |
+| `qcow2`, `dmg`, `diskcopy` | disk-image containers | `qcow2-crypto` implies `qcow2`; `dmg-encrypted` / `dmg-bzip2` / `dmg-lzfse` imply `dmg` |
+| `luks` | LUKS1 / LUKS2 | pulls `purecrypto`; implies `json` (LUKS2 metadata is JSON) |
+
+Every feature in the table except the three marked `no_std`-clean
+implies `std`. The dispatch layers (`inspect`, `repack`, the TOML spec,
+`memconv`, the CLI) are gated per backend as well: a format that was
+compiled out is still *recognised* by its magic and refused with an error
+naming the feature to enable, never mistaken for an unknown image. The
+`cli` feature implies no filesystem, so a slim `fstool` that handles
+exactly the formats you need is `--no-default-features --features
+cli,readline,fat,exfat`.
 
 Four more features carve up what is left, all on by default:
 
@@ -637,24 +669,97 @@ helpers stay), without `json` there is no `--json` and no LUKS2, without
 block device is refused the same way it already is on Windows. Image
 *files* work in every configuration.
 
-That makes the floor `--features codecs` — **7 crates**, of which the
-three that matter are ours:
-[`compcol`](https://github.com/KarpelesLab/compcol) for every codec,
+That makes the hosted floor `--features std,filesystems` — the crate,
+`uuid`, and the three of ours a backend asks for:
 [`charcode`](https://github.com/KarpelesLab/charcode) for legacy
-character encodings, and
+character encodings (`archive`, `grf`), and
 [`intl`](https://github.com/KarpelesLab/intlrs) for the Unicode
-normalization and case folding the APFS directory-record hash needs.
-Add `spec` and [`tomlproc`](https://github.com/KarpelesLab/tomlproc)
+normalization and case folding the APFS directory-record hash needs
+(`apfs`). Add `codecs` and
+[`compcol`](https://github.com/KarpelesLab/compcol) serves every codec;
+add `spec` and [`tomlproc`](https://github.com/KarpelesLab/tomlproc)
 parses the TOML; add `containers` and
 [`purecrypto`](https://github.com/KarpelesLab/purecrypto) joins them for
-every cipher, hash and KDF. All four are pure Rust with no foreign code.
-The only third-party crate left in that floor is `uuid` (with
-`getrandom` and `libc` behind it). CI asserts the floor stays there.
+every cipher, hash and KDF. All of them are pure Rust with no foreign
+code. CI asserts the floor stays there, builds each filesystem on its
+own, and builds the `no_std` core for a Cortex-M target.
 
 The default feature set adds `cli` + `readline` on top, so `cargo install
 fstool` and `cargo build` still produce a working command with no extra
 flags. CI asserts the library-only resolve contains neither `clap` nor
 `rustyline`.
+
+## Embedded targets (`no_std`)
+
+Turn the `std` feature off and fstool is `#![no_std]` (with `alloc`).
+What remains is the core an SD-card or flash reader needs:
+
+- the [`BlockDevice`](src/block/mod.rs) trait, with the in-memory
+  [`MemoryBackend`](src/block/memory.rs), the partition view
+  [`SlicedBackend`](src/block/sliced.rs), and
+  [`SectorDevice`](src/block/sector.rs) — an adapter that turns any
+  sector-addressed driver (implement the four-method `SectorIo` trait
+  over your SD/SDIO/eMMC driver) into a full byte-addressed device;
+- MBR, GPT and APM partition tables ([`part`](src/part/mod.rs));
+- the [`Filesystem`](src/fs/mod.rs) trait and the three formats that
+  carry no host dependency: **FAT12/16/32**, **exFAT** and **littlefs**,
+  each with format, create, list, read, in-place edit and remove;
+- `fstool::io` and `fstool::path`, which are `std::io` / `std::path` on a
+  hosted build and small equivalents (same names, same semantics) without
+  one, so a driver implements the `Read` / `Write` / `Seek` it already
+  knows.
+
+```toml
+[dependencies]
+fstool = { version = "0.4", default-features = false,
+           features = ["fat", "exfat"] }
+```
+
+```rust
+use fstool::block::{BlockDevice, SectorDevice, SectorIo};
+use fstool::fs::fat::Fat32;
+use fstool::fs::Filesystem;
+use fstool::io::Read;
+use fstool::part::{Mbr, slice_partition};
+use fstool::path::Path;
+
+struct SdCard { /* your driver */ }
+
+impl SectorIo for SdCard {
+    fn sector_size(&self) -> u32 { 512 }
+    fn sector_count(&self) -> u64 { /* CSD capacity */ 0 }
+    fn read_sectors(&mut self, lba: u64, buf: &mut [u8]) -> fstool::Result<()> { todo!() }
+    fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> fstool::Result<()> { todo!() }
+}
+
+fn read_config(card: SdCard) -> fstool::Result<alloc::vec::Vec<u8>> {
+    let mut disk = SectorDevice::new(card);
+    let table = Mbr::read(&mut disk)?;                  // or Gpt::read
+    let mut part = slice_partition(&table, &mut disk, 0)?;
+    let mut fs = Fat32::open(&mut part)?;
+    let mut out = alloc::vec::Vec::new();
+    fs.read_file(&mut part, Path::new("/config.txt"))?
+        .read_to_end(&mut out)?;
+    Ok(out)
+}
+```
+
+What it costs: a `#![no_std] #![no_main]` program for a Cortex-M4F
+(`thumbv7em-none-eabihf`) that formats a FAT volume, creates a file,
+lists the root and reads the file back links to **~45 KB of flash**
+(`opt-level = "z"`, fat LTO, `panic = "abort"`; ~49 KB at `"s"`, ~60 KB
+at `3`), bump allocator included. RAM is whatever your allocator hands
+out: the FAT driver keeps the allocation table resident, so budget
+roughly the FAT's size plus a cluster for a mounted volume. The only
+dependency in this configuration is `uuid` (no `getrandom`, no OS): GPT
+*reading* needs nothing more, and GPT *formatting* takes its GUIDs from
+you through `Gpt::build_with_guids` instead of a random source.
+
+The rest of the crate — every other filesystem, the containers, `inspect`
+/ `repack` / the spec engine, host paths — needs `std` and is gated on
+it; enabling any of those features turns `std` back on. The unit tests
+of the core run in the `no_std` configuration too
+(`cargo test --lib --no-default-features --features fat,exfat,littlefs`).
 
 ## Compression
 

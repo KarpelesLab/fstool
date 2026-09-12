@@ -20,14 +20,68 @@
 
 use std::io::Read;
 
-use crate::block::{BlockDevice, MemoryBackend};
-use crate::compression::{self, Algo};
-use crate::fs::{EntryKind, Filesystem, FilesystemFactory};
+use crate::block::MemoryBackend;
+use crate::compression;
+#[cfg(feature = "tar")]
+use crate::compression::Algo;
+use crate::fs::EntryKind;
 use crate::inspect::{self, AnyFs};
-use crate::repack::{FsSink, TarStreamSink, walk_anyfs};
+#[cfg(feature = "tar")]
+use crate::repack::TarStreamSink;
+#[cfg(any(
+    feature = "ext",
+    feature = "fat",
+    feature = "hfs-plus",
+    feature = "hfs",
+    feature = "ntfs",
+    feature = "f2fs",
+    feature = "xfs",
+    feature = "affs",
+    feature = "littlefs",
+    feature = "apfs",
+    feature = "squashfs",
+    feature = "iso9660",
+    feature = "grf",
+    feature = "archive"
+))]
+use crate::repack::{FsSink, walk_anyfs};
 use crate::{Error, Result};
+#[cfg(any(
+    feature = "hfs-plus",
+    feature = "hfs",
+    feature = "ntfs",
+    feature = "f2fs",
+    feature = "xfs",
+    feature = "affs",
+    feature = "littlefs",
+    feature = "apfs",
+    feature = "squashfs",
+    feature = "iso9660",
+    feature = "grf",
+    feature = "archive"
+))]
+use crate::{
+    block::BlockDevice,
+    fs::{Filesystem, FilesystemFactory},
+};
 
 /// Block size used to seed the ext build plan when sizing a destination.
+#[cfg(any(
+    feature = "ext",
+    feature = "fat",
+    feature = "hfs-plus",
+    feature = "hfs",
+    feature = "ntfs",
+    feature = "f2fs",
+    feature = "xfs",
+    feature = "affs",
+    feature = "littlefs",
+    feature = "apfs",
+    feature = "squashfs",
+    feature = "iso9660",
+    feature = "grf",
+    feature = "archive"
+))]
 const PLAN_BLOCK_SIZE: u32 = 4096;
 
 // ======================================================================
@@ -274,23 +328,32 @@ impl MemImage {
     /// The conversion is *lossy-tolerant*: an entry the destination can't
     /// represent (a symlink into FAT, a device node into zip, …) is dropped
     /// with a `log::warn!` rather than failing the whole convert.
+    ///
+    /// A target whose writer is not compiled into this build (its Cargo
+    /// feature is off) fails with [`Error::Unsupported`] naming the feature.
     pub fn convert(&mut self, target: &str) -> Result<Vec<u8>> {
         let t = target.trim().to_ascii_lowercase();
 
         // tar / tar.<codec> — streaming archive, no pre-sized device.
-        if t == "tar" {
-            return self.convert_tar(None);
-        }
-        if let Some(codec_name) = t.strip_prefix("tar.") {
-            let algo = tar_codec(codec_name).ok_or_else(|| {
-                Error::InvalidArgument(format!("unknown tar codec {codec_name:?}"))
-            })?;
-            return self.convert_tar(Some(algo));
+        #[cfg(feature = "tar")]
+        {
+            if t == "tar" {
+                return self.convert_tar(None);
+            }
+            if let Some(codec_name) = t.strip_prefix("tar.") {
+                let algo = tar_codec(codec_name).ok_or_else(|| {
+                    Error::InvalidArgument(format!("unknown tar codec {codec_name:?}"))
+                })?;
+                return self.convert_tar(Some(algo));
+            }
         }
 
         match t.as_str() {
+            #[cfg(feature = "ext")]
             "ext2" | "ext3" | "ext4" => self.convert_ext(&t),
+            #[cfg(feature = "fat")]
             "fat32" | "vfat" => self.convert_fat32(),
+            #[cfg(feature = "hfs-plus")]
             "hfs+" | "hfsplus" => {
                 let sz = self.geometry_size()?;
                 self.build_generic::<crate::fs::hfs_plus::HfsPlus>(
@@ -298,6 +361,7 @@ impl MemImage {
                     sz,
                 )
             }
+            #[cfg(feature = "hfs")]
             "hfs" => {
                 let sz = self.geometry_size()?;
                 self.build_generic::<crate::fs::hfs::Hfs>(
@@ -305,6 +369,7 @@ impl MemImage {
                     sz,
                 )
             }
+            #[cfg(feature = "ntfs")]
             "ntfs" => {
                 let sz = self.geometry_size()?;
                 self.build_generic::<crate::fs::ntfs::Ntfs>(
@@ -312,6 +377,7 @@ impl MemImage {
                     sz,
                 )
             }
+            #[cfg(feature = "f2fs")]
             "f2fs" => {
                 // f2fs needs enough main-area segments to lay out its 6
                 // cursegs; below ~50 MiB its flush indexes past a 1-segment
@@ -324,6 +390,7 @@ impl MemImage {
                     sz,
                 )
             }
+            #[cfg(feature = "xfs")]
             "xfs" => {
                 let sz = self.geometry_size()?;
                 self.build_generic::<crate::fs::xfs::Xfs>(
@@ -331,6 +398,7 @@ impl MemImage {
                     sz,
                 )
             }
+            #[cfg(feature = "affs")]
             "affs" | "ofs" | "ffs" => {
                 let sz = self.geometry_size()?;
                 self.build_generic::<crate::fs::affs::Affs>(
@@ -338,6 +406,7 @@ impl MemImage {
                     sz,
                 )
             }
+            #[cfg(feature = "littlefs")]
             "littlefs" | "lfs" => {
                 // littlefs reserves nothing up front, so a content-fit size
                 // from its own size plan is enough; keep a floor so tiny
@@ -348,6 +417,7 @@ impl MemImage {
                     sz,
                 )
             }
+            #[cfg(feature = "apfs")]
             "apfs" => {
                 let sz = self.geometry_size()?;
                 self.build_generic::<crate::fs::apfs::Apfs>(
@@ -355,6 +425,7 @@ impl MemImage {
                     sz,
                 )
             }
+            #[cfg(feature = "squashfs")]
             "squashfs" => {
                 let sz = self.geometry_size()?;
                 self.build_generic::<crate::fs::squashfs::Squashfs>(
@@ -362,6 +433,7 @@ impl MemImage {
                     sz,
                 )
             }
+            #[cfg(feature = "iso9660")]
             "iso" | "iso9660" => {
                 let opts = crate::fs::iso9660::FormatOpts {
                     volume_id: "FSTOOL".into(),
@@ -371,6 +443,7 @@ impl MemImage {
                 let sz = self.archive_size(32 << 20)?;
                 self.build_generic::<crate::fs::iso9660::Iso9660>(&opts, sz)
             }
+            #[cfg(feature = "grf")]
             "grf" => {
                 let sz = self.archive_size(64 << 10)?;
                 self.build_generic::<crate::fs::grf::Grf>(
@@ -378,6 +451,7 @@ impl MemImage {
                     sz,
                 )
             }
+            #[cfg(feature = "archive")]
             "zip" => {
                 let sz = self.archive_size(16 << 20)?;
                 self.build_generic::<crate::fs::archive::zip::ZipFs>(
@@ -385,6 +459,7 @@ impl MemImage {
                     sz,
                 )
             }
+            #[cfg(feature = "archive")]
             "cpio" => {
                 let sz = self.archive_size(16 << 20)?;
                 self.build_generic::<crate::fs::archive::cpio::CpioFs>(
@@ -392,6 +467,7 @@ impl MemImage {
                     sz,
                 )
             }
+            #[cfg(feature = "archive")]
             "ar" => {
                 let sz = self.archive_size(16 << 20)?;
                 self.build_generic::<crate::fs::archive::ar::ArFs>(
@@ -399,14 +475,13 @@ impl MemImage {
                     sz,
                 )
             }
-            other => Err(Error::InvalidArgument(format!(
-                "unknown conversion target {other:?}"
-            ))),
+            other => Err(unknown_target(other)),
         }
     }
 
     // -- convert helpers ------------------------------------------------
 
+    #[cfg(feature = "tar")]
     fn convert_tar(&mut self, codec: Option<Algo>) -> Result<Vec<u8>> {
         use crate::repack::RepackSink;
         let out = MemWriter::default();
@@ -416,12 +491,15 @@ impl MemImage {
             None => Box::new(out),
         };
         let mut sink = TarStreamSink::new(inner);
-        walk_anyfs(&mut self.fs, &mut self.dev, &mut sink)?;
+        // Path-qualified: the `walk_anyfs` import above belongs to the
+        // block-filesystem targets, which may all be compiled out.
+        crate::repack::walk_anyfs(&mut self.fs, &mut self.dev, &mut sink)?;
         sink.finish()?;
         drop(sink);
         Ok(handle.into_bytes())
     }
 
+    #[cfg(feature = "ext")]
     fn convert_ext(&mut self, flavour: &str) -> Result<Vec<u8>> {
         use crate::fs::ext::{Ext, FsKind};
         let kind = match flavour {
@@ -447,6 +525,7 @@ impl MemImage {
         Ok(dst.into_bytes())
     }
 
+    #[cfg(feature = "fat")]
     fn convert_fat32(&mut self) -> Result<Vec<u8>> {
         use crate::fs::fat::{Fat32, FatFormatOpts};
         let dst_size = crate::analyze::analyze_fs(&mut self.fs, &mut self.dev, PLAN_BLOCK_SIZE)?
@@ -476,6 +555,20 @@ impl MemImage {
     /// `dst_size` (so the formatter sees room), but stays growable so a
     /// streaming writer can exceed it; the result is truncated to the FS's
     /// reported `image_len`.
+    #[cfg(any(
+        feature = "hfs-plus",
+        feature = "hfs",
+        feature = "ntfs",
+        feature = "f2fs",
+        feature = "xfs",
+        feature = "affs",
+        feature = "littlefs",
+        feature = "apfs",
+        feature = "squashfs",
+        feature = "iso9660",
+        feature = "grf",
+        feature = "archive"
+    ))]
     fn build_generic<F: FilesystemFactory>(
         &mut self,
         opts: &F::FormatOpts,
@@ -502,6 +595,17 @@ impl MemImage {
     /// its layout from the device size (xfs / hfs+ / ntfs / f2fs / apfs /
     /// affs). Generous: at least the source image size, and always enough
     /// for the smallest of these formats.
+    #[cfg(any(
+        feature = "hfs-plus",
+        feature = "hfs",
+        feature = "ntfs",
+        feature = "f2fs",
+        feature = "xfs",
+        feature = "affs",
+        feature = "littlefs",
+        feature = "apfs",
+        feature = "squashfs"
+    ))]
     fn geometry_size(&mut self) -> Result<u64> {
         let src_total = self.dev.total_size();
         let tfb = self.total_file_bytes()?;
@@ -515,11 +619,26 @@ impl MemImage {
     /// fixed `headroom` for headers / descriptors. The buffer is truncated
     /// to the real length afterwards, so over-provisioning only costs
     /// transient RAM.
+    #[cfg(any(feature = "iso9660", feature = "grf", feature = "archive"))]
     fn archive_size(&mut self, headroom: u64) -> Result<u64> {
         let tfb = self.total_file_bytes()?;
         Ok(round_up(tfb.saturating_add(headroom), 512))
     }
 
+    #[cfg(any(
+        feature = "hfs-plus",
+        feature = "hfs",
+        feature = "ntfs",
+        feature = "f2fs",
+        feature = "xfs",
+        feature = "affs",
+        feature = "littlefs",
+        feature = "apfs",
+        feature = "squashfs",
+        feature = "iso9660",
+        feature = "grf",
+        feature = "archive"
+    ))]
     fn total_file_bytes(&mut self) -> Result<u64> {
         Ok(
             crate::analyze::analyze_fs(&mut self.fs, &mut self.dev, PLAN_BLOCK_SIZE)?
@@ -559,133 +678,156 @@ pub struct TargetInfo {
 }
 
 /// The conversion targets the UI can offer. Every id is accepted by
-/// [`MemImage::convert`]. Availability of the compressed-tar variants
-/// tracks the codec Cargo features that are compiled in.
+/// [`MemImage::convert`]. Availability tracks the Cargo features that are
+/// compiled in: each filesystem's own feature, and the codec features for
+/// the compressed-tar variants.
 pub fn supported_targets() -> Vec<TargetInfo> {
-    let mut v = vec![TargetInfo {
-        id: "tar",
-        label: "tar",
-        ext: "tar",
-        streaming: true,
-    }];
-    for (id, label, ext, algo) in [
-        ("tar.gz", "tar + gzip", "tar.gz", Algo::Gzip),
-        ("tar.xz", "tar + xz", "tar.xz", Algo::Xz),
-        ("tar.zst", "tar + zstd", "tar.zst", Algo::Zstd),
-        ("tar.lz4", "tar + lz4", "tar.lz4", Algo::Lz4),
-    ] {
-        if algo.enabled() {
-            v.push(TargetInfo {
-                id,
-                label,
-                ext,
-                streaming: true,
-            });
+    let mut v = Vec::new();
+    #[cfg(feature = "tar")]
+    {
+        v.push(TargetInfo {
+            id: "tar",
+            label: "tar",
+            ext: "tar",
+            streaming: true,
+        });
+        for (id, label, ext, algo) in [
+            ("tar.gz", "tar + gzip", "tar.gz", Algo::Gzip),
+            ("tar.xz", "tar + xz", "tar.xz", Algo::Xz),
+            ("tar.zst", "tar + zstd", "tar.zst", Algo::Zstd),
+            ("tar.lz4", "tar + lz4", "tar.lz4", Algo::Lz4),
+        ] {
+            if algo.enabled() {
+                v.push(TargetInfo {
+                    id,
+                    label,
+                    ext,
+                    streaming: true,
+                });
+            }
         }
     }
     v.extend([
+        #[cfg(feature = "archive")]
         TargetInfo {
             id: "zip",
             label: "zip",
             ext: "zip",
             streaming: true,
         },
+        #[cfg(feature = "archive")]
         TargetInfo {
             id: "cpio",
             label: "cpio (newc)",
             ext: "cpio",
             streaming: true,
         },
+        #[cfg(feature = "archive")]
         TargetInfo {
             id: "ar",
             label: "ar",
             ext: "a",
             streaming: true,
         },
+        #[cfg(feature = "ext")]
         TargetInfo {
             id: "ext4",
             label: "ext4",
             ext: "img",
             streaming: false,
         },
+        #[cfg(feature = "ext")]
         TargetInfo {
             id: "ext3",
             label: "ext3",
             ext: "img",
             streaming: false,
         },
+        #[cfg(feature = "ext")]
         TargetInfo {
             id: "ext2",
             label: "ext2",
             ext: "img",
             streaming: false,
         },
+        #[cfg(feature = "fat")]
         TargetInfo {
             id: "fat32",
             label: "FAT32",
             ext: "img",
             streaming: false,
         },
+        #[cfg(feature = "xfs")]
         TargetInfo {
             id: "xfs",
             label: "XFS",
             ext: "img",
             streaming: false,
         },
+        #[cfg(feature = "hfs-plus")]
         TargetInfo {
             id: "hfs+",
             label: "HFS+",
             ext: "img",
             streaming: false,
         },
+        #[cfg(feature = "hfs")]
         TargetInfo {
             id: "hfs",
             label: "HFS",
             ext: "img",
             streaming: false,
         },
+        #[cfg(feature = "ntfs")]
         TargetInfo {
             id: "ntfs",
             label: "NTFS",
             ext: "img",
             streaming: false,
         },
+        #[cfg(feature = "f2fs")]
         TargetInfo {
             id: "f2fs",
             label: "F2FS",
             ext: "img",
             streaming: false,
         },
+        #[cfg(feature = "apfs")]
         TargetInfo {
             id: "apfs",
             label: "APFS",
             ext: "img",
             streaming: false,
         },
+        #[cfg(feature = "affs")]
         TargetInfo {
             id: "affs",
             label: "Amiga FFS",
             ext: "adf",
             streaming: false,
         },
+        #[cfg(feature = "littlefs")]
         TargetInfo {
             id: "littlefs",
             label: "littlefs",
             ext: "img",
             streaming: false,
         },
+        #[cfg(feature = "squashfs")]
         TargetInfo {
             id: "squashfs",
             label: "SquashFS",
             ext: "sqsh",
             streaming: true,
         },
+        #[cfg(feature = "iso9660")]
         TargetInfo {
             id: "iso",
             label: "ISO 9660",
             ext: "iso",
             streaming: true,
         },
+        #[cfg(feature = "grf")]
         TargetInfo {
             id: "grf",
             label: "GRF",
@@ -730,6 +872,44 @@ pub(crate) fn entry_kind_str(k: EntryKind) -> &'static str {
     }
 }
 
+/// The Cargo feature that compiles in conversion target `id`, for every
+/// id [`MemImage::convert`] knows. `None` for an id it has never heard of.
+fn target_feature(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "tar" => "tar",
+        t if t.starts_with("tar.") => "tar",
+        "ext2" | "ext3" | "ext4" => "ext",
+        "fat32" | "vfat" => "fat",
+        "hfs+" | "hfsplus" => "hfs-plus",
+        "hfs" => "hfs",
+        "ntfs" => "ntfs",
+        "f2fs" => "f2fs",
+        "xfs" => "xfs",
+        "affs" | "ofs" | "ffs" => "affs",
+        "littlefs" | "lfs" => "littlefs",
+        "apfs" => "apfs",
+        "squashfs" => "squashfs",
+        "iso" | "iso9660" => "iso9660",
+        "grf" => "grf",
+        "zip" | "cpio" | "ar" => "archive",
+        _ => return None,
+    })
+}
+
+/// The error for a target [`MemImage::convert`] can't produce: a known id
+/// whose writer this build left out names the missing feature; anything
+/// else is simply unknown.
+fn unknown_target(id: &str) -> Error {
+    match target_feature(id) {
+        Some(feature) => Error::Unsupported(format!(
+            "cannot convert to {id:?}: this build of fstool was compiled without the \
+             `{feature}` feature"
+        )),
+        None => Error::InvalidArgument(format!("unknown conversion target {id:?}")),
+    }
+}
+
+#[cfg(feature = "tar")]
 fn tar_codec(name: &str) -> Option<Algo> {
     let algo = match name {
         "gz" | "gzip" => Algo::Gzip,
@@ -743,6 +923,20 @@ fn tar_codec(name: &str) -> Option<Algo> {
     algo.enabled().then_some(algo)
 }
 
+#[cfg(any(
+    feature = "hfs-plus",
+    feature = "hfs",
+    feature = "ntfs",
+    feature = "f2fs",
+    feature = "xfs",
+    feature = "affs",
+    feature = "littlefs",
+    feature = "apfs",
+    feature = "squashfs",
+    feature = "iso9660",
+    feature = "grf",
+    feature = "archive"
+))]
 fn round_up(v: u64, to: u64) -> u64 {
     v.div_ceil(to).saturating_mul(to)
 }
@@ -751,9 +945,11 @@ fn round_up(v: u64, to: u64) -> u64 {
 /// codec wrapper can own the writer while we keep a handle to recover the
 /// bytes. Single-threaded (wasm/CLI); the `Rc`/`RefCell` never crosses a
 /// thread boundary.
+#[cfg(feature = "tar")]
 #[derive(Clone, Default)]
 struct MemWriter(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
 
+#[cfg(feature = "tar")]
 impl MemWriter {
     fn into_bytes(self) -> Vec<u8> {
         // The tar sink + any codec writer have been dropped by now, so this
@@ -765,6 +961,7 @@ impl MemWriter {
     }
 }
 
+#[cfg(feature = "tar")]
 impl std::io::Write for MemWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.0.borrow_mut().extend_from_slice(buf);
@@ -775,13 +972,17 @@ impl std::io::Write for MemWriter {
     }
 }
 
-#[cfg(test)]
+// Every test here writes tar; the fixtures are built through ramfs, and
+// the target-list test asks for ext.
+#[cfg(all(test, feature = "tar", any(feature = "ramfs", feature = "ext")))]
 mod tests {
     use super::*;
+    #[cfg(feature = "ramfs")]
     use crate::repack::RepackSink;
 
     /// Build a small in-memory tar archive to use as a conversion source,
     /// without depending on any external fixture.
+    #[cfg(feature = "ramfs")]
     fn tar_fixture() -> Vec<u8> {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("readme.txt"), b"hello from fstool").unwrap();
@@ -794,13 +995,14 @@ mod tests {
 
         let handle = MemWriter::default();
         let mut sink = TarStreamSink::new(Box::new(handle.clone()));
-        walk_anyfs(&mut ram, &mut dev, &mut sink).unwrap();
+        crate::repack::walk_anyfs(&mut ram, &mut dev, &mut sink).unwrap();
         sink.finish().unwrap();
         drop(sink);
         handle.into_bytes()
     }
 
     #[test]
+    #[cfg(feature = "ramfs")]
     fn probe_and_browse_tar() {
         let tar = tar_fixture();
         let report = probe(&tar).unwrap();
@@ -821,6 +1023,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        feature = "ramfs",
+        feature = "archive",
+        feature = "ext",
+        feature = "squashfs"
+    ))]
     fn convert_tar_to_zip_ext4_squashfs_roundtrips() {
         for target in ["zip", "ext4", "squashfs", "cpio", "tar"] {
             let mut img = MemImage::open(tar_fixture()).unwrap();
@@ -840,6 +1048,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "ramfs", feature = "gzip"))]
     fn convert_compressed_tar_roundtrips() {
         // A gzip-compressed source is transparently decompressed on open.
         let tar = tar_fixture();
@@ -853,6 +1062,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ext")]
     fn supported_targets_nonempty_and_valid() {
         let targets = supported_targets();
         assert!(targets.iter().any(|t| t.id == "tar"));

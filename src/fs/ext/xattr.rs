@@ -56,22 +56,7 @@ pub const ENTRY_HEADER_SIZE: usize = 16;
 /// On-disk entries are padded to a 4-byte boundary.
 pub const PAD: usize = 4;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Xattr {
-    /// Full attribute name including the namespace prefix
-    /// (e.g. `"user.something"`, `"security.selinux"`).
-    pub name: String,
-    pub value: Vec<u8>,
-}
-
-impl Xattr {
-    pub fn new(name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
-        Self {
-            name: name.into(),
-            value: value.into(),
-        }
-    }
-}
+pub use crate::fs::xattr::Xattr;
 
 /// Map a full xattr name to its on-disk `(name_index, suffix)` pair.
 /// Names that don't match a known prefix get `name_index = 0` and the

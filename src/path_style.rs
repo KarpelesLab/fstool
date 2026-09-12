@@ -44,11 +44,22 @@ pub enum PathStyle {
 /// The native on-disk path separator for `kind`: `:` for HFS/HFS+, `\` for the
 /// DOS/Windows filesystems, `/` for everything else (and unknown kinds).
 fn native_separator(kind: FsKind) -> char {
-    match kind {
-        FsKind::Hfs | FsKind::HfsPlus => ':',
-        FsKind::Fat32 | FsKind::Exfat | FsKind::Ntfs => '\\',
-        _ => '/',
+    if in_name_swap(kind) {
+        return ':';
     }
+    #[cfg(feature = "fat")]
+    if kind == FsKind::Fat32 {
+        return '\\';
+    }
+    #[cfg(feature = "exfat")]
+    if kind == FsKind::Exfat {
+        return '\\';
+    }
+    #[cfg(feature = "ntfs")]
+    if kind == FsKind::Ntfs {
+        return '\\';
+    }
+    '/'
 }
 
 /// Whether `kind`'s canonical names carry a `/`→`:` swap (i.e. a real `/` is a
@@ -56,7 +67,16 @@ fn native_separator(kind: FsKind) -> char {
 /// only there is a real `:` provably impossible in a name, which is what makes
 /// the swap reversible.
 fn in_name_swap(kind: FsKind) -> bool {
-    matches!(kind, FsKind::Hfs | FsKind::HfsPlus)
+    #[cfg(feature = "hfs")]
+    if kind == FsKind::Hfs {
+        return true;
+    }
+    #[cfg(feature = "hfs-plus")]
+    if kind == FsKind::HfsPlus {
+        return true;
+    }
+    let _ = kind;
+    false
 }
 
 /// Translate a user-supplied path (written in `style`) into the canonical form
@@ -144,7 +164,16 @@ pub fn display_path(path: &str, kind: FsKind, style: PathStyle) -> String {
     format!("{sep}{}", comps.join(&sep.to_string()))
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    feature = "hfs",
+    feature = "hfs-plus",
+    feature = "fat",
+    feature = "ext",
+    feature = "xfs",
+    feature = "tar",
+    feature = "iso9660"
+))]
 mod tests {
     use super::*;
 

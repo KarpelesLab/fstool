@@ -180,6 +180,7 @@ pub fn rev_newer(a: u32, b: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ::alloc::vec::Vec;
 
     #[test]
     fn tag_fields_round_trip() {

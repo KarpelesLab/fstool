@@ -18,6 +18,10 @@
 //! FAT16/FAT32) also carries the "volume clean" / "no hard error" status
 //! bits.
 
+use alloc::format;
+use alloc::vec;
+use alloc::vec::Vec;
+
 /// A free cluster. Same value for every FAT width.
 pub const FREE: u32 = 0;
 

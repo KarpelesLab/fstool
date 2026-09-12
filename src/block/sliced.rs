@@ -9,7 +9,7 @@
 //! constructs one `SlicedBackend` per partition, and the filesystem layer
 //! formats / mounts that slice as if it were the whole device.
 
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use crate::io::{self, Read, Seek, SeekFrom, Write};
 
 use super::BlockDevice;
 use crate::Result;

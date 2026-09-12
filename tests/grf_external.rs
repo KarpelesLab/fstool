@@ -1,3 +1,4 @@
+#![cfg(all(feature = "cli", feature = "grf", feature = "tar"))]
 //! End-to-end validation of the GRF reader + writer through the
 //! `fstool` CLI. No external tools needed — the test drives `fstool
 //! repack` to build a GRF from a tar, then reopens it via `ls` /

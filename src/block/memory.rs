@@ -19,7 +19,9 @@
 //!
 //! [`from_bytes`]: MemoryBackend::from_bytes
 
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use crate::io::{self, Read, Seek, SeekFrom, Write};
+use alloc::vec;
+use alloc::vec::Vec;
 
 use super::BlockDevice;
 use crate::Result;

@@ -33,29 +33,34 @@
 //! "finish one directory, move to the next" write pattern: by the time a
 //! directory is evicted, the caller has almost always moved on from it.
 
-use std::collections::{HashMap, VecDeque};
-use std::hash::Hash;
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// Default number of directories kept resident before the oldest is
 /// evicted and serialized.
+#[allow(dead_code)] // live only with a backend that batches
 pub const DEFAULT_CAPACITY: usize = 64;
 
 /// Capacity-bounded, FIFO directory-entry batch cache. See the module
 /// docs for the contract.
 #[derive(Debug, Clone)]
-pub struct DirBatch<K: Eq + Hash + Clone, E> {
-    map: HashMap<K, Vec<E>>,
+pub struct DirBatch<K: Ord + Clone, E> {
+    map: BTreeMap<K, Vec<E>>,
     /// Directory keys in first-insertion order; front == oldest.
     order: VecDeque<K>,
     capacity: usize,
 }
 
-impl<K: Eq + Hash + Clone, E> DirBatch<K, E> {
+// Not every backend uses every method, and which ones are live depends on
+// the filesystem features compiled in; a slim build must not warn for it.
+#[allow(dead_code)]
+impl<K: Ord + Clone, E> DirBatch<K, E> {
     /// Create a cache holding up to `capacity` directories (clamped to at
     /// least 1).
     pub fn new(capacity: usize) -> Self {
         Self {
-            map: HashMap::new(),
+            map: BTreeMap::new(),
             order: VecDeque::new(),
             capacity: capacity.max(1),
         }
@@ -105,7 +110,7 @@ impl<K: Eq + Hash + Clone, E> DirBatch<K, E> {
     /// final flush. Batches are independent, so order does not matter.
     pub fn drain_all(&mut self) -> Vec<(K, Vec<E>)> {
         self.order.clear();
-        self.map.drain().collect()
+        core::mem::take(&mut self.map).into_iter().collect()
     }
 
     /// `true` when no directory currently has pending entries.

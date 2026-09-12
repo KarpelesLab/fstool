@@ -15,6 +15,10 @@
 //! v1 assumes a 512-byte logical sector. Devices with `block_size() != 512`
 //! are rejected — a follow-up will generalise the calculations.
 
+use alloc::format;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
 use uuid::Uuid;
 
 use super::mbr::write_protective_mbr;
@@ -61,7 +65,21 @@ impl Gpt {
     /// LBA range when `total_lba` is known (callers normally supply this from
     /// `dev.total_size() / dev.block_size()` at write time, so `build` only
     /// checks intra-table consistency).
-    pub fn build(mut partitions: Vec<Partition>) -> Result<Self> {
+    #[cfg(feature = "std")]
+    pub fn build(partitions: Vec<Partition>) -> Result<Self> {
+        Self::build_with_guids(partitions, Uuid::new_v4(), Uuid::new_v4)
+    }
+
+    /// [`build`](Self::build) with the GUIDs supplied by the caller: the
+    /// disk GUID, and `new_guid` called once for every partition that
+    /// carries none. This is the constructor available without `std`,
+    /// where there is no random source to draw them from; feed it your
+    /// board's RNG, or fixed GUIDs for a reproducible image.
+    pub fn build_with_guids(
+        mut partitions: Vec<Partition>,
+        disk_guid: Uuid,
+        mut new_guid: impl FnMut() -> Uuid,
+    ) -> Result<Self> {
         if partitions.len() > NUM_ENTRIES as usize {
             return Err(crate::Error::InvalidArgument(format!(
                 "GPT supports up to {NUM_ENTRIES} entries, got {}",
@@ -78,7 +96,7 @@ impl Gpt {
                 ));
             }
             if p.uuid.is_none() {
-                p.uuid = Some(Uuid::new_v4());
+                p.uuid = Some(new_guid());
             }
             if let Some(ref n) = p.name
                 && n.encode_utf16().count() > 36
@@ -90,7 +108,7 @@ impl Gpt {
         }
         check_no_overlap(&partitions)?;
         Ok(Self {
-            disk_guid: Uuid::new_v4(),
+            disk_guid,
             partitions,
         })
     }
@@ -465,6 +483,16 @@ mod tests {
     use super::*;
     use crate::block::MemoryBackend;
 
+    /// `Gpt::build` with a fixed disk GUID and a counting per-partition
+    /// GUID, so the tests need no random source (and run without `std`).
+    fn build(partitions: Vec<Partition>) -> Result<Gpt> {
+        let mut next = 0x1000u128;
+        Gpt::build_with_guids(partitions, Uuid::from_u128(0xd15c), move || {
+            next += 1;
+            Uuid::from_u128(next)
+        })
+    }
+
     fn mb(n: u64) -> u64 {
         n * 1024 * 1024
     }
@@ -489,7 +517,7 @@ mod tests {
                 ..Partition::new(0, 0, PartitionKind::LinuxFilesystem)
             },
         ];
-        let gpt = Gpt::build(parts.clone()).unwrap();
+        let gpt = build(parts.clone()).unwrap();
         gpt.write(&mut dev).unwrap();
 
         let parsed = Gpt::read(&mut dev).unwrap();
@@ -507,7 +535,7 @@ mod tests {
     #[test]
     fn backup_header_present() {
         let mut dev = MemoryBackend::new(mb(64));
-        let gpt = Gpt::build(vec![Partition::new(
+        let gpt = build(vec![Partition::new(
             2048,
             1024,
             PartitionKind::LinuxFilesystem,
@@ -526,7 +554,7 @@ mod tests {
     #[test]
     fn header_crc_catches_corruption() {
         let mut dev = MemoryBackend::new(mb(64));
-        let gpt = Gpt::build(vec![Partition::new(
+        let gpt = build(vec![Partition::new(
             2048,
             1024,
             PartitionKind::LinuxFilesystem,
@@ -545,7 +573,7 @@ mod tests {
     #[test]
     fn protective_mbr_present_after_write() {
         let mut dev = MemoryBackend::new(mb(64));
-        let gpt = Gpt::build(vec![Partition::new(
+        let gpt = build(vec![Partition::new(
             2048,
             1024,
             PartitionKind::LinuxFilesystem,
@@ -564,7 +592,7 @@ mod tests {
             Partition::new(2048, 1024, PartitionKind::LinuxFilesystem),
             Partition::new(2500, 1024, PartitionKind::LinuxFilesystem),
         ];
-        let err = Gpt::build(parts).unwrap_err();
+        let err = build(parts).unwrap_err();
         assert!(matches!(err, crate::Error::InvalidArgument(_)));
     }
 
@@ -586,7 +614,7 @@ mod tests {
     fn rejects_bogus_entry_size_too_small() {
         // entry_size < 128 would underflow the fixed-128 slice / mis-stride.
         let mut dev = MemoryBackend::new(mb(64));
-        let gpt = Gpt::build(vec![Partition::new(
+        let gpt = build(vec![Partition::new(
             2048,
             1024,
             PartitionKind::LinuxFilesystem,
@@ -603,7 +631,7 @@ mod tests {
     #[test]
     fn rejects_non_power_of_two_entry_size() {
         let mut dev = MemoryBackend::new(mb(64));
-        let gpt = Gpt::build(vec![Partition::new(
+        let gpt = build(vec![Partition::new(
             2048,
             1024,
             PartitionKind::LinuxFilesystem,
@@ -621,7 +649,7 @@ mod tests {
     fn rejects_oversized_num_entries() {
         // Huge num_entries would size a multi-GiB allocation -> OOM.
         let mut dev = MemoryBackend::new(mb(64));
-        let gpt = Gpt::build(vec![Partition::new(
+        let gpt = build(vec![Partition::new(
             2048,
             1024,
             PartitionKind::LinuxFilesystem,
@@ -650,7 +678,7 @@ mod tests {
     #[test]
     fn rejects_too_small_device() {
         let mut dev = MemoryBackend::new(64 * 1024); // 64 KiB = 128 LBAs
-        let gpt = Gpt::build(vec![Partition::new(34, 32, PartitionKind::LinuxFilesystem)]).unwrap();
+        let gpt = build(vec![Partition::new(34, 32, PartitionKind::LinuxFilesystem)]).unwrap();
         // 128 LBAs is plenty for the GPT itself (66 LBAs of metadata) but we
         // want to make sure it works with a tight fit.
         gpt.write(&mut dev).unwrap();

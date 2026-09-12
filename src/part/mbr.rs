@@ -7,7 +7,9 @@
 //!   entry as LBA-only.
 //! - `start_lba` and `size_lba` must each fit in 32 bits.
 
-use std::io::SeekFrom;
+use crate::io::SeekFrom;
+use alloc::format;
+use alloc::vec::Vec;
 
 use super::{Partition, PartitionKind, PartitionTable};
 use crate::Result;
@@ -197,6 +199,7 @@ pub(crate) fn write_protective_mbr(dev: &mut dyn BlockDevice) -> Result<()> {
 mod tests {
     use super::*;
     use crate::block::MemoryBackend;
+    use alloc::vec;
 
     fn mb(n: u64) -> u64 {
         n * 1024 * 1024

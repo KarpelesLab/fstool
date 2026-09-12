@@ -7,7 +7,13 @@
 //! counter, and they preserve directory-entry slack so an LFN run plus
 //! its 8.3 entry land in consecutive slots as the spec requires.
 
-use std::path::Path;
+use crate::io::Read;
+#[cfg(feature = "std")]
+use crate::path::Path;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
 
 use super::{DirLayout, Fat32, SECTOR, dir, table};
 use crate::Result;
@@ -232,6 +238,7 @@ impl Fat32 {
     /// Add a regular file at `dest_path` populated from a host file. The
     /// parent directory must already exist; an existing entry at the same
     /// destination is an error.
+    #[cfg(feature = "std")]
     pub fn add_file(
         &mut self,
         dev: &mut dyn BlockDevice,
@@ -245,7 +252,7 @@ impl Fat32 {
         self.add_file_from_reader(dev, dest_path, &mut file, size, mtime)
     }
 
-    /// Like [`Self::add_file`] but pulls bytes from any [`std::io::Read`]
+    /// Like `add_file` but pulls bytes from any [`Read`]
     /// instead of a host filesystem path. The reader must produce exactly
     /// `size` bytes; used by the repack path to stream content directly
     /// from another opened filesystem. `mtime` is Unix epoch seconds (`0`
@@ -254,7 +261,7 @@ impl Fat32 {
         &mut self,
         dev: &mut dyn BlockDevice,
         dest_path: &str,
-        reader: &mut dyn std::io::Read,
+        reader: &mut dyn Read,
         size: u64,
         mtime: u32,
     ) -> Result<()> {
@@ -297,7 +304,7 @@ impl Fat32 {
     fn stream_reader_chain(
         &self,
         dev: &mut dyn BlockDevice,
-        reader: &mut dyn std::io::Read,
+        reader: &mut dyn Read,
         chain: &[u32],
         size: u64,
     ) -> Result<()> {
@@ -646,6 +653,7 @@ fn dot_entry(name_83: &[u8; 11], cluster: u32) -> [u8; dir::ENTRY_SIZE] {
 
 /// Host file modification time as Unix epoch seconds, or `0` if unavailable
 /// (or before the epoch). Portable across platforms via `Metadata::modified`.
+#[cfg(feature = "std")]
 pub(super) fn host_mtime_secs(md: &std::fs::Metadata) -> u32 {
     md.modified()
         .ok()

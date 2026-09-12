@@ -11,7 +11,7 @@
 
 // Every test here drives the `fstool` binary, which only exists when
 // the `cli` feature builds it (see `[[bin]] required-features`).
-#![cfg(feature = "cli")]
+#![cfg(all(feature = "cli", feature = "archive"))]
 
 use std::path::Path;
 use std::process::Command;
@@ -332,6 +332,7 @@ fn cross_format_repack_zip_to_cpio() {
     assert_eq!(cat, "nested file contents\n");
 }
 
+#[cfg(feature = "sevenz")]
 #[test]
 fn malformed_archive_is_handled_gracefully() {
     // The archive readers must detect the format and never panic on a
@@ -375,16 +376,25 @@ fn detect_fs_recognises_every_archive_magic() {
         (b"070701", 0, FsKind::Cpio),
         (b"070707", 0, FsKind::Cpio),
         (b"!<arch>\n", 0, FsKind::Ar),
+        #[cfg(feature = "sevenz")]
         (b"7z\xBC\xAF\x27\x1C", 0, FsKind::SevenZ),
+        #[cfg(feature = "rar")]
         (b"Rar!\x1A\x07\x00", 0, FsKind::Rar),
+        #[cfg(feature = "rar")]
         (b"Rar!\x1A\x07\x01\x00", 0, FsKind::Rar),
+        #[cfg(feature = "cab")]
         (b"MSCF", 0, FsKind::Cab),
         // LHA: header-size + checksum byte, then "-lh5-" at offset 2.
+        #[cfg(feature = "lha")]
         (b"\x20\x00-lh5-", 0, FsKind::Lha),
+        #[cfg(feature = "amiga-lzx")]
         (b"LZX\x00", 0, FsKind::Lzx),
+        #[cfg(feature = "sit")]
         (b"SIT!", 0, FsKind::Sit),
+        #[cfg(feature = "sit")]
         (b"StuffIt (c)1997", 0, FsKind::Sit),
         // ARC: 0x1A + method byte, heuristic, checked last.
+        #[cfg(feature = "arc")]
         (b"\x1A\x08", 0, FsKind::Arc),
     ];
 

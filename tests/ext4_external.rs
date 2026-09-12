@@ -1,3 +1,4 @@
+#![cfg(feature = "ext")]
 //! ext4 (journal + extent tree) end-to-end validation.
 
 use std::io::Write;

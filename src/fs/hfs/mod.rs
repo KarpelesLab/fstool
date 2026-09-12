@@ -1298,6 +1298,7 @@ mod tests {
     /// The same volume wrapped in a DiskCopy 4.2 header is detected + read
     /// transparently through the full `AnyFs` pipeline (Part A + Part B).
     #[test]
+    #[cfg(feature = "diskcopy")]
     fn diskcopy_wrapped_hfs_via_anyfs() {
         let vol = build_volume();
         let mut img = vec![0u8; 0x54];

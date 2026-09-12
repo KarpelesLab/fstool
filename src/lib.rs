@@ -16,10 +16,55 @@
 //! spec, [`inspect`] opens and walks an existing one, [`repack`] converts
 //! between formats, and [`memconv`] / [`memedit`] do both in memory.
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+// The `alloc` crate is the floor: every layer hands back `Vec`s and
+// `String`s, so an embedded consumer brings a global allocator (as it
+// already does for `alloc` itself). With `std` on, this is just `std`'s
+// own `alloc` under another name.
+extern crate alloc;
+
+// The unit tests run on a host, and reach for `std` (temp files,
+// `println!`) even when the crate under test is the `no_std` core.
+#[cfg(test)]
+#[macro_use]
+extern crate std;
+
+#[cfg(all(
+    feature = "std",
+    not(any(
+        feature = "affs",
+        feature = "apfs",
+        feature = "archive",
+        feature = "exfat",
+        feature = "ext",
+        feature = "f2fs",
+        feature = "fat",
+        feature = "grf",
+        feature = "hfs",
+        feature = "hfs-plus",
+        feature = "iso9660",
+        feature = "littlefs",
+        feature = "ntfs",
+        feature = "ramfs",
+        feature = "squashfs",
+        feature = "tar",
+        feature = "xfs",
+    ))
+))]
+compile_error!(
+    "fstool: the `std` build needs at least one filesystem feature \
+     (`fat`, `ext`, … or `filesystems`); `inspect` has nothing to dispatch to otherwise"
+);
+
+#[cfg(feature = "std")]
 pub mod analyze;
+#[cfg(feature = "std")]
 pub mod base64;
 pub mod block;
+#[cfg(feature = "std")]
 pub mod compression;
+#[cfg(feature = "ext")]
 pub mod concurrent;
 pub mod crc;
 pub mod error;
@@ -27,15 +72,26 @@ pub mod format_opts;
 pub mod fs;
 #[cfg(feature = "fuse")]
 pub mod fuse_adapter;
+#[cfg(feature = "std")]
 pub mod inspect;
+pub mod io;
+#[cfg(feature = "std")]
 pub mod macroman;
+#[cfg(feature = "std")]
 pub mod memconv;
+#[cfg(feature = "std")]
 pub mod memedit;
+#[cfg(feature = "std")]
 pub mod merge;
 pub mod part;
+pub mod path;
+#[cfg(feature = "std")]
 pub mod path_style;
+#[cfg(feature = "std")]
 pub mod repack;
+#[cfg(feature = "std")]
 pub mod resfork;
+#[cfg(feature = "std")]
 pub mod spec;
 /// WebAssembly bindings (browser UI). Only compiled for `wasm32` with the
 /// `wasm` feature; see `src/wasm.rs`.

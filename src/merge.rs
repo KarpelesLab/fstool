@@ -80,6 +80,7 @@ pub(crate) enum BodyRef {
     Host(PathBuf),
     /// A tar entry inside `layers[layer]`. Matched in pass 2 by body offset
     /// to disambiguate duplicate paths within a layer (last write wins).
+    #[cfg(feature = "tar")]
     Tar {
         layer: usize,
         body_offset: u64,
@@ -199,7 +200,10 @@ impl MergeModel {
     /// no body reads, no tar decompression beyond pass-1 index building.
     pub fn analysis(&self, block_size: u32) -> crate::analyze::Analysis {
         use crate::analyze::Analysis;
+        #[cfg(feature = "ext")]
         use crate::fs::ext::{BuildPlan, FsKind};
+        #[cfg(not(feature = "ext"))]
+        let _ = block_size;
         let mut a = Analysis {
             files: 0,
             dirs: 0,
@@ -207,6 +211,7 @@ impl MergeModel {
             devices: 0,
             hardlinks: 0,
             total_file_bytes: 0,
+            #[cfg(feature = "ext")]
             plan: BuildPlan::new(block_size, FsKind::Ext4),
         };
         for (path, node) in &self.nodes {
@@ -216,10 +221,12 @@ impl MergeModel {
             match node.kind {
                 EntryKind::Dir => {
                     a.dirs += 1;
+                    #[cfg(feature = "ext")]
                     a.plan.add_dir();
                 }
                 EntryKind::Regular => {
                     let size = match &node.body {
+                        #[cfg(feature = "tar")]
                         BodyRef::Tar { size, .. } => *size,
                         BodyRef::Host(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
                         BodyRef::Empty => 0,
@@ -235,21 +242,26 @@ impl MergeModel {
                         a.hardlinks += 1;
                     } else {
                         a.files += 1;
+                        #[cfg(feature = "ext")]
                         a.plan.add_file(size);
                     }
                     a.total_file_bytes = a.total_file_bytes.saturating_add(size);
                 }
                 EntryKind::Symlink => {
                     a.symlinks += 1;
-                    let len = node
-                        .target
-                        .as_ref()
-                        .map(|t| t.to_string_lossy().len())
-                        .unwrap_or(0);
-                    a.plan.add_symlink(len);
+                    #[cfg(feature = "ext")]
+                    {
+                        let len = node
+                            .target
+                            .as_ref()
+                            .map(|t| t.to_string_lossy().len())
+                            .unwrap_or(0);
+                        a.plan.add_symlink(len);
+                    }
                 }
                 EntryKind::Char | EntryKind::Block | EntryKind::Fifo | EntryKind::Socket => {
                     a.devices += 1;
+                    #[cfg(feature = "ext")]
                     a.plan.add_device();
                 }
                 _ => {}
@@ -306,7 +318,12 @@ impl MergeModel {
             }
         }
 
-        // (2) Per-layer forward tar walk for regular-file bodies.
+        // (2) Per-layer forward tar walk for regular-file bodies. (Without
+        //     the `tar` backend no tar layer can have reached the model —
+        //     `apply_layer` refuses them — so there is nothing to stream.)
+        #[cfg(not(feature = "tar"))]
+        let _ = layers;
+        #[cfg(feature = "tar")]
         for (idx, layer) in layers.iter().enumerate() {
             if let Source::TarArchive { path, codec } = layer {
                 stream_tar_layer_winners(self, idx, path, *codec, sink, to_meta, &to_xattrs)?;
@@ -332,10 +349,14 @@ impl MergeModel {
                     sink.put_file(&p_str, &mut empty, 0, to_meta(node), &to_xattrs(node))?;
                     crate::repack::note(&p_str);
                 }
-                BodyRef::Tar { .. } | BodyRef::HardLink(_) | BodyRef::None => {
-                    // Tar winners emitted in (2); hardlinks deferred to
-                    // (3.5) so their target exists; BodyRef::None on a
-                    // Regular shouldn't happen but is a safe no-op.
+                #[cfg(feature = "tar")]
+                BodyRef::Tar { .. } => {
+                    // Tar winners emitted in (2).
+                }
+                BodyRef::HardLink(_) | BodyRef::None => {
+                    // Hardlinks deferred to (3.5) so their target exists;
+                    // BodyRef::None on a Regular shouldn't happen but is a
+                    // safe no-op.
                 }
             }
         }
@@ -453,11 +474,14 @@ fn apply_layer(layer: &Source, model: &mut MergeModel, layer_idx: &mut usize) ->
             *layer_idx += 1;
             Ok(())
         }
+        #[cfg(feature = "tar")]
         Source::TarArchive { path, codec } => {
             apply_tar_layer(path, *codec, *layer_idx, model)?;
             *layer_idx += 1;
             Ok(())
         }
+        #[cfg(not(feature = "tar"))]
+        Source::TarArchive { .. } => Err(crate::inspect::missing_feature("tar", "tar")),
         Source::Image(_) => Err(crate::Error::Unsupported(
             "merge: FS-image source layers are not yet wired (use tar layers or host dirs)".into(),
         )),
@@ -575,6 +599,7 @@ fn apply_host_dir(root: &Path, model: &mut MergeModel) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "tar")]
 fn apply_tar_layer(
     path: &Path,
     codec: Option<crate::compression::Algo>,
@@ -767,7 +792,9 @@ fn resolve_hardlink_target(
     while hops > 0 {
         let n = nodes.get(&cur)?;
         match &n.body {
-            BodyRef::Host(_) | BodyRef::Tar { .. } | BodyRef::Empty => return Some(cur),
+            #[cfg(feature = "tar")]
+            BodyRef::Tar { .. } => return Some(cur),
+            BodyRef::Host(_) | BodyRef::Empty => return Some(cur),
             BodyRef::HardLink(next) => {
                 cur = next.clone();
                 hops -= 1;
@@ -778,6 +805,7 @@ fn resolve_hardlink_target(
     None
 }
 
+#[cfg(feature = "tar")]
 fn normalise_tar_path(p: &str) -> String {
     let mut out = String::new();
     for seg in p
@@ -792,6 +820,7 @@ fn normalise_tar_path(p: &str) -> String {
 
 /// Pass-2 helper: stream tar layer `idx` from disk forward, emitting any
 /// regular-file entries whose model winner is this (layer, body_offset).
+#[cfg(feature = "tar")]
 fn stream_tar_layer_winners<F, G>(
     model: &MergeModel,
     idx: usize,
@@ -892,6 +921,7 @@ fn join_path(parent: &Path, name: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+#[cfg(feature = "tar")]
 fn parent_of_str(path: &str) -> String {
     match path.rsplit_once('/') {
         Some((p, _)) => {
@@ -905,6 +935,7 @@ fn parent_of_str(path: &str) -> String {
     }
 }
 
+#[cfg(feature = "tar")]
 fn basename_of_str(path: &str) -> String {
     match path.rsplit_once('/') {
         Some((_, b)) => b.to_string(),

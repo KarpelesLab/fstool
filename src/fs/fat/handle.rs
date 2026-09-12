@@ -12,7 +12,10 @@
 //! The handle holds `&'a mut Fat32` and `&'a mut dyn BlockDevice` for its
 //! full lifetime, matching the trait signature.
 
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use crate::io::{self, Read, Seek, SeekFrom, Write};
+use alloc::string::ToString;
+use alloc::vec;
+use alloc::vec::Vec;
 
 use super::{DirLayout, Fat32, SECTOR, dir};
 use crate::Result;

@@ -19,6 +19,8 @@
 
 use crate::Result;
 use crate::block::BlockDevice;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use super::{Partition, PartitionKind, PartitionTable};
 
@@ -134,6 +136,7 @@ fn c_str(b: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::block::MemoryBackend;
+    use alloc::string::ToString;
 
     /// Build a minimal APM disk: DDM at block 0, then `entries` partition map
     /// blocks. Each entry is (pyPartStart, partBlkCnt, name, type).

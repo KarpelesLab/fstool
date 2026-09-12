@@ -1,0 +1,9 @@
+[build]
+target = "thumbv7em-none-eabihf"
+
+# rust-lld (the default for thumb targets) with our own linker script.
+# If your rust-lld is unusable, GNU binutils work too:
+#   linker = "arm-none-eabi-ld"
+#   rustflags = ["-C", "linker-flavor=ld", "-C", "link-arg=-Tlink.x", "-C", "link-arg=--nmagic"]
+[target.thumbv7em-none-eabihf]
+rustflags = ["-C", "link-arg=-Tlink.x", "-C", "link-arg=--nmagic"]

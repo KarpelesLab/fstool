@@ -334,7 +334,7 @@ impl HfsPlus {
     /// through the `BSDInfo.fileMode` `S_IF*` bits, and packs the rdev
     /// for char/block devices into `BSDInfo.special` using the same
     /// Linux "new"-style encoding fstool uses elsewhere
-    /// ([`crate::fs::ext::inode::encode_devnum`]) so a tar round-trip
+    /// ([`crate::fs::devnum::encode_devnum`]) so a tar round-trip
     /// through HFS+ preserves `(major, minor)`. FIFOs and sockets
     /// store `special = 0`.
     ///
@@ -367,11 +367,11 @@ impl HfsPlus {
         let (kind_bits, special) = match kind {
             crate::fs::DeviceKind::Char => (
                 catalog::mode::S_IFCHR,
-                crate::fs::ext::inode::encode_devnum(major, minor),
+                crate::fs::devnum::encode_devnum(major, minor),
             ),
             crate::fs::DeviceKind::Block => (
                 catalog::mode::S_IFBLK,
-                crate::fs::ext::inode::encode_devnum(major, minor),
+                crate::fs::devnum::encode_devnum(major, minor),
             ),
             crate::fs::DeviceKind::Fifo => (catalog::mode::S_IFIFO, 0),
             crate::fs::DeviceKind::Socket => (catalog::mode::S_IFSOCK, 0),

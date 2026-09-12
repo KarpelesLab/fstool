@@ -32,6 +32,8 @@
 //! OEM + reserved + checksum), with an identical backup at sectors 12..23.
 //! We only need the first sector for read-only support.
 
+use alloc::format;
+
 /// On-disk size of the main boot sector in this implementation. exFAT
 /// permits 512..=4096 byte sectors; the boot sector is always exactly one
 /// sector wide and parsing reads only the first 512 bytes (every field we

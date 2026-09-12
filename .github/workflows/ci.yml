@@ -113,21 +113,79 @@ jobs:
           fi
           cargo test --no-default-features --features codecs,containers
 
-      # The leanest configuration: no CLI, no serialization, no logging,
-      # no Unix ioctls. It must build, lint and pass its tests, and its
-      # resolve must be the four crates below and their transitive tail.
-      # This is the floor the feature gating promises.
-      - name: leanest build
+      # The leanest hosted configuration: every filesystem, no CLI, no
+      # serialization, no logging, no Unix ioctls, no codecs. It must
+      # build, lint and pass its tests, and its resolve must be the crates
+      # below and their transitive tail. This is the floor the feature
+      # gating promises a `std` consumer.
+      - name: leanest std build
         run: |
           set -euo pipefail
-          cargo clippy --no-default-features --features codecs --all-targets -- -D warnings
-          cargo test --no-default-features --features codecs
-          for crate in serde serde_json tomlproc clap rustyline log; do
-            if cargo tree -e normal --no-default-features --features codecs \
+          cargo clippy --no-default-features --features std,filesystems --all-targets -- -D warnings
+          cargo test --no-default-features --features std,filesystems
+          for crate in serde serde_json tomlproc clap rustyline log compcol purecrypto; do
+            if cargo tree -e normal --no-default-features --features std,filesystems \
                  --prefix none | grep -qw "$crate"; then
-              echo "::error::$crate leaked into the leanest build"; exit 1
+              echo "::error::$crate leaked into the leanest std build"; exit 1
             fi
           done
+
+      # One filesystem at a time. Each backend's feature must stand on its
+      # own (plus whatever it declares), with no unused-import or dead-code
+      # noise from the dispatch layers — the gating in inspect / repack /
+      # spec / memconv / the CLI is what this exercises. A handful of
+      # representative combinations rather than the full power set.
+      - name: single-filesystem builds
+        run: |
+          set -euo pipefail
+          for feats in std,fat std,ext std,exfat std,littlefs std,tar std,archive \
+                       std,hfs std,hfs-plus std,apfs std,xfs std,ntfs std,f2fs \
+                       std,iso9660 std,squashfs std,grf std,affs std,ramfs \
+                       std,fat,qcow2 std,ext,luks std,ext,tar,ramfs \
+                       cli,readline,fat cli,readline,ext,spec cli,readline,filesystems,containers,codecs; do
+            echo "::group::--features $feats"
+            cargo clippy --no-default-features --features "$feats" --all-targets -- -D warnings
+            echo "::endgroup::"
+          done
+
+      # The embedded core: `#![no_std]` + `alloc`, the block / partition /
+      # filesystem traits with FAT, exFAT and littlefs, compiled for a
+      # Cortex-M4F. The `cdylib` crate type (for wasm-bindgen) can't exist
+      # without std, so the check names `rlib` explicitly. The same set is
+      # unit-tested on the host in its no_std configuration, and a `uuid`
+      # resolve without `getrandom` proves nothing pulled in an OS.
+      - name: no_std core (thumbv7em-none-eabihf)
+        run: |
+          set -euo pipefail
+          rustup target add thumbv7em-none-eabihf
+          for feats in fat exfat littlefs fat,exfat,littlefs; do
+            echo "::group::no_std --features $feats"
+            cargo rustc --lib --crate-type rlib --no-default-features --features "$feats" \
+              --target thumbv7em-none-eabihf -- -D warnings
+            echo "::endgroup::"
+          done
+          # Clippy through the cross target: the host build would trip over
+          # the `cdylib` crate type (no allocator without std), the cross
+          # build just drops it.
+          cargo clippy --lib --no-default-features --features fat,exfat,littlefs \
+            --target thumbv7em-none-eabihf -- -D warnings
+          cargo test --lib --no-default-features --features fat,exfat,littlefs
+          if cargo tree -e normal --no-default-features --features fat,exfat,littlefs \
+               --target thumbv7em-none-eabihf --prefix none | grep -Ew 'getrandom|libc|std'; then
+            echo "::error::an OS dependency leaked into the no_std core"; exit 1
+          fi
+
+      # And a real firmware image: the standalone example crate links the
+      # FAT core for a Cortex-M4F with its own allocator, panic handler and
+      # linker script. Its size is printed so a regression is visible in
+      # the log (see examples/embedded-cortex-m/README.md for the baseline).
+      - name: no_std example links (Cortex-M4F)
+        run: |
+          set -euo pipefail
+          rustup component add llvm-tools
+          (cd examples/embedded-cortex-m && cargo build --release)
+          "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-size \
+            examples/embedded-cortex-m/target/thumbv7em-none-eabihf/release/fstool-embedded-cortex-m
 
   # macOS proves the lib + CLI compile and unit-test cleanly on a
   # non-Linux Unix. `qemu-img` is available via Homebrew so the qcow2

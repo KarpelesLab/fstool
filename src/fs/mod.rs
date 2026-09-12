@@ -15,30 +15,55 @@
 //! can produce its bytes through [`std::io::Read`] + [`std::io::Seek`] with a
 //! known total length.
 
-use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use crate::io::{self, Read, Seek, SeekFrom, Write};
+use crate::path::{Path, PathBuf};
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
 
+#[cfg(feature = "affs")]
 pub mod affs;
+#[cfg(feature = "apfs")]
 pub mod apfs;
+#[cfg(feature = "archive")]
 pub mod archive;
+pub mod devnum;
 pub(crate) mod dir_batch;
+#[cfg(feature = "exfat")]
 pub mod exfat;
+#[cfg(feature = "ext")]
 pub mod ext;
+#[cfg(feature = "f2fs")]
 pub mod f2fs;
+#[cfg(feature = "fat")]
 pub mod fat;
+#[cfg(feature = "grf")]
 pub mod grf;
+#[cfg(feature = "hfs")]
 pub mod hfs;
+#[cfg(feature = "hfs-plus")]
 pub mod hfs_plus;
+#[cfg(feature = "iso9660")]
 pub mod iso9660;
+#[cfg(feature = "littlefs")]
 pub mod littlefs;
+#[cfg(feature = "ntfs")]
 pub mod ntfs;
+#[cfg(feature = "ramfs")]
 pub mod ramfs;
+#[cfg(feature = "std")]
 pub mod rootdevs;
+#[cfg(feature = "squashfs")]
 pub mod squashfs;
+#[cfg(feature = "tar")]
 pub mod tar;
+pub mod xattr;
+#[cfg(feature = "xfs")]
 pub mod xfs;
 
+#[cfg(feature = "std")]
 pub use rootdevs::{DeviceEntry, RootDevs};
 
 /// Permissions + ownership + timestamps for a new filesystem entry. All
@@ -89,6 +114,7 @@ impl FileMeta {
 pub enum FileSource {
     /// Stream from a path on the host filesystem. Length is taken from
     /// `metadata().len()` at the time the source is constructed.
+    #[cfg(feature = "std")]
     HostPath(PathBuf),
     /// Stream from an arbitrary seekable reader with a known length.
     Reader {
@@ -107,6 +133,7 @@ impl FileSource {
     /// Length the source will produce.
     pub fn len(&self) -> io::Result<u64> {
         match self {
+            #[cfg(feature = "std")]
             FileSource::HostPath(p) => Ok(std::fs::metadata(p)?.len()),
             FileSource::Reader { len, .. } => Ok(*len),
             FileSource::Zero(n) => Ok(*n),
@@ -124,8 +151,9 @@ impl FileSource {
     /// reading to end.
     pub fn open(self) -> io::Result<(Box<dyn ReadSeek + Send>, u64)> {
         match self {
+            #[cfg(feature = "std")]
             FileSource::HostPath(p) => {
-                let f = File::open(&p)?;
+                let f = std::fs::File::open(&p)?;
                 let len = f.metadata()?.len();
                 Ok((Box::new(f), len))
             }
@@ -858,7 +886,7 @@ pub trait Filesystem {
         &mut self,
         _dev: &mut dyn crate::block::BlockDevice,
         _path: &Path,
-    ) -> crate::Result<std::path::PathBuf> {
+    ) -> crate::Result<PathBuf> {
         Err(crate::Error::Unsupported(
             "this filesystem does not implement read_symlink".into(),
         ))
@@ -1049,8 +1077,8 @@ pub trait Filesystem {
         // than erroring.
         const MAX_DEPTH: usize = 4096;
         let mut total = 0u64;
-        let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(std::path::PathBuf::from("/"), 0)];
+        let mut visited: alloc::collections::BTreeSet<u32> = alloc::collections::BTreeSet::new();
+        let mut stack: Vec<(PathBuf, usize)> = vec![(PathBuf::from("/"), 0)];
         while let Some((dir, depth)) = stack.pop() {
             let entries = self.list(dev, &dir)?;
             for e in entries {
@@ -1162,6 +1190,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn host_path_source_length_matches_file() {
         use tempfile::NamedTempFile;
         let mut f = NamedTempFile::new().unwrap();

@@ -4,16 +4,60 @@
 //! symlink trees and shell out to Linux-only tools (`mke2fs`, `e2fsck`,
 //! `debugfs`, `truncate`, etc.) for cross-validation.
 
-#![cfg(all(unix, feature = "cli"))]
+#![cfg(all(
+    unix,
+    feature = "cli",
+    any(
+        feature = "tar",
+        feature = "ext",
+        feature = "fat",
+        feature = "hfs",
+        feature = "exfat",
+        feature = "ntfs",
+        feature = "xfs",
+        feature = "hfs-plus",
+        feature = "apfs"
+    )
+))]
 
 use std::process::Command;
 
+#[cfg(any(
+    feature = "ext",
+    feature = "fat",
+    feature = "hfs",
+    feature = "exfat",
+    feature = "ntfs",
+    feature = "xfs",
+    feature = "hfs-plus",
+    feature = "apfs"
+))]
 use tempfile::NamedTempFile;
 
 /// Path to the freshly-built `fstool` binary (provided by Cargo for
 /// integration tests).
+#[cfg(any(
+    feature = "ext",
+    feature = "fat",
+    feature = "hfs",
+    feature = "exfat",
+    feature = "ntfs",
+    feature = "xfs",
+    feature = "hfs-plus",
+    feature = "apfs"
+))]
 const FSTOOL: &str = env!("CARGO_BIN_EXE_fstool");
 
+#[cfg(any(
+    feature = "ext",
+    feature = "fat",
+    feature = "hfs",
+    feature = "exfat",
+    feature = "ntfs",
+    feature = "xfs",
+    feature = "hfs-plus",
+    feature = "apfs"
+))]
 fn which(tool: &str) -> bool {
     Command::new("sh")
         .arg("-c")
@@ -24,6 +68,7 @@ fn which(tool: &str) -> bool {
 }
 
 /// build (bare ext4 spec) → ls → cat → add → cat the added file.
+#[cfg(feature = "ext")]
 #[test]
 fn cli_build_ls_cat_add_roundtrip() {
     if !which("e2fsck") {
@@ -128,6 +173,7 @@ fn cli_build_ls_cat_add_roundtrip() {
 
 /// build → rm a file → rm an empty dir → e2fsck clean → non-empty dir
 /// rejected.
+#[cfg(feature = "ext")]
 #[test]
 fn cli_rm_file_and_empty_dir() {
     if !which("e2fsck") {
@@ -213,6 +259,7 @@ fn cli_rm_file_and_empty_dir() {
 }
 
 /// `fstool info` reports the expected filesystem summary.
+#[cfg(feature = "ext")]
 #[test]
 fn cli_info_reports_ext4() {
     let srcdir = tempfile::tempdir().unwrap();
@@ -244,6 +291,7 @@ fn cli_info_reports_ext4() {
 
 /// `fstool info disk.img` on a partitioned image prints the table;
 /// `fstool info disk.img:N` and `ls`/`cat` walk into a partition's FS.
+#[cfg(all(feature = "ext", feature = "fat"))]
 #[test]
 fn cli_partition_target_syntax() {
     if !which("e2fsck") {
@@ -440,6 +488,7 @@ fn cli_partition_target_syntax() {
 /// `fstool shell` runs an SFTP-style REPL. Drive it with a scripted
 /// stdin and assert the captured stdout contains the right output for
 /// each command.
+#[cfg(feature = "ext")]
 #[test]
 fn cli_shell_navigates_and_mutates() {
     if !which("e2fsck") {
@@ -546,6 +595,7 @@ fn cli_shell_navigates_and_mutates() {
 }
 
 /// FAT32 add/rm through `fstool`: parallel to the ext test.
+#[cfg(feature = "fat")]
 #[test]
 fn cli_fat32_add_and_rm() {
     if !which("fsck.vfat") {
@@ -639,6 +689,7 @@ fn cli_fat32_add_and_rm() {
 
 /// `fstool create -t fat32` → `ls` → `cat` → `info` on a FAT32 image. Exercises
 /// the unified inspection dispatch (the CLI doesn't know it's FAT32).
+#[cfg(feature = "fat")]
 #[test]
 fn cli_fat32_build_ls_cat_info_roundtrip() {
     let srcdir = tempfile::tempdir().unwrap();
@@ -719,6 +770,7 @@ fn cli_fat32_build_ls_cat_info_roundtrip() {
 }
 
 /// `fstool convert` does a byte-for-byte raw ↔ qcow2 round-trip.
+#[cfg(all(feature = "ext", feature = "qcow2"))]
 #[test]
 fn cli_convert_raw_qcow2_roundtrip() {
     if !which("qemu-img") {
@@ -815,6 +867,7 @@ fn cli_convert_raw_qcow2_roundtrip() {
 
 /// `fstool repack --shrink` produces a smaller image whose content
 /// matches the source.
+#[cfg(feature = "ext")]
 #[test]
 fn cli_repack_shrink() {
     if !which("e2fsck") || !which("mke2fs") {
@@ -893,6 +946,7 @@ fn cli_repack_shrink() {
 }
 
 /// `fstool repack` cross-FS-type: ext → FAT32.
+#[cfg(all(feature = "ext", feature = "fat"))]
 #[test]
 fn cli_repack_ext_to_fat32() {
     if !which("fsck.vfat") || !which("mke2fs") {
@@ -957,6 +1011,7 @@ fn cli_repack_ext_to_fat32() {
 /// `fstool repack` preserves symlinks, mode, and uid/gid (ext → ext).
 /// Verifies that the direct FS-to-FS copier doesn't drop metadata that
 /// the previous host-tempdir staging implementation lost.
+#[cfg(feature = "ext")]
 #[test]
 fn cli_repack_preserves_symlinks_and_mode() {
     if !which("e2fsck") || !which("mke2fs") || !which("debugfs") {
@@ -1057,6 +1112,7 @@ fn cli_repack_preserves_symlinks_and_mode() {
 /// `fstool repack` preserves ext xattrs through the FS-to-FS copy.
 /// Source is an mke2fs image with `debugfs ea_set`-stamped xattrs;
 /// destination must report identical values via `debugfs ea_get`.
+#[cfg(feature = "ext")]
 #[test]
 fn cli_repack_preserves_xattrs() {
     if !which("mke2fs") || !which("debugfs") || !which("e2fsck") {
@@ -1150,6 +1206,7 @@ fn cli_repack_preserves_xattrs() {
 
 /// `fstool repack` from ext to tar and back: content, mode, symlinks,
 /// and xattrs all survive the round-trip.
+#[cfg(all(feature = "ext", feature = "tar"))]
 #[test]
 fn cli_repack_ext_tar_ext_preserves_metadata() {
     if !which("mke2fs") || !which("debugfs") || !which("e2fsck") {
@@ -1281,6 +1338,7 @@ fn cli_repack_ext_tar_ext_preserves_metadata() {
 }
 
 /// fstool's tar reader is compatible with standard `tar -tvf`.
+#[cfg(all(feature = "ext", feature = "tar"))]
 #[test]
 fn cli_tar_archive_readable_by_system_tar() {
     if !which("mke2fs") || !which("tar") {
@@ -1327,6 +1385,7 @@ fn cli_tar_archive_readable_by_system_tar() {
 
 /// `analyze` on a host directory: human output carries the counts, and
 /// `--json` parses with the expected fields + a per-fs size map.
+#[cfg(all(feature = "ext", feature = "fat"))]
 #[test]
 fn cli_analyze_reports_counts_and_sizes() {
     let dir = tempfile::tempdir().unwrap();
@@ -1372,6 +1431,7 @@ fn cli_analyze_reports_counts_and_sizes() {
 /// the tempfile drops — a data-loss footgun. The guard
 /// (`inspect::reject_compressed_for_mutation`) catches this before
 /// the tempfile is even created.
+#[cfg(feature = "ext")]
 #[test]
 fn cli_mutators_refuse_compressed_inputs() {
     let bin = env!("CARGO_BIN_EXE_fstool");
@@ -1472,6 +1532,7 @@ fn cli_mutators_refuse_compressed_inputs() {
 /// front. The shell's whole point is in-place mutation via put/rm —
 /// opening a streaming FS in shell mode is misleading. The user is
 /// pointed at `fstool ls` / `fstool cat` for read-only browsing.
+#[cfg(feature = "tar")]
 #[test]
 fn cli_shell_refuses_streaming_filesystem() {
     let bin = env!("CARGO_BIN_EXE_fstool");
@@ -1506,6 +1567,7 @@ fn cli_shell_refuses_streaming_filesystem() {
 /// - tar / tar.gz (streaming + compressed) are legal browse targets;
 /// - put / rm / mkdir refuse with a "shell is read-only" message;
 /// - the original on-disk image's bytes are unchanged after a session.
+#[cfg(all(feature = "ext", feature = "tar", feature = "gzip"))]
 #[test]
 fn cli_shell_ro_browses_immutable_and_keeps_image_bytes() {
     let bin = env!("CARGO_BIN_EXE_fstool");
@@ -1621,6 +1683,7 @@ fn cli_shell_ro_browses_immutable_and_keeps_image_bytes() {
 /// crucially terminates — never recursing into the `.`/`..` self/parent links
 /// that ext (and a `tar c .`) surface. Regression guard against the
 /// self-referential infinite recursion that an unguarded walker hits.
+#[cfg(feature = "ext")]
 #[test]
 fn cli_ls_recursive_walks_tree_and_terminates() {
     let bin = FSTOOL;
@@ -1682,6 +1745,7 @@ fn cli_ls_recursive_walks_tree_and_terminates() {
 /// the separator actually differs — is exercised by the path_style unit tests
 /// and the HFS/HFS+ reader fixtures; it needs a Mac volume the CLI tests don't
 /// fabricate.)
+#[cfg(feature = "ext")]
 #[test]
 fn cli_path_style_flag_is_a_noop_on_ext() {
     let bin = FSTOOL;
@@ -1725,6 +1789,7 @@ fn cli_path_style_flag_is_a_noop_on_ext() {
 /// fstool byte-for-byte. When a *working* HFS checker is present (macOS
 /// `fsck_hfs` — the Linux `fsck.hfsplus` segfaults on classic HFS and is
 /// deliberately not used), the volume is validated against it too.
+#[cfg(feature = "hfs")]
 #[test]
 fn cli_create_hfs_round_trip() {
     let bin = FSTOOL;
@@ -1786,7 +1851,7 @@ fn cli_create_hfs_round_trip() {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "hfs", target_os = "macos"))]
 fn validate_hfs_with_fsck(img: &std::path::Path) {
     let attach = Command::new("hdiutil")
         .args([
@@ -1830,12 +1895,13 @@ fn validate_hfs_with_fsck(img: &std::path::Path) {
     );
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(feature = "hfs", not(target_os = "macos")))]
 fn validate_hfs_with_fsck(_img: &std::path::Path) {}
 
 /// In-place mutation of an existing classic-HFS image: `fstool add` and `rm`
 /// each open the volume writable, mutate, flush, and persist across separate
 /// invocations, leaving unrelated files intact.
+#[cfg(feature = "hfs")]
 #[test]
 fn cli_hfs_in_place_add_and_remove() {
     let bin = FSTOOL;
@@ -1935,6 +2001,15 @@ fn cli_hfs_in_place_add_and_remove() {
 
 /// Run `fstool shell IMG`, feeding `script` on stdin. Returns the captured
 /// stdout and whether the process exited successfully.
+#[cfg(any(
+    feature = "ext",
+    feature = "fat",
+    feature = "exfat",
+    feature = "ntfs",
+    feature = "xfs",
+    feature = "hfs-plus",
+    feature = "apfs"
+))]
 fn shell_script(img: &std::path::Path, script: &str) -> (String, bool) {
     use std::io::Write;
     use std::process::Stdio;
@@ -1973,6 +2048,15 @@ fn shell_script(img: &std::path::Path, script: &str) -> (String, bool) {
 /// first cluster — i.e. it needs a real on-disk directory entry plus data
 /// runs, exactly what the dropped flush used to lose. Needs no external
 /// tool: a fresh `fstool` process reads it back, so this runs everywhere.
+#[cfg(any(
+    feature = "ext",
+    feature = "fat",
+    feature = "exfat",
+    feature = "ntfs",
+    feature = "xfs",
+    feature = "hfs-plus",
+    feature = "apfs"
+))]
 #[test]
 fn cli_shell_put_quit_persists_across_backends() {
     let body: Vec<u8> = (0..6144).map(|i| (i % 251) as u8).collect();
@@ -1981,12 +2065,19 @@ fn cli_shell_put_quit_persists_across_backends() {
 
     // Every filesystem `fstool create` can format and then mutate on reopen.
     let cases = [
+        #[cfg(feature = "ext")]
         ("ext4", "32M"),
+        #[cfg(feature = "fat")]
         ("fat32", "64M"),
+        #[cfg(feature = "exfat")]
         ("exfat", "64M"),
+        #[cfg(feature = "ntfs")]
         ("ntfs", "32M"),
+        #[cfg(feature = "xfs")]
         ("xfs", "300M"),
+        #[cfg(feature = "hfs-plus")]
         ("hfs+", "16M"),
+        #[cfg(feature = "apfs")]
         ("apfs", "32M"),
     ];
 
@@ -2046,6 +2137,7 @@ fn cli_shell_put_quit_persists_across_backends() {
 /// `fstool shell` quoting: a filename containing spaces round-trips only when
 /// quoted (single or double), and an unquoted space is treated as an argument
 /// separator (error), not silently joined.
+#[cfg(feature = "ext")]
 #[test]
 fn cli_shell_quoted_paths() {
     let srcdir = tempfile::tempdir().unwrap();
@@ -2094,6 +2186,15 @@ fn cli_shell_quoted_paths() {
 /// zero). Checked on every backend whose getattr round-trips mtime: ext4,
 /// fat32, exfat, ntfs. (fat32/exfat have 2-second resolution, so the host
 /// mtime is an even second.)
+#[cfg(any(
+    feature = "ext",
+    feature = "fat",
+    feature = "exfat",
+    feature = "ntfs",
+    feature = "hfs-plus"
+))]
+// With a single filesystem compiled in the table below has one row.
+#[allow(clippy::single_element_loop)]
 #[test]
 fn cli_shell_put_preserves_mtime() {
     use std::time::{Duration, SystemTime};
@@ -2111,10 +2212,15 @@ fn cli_shell_put_preserves_mtime() {
     drop(f);
 
     for (ty, size) in [
+        #[cfg(feature = "ext")]
         ("ext4", "16M"),
+        #[cfg(feature = "fat")]
         ("fat32", "64M"),
+        #[cfg(feature = "exfat")]
         ("exfat", "64M"),
+        #[cfg(feature = "ntfs")]
         ("ntfs", "32M"),
+        #[cfg(feature = "hfs-plus")]
         ("hfs+", "32M"),
     ] {
         let img = NamedTempFile::new().unwrap();
@@ -2153,6 +2259,16 @@ fn cli_shell_put_preserves_mtime() {
 /// binary. Filesystems with Unix modes (ext) store the bits; DOS-attribute
 /// filesystems (NTFS/FAT/exFAT) map the owner-write bit to READ-ONLY, so a
 /// `chmod 444` reads back as 0o444 and `chmod 644` as 0o644 everywhere.
+#[cfg(any(
+    feature = "ext",
+    feature = "ntfs",
+    feature = "xfs",
+    feature = "fat",
+    feature = "exfat",
+    feature = "hfs-plus"
+))]
+// With a single filesystem compiled in the table below has one row.
+#[allow(clippy::single_element_loop)]
 #[test]
 fn cli_shell_chmod_across_backends() {
     let srcdir = tempfile::tempdir().unwrap();
@@ -2161,11 +2277,17 @@ fn cli_shell_chmod_across_backends() {
 
     // Sizes chosen to satisfy each backend's minimum.
     for (ty, size) in [
+        #[cfg(feature = "ext")]
         ("ext4", "16M"),
+        #[cfg(feature = "ntfs")]
         ("ntfs", "32M"),
+        #[cfg(feature = "xfs")]
         ("xfs", "300M"),
+        #[cfg(feature = "fat")]
         ("fat32", "64M"),
+        #[cfg(feature = "exfat")]
         ("exfat", "64M"),
+        #[cfg(feature = "hfs-plus")]
         ("hfs+", "32M"),
     ] {
         let img = NamedTempFile::new().unwrap();
@@ -2211,6 +2333,7 @@ fn cli_shell_chmod_across_backends() {
 // ------------------------------------- encrypted images and overlays
 
 /// Run `fstool` with `args`, asserting it succeeded.
+#[cfg(all(feature = "ext", any(feature = "luks", feature = "qcow2")))]
 fn fstool(args: &[&str]) -> String {
     let out = Command::new(FSTOOL)
         .args(args)
@@ -2226,6 +2349,7 @@ fn fstool(args: &[&str]) -> String {
 }
 
 /// A tiny source tree for the create commands below.
+#[cfg(all(feature = "ext", any(feature = "luks", feature = "qcow2")))]
 fn fixture_tree() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("sub")).unwrap();
@@ -2236,13 +2360,13 @@ fn fixture_tree() -> tempfile::TempDir {
 
 /// `--encrypt-kdf-*` at the floor, so the tests don't spend seconds in a
 /// KDF that is deliberately expensive in real use.
-#[cfg(feature = "luks")]
+#[cfg(all(feature = "luks", feature = "ext"))]
 const CHEAP_KDF: [&str; 4] = ["--encrypt-kdf-iterations", "1", "--encrypt-kdf-memory", "8"];
 
 /// `create --encrypt` on a raw destination makes a LUKS volume that
 /// cryptsetup recognises and that fstool itself can walk back.
 #[test]
-#[cfg(feature = "luks")]
+#[cfg(all(feature = "luks", feature = "ext"))]
 fn cli_creates_a_luks_volume() {
     let tree = fixture_tree();
     let dir = tempfile::tempdir().unwrap();
@@ -2302,7 +2426,7 @@ fn cli_creates_a_luks_volume() {
 /// The same, but the destination is a qcow2 — which gets qcow2's own
 /// embedded-LUKS encryption instead.
 #[test]
-#[cfg(feature = "qcow2-crypto")]
+#[cfg(all(feature = "qcow2-crypto", feature = "ext"))]
 fn cli_creates_an_encrypted_qcow2() {
     let tree = fixture_tree();
     let dir = tempfile::tempdir().unwrap();
@@ -2354,7 +2478,7 @@ fn cli_creates_an_encrypted_qcow2() {
 
 /// `--password-file` is the form that keeps the passphrase out of `ps`.
 #[test]
-#[cfg(feature = "luks")]
+#[cfg(all(feature = "luks", feature = "ext"))]
 fn cli_reads_the_passphrase_from_a_file() {
     let tree = fixture_tree();
     let dir = tempfile::tempdir().unwrap();
@@ -2390,6 +2514,7 @@ fn cli_reads_the_passphrase_from_a_file() {
 
 /// `create --backing` makes a qcow2 overlay: `info` reports the base, and
 /// the overlay is far smaller than the image it reads through to.
+#[cfg(all(feature = "ext", feature = "qcow2"))]
 #[test]
 fn cli_creates_a_qcow2_overlay() {
     let tree = fixture_tree();
@@ -2451,7 +2576,7 @@ fn cli_creates_a_qcow2_overlay() {
 /// `--encrypt` with no passphrase must be refused up front, not part-way
 /// through writing an image.
 #[test]
-#[cfg(feature = "luks")]
+#[cfg(all(feature = "luks", feature = "ext"))]
 fn cli_refuses_encrypt_without_a_passphrase() {
     let dir = tempfile::tempdir().unwrap();
     let img = dir.path().join("nope.img");

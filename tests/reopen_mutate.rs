@@ -1,4 +1,17 @@
-#![cfg(unix)]
+#![cfg(all(
+    unix,
+    feature = "std",
+    any(
+        feature = "ext",
+        feature = "fat",
+        feature = "exfat",
+        feature = "littlefs",
+        feature = "ntfs",
+        feature = "xfs",
+        feature = "hfs-plus",
+        feature = "f2fs"
+    )
+))]
 //! Cross-backend reopen-mutate sweep.
 //!
 //! The consumer contract under test: *create an image, drop the handle,
@@ -28,6 +41,14 @@
 
 use std::io::{Cursor, Read};
 use std::path::Path;
+#[cfg(any(
+    feature = "ext",
+    feature = "fat",
+    feature = "exfat",
+    feature = "ntfs",
+    feature = "xfs",
+    feature = "hfs-plus"
+))]
 use std::process::Command;
 
 use fstool::block::{BlockDevice, FileBackend};
@@ -38,6 +59,14 @@ use tempfile::NamedTempFile;
 const SEED: &[u8] = b"seed body - present before reopen\n";
 const ADDED: &[u8] = b"added through inspect::open after reopen\n";
 
+#[cfg(any(
+    feature = "ext",
+    feature = "fat",
+    feature = "exfat",
+    feature = "ntfs",
+    feature = "xfs",
+    feature = "hfs-plus"
+))]
 fn which(tool: &str) -> bool {
     Command::new("sh")
         .arg("-c")
@@ -61,6 +90,15 @@ fn read_file(fs: &mut dyn Filesystem, dev: &mut dyn BlockDevice, path: &str) -> 
     v
 }
 
+#[cfg(any(
+    feature = "ext",
+    feature = "fat",
+    feature = "exfat",
+    feature = "littlefs",
+    feature = "ntfs",
+    feature = "xfs",
+    feature = "hfs-plus"
+))]
 fn root_names(fs: &mut dyn Filesystem, dev: &mut dyn BlockDevice) -> Vec<String> {
     let mut n: Vec<String> = fs
         .list(dev, Path::new("/"))
@@ -75,6 +113,15 @@ fn root_names(fs: &mut dyn Filesystem, dev: &mut dyn BlockDevice) -> Vec<String>
 /// Phases 2 + 3 of the contract, generic over the backend: reopen through
 /// `inspect::open`, add `/added.txt`, flush, then reopen once more and
 /// assert both files survive with the right bytes.
+#[cfg(any(
+    feature = "ext",
+    feature = "fat",
+    feature = "exfat",
+    feature = "littlefs",
+    feature = "ntfs",
+    feature = "xfs",
+    feature = "hfs-plus"
+))]
 fn reopen_add_then_verify(path: &Path) {
     // Phase 2: reopen (no format) and add a file.
     {
@@ -129,6 +176,13 @@ fn reopen_add_then_verify(path: &Path) {
 /// fs, reopen via `AnyFs::open`, `add_file` a **non-resident**-sized file,
 /// `AnyFs::flush`, drop, then reopen and read it back — with no read
 /// between add and flush.
+#[cfg(any(
+    feature = "exfat",
+    feature = "littlefs",
+    feature = "ntfs",
+    feature = "xfs",
+    feature = "hfs-plus"
+))]
 fn anyfs_put_flush_survives(path: &Path) {
     // 6 KiB: comfortably past NTFS's resident-data threshold and exFAT's
     // first cluster, so the file needs a real directory entry + data runs.
@@ -166,6 +220,7 @@ fn anyfs_put_flush_survives(path: &Path) {
 // ----------------------------------------------------------------------
 // ext4
 // ----------------------------------------------------------------------
+#[cfg(feature = "ext")]
 #[test]
 fn ext4_reopen_mutate() {
     use fstool::fs::ext::{Ext, FormatOpts, FsKind};
@@ -214,6 +269,7 @@ fn ext4_reopen_mutate() {
 // ----------------------------------------------------------------------
 // FAT32
 // ----------------------------------------------------------------------
+#[cfg(feature = "fat")]
 #[test]
 fn fat32_reopen_mutate() {
     use fstool::fs::fat::{Fat32, FatFormatOpts};
@@ -261,6 +317,7 @@ fn fat32_reopen_mutate() {
 // ----------------------------------------------------------------------
 // exFAT (no fsck.exfat here → self-check only)
 // ----------------------------------------------------------------------
+#[cfg(feature = "exfat")]
 #[test]
 fn exfat_reopen_mutate() {
     use fstool::fs::exfat::Exfat;
@@ -309,6 +366,7 @@ fn exfat_reopen_mutate() {
 // littlefs (every mutation is a metadata-pair commit; a reopened handle
 // is no different from a freshly formatted one)
 // ----------------------------------------------------------------------
+#[cfg(feature = "littlefs")]
 #[test]
 fn littlefs_reopen_mutate() {
     use fstool::fs::littlefs::{LittleFs, LittleFsFormatOpts};
@@ -336,6 +394,7 @@ fn littlefs_reopen_mutate() {
 // ----------------------------------------------------------------------
 // NTFS (DirBatch directory writes; AnyFs::flush must drain them)
 // ----------------------------------------------------------------------
+#[cfg(feature = "ntfs")]
 #[test]
 fn ntfs_reopen_mutate() {
     use fstool::fs::ntfs::Ntfs;
@@ -381,6 +440,7 @@ fn ntfs_reopen_mutate() {
 // ----------------------------------------------------------------------
 // XFS (resume_writes reconstructs on first write)
 // ----------------------------------------------------------------------
+#[cfg(feature = "xfs")]
 #[test]
 fn xfs_reopen_mutate() {
     use fstool::fs::xfs::{self, FormatOpts};
@@ -435,6 +495,7 @@ fn xfs_reopen_mutate() {
 // ----------------------------------------------------------------------
 // HFS+ (open() reconstructs writer state)
 // ----------------------------------------------------------------------
+#[cfg(feature = "hfs-plus")]
 #[test]
 fn hfs_plus_reopen_mutate() {
     use fstool::fs::hfs_plus::{FormatOpts, HfsPlus};
@@ -489,6 +550,7 @@ fn hfs_plus_reopen_mutate() {
 // corrupt the image. This test pins that contract so a future change that
 // silently breaks it (or quietly "succeeds" and corrupts) is caught.
 // ----------------------------------------------------------------------
+#[cfg(feature = "f2fs")]
 #[test]
 fn f2fs_reopen_is_read_only() {
     use fstool::fs::f2fs::{F2fs, FormatOpts};

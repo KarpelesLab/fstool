@@ -13,9 +13,10 @@ readme = "README.md"
 keywords = ["filesystem", "ext4", "ext2", "gpt", "image"]
 categories = ["filesystem", "command-line-utilities"]
 # Keep the published crate to the library + CLI source. The browser UI and CI
-# config are repo-only and would just bloat the crates.io tarball. (The wasm
-# bindings live in-crate at src/wasm.rs behind the `wasm` feature.)
-exclude = ["/web", "/.github"]
+# config are repo-only and would just bloat the crates.io tarball, and the
+# bare-metal example is its own crate. (The wasm bindings live in-crate at
+# src/wasm.rs behind the `wasm` feature.)
+exclude = ["/web", "/.github", "/examples/embedded-cortex-m"]
 
 [lib]
 name = "fstool"
@@ -32,6 +33,18 @@ path = "src/bin/fstool/main.rs"
 # consumer that turns `cli` off doesn't build (or resolve) any of them.
 required-features = ["cli"]
 
+[[example]]
+name = "format_empty_ext2"
+required-features = ["ext"]
+
+[[example]]
+name = "inspect_gpt"
+required-features = ["std"]
+
+[[example]]
+name = "memconv_smoke"
+required-features = ["std"]
+
 [features]
 # Compression codecs for SquashFS reads and `.tar.<algo>` streaming I/O.
 # Enabled by default; disable with `default-features = false` and pick
@@ -43,31 +56,135 @@ required-features = ["cli"]
 # per-format feature (`cab`, `amiga-lzx`, `lha`, `arc`, `sit`, `sevenz`,
 # `rar`); each enables only the compcol codecs it can use today and returns a
 # clean `Unsupported` for methods whose codec hasn't landed in compcol yet.
-default = ["codecs", "containers", "spec", "json", "log", "unix-host", "cli", "readline"]
+default = [
+    "std",
+    "filesystems",
+    "containers",
+    "codecs",
+    "spec",
+    "json",
+    "log",
+    "unix-host",
+    "cli",
+    "readline",
+]
+
+# The Rust standard library. Off, the crate is `#![no_std]` (with `alloc`)
+# and what remains is the embedded core: the `BlockDevice` trait with its
+# in-memory and sliced backends, MBR / GPT / APM partition tables, the
+# `Filesystem` trait, and the filesystems that carry no `std` requirement
+# of their own (`fat`, `exfat`, `littlefs`). Everything that talks to a
+# host — files, the image containers, the TOML spec, `inspect` / `repack`
+# / the CLI — needs `std`, and the features below that cover such code
+# turn it on for you. An embedded build is therefore spelled
+#
+#     fstool = { version = "0.4", default-features = false,
+#                features = ["fat"] }
+#
+# and reads an SD card through the `BlockDevice` you implement over your
+# driver. `uuid` is the one dependency left; its random-GUID generator
+# (GPT formatting) is `std`-only, and `Gpt::build_with_guids` takes the
+# GUIDs from you instead.
+std = ["uuid/std", "uuid/v4"]
 
 # Everything the library reads and writes, with no command-line surface.
 # This is the set a library consumer wants:
 #
 #     fstool = { version = "0.4", default-features = false,
-#                features = ["codecs", "containers"] }
+#                features = ["filesystems", "containers", "codecs"] }
 #
 # which drops `clap` and `rustyline` (and their ~30 transitive crates)
 # while keeping every format.
 codecs = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "cab", "amiga-lzx", "lha", "arc", "sit", "sevenz", "rar", "dmg-bzip2", "dmg-lzfse"]
-# The encrypted disk-image containers.
-containers = ["dmg-encrypted", "luks", "qcow2-crypto"]
+
+# ---------------------------------------------------------------------
+# Filesystems. One feature per backend, every one on by default through
+# `filesystems`. Each pulls exactly what it needs: the three flash / SD
+# card formats (`fat`, `exfat`, `littlefs`) are `no_std`-clean and stand
+# alone; the rest require `std`, and the two that decode legacy or
+# Unicode names take their table crate with them.
+# ---------------------------------------------------------------------
+filesystems = [
+    "affs",
+    "apfs",
+    "archive",
+    "exfat",
+    "ext",
+    "f2fs",
+    "fat",
+    "grf",
+    "hfs",
+    "hfs-plus",
+    "iso9660",
+    "littlefs",
+    "ntfs",
+    "ramfs",
+    "squashfs",
+    "tar",
+    "xfs",
+]
+# FAT12 / FAT16 / FAT32. The embedded floor: `no_std` + `alloc`.
+fat = []
+# exFAT. Shares the allocation-table code with `fat`.
+exfat = ["fat"]
+# littlefs (the embedded-flash filesystem, `lfs2` disk versions 2.0 + 2.1).
+littlefs = []
+# ext2 / ext3 / ext4.
+ext = ["std"]
+# XFS.
+xfs = ["std"]
+# NTFS.
+ntfs = ["std"]
+# F2FS.
+f2fs = ["std"]
+# APFS. `intl` supplies the NFD normalisation + case folding the drec
+# hash needs (see the dependency note below).
+apfs = ["std", "dep:intl"]
+# Classic HFS (Mac OS ≤ 8) — also the resource-fork + MacRoman helpers.
+hfs = ["std"]
+# HFS+ / HFSX.
+hfs-plus = ["std"]
+# Amiga OFS / FFS.
+affs = ["std"]
+# ISO 9660 (+ Joliet, Rock Ridge, El Torito).
+iso9660 = ["std"]
+# SquashFS (reads decode through the codec features).
+squashfs = ["std"]
+# GRF (Gravity Ragnarok Online archive). `charcode` decodes its CP949 names.
+grf = ["std", "dep:charcode"]
+# tar — the streaming reader / writer and the tar-as-filesystem view.
+tar = ["std"]
+# The archive core: zip / cpio / ar, plus the per-format readers below
+# when their feature is on. `charcode` decodes non-UTF-8 zip names.
+archive = ["std", "dep:charcode"]
+# In-memory filesystem — the scratch tree `repack` / `merge` and the FUSE
+# adapter build on.
+ramfs = ["std"]
+
+# ---------------------------------------------------------------------
+# Disk-image containers — the `BlockDevice` layers between a host file
+# and the filesystem inside it. All `std`.
+# ---------------------------------------------------------------------
+containers = ["qcow2", "dmg", "diskcopy", "dmg-encrypted", "luks", "qcow2-crypto"]
+# qcow2 (with backing files; encryption via `qcow2-crypto`).
+qcow2 = ["std"]
+# Apple UDIF `.dmg` (read-only; zero / raw / zlib / ADC always, the other
+# chunk codecs behind `dmg-bzip2` / `dmg-lzfse`).
+dmg = ["std"]
+# DiskCopy 4.2 images (the classic-Mac floppy container).
+diskcopy = ["std"]
 
 # The TOML spec engine: `spec::Spec`, `spec::build`, and
 # `OptionMap::merge_toml` — everything that turns a `.toml` file into an
 # image. Pulls `toml` (and `serde`, which it is built on). Off, the
 # library is driven through its Rust API instead; `spec::parse_size` and
 # the other pure helpers stay either way.
-spec = ["dep:tomlproc", "dep:serde"]
+spec = ["std", "dep:tomlproc", "dep:serde"]
 
 # Speaking JSON: `Serialize` on the report types, the `--json` output of
 # `analyze`, the wasm bridge's return values — and LUKS2, whose on-disk
 # metadata *is* a JSON document, which is why `luks` requires this.
-json = ["dep:serde", "dep:serde_json"]
+json = ["std", "dep:serde", "dep:serde_json"]
 
 # The `log` facade. Four call sites, all of them reporting something
 # recovered from rather than failed on. Off, they compile to nothing.
@@ -80,14 +197,17 @@ log = ["dep:log"]
 # non-Unix: a block device reports no size and is refused, the progress
 # line assumes 80 columns, and Ctrl-C is the default kill. Image *files*
 # are untouched either way.
-unix-host = ["dep:libc"]
+unix-host = ["std", "dep:libc"]
 
 # The `fstool` binary's argument parsing. On by default so `cargo install
 # fstool` produces a working command; a library consumer turns it off with
 # `default-features = false`. Deliberately does NOT imply `readline`: the
 # static libc-free release build wants the CLI without rustyline's
-# unix-only terminal layer.
-cli = ["dep:clap", "spec", "json", "log", "unix-host"]
+# unix-only terminal layer. Nor does it imply any filesystem — the
+# subcommands that need one are compiled in with that filesystem's
+# feature, so a slim `fstool` can be built for exactly the formats it
+# has to handle.
+cli = ["dep:clap", "std", "spec", "json", "log", "unix-host"]
 # Line editing + command history for the interactive `fstool shell` (↑/↓
 # history, Ctrl-A/E, etc.) via `rustyline`. Implied by `cli`; drop it with
 # `--features cli` and no `readline` to lose the dependency — the shell
@@ -104,60 +224,62 @@ wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook", "json"]
 # bzip2/lzfse decoders. The `gzip` feature also covers zip DEFLATE, DMG zlib,
 # and HFS+ decmpfs; lz4 uses compcol's raw block (SquashFS) + canonical frame
 # (tar); lzo uses compcol's raw LZO1X block; lzma is the `.lzma` alone codec.
-gzip = ["dep:compcol", "compcol/gzip", "compcol/zlib", "compcol/deflate"]
-xz = ["dep:compcol", "compcol/xz"]
-lzma = ["dep:compcol", "compcol/lzma"]
-lz4 = ["dep:compcol", "compcol/lz4"]
+# The codecs are consumed by `std`-only code (the compression module, the
+# archive readers, SquashFS, DMG) and so imply `std`.
+gzip = ["std", "dep:compcol", "compcol/gzip", "compcol/zlib", "compcol/deflate"]
+xz = ["std", "dep:compcol", "compcol/xz"]
+lzma = ["std", "dep:compcol", "compcol/lzma"]
+lz4 = ["std", "dep:compcol", "compcol/lz4"]
 # Microsoft Cabinet (.cab) reader: Store/MSZIP/LZX/Quantum folders decode
 # via compcol. Read-only.
-cab = ["dep:compcol", "compcol/deflate", "compcol/lzx", "compcol/quantum"]
+cab = ["archive", "dep:compcol", "compcol/deflate", "compcol/lzx", "compcol/quantum"]
 # Amiga LZX (.lzx) reader: Store + LZX (compcol amiga_lzx) groups. Read-only.
-amiga-lzx = ["dep:compcol", "compcol/amiga_lzx"]
+amiga-lzx = ["archive", "dep:compcol", "compcol/amiga_lzx"]
 # LHA / LZH (.lzh) reader (read-only): walks level-0/1/2 headers. `-lh0-`
 # store decodes today; the lh1/4/5/6/7 LZSS+Huffman methods list but read as
 # Unsupported pending an `lha` codec in compcol (will add `compcol/lha`).
-lha = []
+lha = ["archive"]
 # SEA ARC (.arc) reader (read-only): walks the flat header chain. Stored
 # methods 1/2 decode today; the compressed methods (RLE90 / squeeze / crunch /
 # squash) list but read as Unsupported pending ARC codecs in compcol.
-arc = []
+arc = ["archive"]
 # StuffIt (.sit) reader (read-only): classic `SIT!` container — data-fork
 # method 0 (store) decodes; compressed methods + StuffIt 5 list/detect but
 # read as Unsupported pending StuffIt codecs in compcol.
-sit = []
+sit = ["archive"]
 # 7-Zip (.7z) reader (read-only): parses the container + single-coder folders
 # (Copy / LZMA / BZip2 / Deflate via compcol; solid folders sliced per
 # substream). LZMA2 / BCJ filters / PPMd / multi-coder / encryption list but
 # read as Unsupported pending raw-LZMA2 + branch-filter codecs in compcol.
-sevenz = ["dep:compcol", "compcol/lzma", "compcol/bzip2", "compcol/deflate"]
+sevenz = ["archive", "dep:compcol", "compcol/lzma", "compcol/bzip2", "compcol/deflate"]
 # RAR reader (read-only): RAR5 store + compressed via compcol's rar5 decoder,
 # including solid groups (decoded as one continuous stream; a sequential walk
 # such as repack decompresses the group once). (RAR4 would add compcol/rar1+
 # rar2+rar3 later.)
-rar = ["dep:compcol", "compcol/rar5"]
-zstd = ["dep:compcol", "compcol/zstd"]
-lzo = ["dep:compcol", "compcol/lzo"]
+rar = ["archive", "dep:compcol", "compcol/rar5"]
+zstd = ["std", "dep:compcol", "compcol/zstd"]
+lzo = ["std", "dep:compcol", "compcol/lzo"]
 # DMG chunk codecs beyond the always-available zero / raw / zlib / ADC set,
 # decoded via compcol (bzip2 + lzfse decoders). Gated so a slim build can
 # drop them. (`lzfse_rust` is a dev-dependency used only to generate the
 # lzfse test vector — compcol's LZFSE is decode-only.)
-dmg-bzip2 = ["dep:compcol", "compcol/bzip2"]
-dmg-lzfse = ["dep:compcol", "compcol/lzfse"]
+dmg-bzip2 = ["dmg", "dep:compcol", "compcol/bzip2"]
+dmg-lzfse = ["dmg", "dep:compcol", "compcol/lzfse"]
 # Password-protected DMG read support (`encrcdsa` v2). Served by the
 # `purecrypto` crate (AES-CBC, 3DES-EDE3-CBC via Cbc64, HMAC-SHA1, SHA-1,
 # PBKDF2) — pure-Rust, no foreign code. Gated so a slim build can drop it.
-dmg-encrypted = ["dep:purecrypto"]
+dmg-encrypted = ["dmg", "dep:purecrypto"]
 # LUKS1 / LUKS2 containers: unlock an existing volume with a passphrase,
 # read and write it in place, and format a fresh one. Served by
 # `purecrypto` (AES/Camellia/ARIA/SM4 in XTS/CBC/CTR/ECB, PBKDF2,
 # Argon2i/id, SHA-1/2, RIPEMD-160, Whirlpool) — pure-Rust, no foreign
 # code. Gated so a slim build can drop it.
-luks = ["dep:purecrypto", "json"]
+luks = ["std", "dep:purecrypto", "json"]
 # qcow2 encryption — both `crypt_method` values: 1 (the legacy AES-CBC
 # scheme qemu now reads but no longer creates) and 2 (LUKS, whose header
 # is embedded in the image via the crypto-header extension). Builds on
 # the `luks` engine for the sector cipher and keyslot unwrap.
-qcow2-crypto = ["luks"]
+qcow2-crypto = ["qcow2", "luks"]
 # FUSE adapter: enables the `fstool mount` subcommand which exposes an
 # ext{2,3,4} image as a userspace filesystem via libfuse (Linux) or
 # macFUSE (macOS). Off by default so the core build doesn't need a C
@@ -166,7 +288,7 @@ fuse = ["dep:fuser", "unix-host"]
 
 [dependencies]
 log = { version = "0.4", optional = true }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", default-features = false }
 # Argument parsing for the `fstool` binary — see the `cli` feature. The
 # library itself needs clap only to derive `ValueEnum` on `PathStyle`,
 # which is `cfg_attr`-gated on the same feature.
@@ -196,7 +318,7 @@ tomlproc = { version = "0.1.1", optional = true, default-features = false, featu
 # folds, so getting it wrong files a drec in a bucket the kernel never
 # looks up (see the `apfs_drec_hash_known_vectors` test, which pins the
 # exact hashes).
-intl = { version = "0.6.1", default-features = false, features = ["case", "full"] }
+intl = { version = "0.6.1", optional = true, default-features = false, features = ["case", "full"] }
 
 # Legacy character encodings, via `charcode` (KarpelesLab) — the WHATWG
 # Encoding Standard with no dependencies of its own. Four of its tables
@@ -205,7 +327,7 @@ intl = { version = "0.6.1", default-features = false, features = ["case", "full"
 # `euc-jp` (the Japanese legacy encodings a ZIP filename may be in when
 # it carries no UTF-8 flag), and `single-byte` for the ISO-8859-15
 # fallback that maps every byte.
-charcode = { version = "0.1.3", default-features = false, features = ["std", "euc-kr", "shift-jis", "euc-jp", "single-byte"] }
+charcode = { version = "0.1.3", optional = true, default-features = false, features = ["std", "euc-kr", "shift-jis", "euc-jp", "single-byte"] }
 
 # Compression codecs — all optional and feature-gated. Pure-rust where
 # possible (flate2 via miniz_oxide, lz4_flex, lzma-rs); zstd and lzo

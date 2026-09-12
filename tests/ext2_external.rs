@@ -7,7 +7,7 @@
 //! (`e2fsck`, `debugfs`, `mke2fs`, `truncate`) only exist on
 //! Unix-like systems.
 
-#![cfg(unix)]
+#![cfg(all(unix, feature = "ext"))]
 
 use std::io::Write;
 use std::path::Path;
@@ -942,7 +942,7 @@ fn prezeroed_skips_full_device_zero_and_stays_sparse() {
 /// the `RO_COMPAT_LARGE_FILE` size-high handling. The image must
 /// validate clean with e2fsck and our own reader must produce the same
 /// bytes back.
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", feature = "tar"))]
 #[test]
 fn large_file_round_trips_through_triple_indirect() {
     let Some(_) = which("e2fsck") else {

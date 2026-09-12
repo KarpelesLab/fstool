@@ -1,7 +1,7 @@
 //! End-to-end validation of the TOML spec `build` path.
 
 // Every test here drives the TOML spec engine.
-#![cfg(feature = "spec")]
+#![cfg(all(feature = "spec", any(feature = "ext", feature = "fat")))]
 
 use std::process::Command;
 
@@ -21,6 +21,7 @@ fn which(tool: &str) -> Option<std::path::PathBuf> {
     if p.is_empty() { None } else { Some(p.into()) }
 }
 
+#[cfg(feature = "ext")]
 #[test]
 fn build_bare_ext4_from_spec() {
     let Some(_) = which("e2fsck") else {
@@ -105,6 +106,7 @@ fn build_bare_ext4_from_spec() {
 
 /// Build a partitioned GPT disk image with an ESP + an ext4 root, then
 /// validate the GPT with sgdisk and the root filesystem with e2fsck.
+#[cfg(feature = "ext")]
 #[test]
 fn build_partitioned_gpt_disk_from_spec() {
     let Some(_) = which("sgdisk") else {
@@ -208,6 +210,7 @@ fn build_partitioned_gpt_disk_from_spec() {
     );
 }
 
+#[cfg(feature = "fat")]
 #[test]
 fn build_bare_fat32_from_spec() {
     let Some(_) = which("fsck.vfat") else {
@@ -244,6 +247,7 @@ fn build_bare_fat32_from_spec() {
     );
 }
 
+#[cfg(feature = "fat")]
 #[test]
 fn fat32_bare_requires_explicit_size() {
     let spec = fstool::spec::Spec::parse(
@@ -262,6 +266,7 @@ fn fat32_bare_requires_explicit_size() {
     );
 }
 
+#[cfg(feature = "ext")]
 #[test]
 fn build_empty_ext2_from_spec() {
     let Some(_) = which("e2fsck") else {

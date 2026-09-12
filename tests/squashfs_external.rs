@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(all(unix, feature = "squashfs"))]
 //! SquashFS end-to-end validation against the native `squashfs-tools`.
 //!
 //! Three scenarios:

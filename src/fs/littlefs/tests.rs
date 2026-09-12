@@ -1,8 +1,13 @@
 //! In-tree tests for the littlefs backend: format, mutate, re-open, and
 //! read back through the same code paths the CLI drives.
 
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use crate::io::{Read, Seek, SeekFrom, Write};
+use crate::path::Path;
+use ::alloc::boxed::Box;
+use ::alloc::format;
+use ::alloc::string::{String, ToString};
+use ::alloc::vec;
+use ::alloc::vec::Vec;
 
 use crate::block::{BlockDevice, MemoryBackend};
 use crate::fs::{EntryKind, FileMeta, FileSource, Filesystem, OpenFlags};
@@ -22,7 +27,7 @@ fn write_file(fs: &mut LittleFs, dev: &mut dyn BlockDevice, path: &str, data: &[
         dev,
         Path::new(path),
         FileSource::Reader {
-            reader: Box::new(std::io::Cursor::new(data.to_vec())),
+            reader: Box::new(crate::io::Cursor::new(data.to_vec())),
             len: data.len() as u64,
         },
         FileMeta::default(),
@@ -820,6 +825,6 @@ fn paths_built_with_the_platform_separator_resolve() {
     assert_eq!(fs.total_file_bytes(&mut dev).unwrap(), 2);
 
     // A path assembled the way the walker assembles it.
-    let joined = std::path::PathBuf::from("/").join("usr").join("local");
+    let joined = crate::path::PathBuf::from("/").join("usr").join("local");
     assert_eq!(fs.list(&mut dev, &joined).unwrap().len(), 1);
 }

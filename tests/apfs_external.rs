@@ -12,7 +12,7 @@
 //! prints a `skipping: …` line and returns success, so the suite stays
 //! green there; the actual exercise happens on macOS in CI.
 
-#![cfg(unix)]
+#![cfg(all(unix, feature = "apfs"))]
 
 use std::io::Cursor;
 use std::path::PathBuf;

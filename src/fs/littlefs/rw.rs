@@ -13,8 +13,13 @@
 //! rewritten anyway — which is exactly the copy-on-write littlefs performs
 //! itself.
 
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use crate::io::{self, Read, Seek, SeekFrom, Write};
+use crate::path::{Path, PathBuf};
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::ToString;
+use alloc::vec;
+use alloc::vec::Vec;
 
 use crate::block::BlockDevice;
 use crate::fs::{FileHandle, FileMeta, FileReadHandle, OpenFlags};

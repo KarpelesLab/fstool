@@ -45,7 +45,7 @@ use header::{BLOCK_SIZE, Header};
 
 use crate::Result;
 use crate::block::BlockDevice;
-use crate::fs::ext::xattr::Xattr;
+use crate::fs::xattr::Xattr;
 
 /// Common write-side surface shared by [`TarWriter`] (BlockDevice-backed)
 /// and [`TarStreamWriter`] (Write-backed). Callers that walk a source
@@ -653,7 +653,7 @@ impl crate::fs::Filesystem for Tar {
         };
         let rdev = match e.kind {
             EntryKind::CharDev | EntryKind::BlockDev => {
-                crate::fs::ext::inode::encode_devnum(e.device_major, e.device_minor)
+                crate::fs::devnum::encode_devnum(e.device_major, e.device_minor)
             }
             _ => 0,
         };

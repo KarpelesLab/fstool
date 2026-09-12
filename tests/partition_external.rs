@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 //! Cross-check our MBR/GPT writers against system tools (`sgdisk`, `fdisk`).
 //!
 //! Each test silently skips if the corresponding tool is missing from PATH —

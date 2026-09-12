@@ -24,8 +24,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use fstool::block::{BlockDevice, FileBackend};
-use fstool::format_opts::OptionMap;
+use fstool::block::BlockDevice;
+#[cfg(feature = "ext")]
 use fstool::fs::ext::{Ext, FsKind};
 use fstool::path_style::{self, PathStyle};
 
@@ -71,11 +71,13 @@ struct Cli {
     /// qcow2's own LUKS encryption (`crypt_method = 2`); anything else
     /// becomes a LUKS container with the filesystem inside it, which
     /// `cryptsetup open` will unlock. Needs a passphrase.
+    #[cfg(feature = "luks")]
     #[arg(long = "encrypt", global = true)]
     encrypt: bool,
 
     /// Cipher for `--encrypt`, as dm-crypt spells it. Default
     /// `aes-xts-plain64`.
+    #[cfg(feature = "luks")]
     #[arg(
         long = "encrypt-cipher",
         global = true,
@@ -86,12 +88,14 @@ struct Cli {
 
     /// Master-key length in bytes for `--encrypt`. XTS counts both
     /// halves, so 64 is AES-256 and 32 is AES-128. Default 64.
+    #[cfg(feature = "luks")]
     #[arg(long = "encrypt-key-bytes", global = true, value_name = "N")]
     encrypt_key_bytes: Option<usize>,
 
     /// LUKS format for `--encrypt` on a non-qcow2 destination: `luks2`
     /// (default) or `luks1`. A qcow2 destination is always LUKS1 —
     /// that is the header qemu embeds.
+    #[cfg(feature = "luks")]
     #[arg(
         long = "encrypt-format",
         global = true,
@@ -106,6 +110,7 @@ struct Cli {
     /// This is what makes guessing the passphrase expensive. Lower it
     /// only for throwaway images — a fixture, a test — and expect the
     /// result to be brute-forceable.
+    #[cfg(feature = "luks")]
     #[arg(long = "encrypt-kdf-iterations", global = true, value_name = "N")]
     encrypt_kdf_iterations: Option<u32>,
 
@@ -114,6 +119,7 @@ struct Cli {
     ///
     /// Memory hardness is what Argon2 buys over PBKDF2; it is the
     /// parameter that makes GPU cracking expensive.
+    #[cfg(feature = "luks")]
     #[arg(long = "encrypt-kdf-memory", global = true, value_name = "MIB")]
     encrypt_kdf_memory: Option<u32>,
 
@@ -121,12 +127,14 @@ struct Cli {
     /// every cluster it does not hold itself. A relative FILE is
     /// resolved against the new image's directory when it is opened, so
     /// the pair stays movable together.
+    #[cfg(feature = "qcow2")]
     #[arg(long = "backing", global = true, value_name = "FILE")]
     backing: Option<PathBuf>,
 
     /// Format of `--backing` (`qcow2`, `raw`, …). Recording it is what
     /// stops a raw base that happens to start with qcow2 magic from
     /// being read as qcow2; without it the format is probed.
+    #[cfg(feature = "qcow2")]
     #[arg(
         long = "backing-format",
         global = true,
@@ -149,6 +157,26 @@ enum Command {
     /// The recognised keys are documented next to each backend's
     /// `FormatOpts::apply_options`; unknown keys are rejected with a
     /// clear error citing the FS type.
+    ///
+    /// Compiled in with any filesystem that can be formatted — a build
+    /// with none has no `create`.
+    #[cfg(any(
+        feature = "affs",
+        feature = "apfs",
+        feature = "archive",
+        feature = "exfat",
+        feature = "ext",
+        feature = "f2fs",
+        feature = "fat",
+        feature = "grf",
+        feature = "hfs",
+        feature = "hfs-plus",
+        feature = "iso9660",
+        feature = "littlefs",
+        feature = "ntfs",
+        feature = "squashfs",
+        feature = "xfs"
+    ))]
     Create {
         /// Filesystem type to format: ext2 / ext3 / ext4 / fat12 / fat16 /
         /// fat32 / vfat / exfat / hfs+ / hfsplus / ntfs / f2fs / squashfs /
@@ -181,6 +209,7 @@ enum Command {
         /// qcow2 cluster size (only honoured when OUTPUT ends in
         /// `.qcow2` / `.qcow` / `.q2`). Accepts `64KiB`, `1MiB`, or a
         /// bare byte count; must be a power of two ≥ 512. Default 64 KiB.
+        #[cfg(feature = "qcow2")]
         #[arg(long, value_name = "SIZE", default_value = "64KiB")]
         cluster_size: String,
         /// FS-specific options as `key=val[,key=val]…`. Repeatable.
@@ -191,6 +220,7 @@ enum Command {
         options: Vec<String>,
         /// Compress the qcow2 output. `--compress` = zlib level 6;
         /// also `--compress=zstd`, `--compress=9`, or `--compress=zstd:9`.
+        #[cfg(feature = "qcow2")]
         #[arg(long, value_name = "SPEC", num_args = 0..=1, default_missing_value = "zlib")]
         compress: Option<String>,
     },
@@ -221,6 +251,7 @@ enum Command {
         path: String,
         /// Stream the file's resource fork instead of its data fork
         /// (classic HFS only).
+        #[cfg(any(feature = "hfs", feature = "hfs-plus"))]
         #[arg(long = "rsrc", visible_alias = "resource-fork")]
         rsrc: bool,
     },
@@ -228,6 +259,7 @@ enum Command {
     /// List a classic-HFS file's resource fork — the typed, numbered
     /// resources (ICN# icons, vers strings, DITL dialogs, …) you'd open in
     /// ResEdit. With `--extract`, dump one resource's raw bytes to stdout.
+    #[cfg(any(feature = "hfs", feature = "hfs-plus"))]
     Resources {
         /// Image path, optionally with `:N` to select partition N.
         #[arg(value_name = "IMAGE[:N]")]
@@ -283,6 +315,7 @@ enum Command {
         output: PathBuf,
         /// Compress the qcow2 output. `--compress` = zlib level 6;
         /// also `--compress=zstd`, `--compress=9`, or `--compress=zstd:9`.
+        #[cfg(feature = "qcow2")]
         #[arg(long, value_name = "SPEC", num_args = 0..=1, default_missing_value = "zlib")]
         compress: Option<String>,
     },
@@ -323,10 +356,12 @@ enum Command {
         /// Start an empty in-memory ramfs instead of opening an image. Build a
         /// tree interactively (`put` / `mkdir` / `rm`) then `save OUT` to a tar
         /// when done. Nothing is persisted unless you `save`.
+        #[cfg(feature = "ramfs")]
         #[arg(long)]
         new_ramfs: bool,
         /// With `--new-ramfs`, pre-populate the ramfs from this source (a host
         /// directory, an image, or a tar archive) before the first prompt.
+        #[cfg(feature = "ramfs")]
         #[arg(long, value_name = "SOURCE")]
         from: Option<String>,
         /// Open the image strictly read-only. The underlying file is
@@ -364,10 +399,12 @@ enum Command {
         #[arg(long, value_name = "SIZE")]
         size: Option<String>,
         /// qcow2 cluster size for the destination, when DST is a qcow2.
+        #[cfg(feature = "qcow2")]
         #[arg(long, value_name = "SIZE", default_value = "64KiB")]
         cluster_size: String,
         /// Compress the qcow2 output. `--compress` = zlib level 6;
         /// also `--compress=zstd`, `--compress=9`, or `--compress=zstd:9`.
+        #[cfg(feature = "qcow2")]
         #[arg(long, value_name = "SPEC", num_args = 0..=1, default_missing_value = "zlib")]
         compress: Option<String>,
     },
@@ -405,10 +442,12 @@ enum Command {
         #[arg(long, default_value_t = 1024)]
         block_size: u32,
         /// qcow2 cluster size for the destination, when DST is a qcow2.
+        #[cfg(feature = "qcow2")]
         #[arg(long, value_name = "SIZE", default_value = "64KiB")]
         cluster_size: String,
         /// Compress the qcow2 output. `--compress` = zlib level 6;
         /// also `--compress=zstd`, `--compress=9`, or `--compress=zstd:9`.
+        #[cfg(feature = "qcow2")]
         #[arg(long, value_name = "SPEC", num_args = 0..=1, default_missing_value = "zlib")]
         compress: Option<String>,
     },
@@ -463,7 +502,11 @@ enum Command {
     Mount {
         /// Image to mount. Plain file or `path:N` partition selector. Omit it
         /// together with `--new-ramfs` to mount an empty in-memory filesystem.
-        #[arg(value_name = "IMAGE", required_unless_present = "new_ramfs")]
+        #[cfg_attr(
+            feature = "ramfs",
+            arg(value_name = "IMAGE", required_unless_present = "new_ramfs")
+        )]
+        #[cfg_attr(not(feature = "ramfs"), arg(value_name = "IMAGE", required = true))]
         image: Option<String>,
         /// Host directory to mount under. Must already exist and be empty (or
         /// close to it — your kernel decides). With `--new-ramfs` this is the
@@ -473,10 +516,12 @@ enum Command {
         /// Mount a fresh in-memory ramfs instead of an image. Writes through
         /// the mountpoint land in RAM and are discarded on unmount unless you
         /// snapshot them first (`fstool shell --new-ramfs … save`).
+        #[cfg(feature = "ramfs")]
         #[arg(long)]
         new_ramfs: bool,
         /// With `--new-ramfs`, pre-populate the ramfs from this source (a host
         /// directory, an image, or a tar archive) before mounting.
+        #[cfg(feature = "ramfs")]
         #[arg(long, value_name = "SOURCE")]
         from: Option<String>,
     },
@@ -573,32 +618,122 @@ fn resolve_encrypt(
     }))
 }
 
-#[cfg(not(feature = "luks"))]
-fn resolve_encrypt(
-    cli: &Cli,
-    _password: Option<&str>,
-) -> fstool::Result<Option<fstool::block::EncryptOpts>> {
-    if cli.encrypt {
-        return Err(fstool::Error::Unsupported(
-            "--encrypt needs fstool built with the `luks` feature".into(),
-        ));
-    }
-    Ok(None)
-}
-
 /// The destination path of a command that creates an image, so
 /// `--encrypt` can tell a qcow2 destination from a raw one. Commands
 /// that create nothing return an empty path, which is not a qcow2.
 #[cfg(feature = "luks")]
 fn output_path_of(cmd: &Command) -> &std::path::Path {
     match cmd {
-        Command::Create { output, .. } | Command::Build { output, .. } => output,
+        #[cfg(any(
+            feature = "affs",
+            feature = "apfs",
+            feature = "archive",
+            feature = "exfat",
+            feature = "ext",
+            feature = "f2fs",
+            feature = "fat",
+            feature = "grf",
+            feature = "hfs",
+            feature = "hfs-plus",
+            feature = "iso9660",
+            feature = "littlefs",
+            feature = "ntfs",
+            feature = "squashfs",
+            feature = "xfs"
+        ))]
+        Command::Create { output, .. } => output,
+        Command::Build { output, .. } => output,
         Command::Convert { dst, .. } => dst,
         Command::Repack { paths, .. } => paths
             .last()
             .map(std::path::Path::new)
             .unwrap_or(std::path::Path::new("")),
         _ => std::path::Path::new(""),
+    }
+}
+
+/// The container-level choices shared by every subcommand that creates
+/// an image, settled once from the global flags: LUKS encryption (with
+/// the `luks` feature) and a qcow2 backing file (with `qcow2`). Each
+/// creating subcommand folds its own `--cluster-size` in through
+/// [`ContainerFlags::create_opts`].
+struct ContainerFlags {
+    #[cfg(feature = "luks")]
+    encrypt: Option<fstool::block::EncryptOpts>,
+    #[cfg(feature = "qcow2")]
+    backing: Option<(PathBuf, Option<String>)>,
+}
+
+impl ContainerFlags {
+    /// The [`fstool::block::CreateOpts`] for a new image.
+    #[cfg(feature = "qcow2")]
+    fn create_opts(&self, cluster_size: &str) -> fstool::Result<fstool::block::CreateOpts> {
+        let mut opts = self.base_opts();
+        opts.cluster_size = parse_cluster_size(cluster_size)?;
+        opts.backing = self.backing.clone();
+        Ok(opts)
+    }
+
+    /// The [`fstool::block::CreateOpts`] for a new image. Without `qcow2`
+    /// there is no cluster size to parse.
+    #[cfg(not(feature = "qcow2"))]
+    fn create_opts(&self) -> fstool::Result<fstool::block::CreateOpts> {
+        Ok(self.base_opts())
+    }
+
+    fn base_opts(&self) -> fstool::block::CreateOpts {
+        #[cfg(feature = "luks")]
+        {
+            fstool::block::CreateOpts {
+                encrypt: self.encrypt.clone(),
+                ..fstool::block::CreateOpts::default()
+            }
+        }
+        #[cfg(not(feature = "luks"))]
+        {
+            fstool::block::CreateOpts::default()
+        }
+    }
+}
+
+/// The Cargo feature that compiles the backend a `--type` / `--fs-type`
+/// name selects, when this build left it out. `None` for a name that is
+/// compiled in — or that no build of fstool knows, which the caller's own
+/// "unknown type" error covers.
+fn missing_fs_feature(name: &str) -> Option<&'static str> {
+    let (feature, enabled) = match name {
+        "ext2" | "ext3" | "ext4" => ("ext", cfg!(feature = "ext")),
+        "fat12" | "fat16" | "fat32" | "vfat" => ("fat", cfg!(feature = "fat")),
+        "exfat" => ("exfat", cfg!(feature = "exfat")),
+        "hfs+" | "hfsplus" => ("hfs-plus", cfg!(feature = "hfs-plus")),
+        "hfs" => ("hfs", cfg!(feature = "hfs")),
+        "affs" | "ffs" | "ofs" => ("affs", cfg!(feature = "affs")),
+        "littlefs" | "lfs" => ("littlefs", cfg!(feature = "littlefs")),
+        "ntfs" => ("ntfs", cfg!(feature = "ntfs")),
+        "f2fs" => ("f2fs", cfg!(feature = "f2fs")),
+        "squashfs" => ("squashfs", cfg!(feature = "squashfs")),
+        "xfs" => ("xfs", cfg!(feature = "xfs")),
+        "iso" | "iso9660" => ("iso9660", cfg!(feature = "iso9660")),
+        "grf" => ("grf", cfg!(feature = "grf")),
+        "apfs" => ("apfs", cfg!(feature = "apfs")),
+        "zip" | "cpio" | "ar" => ("archive", cfg!(feature = "archive")),
+        "tar" => ("tar", cfg!(feature = "tar")),
+        _ => return None,
+    };
+    (!enabled).then_some(feature)
+}
+
+/// Name-driven dispatch (`create --type`, `repack --fs-type`) in a build
+/// that left the named backend out: refuse up front, naming the feature to
+/// enable, rather than fall through to an "unknown type" error or touch
+/// the destination.
+fn require_fs_feature(verb: &str, name: &str) -> fstool::Result<()> {
+    match missing_fs_feature(name) {
+        Some(feature) => Err(fstool::Error::Unsupported(format!(
+            "{verb}: {name} support is not in this build of fstool \
+             (compiled without the `{feature}` feature)"
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -615,9 +750,30 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> fstool::Result<()> {
     let password = resolve_password(cli.password.as_deref(), cli.password_file.as_deref())?;
-    let encrypt = resolve_encrypt(&cli, password.as_deref())?;
-    let backing = cli.backing.clone().map(|p| (p, cli.backing_format.clone()));
+    let container = ContainerFlags {
+        #[cfg(feature = "luks")]
+        encrypt: resolve_encrypt(&cli, password.as_deref())?,
+        #[cfg(feature = "qcow2")]
+        backing: cli.backing.clone().map(|p| (p, cli.backing_format.clone())),
+    };
     match cli.command {
+        #[cfg(any(
+            feature = "affs",
+            feature = "apfs",
+            feature = "archive",
+            feature = "exfat",
+            feature = "ext",
+            feature = "f2fs",
+            feature = "fat",
+            feature = "grf",
+            feature = "hfs",
+            feature = "hfs-plus",
+            feature = "iso9660",
+            feature = "littlefs",
+            feature = "ntfs",
+            feature = "squashfs",
+            feature = "xfs"
+        ))]
         Command::Create {
             fs_type,
             src_dir,
@@ -625,16 +781,18 @@ fn run(cli: Cli) -> fstool::Result<()> {
             size,
             label,
             force,
+            #[cfg(feature = "qcow2")]
             cluster_size,
             options,
+            #[cfg(feature = "qcow2")]
             compress,
         } => {
+            #[cfg(feature = "qcow2")]
             let comp = parse_compress(compress.as_deref())?;
-            let create_opts = fstool::block::CreateOpts {
-                cluster_size: parse_cluster_size(&cluster_size)?,
-                encrypt: encrypt.clone(),
-                backing: backing.clone(),
-            };
+            #[cfg(feature = "qcow2")]
+            let create_opts = container.create_opts(&cluster_size)?;
+            #[cfg(not(feature = "qcow2"))]
+            let create_opts = container.create_opts()?;
             create_cmd(CreateArgs {
                 fs_type: &fs_type,
                 src_dir: src_dir.as_deref(),
@@ -645,6 +803,7 @@ fn run(cli: Cli) -> fstool::Result<()> {
                 create_opts: &create_opts,
                 options: &options,
             })?;
+            #[cfg(feature = "qcow2")]
             if let Some((ctype, level)) = comp {
                 finalize_compress_qcow2(&output, ctype, level)?;
             }
@@ -661,9 +820,19 @@ fn run(cli: Cli) -> fstool::Result<()> {
             cli.path_style,
             password.as_deref(),
         ),
-        Command::Cat { image, path, rsrc } => {
-            cat(&image, &path, rsrc, cli.path_style, password.as_deref())
+        Command::Cat {
+            image,
+            path,
+            #[cfg(any(feature = "hfs", feature = "hfs-plus"))]
+            rsrc,
+        } => {
+            #[cfg(any(feature = "hfs", feature = "hfs-plus"))]
+            if rsrc {
+                return cat_rsrc(&image, &path, cli.path_style, password.as_deref());
+            }
+            cat(&image, &path, cli.path_style, password.as_deref())
         }
+        #[cfg(any(feature = "hfs", feature = "hfs-plus"))]
         Command::Resources {
             image,
             path,
@@ -685,10 +854,13 @@ fn run(cli: Cli) -> fstool::Result<()> {
         Command::Build {
             spec,
             output,
+            #[cfg(feature = "qcow2")]
             compress,
         } => {
+            #[cfg(feature = "qcow2")]
             let comp = parse_compress(compress.as_deref())?;
             build(&spec, &output)?;
+            #[cfg(feature = "qcow2")]
             if let Some((ctype, level)) = comp {
                 finalize_compress_qcow2(&output, ctype, level)?;
             }
@@ -710,34 +882,46 @@ fn run(cli: Cli) -> fstool::Result<()> {
             image,
             ro,
             with_cache,
+            #[cfg(feature = "ramfs")]
             new_ramfs,
+            #[cfg(feature = "ramfs")]
             from,
-        } => shell_cmd(
-            image.as_deref(),
-            ro,
-            with_cache,
-            new_ramfs,
-            from.as_deref(),
-            cli.path_style,
-            password.as_deref(),
-        ),
+        } => {
+            #[cfg(feature = "ramfs")]
+            if new_ramfs {
+                return shell_ramfs_cmd(with_cache, from.as_deref(), cli.path_style);
+            }
+            shell_cmd(
+                image.as_deref(),
+                ro,
+                with_cache,
+                cli.path_style,
+                password.as_deref(),
+            )
+        }
         Command::Convert {
             src,
             dst,
             size,
+            #[cfg(feature = "qcow2")]
             cluster_size,
+            #[cfg(feature = "qcow2")]
             compress,
         } => {
+            #[cfg(feature = "qcow2")]
             let comp = parse_compress(compress.as_deref())?;
+            #[cfg(feature = "qcow2")]
+            let create_opts = container.create_opts(&cluster_size)?;
+            #[cfg(not(feature = "qcow2"))]
+            let create_opts = container.create_opts()?;
             convert_cmd(
                 &src,
                 &dst,
                 size.as_deref(),
-                &cluster_size,
                 password.as_deref(),
-                encrypt.as_ref(),
-                backing.as_ref(),
+                &create_opts,
             )?;
+            #[cfg(feature = "qcow2")]
             if let Some((ctype, level)) = comp {
                 finalize_compress_qcow2(&dst, ctype, level)?;
             }
@@ -749,10 +933,17 @@ fn run(cli: Cli) -> fstool::Result<()> {
             shrink,
             fs_type,
             block_size,
+            #[cfg(feature = "qcow2")]
             cluster_size,
+            #[cfg(feature = "qcow2")]
             compress,
         } => {
+            #[cfg(feature = "qcow2")]
             let comp = parse_compress(compress.as_deref())?;
+            #[cfg(feature = "qcow2")]
+            let create_opts = container.create_opts(&cluster_size)?;
+            #[cfg(not(feature = "qcow2"))]
+            let create_opts = container.create_opts()?;
             let dst_str = paths.pop().expect("clap enforces num_args >= 2");
             let dst = PathBuf::from(dst_str);
             let srcs = paths;
@@ -767,13 +958,12 @@ fn run(cli: Cli) -> fstool::Result<()> {
                 shrink,
                 fs_type_override: fs_type.as_deref(),
                 block_size,
-                cluster_size: &cluster_size,
                 password: password.as_deref(),
-                encrypt: encrypt.as_ref(),
-                backing: backing.as_ref(),
+                create_opts: &create_opts,
             });
             fstool::repack::leave();
             res?;
+            #[cfg(feature = "qcow2")]
             if let Some((ctype, level)) = comp {
                 finalize_compress_qcow2(&dst, ctype, level)?;
             }
@@ -800,56 +990,63 @@ fn run(cli: Cli) -> fstool::Result<()> {
         Command::Mount {
             image,
             mountpoint,
+            #[cfg(feature = "ramfs")]
             new_ramfs,
+            #[cfg(feature = "ramfs")]
             from,
-        } => mount_cmd(
-            image.as_deref(),
-            mountpoint.as_deref(),
-            new_ramfs,
-            from.as_deref(),
-        ),
+        } => {
+            #[cfg(feature = "ramfs")]
+            if new_ramfs {
+                return mount_ramfs_cmd(image.as_deref(), mountpoint.as_deref(), from.as_deref());
+            }
+            mount_cmd(image.as_deref(), mountpoint.as_deref())
+        }
     }
 }
 
-#[cfg(feature = "fuse")]
-fn mount_cmd(
+/// `fstool mount --new-ramfs`: an in-memory ramfs, optionally seeded
+/// from a source, exposed through FUSE. Writes through the mount stay in
+/// RAM.
+#[cfg(all(feature = "fuse", feature = "ramfs"))]
+fn mount_ramfs_cmd(
     image: Option<&str>,
     mountpoint: Option<&std::path::Path>,
-    new_ramfs: bool,
     from: Option<&str>,
 ) -> fstool::Result<()> {
     use fstool::fs::Filesystem;
-    use fstool::inspect::FsKind;
 
-    if new_ramfs {
-        // With `--new-ramfs` the lone positional is the mountpoint; clap binds
-        // it to `image` (the first positional) when `mountpoint` is absent.
-        let mountpoint = mountpoint
-            .or_else(|| image.map(std::path::Path::new))
-            .ok_or_else(|| {
-                fstool::Error::InvalidArgument("mount --new-ramfs: a MOUNTPOINT is required".into())
-            })?;
-        // An in-memory ramfs: a throwaway device the FS ignores, optionally
-        // seeded from a source. Writes through the mount stay in RAM.
-        let mut dev: Box<dyn fstool::block::BlockDevice + Send> =
-            Box::new(fstool::block::MemoryBackend::new(0));
-        let fs: Box<dyn Filesystem + Send> = match from {
-            Some(src) => {
-                let source = fstool::repack::Source::detect(src)?;
-                let mut r = fstool::fs::ramfs::Ramfs::new();
-                fstool::repack::populate_fs_from_source_dyn(dev.as_mut(), &mut r, &source)?;
-                Box::new(r)
-            }
-            None => Box::new(fstool::fs::ramfs::Ramfs::new()),
-        };
-        let adapter = fstool::fuse_adapter::FstoolFs::new(fs, dev, "ramfs").allow_other(true);
-        eprintln!(
-            "fstool: mounted in-memory ramfs at {} (changes are NOT persisted; umount to detach)",
-            mountpoint.display()
-        );
-        adapter.mount(mountpoint).map_err(fstool::Error::Io)?;
-        return Ok(());
-    }
+    // With `--new-ramfs` the lone positional is the mountpoint; clap binds
+    // it to `image` (the first positional) when `mountpoint` is absent.
+    let mountpoint = mountpoint
+        .or_else(|| image.map(std::path::Path::new))
+        .ok_or_else(|| {
+            fstool::Error::InvalidArgument("mount --new-ramfs: a MOUNTPOINT is required".into())
+        })?;
+    // An in-memory ramfs: a throwaway device the FS ignores, optionally
+    // seeded from a source. Writes through the mount stay in RAM.
+    let mut dev: Box<dyn fstool::block::BlockDevice + Send> =
+        Box::new(fstool::block::MemoryBackend::new(0));
+    let fs: Box<dyn Filesystem + Send> = match from {
+        Some(src) => {
+            let source = fstool::repack::Source::detect(src)?;
+            let mut r = fstool::fs::ramfs::Ramfs::new();
+            fstool::repack::populate_fs_from_source_dyn(dev.as_mut(), &mut r, &source)?;
+            Box::new(r)
+        }
+        None => Box::new(fstool::fs::ramfs::Ramfs::new()),
+    };
+    let adapter = fstool::fuse_adapter::FstoolFs::new(fs, dev, "ramfs").allow_other(true);
+    eprintln!(
+        "fstool: mounted in-memory ramfs at {} (changes are NOT persisted; umount to detach)",
+        mountpoint.display()
+    );
+    adapter.mount(mountpoint).map_err(fstool::Error::Io)?;
+    Ok(())
+}
+
+#[cfg(feature = "fuse")]
+fn mount_cmd(image: Option<&str>, mountpoint: Option<&std::path::Path>) -> fstool::Result<()> {
+    use fstool::fs::Filesystem;
 
     let image = image.ok_or_else(|| {
         fstool::Error::InvalidArgument(
@@ -876,7 +1073,8 @@ fn mount_cmd(
         Box::new(fstool::block::FileBackend::open(path)?);
     let kind = fstool::inspect::detect_fs(dev.as_mut())?;
     let (fs, fs_name): (Box<dyn Filesystem + Send>, &'static str) = match kind {
-        FsKind::Ext => {
+        #[cfg(feature = "ext")]
+        fstool::inspect::FsKind::Ext => {
             let mut ext = fstool::fs::ext::Ext::open(dev.as_mut())?;
             // Replay any pending journal so the mounted view matches
             // what the kernel would see on first mount of an unclean
@@ -884,93 +1082,118 @@ fn mount_cmd(
             let _ = ext.replay_pending_journal(dev.as_mut())?;
             (Box::new(ext), "ext")
         }
-        FsKind::Fat32 => {
+        #[cfg(feature = "fat")]
+        fstool::inspect::FsKind::Fat32 => {
             let fat = fstool::fs::fat::Fat32::open(dev.as_mut())?;
             // FAT12 / FAT16 / FAT32 all land here; report the real one.
             let name = fat.kind().as_str();
             (Box::new(fat) as Box<dyn Filesystem + Send>, name)
         }
-        FsKind::Exfat => (
+        #[cfg(feature = "exfat")]
+        fstool::inspect::FsKind::Exfat => (
             Box::new(fstool::fs::exfat::Exfat::open(dev.as_mut())?),
             "exfat",
         ),
-        FsKind::Xfs => (Box::new(fstool::fs::xfs::Xfs::open(dev.as_mut())?), "xfs"),
-        FsKind::HfsPlus => (
+        #[cfg(feature = "xfs")]
+        fstool::inspect::FsKind::Xfs => {
+            (Box::new(fstool::fs::xfs::Xfs::open(dev.as_mut())?), "xfs")
+        }
+        #[cfg(feature = "hfs-plus")]
+        fstool::inspect::FsKind::HfsPlus => (
             Box::new(fstool::fs::hfs_plus::HfsPlus::open(dev.as_mut())?),
             "hfs+",
         ),
-        FsKind::Apfs => (
+        #[cfg(feature = "apfs")]
+        fstool::inspect::FsKind::Apfs => (
             Box::new(fstool::fs::apfs::Apfs::open(dev.as_mut())?),
             "apfs",
         ),
-        FsKind::Ntfs => (
+        #[cfg(feature = "ntfs")]
+        fstool::inspect::FsKind::Ntfs => (
             Box::new(fstool::fs::ntfs::Ntfs::open(dev.as_mut())?),
             "ntfs",
         ),
-        FsKind::F2fs => (
+        #[cfg(feature = "f2fs")]
+        fstool::inspect::FsKind::F2fs => (
             Box::new(fstool::fs::f2fs::F2fs::open(dev.as_mut())?),
             "f2fs",
         ),
-        FsKind::Squashfs => (
+        #[cfg(feature = "squashfs")]
+        fstool::inspect::FsKind::Squashfs => (
             Box::new(fstool::fs::squashfs::Squashfs::open(dev.as_mut())?),
             "squashfs",
         ),
-        FsKind::Iso9660 => (
+        #[cfg(feature = "iso9660")]
+        fstool::inspect::FsKind::Iso9660 => (
             Box::new(fstool::fs::iso9660::Iso9660::open(dev.as_mut())?),
             "iso9660",
         ),
-        FsKind::Tar => (Box::new(fstool::fs::tar::Tar::open(dev.as_mut())?), "tar"),
-        FsKind::Grf => (
+        #[cfg(feature = "tar")]
+        fstool::inspect::FsKind::Tar => {
+            (Box::new(fstool::fs::tar::Tar::open(dev.as_mut())?), "tar")
+        }
+        #[cfg(feature = "grf")]
+        fstool::inspect::FsKind::Grf => (
             Box::new(fstool::fs::grf::Grf::open_dev(dev.as_mut())?),
             "grf",
         ),
-        FsKind::Zip => (
+        #[cfg(feature = "archive")]
+        fstool::inspect::FsKind::Zip => (
             Box::new(fstool::fs::archive::zip::ZipFs::open(dev.as_mut())?),
             "zip",
         ),
-        FsKind::Cpio => (
+        #[cfg(feature = "archive")]
+        fstool::inspect::FsKind::Cpio => (
             Box::new(fstool::fs::archive::cpio::CpioFs::open(dev.as_mut())?),
             "cpio",
         ),
-        FsKind::Ar => (
+        #[cfg(feature = "archive")]
+        fstool::inspect::FsKind::Ar => (
             Box::new(fstool::fs::archive::ar::ArFs::open(dev.as_mut())?),
             "ar",
         ),
-        FsKind::SevenZ => (
+        #[cfg(feature = "sevenz")]
+        fstool::inspect::FsKind::SevenZ => (
             Box::new(fstool::fs::archive::sevenz::SevenZFs::open(dev.as_mut())?),
             "7z",
         ),
-        FsKind::Rar => (
+        #[cfg(feature = "rar")]
+        fstool::inspect::FsKind::Rar => (
             Box::new(fstool::fs::archive::rar::RarFs::open(dev.as_mut())?),
             "rar",
         ),
-        FsKind::Arc => (
+        #[cfg(feature = "arc")]
+        fstool::inspect::FsKind::Arc => (
             Box::new(fstool::fs::archive::arc::ArcFs::open(dev.as_mut())?),
             "arc",
         ),
-        FsKind::Lha => (
+        #[cfg(feature = "lha")]
+        fstool::inspect::FsKind::Lha => (
             Box::new(fstool::fs::archive::lha::LhaFs::open(dev.as_mut())?),
             "lha",
         ),
-        FsKind::Lzx => (
+        #[cfg(feature = "amiga-lzx")]
+        fstool::inspect::FsKind::Lzx => (
             Box::new(fstool::fs::archive::lzx::LzxFs::open(dev.as_mut())?),
             "lzx",
         ),
-        FsKind::Cab => (
+        #[cfg(feature = "cab")]
+        fstool::inspect::FsKind::Cab => (
             Box::new(fstool::fs::archive::cab::CabFs::open(dev.as_mut())?),
             "cab",
         ),
-        FsKind::Sit => (
+        #[cfg(feature = "sit")]
+        fstool::inspect::FsKind::Sit => (
             Box::new(fstool::fs::archive::sit::SitFs::open(dev.as_mut())?),
             "sit",
         ),
         // FsKind is #[non_exhaustive]; new variants added in the
         // future error out here instead of silently falling through.
-        _ => {
-            return Err(fstool::Error::Unsupported(format!(
-                "fstool mount: filesystem {kind:?} is not wired through the FUSE adapter yet"
-            )));
-        }
+        // `?` rather than `return`, so the match never diverges: a build may
+        // compile every arm above out, and the code below must stay reachable.
+        _ => Err(fstool::Error::Unsupported(format!(
+            "fstool mount: filesystem {kind:?} is not wired through the FUSE adapter yet"
+        )))?,
     };
     let cap = fs.mutation_capability();
     let ro_suffix = if cap.supports_add_remove() {
@@ -995,6 +1218,7 @@ fn mount_cmd(
 /// `""`/absent-value → zlib/6, a codec name (`zlib`/`zstd`), a bare level
 /// (`9` → zlib/9), or `codec:level` (`zstd:19`-style, clamped to deflate's
 /// 1..=9 for zlib). Returns `Ok(None)` when the flag wasn't given.
+#[cfg(feature = "qcow2")]
 fn parse_compress(spec: Option<&str>) -> fstool::Result<Option<(u8, u8)>> {
     let Some(s) = spec else {
         return Ok(None);
@@ -1027,6 +1251,7 @@ fn parse_compress(spec: Option<&str>) -> fstool::Result<Option<(u8, u8)>> {
 /// Recompress an already-produced qcow2 image in place: read its virtual
 /// content, serialise a fresh compressed qcow2 next to it, and rename over the
 /// original. The cluster size is taken from the produced image's header.
+#[cfg(feature = "qcow2")]
 fn finalize_compress_qcow2(path: &std::path::Path, ctype: u8, level: u8) -> fstool::Result<()> {
     use fstool::block::BlockDevice;
     if !fstool::block::is_qcow2_path(path) {
@@ -1066,16 +1291,9 @@ fn convert_cmd(
     src: &std::path::Path,
     dst: &std::path::Path,
     size_arg: Option<&str>,
-    cluster_size: &str,
     password: Option<&str>,
-    encrypt: Option<&fstool::block::EncryptOpts>,
-    backing: Option<&(PathBuf, Option<String>)>,
+    create_opts: &fstool::block::CreateOpts,
 ) -> fstool::Result<()> {
-    let create_opts = fstool::block::CreateOpts {
-        cluster_size: parse_cluster_size(cluster_size)?,
-        encrypt: encrypt.cloned(),
-        backing: backing.cloned(),
-    };
     let mut src_dev = fstool::block::open_image_with_password(src, password)?;
     let src_size = src_dev.total_size();
     let dst_size = match size_arg {
@@ -1090,7 +1308,7 @@ fn convert_cmd(
             want
         }
     };
-    let mut dst_dev = fstool::block::create_image(dst, dst_size, &create_opts)?;
+    let mut dst_dev = fstool::block::create_image(dst, dst_size, create_opts)?;
     // 1 MiB copy buffer. Reads from sparse regions return zeros; on the
     // qcow2 side those become unallocated clusters (no on-disk cost).
     let mut buf = vec![0u8; 1024 * 1024];
@@ -1124,13 +1342,11 @@ struct RepackArgs<'a> {
     shrink: bool,
     fs_type_override: Option<&'a str>,
     block_size: u32,
-    cluster_size: &'a str,
     /// Passphrase for encrypted *sources*.
     password: Option<&'a str>,
-    /// Encryption for the *destination*, if `--encrypt` was given.
-    encrypt: Option<&'a fstool::block::EncryptOpts>,
-    /// Backing file for a qcow2 destination.
-    backing: Option<&'a (PathBuf, Option<String>)>,
+    /// How to make the destination container: cluster size, and any
+    /// encryption or backing file the caller asked for.
+    create_opts: &'a fstool::block::CreateOpts,
 }
 
 fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
@@ -1141,17 +1357,11 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
         shrink,
         fs_type_override,
         block_size,
-        cluster_size,
         password,
-        encrypt,
-        backing,
+        create_opts,
     } = args;
+    #[cfg(feature = "tar")]
     use fstool::repack::RepackSink;
-    let create_opts = &fstool::block::CreateOpts {
-        cluster_size: parse_cluster_size(cluster_size)?,
-        encrypt: encrypt.cloned(),
-        backing: backing.cloned(),
-    };
 
     if srcs.is_empty() {
         return Err(fstool::Error::InvalidArgument(
@@ -1193,77 +1403,61 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
     // plain tar no longer falls through to the random-access `Tar::open`
     // — which was eating ~17 % of the W1s ext4 profile parsing entry
     // headers up front.
-    let raw_src = srcs[0].as_str();
-    let codec_opt: Option<Option<fstool::compression::Algo>> =
-        if let Some(algo) = tar_input_codec(raw_src) {
-            Some(Some(algo))
-        } else {
-            let bare = raw_src.split(':').next().unwrap_or(raw_src);
-            let p = std::path::Path::new(bare);
-            if p.extension()
-                .and_then(|s| s.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("tar"))
-            {
-                Some(None)
+    #[cfg(feature = "tar")]
+    {
+        let raw_src = srcs[0].as_str();
+        let codec_opt: Option<Option<fstool::compression::Algo>> =
+            if let Some(algo) = tar_input_codec(raw_src) {
+                Some(Some(algo))
             } else {
-                None
-            }
-        };
-    if let Some(codec) = codec_opt {
-        let raw = srcs[0].as_str();
-        let tar_path = std::path::PathBuf::from(raw.split(':').next().unwrap_or(raw));
-        // Resolve the destination FS the same way the main path does;
-        // a tar source defaults to ext4 when nothing else specifies one.
-        let target_fs = fs_type_override
-            .map(|s| s.to_string())
-            .or_else(|| {
-                dst.extension()
+                let bare = raw_src.split(':').next().unwrap_or(raw_src);
+                let p = std::path::Path::new(bare);
+                if p.extension()
                     .and_then(|s| s.to_str())
-                    .filter(|e| e.eq_ignore_ascii_case("tar"))
-                    .map(|_| "tar".to_string())
-            })
-            .or_else(|| tar_output_codec(dst).map(|_| "tar".to_string()))
-            .unwrap_or_else(|| "ext4".to_string());
-        let lower = target_fs.to_ascii_lowercase();
-        // tar → tar is a pure forward re-mux: decode the source on the fly
-        // and re-emit through the tar stream sink, no tempfile.
-        if lower == "tar" {
-            return repack_tar_stream_to_tar(&tar_path, codec, dst, tar_output_codec(dst));
+                    .is_some_and(|e| e.eq_ignore_ascii_case("tar"))
+                {
+                    Some(None)
+                } else {
+                    None
+                }
+            };
+        if let Some(codec) = codec_opt {
+            let raw = srcs[0].as_str();
+            let tar_path = std::path::PathBuf::from(raw.split(':').next().unwrap_or(raw));
+            // Resolve the destination FS the same way the main path does;
+            // a tar source defaults to ext4 when nothing else specifies one.
+            let target_fs = fs_type_override
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    dst.extension()
+                        .and_then(|s| s.to_str())
+                        .filter(|e| e.eq_ignore_ascii_case("tar"))
+                        .map(|_| "tar".to_string())
+                })
+                .or_else(|| tar_output_codec(dst).map(|_| "tar".to_string()))
+                .unwrap_or_else(|| "ext4".to_string());
+            let lower = target_fs.to_ascii_lowercase();
+            require_fs_feature("repack", &lower)?;
+            // tar → tar is a pure forward re-mux: decode the source on the fly
+            // and re-emit through the tar stream sink, no tempfile.
+            if lower == "tar" {
+                return repack_tar_stream_to_tar(&tar_path, codec, dst, tar_output_codec(dst));
+            }
+            if is_stream_repack_target(&lower) {
+                return repack_tar_stream_to_fs(
+                    &tar_path,
+                    codec,
+                    dst,
+                    &lower,
+                    size_arg,
+                    shrink,
+                    block_size,
+                    create_opts,
+                );
+            }
+            // All streamable destinations are handled above; nothing falls
+            // through for a compressed-tar source.
         }
-        if matches!(
-            lower.as_str(),
-            "ext2"
-                | "ext3"
-                | "ext4"
-                | "fat12"
-                | "fat16"
-                | "fat32"
-                | "vfat"
-                | "xfs"
-                | "hfsplus"
-                | "hfs+"
-                | "ntfs"
-                | "f2fs"
-                | "squashfs"
-                | "iso"
-                | "iso9660"
-                | "grf"
-                | "zip"
-                | "cpio"
-        ) {
-            return repack_tar_stream_to_fs(
-                &tar_path,
-                codec,
-                dst,
-                &lower,
-                size_arg,
-                shrink,
-                block_size,
-                create_opts,
-            );
-        }
-        // All streamable destinations are handled above; nothing falls
-        // through for a compressed-tar source.
     }
 
     // Compressed source that fell through the streaming fast paths (a
@@ -1286,12 +1480,16 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
     // the destination build so we stream each file straight through
     // without ever touching the host filesystem.
     fstool::inspect::with_target_device(&src_target, |src_dev| {
-        let mut src_fs = fstool::inspect::AnyFs::open(src_dev)?;
+        let src_fs = &mut fstool::inspect::AnyFs::open(src_dev)?;
         // For ext sources with INCOMPAT_RECOVER / s_start != 0,
         // replay the journal onto the source so we read the
         // post-recovery state (anything still pending in the log
         // would otherwise be lost from the repack output).
-        if let fstool::inspect::AnyFs::Ext(ext) = &mut src_fs {
+        // (Irrefutable when ext is the only filesystem compiled in — the
+        // `if let` is still the right shape for every other build.)
+        #[cfg(feature = "ext")]
+        #[allow(irrefutable_let_patterns)]
+        if let fstool::inspect::AnyFs::Ext(ext) = src_fs {
             let _ = ext.replay_pending_journal(src_dev)?;
         }
         let source_kind = src_fs.kind_string();
@@ -1328,20 +1526,24 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
                 }
             });
         let lower = target_fs_str.to_ascii_lowercase();
+        require_fs_feature("repack", &lower)?;
         let dst_size = match (size_arg, shrink) {
             (Some(s), _) => fstool::spec::parse_size(s)?,
             (None, true) => match lower.as_str() {
                 // Fixed-size block filesystems: the analyze API owns the
                 // content-fit sizing (ext via BuildPlan, fat32 via the
                 // byte heuristic).
+                #[cfg(any(feature = "ext", feature = "fat"))]
                 "ext2" | "ext3" | "ext4" | "fat12" | "fat16" | "fat32" | "vfat" => {
-                    fstool::analyze::analyze_fs(&mut src_fs, src_dev, block_size)?
+                    fstool::analyze::analyze_fs(src_fs, src_dev, block_size)?
                         .recommended_size(&lower)
                         .expect("block fs has a recommended size")
                 }
                 // Tar output streams to a file; no pre-sized device, so
                 // the destination size is unused.
+                #[cfg(feature = "tar")]
                 "tar" => 0,
+                #[cfg(feature = "littlefs")]
                 "littlefs" | "lfs" => {
                     // littlefs reserves nothing up front, so its own size
                     // plan gives an exact content fit.
@@ -1349,28 +1551,31 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
                     let mut plan = <fstool::fs::littlefs::LittleFs as fstool::fs::FilesystemFactory>
                         ::size_plan(&opts)
                         .expect("littlefs has a size plan");
-                    fstool::analyze::plan_size_fs(&mut src_fs, src_dev, plan.as_mut())?
+                    fstool::analyze::plan_size_fs(src_fs, src_dev, plan.as_mut())?
                 }
+                #[cfg(feature = "iso9660")]
                 "iso" | "iso9660" => {
                     // ISO writer needs ~32 MiB headroom for a small tree.
                     // Real sizing happens during flush; we just want enough
                     // backing image to write into.
-                    let bytes = sum_source_file_bytes(src_dev, &mut src_fs)?;
+                    let bytes = sum_source_file_bytes(src_dev, src_fs)?;
                     bytes.saturating_add(32 * 1024 * 1024)
                 }
+                #[cfg(feature = "grf")]
                 "grf" => {
                     // GRF stores zlib-compressed bodies — sum_source
                     // gives an upper bound (uncompressed). Add 64 KiB
                     // headroom for the header + table.
-                    let bytes = sum_source_file_bytes(src_dev, &mut src_fs)?;
+                    let bytes = sum_source_file_bytes(src_dev, src_fs)?;
                     bytes.saturating_add(64 * 1024)
                 }
+                #[cfg(feature = "archive")]
                 "zip" | "cpio" | "ar" => {
                     // Archive writers stream into a sparse, over-sized
                     // file that is truncated to the real length after
                     // flush. ×2 + 16 MiB covers per-entry headers even
                     // for a tree of many tiny files.
-                    let bytes = sum_source_file_bytes(src_dev, &mut src_fs)?;
+                    let bytes = sum_source_file_bytes(src_dev, src_fs)?;
                     bytes.saturating_mul(2).saturating_add(16 * 1024 * 1024)
                 }
                 other => {
@@ -1385,27 +1590,32 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
             (None, false) => match lower.as_str() {
                 // Tar output streams to a file; no pre-sized device, so
                 // the destination size is unused.
+                #[cfg(feature = "tar")]
                 "tar" => 0,
+                #[cfg(feature = "iso9660")]
                 "iso" | "iso9660" => {
                     // ISO writer needs enough room for descriptors,
                     // path tables, dir records, and file data. Use a
                     // generous upper bound — the writer leaves the
                     // unused tail of the backing file alone.
-                    let bytes = sum_source_file_bytes(src_dev, &mut src_fs).unwrap_or(0);
+                    let bytes = sum_source_file_bytes(src_dev, src_fs).unwrap_or(0);
                     bytes.saturating_add(32 * 1024 * 1024)
                 }
+                #[cfg(feature = "grf")]
                 "grf" => {
-                    let bytes = sum_source_file_bytes(src_dev, &mut src_fs).unwrap_or(0);
+                    let bytes = sum_source_file_bytes(src_dev, src_fs).unwrap_or(0);
                     bytes.saturating_add(64 * 1024)
                 }
+                #[cfg(feature = "archive")]
                 "zip" | "cpio" | "ar" => {
-                    let bytes = sum_source_file_bytes(src_dev, &mut src_fs).unwrap_or(0);
+                    let bytes = sum_source_file_bytes(src_dev, src_fs).unwrap_or(0);
                     bytes.saturating_mul(2).saturating_add(16 * 1024 * 1024)
                 }
+                #[cfg(feature = "littlefs")]
                 "littlefs" | "lfs" => {
                     // File data rounded up to whole blocks, plus room for
                     // metadata pairs and later edits.
-                    let bytes = sum_source_file_bytes(src_dev, &mut src_fs).unwrap_or(0);
+                    let bytes = sum_source_file_bytes(src_dev, src_fs).unwrap_or(0);
                     bytes.saturating_mul(2).saturating_add(1024 * 1024)
                 }
                 _ => src_total,
@@ -1415,6 +1625,7 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
         // Tar output is special: a tar archive is sequential, written to
         // a `Write` (optionally codec-wrapped) rather than a pre-sized
         // block device. This is the one stream-vs-non-stream branch.
+        #[cfg(feature = "tar")]
         if lower == "tar" {
             let file = std::fs::File::create(dst)?;
             let buffered: Box<dyn std::io::Write> =
@@ -1424,7 +1635,7 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
                 None => buffered,
             };
             let mut sink = fstool::repack::TarStreamSink::new(inner);
-            fstool::repack::walk_anyfs(&mut src_fs, src_dev, &mut sink)?;
+            fstool::repack::walk_anyfs(src_fs, src_dev, &mut sink)?;
             sink.finish()?;
             let written = sink.bytes_written();
             match dst_tar_codec {
@@ -1453,14 +1664,15 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
         // `Some(len)` for archive writers (zip/cpio/ar) so we truncate
         // the over-provisioned file; `None` for fixed-size FS images.
         let archive_len: Option<u64> = match lower.as_str() {
+            #[cfg(feature = "ext")]
             "ext2" | "ext3" | "ext4" => {
                 let kind = match lower.as_str() {
                     "ext2" => fstool::fs::ext::FsKind::Ext2,
                     "ext3" => fstool::fs::ext::FsKind::Ext3,
                     _ => fstool::fs::ext::FsKind::Ext4,
                 };
-                let mut opts = fstool::analyze::analyze_fs(&mut src_fs, src_dev, block_size)?
-                    .ext_format_opts(kind);
+                let mut opts =
+                    fstool::analyze::analyze_fs(src_fs, src_dev, block_size)?.ext_format_opts(kind);
                 // Sparse: the source reader emits zeros over holes and
                 // the ext writer re-sparsifies all-zero blocks, so holes
                 // round-trip.
@@ -1481,11 +1693,12 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
                 let mut dst_ext = fstool::fs::ext::Ext::format_with(dst_dev.as_mut(), &opts)?;
                 {
                     let mut sink = fstool::repack::FsSink::new(&mut dst_ext, dst_dev.as_mut());
-                    fstool::repack::walk_anyfs(&mut src_fs, src_dev, &mut sink)?;
+                    fstool::repack::walk_anyfs(src_fs, src_dev, &mut sink)?;
                 }
                 dst_ext.flush(dst_dev.as_mut())?;
                 None
             }
+            #[cfg(feature = "fat")]
             "fat12" | "fat16" | "fat32" | "vfat" => {
                 let total_sectors: u32 = (dst_size / 512).try_into().map_err(|_| {
                     fstool::Error::InvalidArgument(
@@ -1503,56 +1716,63 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
                 {
                     let mut sink =
                         fstool::repack::FsSink::new(&mut dst_fat, dst_dev.as_mut()).lossy();
-                    fstool::repack::walk_anyfs(&mut src_fs, src_dev, &mut sink)?;
+                    fstool::repack::walk_anyfs(src_fs, src_dev, &mut sink)?;
                 }
                 dst_fat.flush(dst_dev.as_mut())?;
                 None
             }
+            #[cfg(feature = "hfs-plus")]
             "hfsplus" | "hfs+" => repack_via_trait::<fstool::fs::hfs_plus::HfsPlus>(
                 dst_dev.as_mut(),
                 &fstool::fs::hfs_plus::FormatOpts::default(),
-                &mut src_fs,
+                src_fs,
                 src_dev,
                 false,
             )?,
+            #[cfg(feature = "ntfs")]
             "ntfs" => repack_via_trait::<fstool::fs::ntfs::Ntfs>(
                 dst_dev.as_mut(),
                 &fstool::fs::ntfs::format::FormatOpts::default(),
-                &mut src_fs,
+                src_fs,
                 src_dev,
                 false,
             )?,
+            #[cfg(feature = "f2fs")]
             "f2fs" => repack_via_trait::<fstool::fs::f2fs::F2fs>(
                 dst_dev.as_mut(),
                 &fstool::fs::f2fs::FormatOpts::default(),
-                &mut src_fs,
+                src_fs,
                 src_dev,
                 false,
             )?,
             // littlefs has neither symlinks nor device nodes, so the sink
             // runs lossy: those entries are skipped instead of failing the
             // whole repack.
+            #[cfg(feature = "littlefs")]
             "littlefs" | "lfs" => repack_via_trait::<fstool::fs::littlefs::LittleFs>(
                 dst_dev.as_mut(),
                 &fstool::fs::littlefs::LittleFsFormatOpts::default(),
-                &mut src_fs,
+                src_fs,
                 src_dev,
                 true,
             )?,
+            #[cfg(feature = "squashfs")]
             "squashfs" => repack_via_trait::<fstool::fs::squashfs::Squashfs>(
                 dst_dev.as_mut(),
                 &fstool::fs::squashfs::FormatOpts::default(),
-                &mut src_fs,
+                src_fs,
                 src_dev,
                 false,
             )?,
+            #[cfg(feature = "xfs")]
             "xfs" => repack_via_trait::<fstool::fs::xfs::Xfs>(
                 dst_dev.as_mut(),
                 &fstool::fs::xfs::format::FormatOpts::default(),
-                &mut src_fs,
+                src_fs,
                 src_dev,
                 false,
             )?,
+            #[cfg(feature = "iso9660")]
             "iso" | "iso9660" => {
                 let opts = fstool::fs::iso9660::FormatOpts {
                     volume_id: "FSTOOL".into(),
@@ -1562,44 +1782,48 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
                 repack_via_trait::<fstool::fs::iso9660::Iso9660>(
                     dst_dev.as_mut(),
                     &opts,
-                    &mut src_fs,
+                    src_fs,
                     src_dev,
                     false,
                 )?
             }
+            #[cfg(feature = "grf")]
             "grf" => repack_via_trait::<fstool::fs::grf::Grf>(
                 dst_dev.as_mut(),
                 &fstool::fs::grf::FormatOpts::default(),
-                &mut src_fs,
+                src_fs,
                 src_dev,
                 false,
             )?,
+            #[cfg(feature = "archive")]
             "zip" => repack_via_trait::<fstool::fs::archive::zip::ZipFs>(
                 dst_dev.as_mut(),
                 &fstool::fs::archive::zip::ZipFormatOpts::default(),
-                &mut src_fs,
+                src_fs,
                 src_dev,
                 true,
             )?,
+            #[cfg(feature = "archive")]
             "cpio" => repack_via_trait::<fstool::fs::archive::cpio::CpioFs>(
                 dst_dev.as_mut(),
                 &fstool::fs::archive::cpio::CpioFormatOpts,
-                &mut src_fs,
+                src_fs,
                 src_dev,
                 false,
             )?,
+            #[cfg(feature = "archive")]
             "ar" => repack_via_trait::<fstool::fs::archive::ar::ArFs>(
                 dst_dev.as_mut(),
                 &fstool::fs::archive::ar::ArFormatOpts,
-                &mut src_fs,
+                src_fs,
                 src_dev,
                 true,
             )?,
-            other => {
-                return Err(fstool::Error::InvalidArgument(format!(
-                    "repack: unknown --fs-type {other:?}"
-                )));
-            }
+            // `?` rather than `return`, so the match never diverges: a build may
+            // compile every arm above out, and the code below must stay reachable.
+            other => Err(fstool::Error::InvalidArgument(format!(
+                "repack: unknown --fs-type {other:?}"
+            )))?,
         };
         dst_dev.sync()?;
         let report_size = match archive_len {
@@ -1626,6 +1850,17 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
 /// flushed before returning; the `Option<u64>` is the exact archive
 /// length for stream-style writers (zip/cpio/ar), `None` for sized
 /// filesystem images.
+#[cfg(any(
+    feature = "hfs-plus",
+    feature = "ntfs",
+    feature = "f2fs",
+    feature = "littlefs",
+    feature = "squashfs",
+    feature = "xfs",
+    feature = "iso9660",
+    feature = "grf",
+    feature = "archive"
+))]
 fn repack_via_trait<F: fstool::fs::FilesystemFactory>(
     dst_dev: &mut dyn fstool::block::BlockDevice,
     opts: &F::FormatOpts,
@@ -1649,6 +1884,20 @@ fn repack_via_trait<F: fstool::fs::FilesystemFactory>(
 /// populate it by walking the compressed tar at `tar_path` forward
 /// (decoded on the fly via [`fstool::repack::open_tar_stream`]) — no
 /// tempfile, no random access.
+#[cfg(all(
+    feature = "tar",
+    any(
+        feature = "hfs-plus",
+        feature = "ntfs",
+        feature = "f2fs",
+        feature = "littlefs",
+        feature = "squashfs",
+        feature = "xfs",
+        feature = "iso9660",
+        feature = "grf",
+        feature = "archive"
+    )
+))]
 fn repack_stream_via_trait<F: fstool::fs::FilesystemFactory>(
     dst_dev: &mut dyn fstool::block::BlockDevice,
     opts: &F::FormatOpts,
@@ -1680,6 +1929,7 @@ fn repack_stream_via_trait<F: fstool::fs::FilesystemFactory>(
 /// decode the source archive on the fly and re-emit each entry through the
 /// tar stream sink, optionally re-compressing the output. No tempfile and
 /// no random access — a tar is only ever walked forward.
+#[cfg(feature = "tar")]
 fn repack_tar_stream_to_tar(
     tar_path: &std::path::Path,
     src_codec: Option<fstool::compression::Algo>,
@@ -1731,7 +1981,10 @@ fn repack_layered_to_dst(
     create_opts: &fstool::block::CreateOpts,
 ) -> fstool::Result<()> {
     use fstool::merge::MergeModel;
-    use fstool::repack::{FsSink, RepackSink, TarStreamSink};
+    #[cfg(any(feature = "ext", feature = "fat"))]
+    use fstool::repack::FsSink;
+    #[cfg(feature = "tar")]
+    use fstool::repack::{RepackSink, TarStreamSink};
     let _ = shrink; // sizing always derives from the model when no explicit size
 
     // Pass 1 — build the metadata-only model. No file body is read here.
@@ -1753,6 +2006,7 @@ fn repack_layered_to_dst(
         .or_else(|| dst_tar_codec.map(|_| "tar".to_string()))
         .unwrap_or_else(|| "ext4".to_string());
     let lower = target_fs.to_ascii_lowercase();
+    require_fs_feature("repack", &lower)?;
 
     let explicit = match size_arg {
         Some(s) => Some(fstool::spec::parse_size(s)?),
@@ -1775,6 +2029,7 @@ fn repack_layered_to_dst(
 
     // tar output is sequential — write straight through a `TarStreamSink`,
     // optionally codec-wrapped. No backing device.
+    #[cfg(feature = "tar")]
     if lower == "tar" {
         let file = std::fs::File::create(dst)?;
         let buffered: Box<dyn std::io::Write> =
@@ -1811,6 +2066,7 @@ fn repack_layered_to_dst(
     let mut dst_dev = fstool::block::create_image(dst, dst_size, create_opts)?;
 
     let archive_len: Option<u64> = match lower.as_str() {
+        #[cfg(feature = "ext")]
         "ext2" | "ext3" | "ext4" => {
             use fstool::fs::ext::{Ext, FsKind};
             let kind = match lower.as_str() {
@@ -1838,6 +2094,7 @@ fn repack_layered_to_dst(
             dst.flush(dst_dev.as_mut())?;
             None
         }
+        #[cfg(feature = "fat")]
         "fat12" | "fat16" | "fat32" | "vfat" => {
             let total_sectors: u32 = (dst_size / 512).try_into().map_err(|_| {
                 fstool::Error::InvalidArgument(
@@ -1859,6 +2116,7 @@ fn repack_layered_to_dst(
             dst.flush(dst_dev.as_mut())?;
             None
         }
+        #[cfg(feature = "xfs")]
         "xfs" => repack_layered_via_trait::<fstool::fs::xfs::Xfs>(
             dst_dev.as_mut(),
             &fstool::fs::xfs::format::FormatOpts::default(),
@@ -1866,6 +2124,7 @@ fn repack_layered_to_dst(
             &layers,
             false,
         )?,
+        #[cfg(feature = "hfs-plus")]
         "hfsplus" | "hfs+" => repack_layered_via_trait::<fstool::fs::hfs_plus::HfsPlus>(
             dst_dev.as_mut(),
             &fstool::fs::hfs_plus::FormatOpts::default(),
@@ -1873,6 +2132,7 @@ fn repack_layered_to_dst(
             &layers,
             false,
         )?,
+        #[cfg(feature = "ntfs")]
         "ntfs" => repack_layered_via_trait::<fstool::fs::ntfs::Ntfs>(
             dst_dev.as_mut(),
             &fstool::fs::ntfs::format::FormatOpts::default(),
@@ -1880,6 +2140,7 @@ fn repack_layered_to_dst(
             &layers,
             false,
         )?,
+        #[cfg(feature = "f2fs")]
         "f2fs" => repack_layered_via_trait::<fstool::fs::f2fs::F2fs>(
             dst_dev.as_mut(),
             &fstool::fs::f2fs::FormatOpts::default(),
@@ -1887,6 +2148,7 @@ fn repack_layered_to_dst(
             &layers,
             false,
         )?,
+        #[cfg(feature = "squashfs")]
         "squashfs" => repack_layered_via_trait::<fstool::fs::squashfs::Squashfs>(
             dst_dev.as_mut(),
             &fstool::fs::squashfs::FormatOpts::default(),
@@ -1894,6 +2156,7 @@ fn repack_layered_to_dst(
             &layers,
             false,
         )?,
+        #[cfg(feature = "littlefs")]
         "littlefs" | "lfs" => repack_layered_via_trait::<fstool::fs::littlefs::LittleFs>(
             dst_dev.as_mut(),
             &fstool::fs::littlefs::LittleFsFormatOpts::default(),
@@ -1901,6 +2164,7 @@ fn repack_layered_to_dst(
             &layers,
             true,
         )?,
+        #[cfg(feature = "iso9660")]
         "iso" | "iso9660" => {
             let opts = fstool::fs::iso9660::FormatOpts {
                 volume_id: "FSTOOL".into(),
@@ -1915,6 +2179,7 @@ fn repack_layered_to_dst(
                 false,
             )?
         }
+        #[cfg(feature = "grf")]
         "grf" => repack_layered_via_trait::<fstool::fs::grf::Grf>(
             dst_dev.as_mut(),
             &fstool::fs::grf::FormatOpts::default(),
@@ -1922,6 +2187,7 @@ fn repack_layered_to_dst(
             &layers,
             false,
         )?,
+        #[cfg(feature = "archive")]
         "zip" => repack_layered_via_trait::<fstool::fs::archive::zip::ZipFs>(
             dst_dev.as_mut(),
             &fstool::fs::archive::zip::ZipFormatOpts::default(),
@@ -1929,6 +2195,7 @@ fn repack_layered_to_dst(
             &layers,
             true,
         )?,
+        #[cfg(feature = "archive")]
         "cpio" => repack_layered_via_trait::<fstool::fs::archive::cpio::CpioFs>(
             dst_dev.as_mut(),
             &fstool::fs::archive::cpio::CpioFormatOpts,
@@ -1936,11 +2203,11 @@ fn repack_layered_to_dst(
             &layers,
             false,
         )?,
-        other => {
-            return Err(fstool::Error::InvalidArgument(format!(
-                "repack: unknown --fs-type {other:?}"
-            )));
-        }
+        // `?` rather than `return`, so the match never diverges: a build may
+        // compile every arm above out, and the code below must stay reachable.
+        other => Err(fstool::Error::InvalidArgument(format!(
+            "repack: unknown --fs-type {other:?}"
+        )))?,
     };
     dst_dev.sync()?;
     let report_size = match archive_len {
@@ -1965,6 +2232,17 @@ fn repack_layered_to_dst(
 /// arms: format `F` on `dst_dev`, walk the in-memory model into an
 /// `FsSink`, flush. The model is built once by the caller and reused so
 /// the per-layer tar index is scanned exactly once.
+#[cfg(any(
+    feature = "hfs-plus",
+    feature = "ntfs",
+    feature = "f2fs",
+    feature = "littlefs",
+    feature = "squashfs",
+    feature = "xfs",
+    feature = "iso9660",
+    feature = "grf",
+    feature = "archive"
+))]
 fn repack_layered_via_trait<F: fstool::fs::FilesystemFactory>(
     dst_dev: &mut dyn fstool::block::BlockDevice,
     opts: &F::FormatOpts,
@@ -1984,6 +2262,7 @@ fn repack_layered_via_trait<F: fstool::fs::FilesystemFactory>(
     Ok(fstool::fs::Filesystem::image_len(&dst))
 }
 
+#[cfg(feature = "tar")]
 #[allow(clippy::too_many_arguments)]
 fn repack_tar_stream_to_fs(
     tar_path: &std::path::Path,
@@ -1995,6 +2274,7 @@ fn repack_tar_stream_to_fs(
     block_size: u32,
     create_opts: &fstool::block::CreateOpts,
 ) -> fstool::Result<()> {
+    #[cfg(feature = "ext")]
     use fstool::fs::ext::{Ext, FsKind};
     let _ = shrink; // sizing always uses a pass when no explicit size
 
@@ -2016,6 +2296,7 @@ fn repack_tar_stream_to_fs(
     )?;
 
     // ext needs full FormatOpts regardless of whether the size is explicit.
+    #[cfg(feature = "ext")]
     let mut ext_opts = match lower {
         "ext2" | "ext3" | "ext4" => {
             let kind = match lower {
@@ -2036,10 +2317,16 @@ fn repack_tar_stream_to_fs(
     // Destination size: explicit wins; ext derives from its plan; fat32
     // uses the analyze recommendation; the remaining self-sizing block
     // FSes (xfs/hfs+/ntfs/f2fs) get a generous upper bound.
+    #[cfg(feature = "ext")]
+    let plan_size = ext_opts
+        .as_ref()
+        .map(|opts| opts.blocks_count as u64 * opts.block_size as u64);
+    #[cfg(not(feature = "ext"))]
+    let plan_size: Option<u64> = None;
     let dst_size = if let Some(sz) = explicit {
         sz
-    } else if let Some(opts) = &ext_opts {
-        opts.blocks_count as u64 * opts.block_size as u64
+    } else if let Some(sz) = plan_size {
+        sz
     } else if let Some(sz) = analysis.recommended_size(lower) {
         sz
     } else {
@@ -2051,6 +2338,7 @@ fn repack_tar_stream_to_fs(
 
     // Grow the ext plan's image to an explicitly-requested larger size
     // (mirrors the random-access path's adjustment).
+    #[cfg(feature = "ext")]
     if let Some(opts) = ext_opts.as_mut() {
         let plan_size = opts.blocks_count as u64 * opts.block_size as u64;
         if dst_size > plan_size {
@@ -2075,6 +2363,7 @@ fn repack_tar_stream_to_fs(
     // the over-provisioned backing file is truncated to its real length;
     // `None` for the fixed-size block filesystems.
     let archive_len: Option<u64> = match lower {
+        #[cfg(feature = "ext")]
         "ext2" | "ext3" | "ext4" => {
             let opts = ext_opts.expect("ext opts computed above");
             let mut dst_ext = Ext::format_with(dst_dev.as_mut(), &opts)?;
@@ -2087,6 +2376,7 @@ fn repack_tar_stream_to_fs(
             dst_ext.flush(dst_dev.as_mut())?;
             None
         }
+        #[cfg(feature = "fat")]
         "fat12" | "fat16" | "fat32" | "vfat" => {
             let total_sectors: u32 = (dst_size / 512).try_into().map_err(|_| {
                 fstool::Error::InvalidArgument(
@@ -2110,6 +2400,7 @@ fn repack_tar_stream_to_fs(
             dst_fat.flush(dst_dev.as_mut())?;
             None
         }
+        #[cfg(feature = "xfs")]
         "xfs" => repack_stream_via_trait::<fstool::fs::xfs::Xfs>(
             dst_dev.as_mut(),
             &fstool::fs::xfs::format::FormatOpts::default(),
@@ -2117,6 +2408,7 @@ fn repack_tar_stream_to_fs(
             codec,
             false,
         )?,
+        #[cfg(feature = "hfs-plus")]
         "hfsplus" | "hfs+" => repack_stream_via_trait::<fstool::fs::hfs_plus::HfsPlus>(
             dst_dev.as_mut(),
             &fstool::fs::hfs_plus::FormatOpts::default(),
@@ -2124,6 +2416,7 @@ fn repack_tar_stream_to_fs(
             codec,
             false,
         )?,
+        #[cfg(feature = "ntfs")]
         "ntfs" => repack_stream_via_trait::<fstool::fs::ntfs::Ntfs>(
             dst_dev.as_mut(),
             &fstool::fs::ntfs::format::FormatOpts::default(),
@@ -2131,6 +2424,7 @@ fn repack_tar_stream_to_fs(
             codec,
             false,
         )?,
+        #[cfg(feature = "f2fs")]
         "f2fs" => repack_stream_via_trait::<fstool::fs::f2fs::F2fs>(
             dst_dev.as_mut(),
             &fstool::fs::f2fs::FormatOpts::default(),
@@ -2139,6 +2433,7 @@ fn repack_tar_stream_to_fs(
             false,
         )?,
         // Lossy: littlefs stores neither symlinks nor device nodes.
+        #[cfg(feature = "littlefs")]
         "littlefs" | "lfs" => repack_stream_via_trait::<fstool::fs::littlefs::LittleFs>(
             dst_dev.as_mut(),
             &fstool::fs::littlefs::LittleFsFormatOpts::default(),
@@ -2146,6 +2441,7 @@ fn repack_tar_stream_to_fs(
             codec,
             true,
         )?,
+        #[cfg(feature = "squashfs")]
         "squashfs" => repack_stream_via_trait::<fstool::fs::squashfs::Squashfs>(
             dst_dev.as_mut(),
             &fstool::fs::squashfs::FormatOpts::default(),
@@ -2153,6 +2449,7 @@ fn repack_tar_stream_to_fs(
             codec,
             false,
         )?,
+        #[cfg(feature = "iso9660")]
         "iso" | "iso9660" => {
             let opts = fstool::fs::iso9660::FormatOpts {
                 volume_id: "FSTOOL".into(),
@@ -2167,6 +2464,7 @@ fn repack_tar_stream_to_fs(
                 false,
             )?
         }
+        #[cfg(feature = "grf")]
         "grf" => repack_stream_via_trait::<fstool::fs::grf::Grf>(
             dst_dev.as_mut(),
             &fstool::fs::grf::FormatOpts::default(),
@@ -2174,6 +2472,7 @@ fn repack_tar_stream_to_fs(
             codec,
             false,
         )?,
+        #[cfg(feature = "archive")]
         "zip" => repack_stream_via_trait::<fstool::fs::archive::zip::ZipFs>(
             dst_dev.as_mut(),
             &fstool::fs::archive::zip::ZipFormatOpts::default(),
@@ -2181,6 +2480,7 @@ fn repack_tar_stream_to_fs(
             codec,
             true,
         )?,
+        #[cfg(feature = "archive")]
         "cpio" => repack_stream_via_trait::<fstool::fs::archive::cpio::CpioFs>(
             dst_dev.as_mut(),
             &fstool::fs::archive::cpio::CpioFormatOpts,
@@ -2188,7 +2488,12 @@ fn repack_tar_stream_to_fs(
             codec,
             false,
         )?,
-        other => unreachable!("repack_tar_stream_to_fs reached for ungated fs {other:?}"),
+        // Guarded by `is_stream_repack_target`, so never taken; an error
+        // rather than `unreachable!` keeps the match from diverging in a
+        // build that compiles every arm above out.
+        other => Err(fstool::Error::InvalidArgument(format!(
+            "repack: {other:?} is not a streaming destination"
+        )))?,
     };
     dst_dev.sync()?;
     let report_size = match archive_len {
@@ -2209,6 +2514,36 @@ fn repack_tar_stream_to_fs(
         dst.display()
     );
     Ok(())
+}
+
+/// The destinations `repack_tar_stream_to_fs` can format while walking a
+/// tar source forward — every block filesystem and archive whose writer
+/// streams each file as it arrives. Only the backends in this build count.
+#[cfg(feature = "tar")]
+fn is_stream_repack_target(fs: &str) -> bool {
+    match fs {
+        #[cfg(feature = "ext")]
+        "ext2" | "ext3" | "ext4" => true,
+        #[cfg(feature = "fat")]
+        "fat12" | "fat16" | "fat32" | "vfat" => true,
+        #[cfg(feature = "xfs")]
+        "xfs" => true,
+        #[cfg(feature = "hfs-plus")]
+        "hfsplus" | "hfs+" => true,
+        #[cfg(feature = "ntfs")]
+        "ntfs" => true,
+        #[cfg(feature = "f2fs")]
+        "f2fs" => true,
+        #[cfg(feature = "squashfs")]
+        "squashfs" => true,
+        #[cfg(feature = "iso9660")]
+        "iso" | "iso9660" => true,
+        #[cfg(feature = "grf")]
+        "grf" => true,
+        #[cfg(feature = "archive")]
+        "zip" | "cpio" => true,
+        _ => false,
+    }
 }
 
 /// Repack-source error for the four read-only FSes (xfs/exfat/hfs+/apfs)
@@ -2248,6 +2583,7 @@ fn tar_input_codec(path: &str) -> Option<fstool::compression::Algo> {
 /// decompressed stream's byte 0. Boxed so it composes with the
 /// existing helpers; callers feed this to [`TarStreamIndex::open_body`]
 /// to seek to a specific entry's body offset.
+#[cfg(feature = "tar")]
 fn open_decoded_stream(
     src: &str,
     algo: fstool::compression::Algo,
@@ -2260,6 +2596,7 @@ fn open_decoded_stream(
 }
 
 /// Open a (possibly codec-wrapped) tar archive as a streaming reader.
+#[cfg(feature = "tar")]
 fn open_tar_stream_reader(
     path: &str,
     algo: Option<fstool::compression::Algo>,
@@ -2284,6 +2621,7 @@ fn open_tar_stream_reader(
 
 /// Normalise an absolute tar path: starts with '/', no trailing '/'
 /// (root is '/'). Matches `Tar::normalise_path`'s output.
+#[cfg(feature = "tar")]
 fn normalise_tar_path(p: &str) -> String {
     let trimmed = p.trim_end_matches('/');
     if trimmed.is_empty() {
@@ -2296,6 +2634,7 @@ fn normalise_tar_path(p: &str) -> String {
     }
 }
 
+#[cfg(feature = "tar")]
 fn parent_of_tar_path(p: &str) -> String {
     match p.rfind('/') {
         Some(0) => "/".to_string(),
@@ -2304,6 +2643,7 @@ fn parent_of_tar_path(p: &str) -> String {
     }
 }
 
+#[cfg(feature = "tar")]
 fn leaf_of_tar_path(p: &str) -> &str {
     match p.rfind('/') {
         Some(i) => &p[i + 1..],
@@ -2316,6 +2656,7 @@ fn leaf_of_tar_path(p: &str) -> &str {
 /// The index is the same one used by `cat`/`info`/`repack`, so the
 /// one-pass-decompression cost is amortised whenever a single CLI
 /// invocation needs multiple lookups.
+#[cfg(feature = "tar")]
 fn ls_tar_stream(
     image: &str,
     path: &str,
@@ -2347,6 +2688,7 @@ fn ls_tar_stream(
 
 /// The entries living directly under `want` in a tar stream index, deduped by
 /// leaf name (the tar may carry both an explicit dir entry and its members).
+#[cfg(feature = "tar")]
 fn tar_children(index: &fstool::fs::tar::TarStreamIndex, want: &str) -> Vec<fstool::fs::DirEntry> {
     use fstool::fs::tar::EntryKind as TarKind;
     let mut children: Vec<fstool::fs::DirEntry> = Vec::new();
@@ -2384,6 +2726,7 @@ fn tar_children(index: &fstool::fs::tar::TarStreamIndex, want: &str) -> Vec<fsto
 }
 
 /// Error unless `want` exists as a directory (or has descendants) in the index.
+#[cfg(feature = "tar")]
 fn tar_require_dir(index: &fstool::fs::tar::TarStreamIndex, want: &str) -> fstool::Result<()> {
     let exists_as_dir = index.entries().iter().any(|ix| ix.entry.path == want);
     let has_descendants = index.entries().iter().any(|ix| {
@@ -2400,6 +2743,7 @@ fn tar_require_dir(index: &fstool::fs::tar::TarStreamIndex, want: &str) -> fstoo
 
 /// Recursive (`ls -R`) walk of a tar stream index: print `want` under a header,
 /// then descend into each subdirectory in listing order.
+#[cfg(feature = "tar")]
 fn ls_tar_recursive(
     index: &fstool::fs::tar::TarStreamIndex,
     want: &str,
@@ -2441,6 +2785,7 @@ fn ls_tar_recursive(
 /// open a bounded body reader that re-decompresses the source up to
 /// the entry's body offset. Hard links resolve transparently via the
 /// index (the link target's body bytes are returned).
+#[cfg(feature = "tar")]
 fn cat_tar_stream(
     image: &str,
     path: &str,
@@ -2459,6 +2804,7 @@ fn cat_tar_stream(
 
 /// `info` for a `.tar.<algo>`: drive the same indexer used by `ls`/
 /// `cat`/`repack`, then summarise the entry counts and root listing.
+#[cfg(feature = "tar")]
 fn info_tar_stream(image: &str, algo: Option<fstool::compression::Algo>) -> fstool::Result<()> {
     use fstool::fs::tar::EntryKind as TarKind;
     let index = open_tar_stream_index(image, algo)?;
@@ -2520,6 +2866,7 @@ fn info_tar_stream(image: &str, algo: Option<fstool::compression::Algo>) -> fsto
 /// Open the tar source (optionally codec-wrapped) and build a
 /// random-access index over it. Shared entry point for the
 /// streaming-tar inspector commands.
+#[cfg(feature = "tar")]
 fn open_tar_stream_index(
     image: &str,
     algo: Option<fstool::compression::Algo>,
@@ -2531,6 +2878,7 @@ fn open_tar_stream_index(
 /// Open a plain (uncompressed) tar source as a boxed `Read`. Returned
 /// from the `factory` closure passed to `TarStreamIndex::open_body`
 /// when the source isn't codec-wrapped.
+#[cfg(feature = "tar")]
 fn open_decoded_stream_plain(image: &str) -> fstool::Result<Box<dyn std::io::Read>> {
     let p = std::path::Path::new(image.split(':').next().unwrap_or(image));
     let file = std::fs::File::open(p)?;
@@ -2554,6 +2902,12 @@ fn open_decoded_stream_plain(image: &str) -> fstool::Result<Box<dyn std::io::Rea
 /// Sum the size of every regular file in the source filesystem — used
 /// by FAT32 / ISO shrink sizing. Trait-driven walk via
 /// [`fstool::inspect::AnyFs::total_file_bytes`].
+#[cfg(any(
+    feature = "littlefs",
+    feature = "iso9660",
+    feature = "grf",
+    feature = "archive"
+))]
 fn sum_source_file_bytes(
     src_dev: &mut dyn fstool::block::BlockDevice,
     src_fs: &mut fstool::inspect::AnyFs,
@@ -2561,33 +2915,33 @@ fn sum_source_file_bytes(
     src_fs.total_file_bytes(src_dev)
 }
 
+/// `fstool shell --new-ramfs`: an in-memory ramfs with no backing file.
+/// Build it (optionally from a source), then drive the shell over a
+/// throwaway device — `save OUT` is the only way bytes leave the session.
+#[cfg(feature = "ramfs")]
+fn shell_ramfs_cmd(with_cache: bool, from: Option<&str>, style: PathStyle) -> fstool::Result<()> {
+    let mut dev = fstool::block::MemoryBackend::new(0);
+    let fs = match from {
+        Some(src) => {
+            let source = fstool::repack::Source::detect(src)?;
+            fstool::inspect::AnyFs::new_ramfs_from(&mut dev, &source)?
+        }
+        None => fstool::inspect::AnyFs::new_ramfs(),
+    };
+    let mut sh = shell::Shell::new(fs, style);
+    if with_cache {
+        sh.enable_cache();
+    }
+    run_shell(&mut sh, &mut dev)
+}
+
 fn shell_cmd(
     image: Option<&str>,
     ro: bool,
     with_cache: bool,
-    new_ramfs: bool,
-    from: Option<&str>,
     style: PathStyle,
     password: Option<&str>,
 ) -> fstool::Result<()> {
-    if new_ramfs {
-        // An in-memory ramfs: no backing file. Build it (optionally from a
-        // source), then drive the shell over a throwaway device — `save OUT`
-        // is the only way bytes leave the session.
-        let mut dev = fstool::block::MemoryBackend::new(0);
-        let fs = match from {
-            Some(src) => {
-                let source = fstool::repack::Source::detect(src)?;
-                fstool::inspect::AnyFs::new_ramfs_from(&mut dev, &source)?
-            }
-            None => fstool::inspect::AnyFs::new_ramfs(),
-        };
-        let mut sh = shell::Shell::new(fs, style);
-        if with_cache {
-            sh.enable_cache();
-        }
-        return run_shell(&mut sh, &mut dev);
-    }
     let image = image.ok_or_else(|| {
         fstool::Error::InvalidArgument(
             "shell: an IMAGE is required (or pass --new-ramfs for an empty in-memory tree)".into(),
@@ -2731,6 +3085,23 @@ fn build(spec_path: &std::path::Path, output: &std::path::Path) -> fstool::Resul
 
 /// Group of flag values plumbed into [`create_cmd`]. Keeps the
 /// callsite in `run` tidy and avoids a 10-parameter function signature.
+#[cfg(any(
+    feature = "affs",
+    feature = "apfs",
+    feature = "archive",
+    feature = "exfat",
+    feature = "ext",
+    feature = "f2fs",
+    feature = "fat",
+    feature = "grf",
+    feature = "hfs",
+    feature = "hfs-plus",
+    feature = "iso9660",
+    feature = "littlefs",
+    feature = "ntfs",
+    feature = "squashfs",
+    feature = "xfs"
+))]
 struct CreateArgs<'a> {
     fs_type: &'a str,
     src_dir: Option<&'a std::path::Path>,
@@ -2748,19 +3119,38 @@ struct CreateArgs<'a> {
 /// populate it from a host directory tree. The fs-type chooses the
 /// formatter; `-O key=val[,key=val]…` ferries FS-specific knobs through
 /// the [`OptionMap`] surface.
+#[cfg(any(
+    feature = "affs",
+    feature = "apfs",
+    feature = "archive",
+    feature = "exfat",
+    feature = "ext",
+    feature = "f2fs",
+    feature = "fat",
+    feature = "grf",
+    feature = "hfs",
+    feature = "hfs-plus",
+    feature = "iso9660",
+    feature = "littlefs",
+    feature = "ntfs",
+    feature = "squashfs",
+    feature = "xfs"
+))]
 fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
     use fstool::block::file::is_block_device;
 
     let fs_type = args.fs_type.to_ascii_lowercase();
     let is_device = is_block_device(args.output);
     require_force_for_device(args.output, is_device, args.force)?;
+    require_fs_feature("create", &fs_type)?;
+
     let create_opts = args.create_opts;
 
     // Build the option bag. `--label` is a shortcut for the standard
     // `volume_label` key so the same flag works for every FS that
     // accepts a label (even when the underlying field has a different
     // name — each backend's `apply_options` translates).
-    let mut opts = OptionMap::new();
+    let mut opts = fstool::format_opts::OptionMap::new();
     for o in args.options {
         opts.merge_cli(o)?;
     }
@@ -2778,6 +3168,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
     // calls `check_empty`, sizes the destination, then formats +
     // populates.
     match fs_type.as_str() {
+        #[cfg(feature = "ext")]
         "ext2" | "ext3" | "ext4" => create_ext(
             &fs_type,
             source.as_ref(),
@@ -2787,6 +3178,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             is_device,
             create_opts,
         )?,
+        #[cfg(feature = "fat")]
         "fat12" | "fat16" | "fat32" | "vfat" => create_fat(
             &fs_type,
             source.as_ref(),
@@ -2796,6 +3188,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             is_device,
             create_opts,
         )?,
+        #[cfg(feature = "exfat")]
         "exfat" => create_exfat(
             source.as_ref(),
             args.output,
@@ -2804,6 +3197,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             is_device,
             create_opts,
         )?,
+        #[cfg(feature = "hfs-plus")]
         "hfs+" | "hfsplus" => create_via_factory::<fstool::fs::hfs_plus::HfsPlus>(
             "hfs+",
             source.as_ref(),
@@ -2816,6 +3210,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             |o, m| o.apply_options(m),
             DEFAULT_MIN_SIZE,
         )?,
+        #[cfg(feature = "hfs")]
         "hfs" => create_via_factory::<fstool::fs::hfs::Hfs>(
             "hfs",
             source.as_ref(),
@@ -2836,6 +3231,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             },
             DEFAULT_MIN_SIZE,
         )?,
+        #[cfg(feature = "affs")]
         "affs" | "ffs" | "ofs" => create_via_factory::<fstool::fs::affs::Affs>(
             "affs",
             source.as_ref(),
@@ -2875,6 +3271,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             },
             DEFAULT_MIN_SIZE,
         )?,
+        #[cfg(feature = "littlefs")]
         "littlefs" | "lfs" => create_via_factory::<fstool::fs::littlefs::LittleFs>(
             "littlefs",
             source.as_ref(),
@@ -2915,6 +3312,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             },
             DEFAULT_MIN_SIZE,
         )?,
+        #[cfg(feature = "ntfs")]
         "ntfs" => create_via_factory::<fstool::fs::ntfs::Ntfs>(
             "ntfs",
             source.as_ref(),
@@ -2927,6 +3325,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             |o, m| o.apply_options(m),
             4 * 1024 * 1024,
         )?,
+        #[cfg(feature = "f2fs")]
         "f2fs" => create_via_factory::<fstool::fs::f2fs::F2fs>(
             "f2fs",
             source.as_ref(),
@@ -2941,6 +3340,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             // (~27 MiB); keep a modest empty-image minimum below it.
             16 * 1024 * 1024,
         )?,
+        #[cfg(feature = "squashfs")]
         "squashfs" => create_via_factory::<fstool::fs::squashfs::Squashfs>(
             "squashfs",
             source.as_ref(),
@@ -2953,6 +3353,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             |o, m| o.apply_options(m),
             DEFAULT_MIN_SIZE,
         )?,
+        #[cfg(feature = "xfs")]
         "xfs" => create_via_factory::<fstool::fs::xfs::Xfs>(
             "xfs",
             source.as_ref(),
@@ -2965,6 +3366,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             |o, m| o.apply_options(m),
             16 * 1024 * 1024,
         )?,
+        #[cfg(feature = "iso9660")]
         "iso" | "iso9660" => create_via_factory::<fstool::fs::iso9660::Iso9660>(
             "iso9660",
             source.as_ref(),
@@ -2977,6 +3379,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             |o, m| o.apply_options(m),
             DEFAULT_MIN_SIZE,
         )?,
+        #[cfg(feature = "grf")]
         "grf" => create_via_factory::<fstool::fs::grf::Grf>(
             "grf",
             source.as_ref(),
@@ -2989,6 +3392,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             |o, m| o.apply_options(m),
             DEFAULT_MIN_SIZE,
         )?,
+        #[cfg(feature = "apfs")]
         "apfs" => create_via_factory::<fstool::fs::apfs::Apfs>(
             "apfs",
             source.as_ref(),
@@ -3001,6 +3405,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             |o, m| o.apply_options(m),
             DEFAULT_MIN_SIZE,
         )?,
+        #[cfg(feature = "archive")]
         "zip" => create_via_factory::<fstool::fs::archive::zip::ZipFs>(
             "zip",
             source.as_ref(),
@@ -3013,6 +3418,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             |o, m| o.apply_options(m),
             DEFAULT_MIN_SIZE,
         )?,
+        #[cfg(feature = "archive")]
         "cpio" => create_via_factory::<fstool::fs::archive::cpio::CpioFs>(
             "cpio",
             source.as_ref(),
@@ -3025,6 +3431,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             |o, m| o.apply_options(m),
             DEFAULT_MIN_SIZE,
         )?,
+        #[cfg(feature = "archive")]
         "ar" => create_via_factory::<fstool::fs::archive::ar::ArFs>(
             "ar",
             source.as_ref(),
@@ -3037,12 +3444,12 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             |o, m| o.apply_options(m),
             DEFAULT_MIN_SIZE,
         )?,
-        other => {
-            return Err(fstool::Error::InvalidArgument(format!(
-                "create: unknown --type {other:?} (try ext4, fat32, exfat, hfs+, ntfs, \
-                 f2fs, littlefs, squashfs, xfs, iso, grf, apfs, zip, cpio, ar)"
-            )));
-        }
+        // `?` rather than `return`, so the match never diverges: a build may
+        // compile every arm above out, and the code below must stay reachable.
+        other => Err(fstool::Error::InvalidArgument(format!(
+            "create: unknown --type {other:?} (try ext4, fat32, exfat, hfs+, ntfs, \
+             f2fs, littlefs, squashfs, xfs, iso, grf, apfs, zip, cpio, ar)"
+        )))?,
     }
     Ok(())
 }
@@ -3050,17 +3457,29 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
 /// Conservative default `--size` for filesystems that don't auto-size
 /// today. 1 MiB is enough for an empty image; populated images bump up
 /// via the per-arm minimum.
+#[cfg(any(
+    feature = "affs",
+    feature = "apfs",
+    feature = "archive",
+    feature = "grf",
+    feature = "hfs",
+    feature = "hfs-plus",
+    feature = "iso9660",
+    feature = "littlefs",
+    feature = "squashfs"
+))]
 const DEFAULT_MIN_SIZE: u64 = 1024 * 1024;
 
 /// ext2 / ext3 / ext4 arm of `create`. Honours `block_size` from the
 /// option bag (default 1024), then uses [`BuildPlan`] to auto-size
 /// against the source. Falls back to a minimum-format on an empty FS.
+#[cfg(feature = "ext")]
 fn create_ext(
     fs_kind: &str,
     source: Option<&fstool::repack::Source>,
     output: &std::path::Path,
     size_arg: Option<&str>,
-    mut bag: OptionMap,
+    mut bag: fstool::format_opts::OptionMap,
     is_device: bool,
     create_opts: &fstool::block::CreateOpts,
 ) -> fstool::Result<()> {
@@ -3140,12 +3559,13 @@ fn create_ext(
 /// 65 525-cluster floor means even an empty image needs ~33 MiB, so the
 /// device capacity (or an explicit --size) is mandatory there; the
 /// narrower flavours have correspondingly smaller floors.
+#[cfg(feature = "fat")]
 fn create_fat(
     fs_type: &str,
     source: Option<&fstool::repack::Source>,
     output: &std::path::Path,
     size_arg: Option<&str>,
-    mut bag: OptionMap,
+    mut bag: fstool::format_opts::OptionMap,
     is_device: bool,
     create_opts: &fstool::block::CreateOpts,
 ) -> fstool::Result<()> {
@@ -3175,7 +3595,7 @@ fn create_fat(
     let name = kind.as_str();
 
     let bytes = if is_device {
-        let dev = FileBackend::open(output)?;
+        let dev = fstool::block::FileBackend::open(output)?;
         dev.total_size()
     } else if let Some(s) = size_arg {
         fstool::spec::parse_size(s)?
@@ -3213,11 +3633,12 @@ fn create_fat(
 
 /// exFAT arm of `create`. Routes through [`populate_fs_from_source_dyn`]
 /// since exFAT doesn't implement [`FilesystemFactory`] yet.
+#[cfg(feature = "exfat")]
 fn create_exfat(
     source: Option<&fstool::repack::Source>,
     output: &std::path::Path,
     size_arg: Option<&str>,
-    mut bag: OptionMap,
+    mut bag: fstool::format_opts::OptionMap,
     is_device: bool,
     create_opts: &fstool::block::CreateOpts,
 ) -> fstool::Result<()> {
@@ -3247,17 +3668,31 @@ fn create_exfat(
 /// Format + populate any FS that implements [`FilesystemFactory`].
 /// `apply` is the per-FS `FormatOpts::apply_options` closure (avoids
 /// adding the method to the trait surface).
+#[cfg(any(
+    feature = "affs",
+    feature = "apfs",
+    feature = "archive",
+    feature = "f2fs",
+    feature = "grf",
+    feature = "hfs",
+    feature = "hfs-plus",
+    feature = "iso9660",
+    feature = "littlefs",
+    feature = "ntfs",
+    feature = "squashfs",
+    feature = "xfs"
+))]
 #[allow(clippy::too_many_arguments)] // generic dispatcher — each arg is a distinct knob
 fn create_via_factory<F>(
     label: &str,
     source: Option<&fstool::repack::Source>,
     output: &std::path::Path,
     size_arg: Option<&str>,
-    mut bag: OptionMap,
+    mut bag: fstool::format_opts::OptionMap,
     is_device: bool,
     create_opts: &fstool::block::CreateOpts,
     mut format_opts: F::FormatOpts,
-    apply: impl FnOnce(&mut F::FormatOpts, &mut OptionMap) -> fstool::Result<()>,
+    apply: impl FnOnce(&mut F::FormatOpts, &mut fstool::format_opts::OptionMap) -> fstool::Result<()>,
     default_min_size: u64,
 ) -> fstool::Result<()>
 where
@@ -3359,6 +3794,21 @@ fn truncate_output_file(output: &std::path::Path, len: u64) -> fstool::Result<()
 /// to the FS's per-arm minimum (which exists because every FS but ext
 /// has a non-trivial floor — FAT32 ~33 MiB, NTFS / XFS / F2FS several
 /// MiB, …).
+#[cfg(any(
+    feature = "exfat",
+    feature = "affs",
+    feature = "apfs",
+    feature = "archive",
+    feature = "f2fs",
+    feature = "grf",
+    feature = "hfs",
+    feature = "hfs-plus",
+    feature = "iso9660",
+    feature = "littlefs",
+    feature = "ntfs",
+    feature = "squashfs",
+    feature = "xfs"
+))]
 fn resolve_size_for_dev(
     output: &std::path::Path,
     size_arg: Option<&str>,
@@ -3366,7 +3816,7 @@ fn resolve_size_for_dev(
     default_min: u64,
 ) -> fstool::Result<u64> {
     if is_device {
-        let dev = FileBackend::open(output)?;
+        let dev = fstool::block::FileBackend::open(output)?;
         return Ok(dev.total_size());
     }
     match size_arg {
@@ -3377,6 +3827,7 @@ fn resolve_size_for_dev(
 
 /// Pack a label into the 11-byte FAT32 short-label slot: ASCII upper-case,
 /// space-padded, non-printable bytes replaced with `_`.
+#[cfg(feature = "fat")]
 fn fat32_label_bytes(label: &str) -> [u8; 11] {
     let mut out = [b' '; 11];
     let upper = label.to_ascii_uppercase();
@@ -3392,6 +3843,7 @@ fn fat32_label_bytes(label: &str) -> [u8; 11] {
 
 /// Parse the `--cluster-size` flag's value into a u32 byte count.
 /// Errors if not a power of two or below the 512-byte minimum.
+#[cfg(feature = "qcow2")]
 fn parse_cluster_size(s: &str) -> fstool::Result<u32> {
     let bytes = fstool::spec::parse_size(s)?;
     if !bytes.is_power_of_two() {
@@ -3409,6 +3861,23 @@ fn parse_cluster_size(s: &str) -> fstool::Result<u32> {
 
 /// Refuse to format a block device without --force; emit a clear message
 /// pointing at the flag.
+#[cfg(any(
+    feature = "affs",
+    feature = "apfs",
+    feature = "archive",
+    feature = "exfat",
+    feature = "ext",
+    feature = "f2fs",
+    feature = "fat",
+    feature = "grf",
+    feature = "hfs",
+    feature = "hfs-plus",
+    feature = "iso9660",
+    feature = "littlefs",
+    feature = "ntfs",
+    feature = "squashfs",
+    feature = "xfs"
+))]
 fn require_force_for_device(
     output: &std::path::Path,
     is_device: bool,
@@ -3433,6 +3902,7 @@ fn ls(
     // Compressed-tar archives stream-walk per invocation; bypass the
     // tempfile-spooling BlockDevice path entirely. Tar's separator is `/`, so
     // path-style is a no-op there — pass the path through unchanged.
+    #[cfg(feature = "tar")]
     if let Some(algo) = tar_input_codec(image) {
         return ls_tar_stream(image, path, Some(algo), recursive);
     }
@@ -3521,19 +3991,9 @@ fn join_image_path(dir: &str, name: &str) -> String {
     }
 }
 
-fn cat(
-    image: &str,
-    path: &str,
-    rsrc: bool,
-    style: PathStyle,
-    password: Option<&str>,
-) -> fstool::Result<()> {
+fn cat(image: &str, path: &str, style: PathStyle, password: Option<&str>) -> fstool::Result<()> {
+    #[cfg(feature = "tar")]
     if let Some(algo) = tar_input_codec(image) {
-        if rsrc {
-            return Err(fstool::Error::Unsupported(
-                "cat --rsrc: tar/archive members have no resource fork".into(),
-            ));
-        }
         return cat_tar_stream(image, path, Some(algo));
     }
     let target = fstool::inspect::Target::parse(image).with_password(password.map(str::to_owned));
@@ -3541,18 +4001,39 @@ fn cat(
         let mut fs = fstool::inspect::AnyFs::open(dev)?;
         let cpath = path_style::to_canonical(path, fs.kind(), style);
         let mut out = std::io::stdout().lock();
-        if rsrc {
-            let mut r = fs.open_resource_fork_reader(dev, &cpath)?;
-            std::io::copy(&mut r, &mut out)?;
-        } else {
-            fs.copy_file_to(dev, &cpath, &mut out)?;
-        }
+        fs.copy_file_to(dev, &cpath, &mut out)?;
+        Ok(())
+    })
+}
+
+/// `fstool cat --rsrc`: stream a file's resource fork (HFS / HFS+) instead
+/// of its data fork.
+#[cfg(any(feature = "hfs", feature = "hfs-plus"))]
+fn cat_rsrc(
+    image: &str,
+    path: &str,
+    style: PathStyle,
+    password: Option<&str>,
+) -> fstool::Result<()> {
+    if tar_input_codec(image).is_some() {
+        return Err(fstool::Error::Unsupported(
+            "cat --rsrc: tar/archive members have no resource fork".into(),
+        ));
+    }
+    let target = fstool::inspect::Target::parse(image).with_password(password.map(str::to_owned));
+    fstool::inspect::with_target_device(&target, |dev| {
+        let mut fs = fstool::inspect::AnyFs::open(dev)?;
+        let cpath = path_style::to_canonical(path, fs.kind(), style);
+        let mut out = std::io::stdout().lock();
+        let mut r = fs.open_resource_fork_reader(dev, &cpath)?;
+        std::io::copy(&mut r, &mut out)?;
         Ok(())
     })
 }
 
 /// `fstool resources` — inventory a classic-HFS file's resource fork, or with
 /// `--extract TYPE:ID` dump one resource's raw bytes to stdout.
+#[cfg(any(feature = "hfs", feature = "hfs-plus"))]
 fn resources_cmd(
     image: &str,
     path: &str,
@@ -3587,6 +4068,7 @@ fn resources_cmd(
 
 /// Parse a `TYPE:ID` selector. TYPE is padded to four bytes with spaces; the ID
 /// is the final colon-separated field (so a type containing `:` still works).
+#[cfg(any(feature = "hfs", feature = "hfs-plus"))]
 fn parse_resource_spec(spec: &str) -> fstool::Result<([u8; 4], i16)> {
     let (ty, id) = spec.rsplit_once(':').ok_or_else(|| {
         fstool::Error::InvalidArgument(format!("resources: expected TYPE:ID, got {spec:?}"))
@@ -3605,6 +4087,7 @@ fn parse_resource_spec(spec: &str) -> fstool::Result<([u8; 4], i16)> {
     Ok((ostype, id))
 }
 
+#[cfg(any(feature = "hfs", feature = "hfs-plus"))]
 fn print_resources(path: &str, total_bytes: usize, rf: &fstool::resfork::ResourceFork) {
     let types = rf.types();
     let total: usize = types.iter().map(|t| t.items.len()).sum();
@@ -3673,11 +4156,17 @@ fn analyze_cmd(
         human_size(report.total_file_bytes),
         report.total_file_bytes
     );
+    // The inode estimate and its block size are ext's; the report only
+    // carries them in an `ext` build.
+    #[cfg(feature = "ext")]
     println!("inodes:    {}", report.inode_count);
+    #[cfg(feature = "ext")]
     println!(
         "recommended image size (ext block size {}):",
         report.block_size
     );
+    #[cfg(not(feature = "ext"))]
+    println!("recommended image size:");
     if report.recommended_size.is_empty() {
         println!("  (none — destination grows/truncates; no fixed size needed)");
     } else {
@@ -3689,6 +4178,7 @@ fn analyze_cmd(
 }
 
 fn info(image: &str, password: Option<&str>) -> fstool::Result<()> {
+    #[cfg(feature = "tar")]
     if let Some(algo) = tar_input_codec(image) {
         return info_tar_stream(image, Some(algo));
     }
@@ -3722,6 +4212,7 @@ fn info(image: &str, password: Option<&str>) -> fstool::Result<()> {
 /// this is a courtesy line, so a container we cannot describe just
 /// doesn't get one and the filesystem summary carries on.
 fn print_container_info(path: &std::path::Path, password: Option<&str>) {
+    #[cfg(feature = "qcow2")]
     if print_qcow2_container_info(path, password) {
         return;
     }
@@ -3729,6 +4220,7 @@ fn print_container_info(path: &std::path::Path, password: Option<&str>) {
 }
 
 /// The qcow2 half. Returns true when it printed, so the caller stops.
+#[cfg(feature = "qcow2")]
 fn print_qcow2_container_info(path: &std::path::Path, password: Option<&str>) -> bool {
     if !fstool::block::Qcow2Backend::probe(path).unwrap_or(false) {
         return false;
@@ -3833,6 +4325,7 @@ fn print_partition_table(
     }
 }
 
+#[cfg(feature = "tar")]
 fn print_tar_info(dev: &mut dyn fstool::block::BlockDevice, tar: &fstool::fs::tar::Tar) {
     // Tar holds no index — forward-scan the device to summarise it.
     let entries = match tar.entries(dev) {
@@ -3889,26 +4382,62 @@ fn human_size(b: u64) -> String {
 
 fn print_fs_info(dev: &mut dyn fstool::block::BlockDevice, fs: &mut fstool::inspect::AnyFs) {
     println!("fs kind:           {}", fs.kind_string());
+    #[cfg(any(
+        feature = "affs",
+        feature = "apfs",
+        feature = "archive",
+        feature = "exfat",
+        feature = "ext",
+        feature = "f2fs",
+        feature = "fat",
+        feature = "grf",
+        feature = "hfs",
+        feature = "hfs-plus",
+        feature = "iso9660",
+        feature = "littlefs",
+        feature = "ntfs",
+        feature = "ramfs",
+        feature = "squashfs",
+        feature = "tar",
+        feature = "xfs"
+    ))]
     match fs {
+        #[cfg(feature = "ext")]
         fstool::inspect::AnyFs::Ext(ext) => print_ext_info(ext),
+        #[cfg(feature = "fat")]
         fstool::inspect::AnyFs::Fat32(fat) => print_fat_info(fat),
+        #[cfg(feature = "tar")]
         fstool::inspect::AnyFs::Tar(tar) => print_tar_info(dev, tar),
+        #[cfg(feature = "xfs")]
         fstool::inspect::AnyFs::Xfs(xfs) => print_xfs_info(xfs),
+        #[cfg(feature = "exfat")]
         fstool::inspect::AnyFs::Exfat(exfat) => print_exfat_info(exfat),
+        #[cfg(feature = "hfs-plus")]
         fstool::inspect::AnyFs::HfsPlus(hfs) => print_hfs_plus_info(hfs),
+        #[cfg(feature = "hfs")]
         fstool::inspect::AnyFs::Hfs(hfs) => print_hfs_info(hfs),
+        #[cfg(feature = "affs")]
         fstool::inspect::AnyFs::Affs(affs) => print_affs_info(affs),
+        #[cfg(feature = "littlefs")]
         fstool::inspect::AnyFs::LittleFs(lfs) => print_littlefs_info(dev, lfs),
+        #[cfg(feature = "apfs")]
         fstool::inspect::AnyFs::Apfs(apfs) => print_apfs_info(apfs),
+        #[cfg(feature = "ntfs")]
         fstool::inspect::AnyFs::Ntfs(ntfs) => print_ntfs_info(ntfs),
+        #[cfg(feature = "f2fs")]
         fstool::inspect::AnyFs::F2fs(f2) => print_f2fs_info(f2),
+        #[cfg(feature = "squashfs")]
         fstool::inspect::AnyFs::Squashfs(sq) => print_squashfs_info(sq),
+        #[cfg(feature = "iso9660")]
         fstool::inspect::AnyFs::Iso9660(iso) => print_iso9660_info(iso),
+        #[cfg(feature = "grf")]
         fstool::inspect::AnyFs::Grf(grf) => print_grf_info(grf),
         // Archive backends carry no extra summary beyond the kind line
         // above; the `/ listing` below covers their contents.
+        #[cfg(feature = "archive")]
         fstool::inspect::AnyFs::Archive(..) => {}
         // ramfs is in-memory with no superblock; the listing covers it.
+        #[cfg(feature = "ramfs")]
         fstool::inspect::AnyFs::Ramfs(_) => {}
     }
     println!();
@@ -3964,6 +4493,7 @@ fn print_statfs(dev: &mut dyn fstool::block::BlockDevice, fs: &mut fstool::inspe
     }
 }
 
+#[cfg(feature = "ext")]
 fn print_ext_info(ext: &Ext) {
     let sb = &ext.sb;
     println!("block size:        {}", sb.block_size());
@@ -3985,6 +4515,7 @@ fn print_ext_info(ext: &Ext) {
     println!("uuid:              {}", format_uuid(&sb.uuid));
 }
 
+#[cfg(feature = "fat")]
 fn print_fat_info(fat: &fstool::fs::fat::Fat32) {
     let b = fat.boot_sector();
     let label = std::str::from_utf8(&b.volume_label)
@@ -4012,6 +4543,7 @@ fn print_fat_info(fat: &fstool::fs::fat::Fat32) {
     println!("volume label:      {label:?}");
 }
 
+#[cfg(feature = "xfs")]
 fn print_xfs_info(xfs: &fstool::fs::xfs::Xfs) {
     println!("total bytes:       {}", xfs.total_bytes());
     println!("block size:        {}", xfs.block_size());
@@ -4019,6 +4551,7 @@ fn print_xfs_info(xfs: &fstool::fs::xfs::Xfs) {
     println!("AG count:          {}", xfs.ag_count());
 }
 
+#[cfg(feature = "exfat")]
 fn print_exfat_info(exfat: &fstool::fs::exfat::Exfat) {
     println!("total bytes:       {}", exfat.total_bytes());
     println!("cluster size:      {}", exfat.cluster_size());
@@ -4027,16 +4560,19 @@ fn print_exfat_info(exfat: &fstool::fs::exfat::Exfat) {
     println!("volume label:      {:?}", exfat.volume_label());
 }
 
+#[cfg(feature = "hfs-plus")]
 fn print_hfs_plus_info(hfs: &fstool::fs::hfs_plus::HfsPlus) {
     println!("total bytes:       {}", hfs.total_bytes());
     println!("block size:        {}", hfs.block_size());
     println!("volume name:       {:?}", hfs.volume_name());
 }
 
+#[cfg(feature = "hfs")]
 fn print_hfs_info(hfs: &fstool::fs::hfs::Hfs) {
     println!("volume name:       {:?}", hfs.volume_name);
 }
 
+#[cfg(feature = "affs")]
 fn print_affs_info(affs: &fstool::fs::affs::Affs) {
     let v = affs.variant();
     println!("volume name:       {:?}", affs.volume_name);
@@ -4049,6 +4585,7 @@ fn print_affs_info(affs: &fstool::fs::affs::Affs) {
     );
 }
 
+#[cfg(feature = "littlefs")]
 fn print_littlefs_info(
     dev: &mut dyn fstool::block::BlockDevice,
     lfs: &mut fstool::fs::littlefs::LittleFs,
@@ -4066,12 +4603,14 @@ fn print_littlefs_info(
     }
 }
 
+#[cfg(feature = "apfs")]
 fn print_apfs_info(apfs: &fstool::fs::apfs::Apfs) {
     println!("total bytes:       {}", apfs.total_bytes());
     println!("block size:        {}", apfs.block_size());
     println!("volume name:       {:?}", apfs.volume_name());
 }
 
+#[cfg(feature = "ntfs")]
 fn print_ntfs_info(ntfs: &fstool::fs::ntfs::Ntfs) {
     println!("total bytes:       {}", ntfs.total_bytes());
     println!("cluster size:      {}", ntfs.cluster_size());
@@ -4081,6 +4620,7 @@ fn print_ntfs_info(ntfs: &fstool::fs::ntfs::Ntfs) {
     println!("volume serial:     {:#018x}", ntfs.volume_serial());
 }
 
+#[cfg(feature = "f2fs")]
 fn print_f2fs_info(f2: &fstool::fs::f2fs::F2fs) {
     let sb = f2.superblock();
     println!("total bytes:       {}", f2.total_bytes());
@@ -4091,6 +4631,7 @@ fn print_f2fs_info(f2: &fstool::fs::f2fs::F2fs) {
     println!("note:              write is build-once (a re-opened image is read-only)");
 }
 
+#[cfg(feature = "squashfs")]
 fn print_squashfs_info(sq: &fstool::fs::squashfs::Squashfs) {
     let sb = sq.superblock();
     println!("total bytes:       {}", sq.total_bytes());
@@ -4101,6 +4642,7 @@ fn print_squashfs_info(sq: &fstool::fs::squashfs::Squashfs) {
     println!("note:              write via `repack` only (no in-place mutation)");
 }
 
+#[cfg(feature = "iso9660")]
 fn print_iso9660_info(iso: &fstool::fs::iso9660::Iso9660) {
     println!("volume id:         {}", iso.volume_id());
     println!("system id:         {}", iso.pvd.system_id);
@@ -4119,6 +4661,7 @@ fn print_iso9660_info(iso: &fstool::fs::iso9660::Iso9660) {
     }
 }
 
+#[cfg(feature = "grf")]
 fn print_grf_info(grf: &fstool::fs::grf::Grf) {
     println!("grf version:       {:#x}", grf.version);
     println!("table offset:      {}", grf.table_offset);
@@ -4128,6 +4671,7 @@ fn print_grf_info(grf: &fstool::fs::grf::Grf) {
     println!("wasted space (B):  {}", grf.wasted_space());
 }
 
+#[cfg(feature = "ext")]
 fn format_uuid(bytes: &[u8; 16]) -> String {
     let mut s = String::with_capacity(36);
     for (i, b) in bytes.iter().enumerate() {

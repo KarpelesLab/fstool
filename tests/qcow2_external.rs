@@ -1,3 +1,4 @@
+#![cfg(feature = "qcow2")]
 //! qcow2 backend validation against real `qemu-img`-produced images.
 //! Each test skips silently when `qemu-img` isn't on PATH.
 
@@ -118,7 +119,7 @@ fn read_back_pattern_via_qemu_img_convert() {
 }
 
 /// Build a compressible 4 MiB raw source with a few recognizable regions.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "gzip", feature = "zstd")))]
 fn compressible_source() -> (NamedTempFile, Vec<u8>) {
     let mut data = vec![0u8; 4 * 1024 * 1024];
     // Highly compressible text spanning the first cluster.
@@ -136,6 +137,7 @@ fn compressible_source() -> (NamedTempFile, Vec<u8>) {
 }
 
 /// Read back a **zlib**-compressed qcow2 (`qemu-img convert -c`), byte-exact.
+#[cfg(feature = "gzip")]
 #[test]
 fn read_back_zlib_compressed() {
     if !which("qemu-img") {
@@ -168,6 +170,7 @@ fn read_back_zlib_compressed() {
 
 /// Read back a **zstd**-compressed qcow2 (sets the COMPRESSION_TYPE incompat
 /// bit), byte-exact.
+#[cfg(feature = "zstd")]
 #[test]
 fn read_back_zstd_compressed() {
     if !which("qemu-img") {
@@ -211,6 +214,7 @@ fn read_back_zstd_compressed() {
 /// Writing into a compressed cluster copies it out to a plain cluster
 /// (COW): the edit sticks, untouched compressed clusters survive byte-exact,
 /// and `qemu-img check` stays clean (refcounts intact).
+#[cfg(feature = "gzip")]
 #[test]
 fn cow_write_into_compressed_cluster() {
     if !which("qemu-img") {
@@ -262,6 +266,7 @@ fn cow_write_into_compressed_cluster() {
 
 /// Produce a compressed qcow2 with our serializer; qemu-img must validate
 /// it (check clean) and decode it back to the original bytes.
+#[cfg(any(feature = "gzip", feature = "zstd"))]
 fn write_compressed_roundtrip(ctype: u8) {
     if !which("qemu-img") {
         eprintln!("skipping: qemu-img not installed");
@@ -325,11 +330,13 @@ fn write_compressed_roundtrip(ctype: u8) {
     );
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn write_compressed_zlib_roundtrip() {
     write_compressed_roundtrip(0);
 }
 
+#[cfg(feature = "zstd")]
 #[test]
 fn write_compressed_zstd_roundtrip() {
     write_compressed_roundtrip(1);
@@ -401,7 +408,7 @@ fn create_then_qemu_img_check() {
 /// `fstool create -t ext4 src -o out.qcow2` produces a valid qcow2
 /// carrying an ext4 image. Verified with qemu-img check + (after
 /// convert-to-raw) e2fsck.
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", feature = "ext"))]
 #[test]
 fn ext_build_into_qcow2() {
     if !which("qemu-img") || !which("e2fsck") {
@@ -487,7 +494,7 @@ fn ext_build_into_qcow2() {
 /// `fstool build spec -o disk.qcow2` produces a GPT-partitioned qcow2
 /// with two filesystems. The partition target syntax (`disk.qcow2:N`)
 /// walks each partition cleanly.
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", feature = "ext", feature = "fat"))]
 #[test]
 fn build_partitioned_qcow2() {
     if !which("qemu-img") {
@@ -1258,7 +1265,7 @@ fn qemu_reads_a_legacy_aes_image() {
 
 /// A filesystem inside an encrypted image, reopened from scratch.
 #[test]
-#[cfg(feature = "qcow2-crypto")]
+#[cfg(all(feature = "qcow2-crypto", feature = "ext"))]
 fn hosts_a_filesystem_inside_an_encrypted_image() {
     use fstool::block::luks::{FormatOpts as LuksOpts, Version};
     use fstool::fs::ext::{Ext, FormatOpts as ExtOpts};

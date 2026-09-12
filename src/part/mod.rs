@@ -9,6 +9,8 @@
 //! single partition's bytes, call [`slice_partition`] which builds a
 //! [`SlicedBackend`] covering exactly the partition's LBA range.
 
+use alloc::format;
+use alloc::string::{String, ToString};
 use uuid::Uuid;
 
 use crate::Result;

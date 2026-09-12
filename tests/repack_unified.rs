@@ -5,12 +5,48 @@
 
 // Every test here drives the `fstool` binary, which only exists when
 // the `cli` feature builds it (see `[[bin]] required-features`).
-#![cfg(feature = "cli")]
+#![cfg(all(
+    feature = "cli",
+    any(
+        all(feature = "archive", any(feature = "tar", feature = "ext")),
+        all(
+            feature = "tar",
+            any(
+                feature = "ext",
+                feature = "squashfs",
+                feature = "iso9660",
+                feature = "ntfs",
+                feature = "hfs-plus",
+                feature = "apfs",
+                feature = "f2fs"
+            )
+        ),
+        feature = "squashfs",
+        feature = "iso9660",
+        feature = "grf"
+    )
+))]
 
 use std::process::Command;
 
 const FSTOOL: &str = env!("CARGO_BIN_EXE_fstool");
 
+#[cfg(any(
+    all(feature = "archive", feature = "tar"),
+    all(
+        unix,
+        feature = "tar",
+        any(
+            feature = "ext",
+            feature = "squashfs",
+            feature = "iso9660",
+            feature = "ntfs",
+            feature = "hfs-plus",
+            feature = "apfs",
+            feature = "f2fs"
+        )
+    )
+))]
 fn which(tool: &str) -> bool {
     Command::new("sh")
         .arg("-c")
@@ -31,6 +67,12 @@ fn run(args: &[&str]) -> (bool, String) {
     )
 }
 
+#[cfg(any(
+    all(feature = "archive", any(feature = "tar", feature = "ext")),
+    feature = "squashfs",
+    feature = "iso9660",
+    feature = "grf"
+))]
 fn stage(root: &std::path::Path) {
     std::fs::create_dir_all(root.join("sub")).unwrap();
     std::fs::write(root.join("top.txt"), b"top\n").unwrap();
@@ -40,6 +82,7 @@ fn stage(root: &std::path::Path) {
 /// A zip *source* repacked into a tar — the combination the old
 /// FS-to-FS copiers rejected ("zip source is not yet wired"). The
 /// unified walker drives any source through one path.
+#[cfg(all(feature = "archive", feature = "tar"))]
 #[test]
 fn zip_source_repacks_to_tar() {
     if !which("tar") {
@@ -85,6 +128,7 @@ fn zip_source_repacks_to_tar() {
 /// A zip *source* repacked into an ext4 image — another previously
 /// unsupported pair. `--shrink` sizes the ext destination from the
 /// source content (trait-driven, works for any source).
+#[cfg(all(feature = "archive", feature = "ext"))]
 #[test]
 fn zip_source_repacks_to_ext4() {
     let work = tempfile::tempdir().unwrap();
@@ -134,7 +178,7 @@ fn zip_source_repacks_to_ext4() {
 /// byte-oriented and platform-agnostic — it's exercised on the Linux
 /// and macOS runners (both of which also have `e2fsck` / a usable
 /// `tar`).
-#[cfg(unix)]
+#[cfg(all(unix, feature = "tar", feature = "gzip", feature = "ext"))]
 #[test]
 fn compressed_tar_source_streams_to_ext4() {
     if !which("tar") {
@@ -222,12 +266,20 @@ fn compressed_tar_source_streams_to_ext4() {
 /// `flush`, so the body must outlive `create_file` — a regression guard
 /// for `FileSource::TempFile`. (Their lib-level tests drive the writer
 /// API directly and wouldn't catch a broken CLI `create` path.)
+#[cfg(any(feature = "squashfs", feature = "iso9660", feature = "grf"))]
 #[test]
 fn create_deferred_write_backends_from_dir() {
     let work = tempfile::tempdir().unwrap();
     let src = work.path().join("src");
     stage(&src);
-    for fs in ["squashfs", "iso", "grf"] {
+    for fs in [
+        #[cfg(feature = "squashfs")]
+        "squashfs",
+        #[cfg(feature = "iso9660")]
+        "iso",
+        #[cfg(feature = "grf")]
+        "grf",
+    ] {
         let out = work.path().join(format!("o.{fs}"));
         let (ok, err) = run(&[
             "create",
@@ -253,7 +305,7 @@ fn create_deferred_write_backends_from_dir() {
 /// keeps its mode + uid/gid (SquashFS `getattr` reads them from the
 /// inode header + id table).
 #[test]
-#[cfg(unix)]
+#[cfg(all(unix, feature = "squashfs", feature = "tar"))]
 fn squashfs_source_preserves_mode_into_tar() {
     if !which("tar") {
         eprintln!("skipping: tar not installed");
@@ -295,7 +347,7 @@ fn squashfs_source_preserves_mode_into_tar() {
 /// `mkisofs`/`genisoimage`/`xorrisofs`, since fstool's own writer
 /// hardcodes the PX mode) repacked to tar keeps the PX mode + uid/gid.
 #[test]
-#[cfg(unix)]
+#[cfg(all(unix, feature = "iso9660", feature = "tar"))]
 fn iso_rock_ridge_source_preserves_mode_into_tar() {
     use std::os::unix::fs::PermissionsExt;
     let tool = ["genisoimage", "mkisofs", "xorrisofs"]
@@ -342,7 +394,7 @@ fn iso_rock_ridge_source_preserves_mode_into_tar() {
 /// `list_xattrs` carries the native metadata (`user.ntfs.dos_attrs`).
 /// Content + size must survive (the walker streams `getattr` size).
 #[test]
-#[cfg(unix)]
+#[cfg(all(unix, feature = "ntfs", feature = "tar"))]
 fn ntfs_source_surfaces_times_mode_and_xattrs() {
     if !which("tar") {
         eprintln!("skipping: tar not installed");
@@ -397,7 +449,7 @@ fn ntfs_source_surfaces_times_mode_and_xattrs() {
 /// HFS+ source fidelity: a `0640` file repacked to tar keeps its mode +
 /// uid/gid (HFS+ `getattr` reads `HFSPlusBSDInfo`).
 #[test]
-#[cfg(unix)]
+#[cfg(all(unix, feature = "hfs-plus", feature = "tar"))]
 fn hfs_plus_source_preserves_mode_into_tar() {
     if !which("tar") {
         eprintln!("skipping: tar not installed");
@@ -439,7 +491,7 @@ fn hfs_plus_source_preserves_mode_into_tar() {
 /// mode bits (APFS `getattr` reads `InodeVal.mode`). (APFS *create*
 /// doesn't yet persist uid/gid/mtime, so only the mode is asserted.)
 #[test]
-#[cfg(unix)]
+#[cfg(all(unix, feature = "apfs", feature = "tar"))]
 fn apfs_source_preserves_mode_into_tar() {
     if !which("tar") {
         eprintln!("skipping: tar not installed");
@@ -482,7 +534,7 @@ fn apfs_source_preserves_mode_into_tar() {
 /// survive — proving f2fs's `getattr` is faithful (it would default to
 /// `0644` root/root without it).
 #[test]
-#[cfg(unix)]
+#[cfg(all(unix, feature = "f2fs", feature = "tar"))]
 fn f2fs_source_preserves_mode_into_tar() {
     if !which("tar") {
         eprintln!("skipping: tar not installed");
@@ -529,7 +581,7 @@ fn f2fs_source_preserves_mode_into_tar() {
 /// Hard links from an ext source materialise into a tar (tar can't
 /// represent links across the walk), and both names carry the content.
 #[test]
-#[cfg(unix)]
+#[cfg(all(unix, feature = "ext", feature = "tar"))]
 fn ext_hardlinks_materialise_into_tar() {
     if !which("mke2fs") || !which("tar") {
         eprintln!("skipping: mke2fs/tar not installed");

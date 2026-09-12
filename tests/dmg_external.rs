@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(all(unix, feature = "dmg"))]
 //! DMG end-to-end validation against macOS' `hdiutil`.
 //!
 //! The unit tests in `src/block/dmg/{mish,codec}.rs` exercise the
@@ -190,6 +190,7 @@ fn dmg_ulfo_lzfse_reads_every_sector() {
 /// assertion is just "the catalog is readable" — not a specific name
 /// list. This catches a class of regressions where the codec layer
 /// returns garbage that happens to parse as catalog nodes.
+#[cfg(feature = "hfs-plus")]
 #[test]
 fn dmg_udzo_hfs_plus_walks_through_fstool() {
     if skip_unless_macos_hdiutil() {

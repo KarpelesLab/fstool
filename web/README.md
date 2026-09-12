@@ -58,7 +58,7 @@ cargo install wasm-bindgen-cli --version 0.2.121   # match the crate
 # from the repo root — build the wasm and generate bindings into web/src/wasm:
 cargo build --release --lib --target wasm32-unknown-unknown \
   --no-default-features \
-  --features wasm,gzip,xz,lzma,lz4,zstd,lzo,cab,amiga-lzx,lha,arc,sit,sevenz,rar,dmg-bzip2,dmg-lzfse,dmg-encrypted
+  --features wasm,filesystems,qcow2,dmg,diskcopy,gzip,xz,lzma,lz4,zstd,lzo,cab,amiga-lzx,lha,arc,sit,sevenz,rar,dmg-bzip2,dmg-lzfse,dmg-encrypted
 wasm-bindgen --target bundler --no-typescript \
   --out-dir web/src/wasm \
   target/wasm32-unknown-unknown/release/fstool.wasm

@@ -56,7 +56,7 @@ use std::io::{Read, Write};
 
 use crate::Result;
 use crate::fs::DeviceKind;
-use crate::fs::ext::xattr::Xattr;
+use crate::fs::xattr::Xattr;
 
 use super::header::{self, BLOCK_SIZE, Header};
 use super::pax;

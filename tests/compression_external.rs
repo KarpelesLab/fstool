@@ -5,14 +5,37 @@
 //! Skips when external tools fstool depends on aren't available, but
 //! the basic gzip path (pure-Rust flate2) always runs.
 
-#![cfg(unix)]
+#![cfg(all(
+    unix,
+    any(
+        all(
+            feature = "cli",
+            feature = "ext",
+            feature = "tar",
+            any(feature = "gzip", feature = "lz4")
+        ),
+        all(feature = "xz", feature = "lzma")
+    )
+))]
 
 use std::process::Command;
 
-#[cfg(feature = "cli")]
+// The CLI round-trips need the binary plus ext2 (source image) and tar
+// (destination), and one of the two codecs they exercise.
+#[cfg(all(
+    feature = "cli",
+    feature = "ext",
+    feature = "tar",
+    any(feature = "gzip", feature = "lz4")
+))]
 use tempfile::NamedTempFile;
 
-#[cfg(feature = "cli")]
+#[cfg(all(
+    feature = "cli",
+    feature = "ext",
+    feature = "tar",
+    any(feature = "gzip", feature = "lz4")
+))]
 const FSTOOL: &str = env!("CARGO_BIN_EXE_fstool");
 
 fn which(tool: &str) -> bool {
@@ -23,7 +46,7 @@ fn which(tool: &str) -> bool {
         .is_some_and(|o| o.status.success())
 }
 
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", feature = "ext", feature = "tar", feature = "gzip"))]
 #[test]
 fn repack_into_tar_gz_then_inspect() {
     if !which("mke2fs") {
@@ -112,7 +135,7 @@ fn repack_into_tar_gz_then_inspect() {
 /// Repack an ext2 image into a `.tar.lz4` and confirm the canonical LZ4
 /// Frame (compcol) is both readable by the system `lz4` CLI and round-trips
 /// back through fstool — exercising the `compcol::lz4::frame` path.
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", feature = "ext", feature = "tar", feature = "lz4"))]
 #[test]
 fn repack_into_tar_lz4_interops_with_lz4_cli() {
     if !which("mke2fs") {
@@ -195,6 +218,7 @@ fn repack_into_tar_lz4_interops_with_lz4_cli() {
 }
 
 /// Pipe `input` through `xz <args>` (stdin → stdout) and return stdout.
+#[cfg(all(feature = "xz", feature = "lzma"))]
 fn xz_pipe(args: &[&str], input: &[u8]) -> Vec<u8> {
     use std::io::Write;
     use std::process::Stdio;
@@ -225,6 +249,7 @@ fn xz_pipe(args: &[&str], input: &[u8]) -> Vec<u8> {
 /// This is the lzma/xz compatibility check called out during the compcol
 /// migration — SquashFS's legacy LZMA compressor and `.tar.lzma` rely on
 /// byte-compatible alone-format framing.
+#[cfg(all(feature = "xz", feature = "lzma"))]
 #[test]
 fn lzma_and_xz_interoperate_with_xz_cli() {
     use fstool::compression::{Algo, compress, decompress};

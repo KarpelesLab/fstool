@@ -403,6 +403,7 @@ impl Shell {
                 self.cmd_get(dev, rest, output)?;
                 Ok(false)
             }
+            #[cfg(feature = "tar")]
             "save" => {
                 self.cmd_save(dev, rest, output)?;
                 Ok(false)
@@ -470,6 +471,15 @@ impl Shell {
         } else {
             ""
         };
+        #[cfg(feature = "tar")]
+        let save_help = "save OUT[.tar[.gz|.zst|.xz]]
+                    snapshot the whole tree to a (optionally compressed) tar
+                    on the host — symlinks, devices and xattrs preserved. Handy
+                    for a `--new-ramfs` session; `fstool repack OUT image -t …`
+                    then builds an exactly-sized real filesystem from it.
+";
+        #[cfg(not(feature = "tar"))]
+        let save_help = "";
         let body = format!(
             "ls [PATH]           list a directory (default: cwd)
 pwd                 print the current directory
@@ -500,12 +510,7 @@ grep [-i] [-n] [-r] [-v] [-l] [-c] PATTERN [PATH...]
                     -v invert, -l list matching filenames, -c count matches.
                     Binary files print their matches as `hexdump -C` rows
                     (Ctrl-C cancels a running find/grep without leaving the shell)
-save OUT[.tar[.gz|.zst|.xz]]
-                    snapshot the whole tree to a (optionally compressed) tar
-                    on the host — symlinks, devices and xattrs preserved. Handy
-                    for a `--new-ramfs` session; `fstool repack OUT image -t …`
-                    then builds an exactly-sized real filesystem from it.
-help | ?            print this help
+{save_help}help | ?            print this help
 quit | exit         leave
 (paths with spaces must be quoted: cd \"my dir\" or cd 'my dir'; \\ is a
  literal character, e.g. a native NTFS path \\Windows\\System32){ro_note}\n{cache_note}"
@@ -668,6 +673,7 @@ quit | exit         leave
     /// xattrs are preserved. Works in `--ro` mode too (it only reads the
     /// image and writes to the host). Compose with `fstool repack OUT image
     /// -t <fs>` to materialise an exactly-sized real filesystem.
+    #[cfg(feature = "tar")]
     fn cmd_save(
         &mut self,
         dev: &mut dyn BlockDevice,
@@ -912,7 +918,7 @@ quit | exit         leave
         )?;
         match attrs.kind {
             fstool::fs::EntryKind::Char | fstool::fs::EntryKind::Block => {
-                let (maj, min) = fstool::fs::ext::inode::decode_devnum(attrs.rdev);
+                let (maj, min) = fstool::fs::devnum::decode_devnum(attrs.rdev);
                 writeln!(
                     output,
                     "rdev:   {:#x}  (major {maj}, minor {min})",
@@ -2190,6 +2196,7 @@ mod tests {
 
     /// Format a tiny ext image in memory with a couple of nested dirs and
     /// return the device plus a mutating `Shell` over it.
+    #[cfg(feature = "ext")]
     fn ext_shell() -> (fstool::block::MemoryBackend, Shell) {
         use fstool::fs::ext::{Ext, FormatOpts};
         let opts = FormatOpts {
@@ -2210,6 +2217,7 @@ mod tests {
         (dev, sh)
     }
 
+    #[cfg(feature = "ext")]
     #[test]
     fn get_roundtrips_file_dir_and_dest_modes() {
         let (mut dev, mut sh) = ext_shell();
@@ -2268,6 +2276,7 @@ mod tests {
         assert!(adst.join("b").is_dir());
     }
 
+    #[cfg(feature = "ext")]
     #[test]
     fn get_missing_source_errors() {
         let (mut dev, mut sh) = ext_shell();
@@ -2280,6 +2289,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "ext")]
     #[test]
     fn preload_populates_cache_and_marks_done() {
         let (mut dev, mut sh) = ext_shell();
@@ -2296,6 +2306,7 @@ mod tests {
         assert!(c.attrs.contains_key("/a/b"));
     }
 
+    #[cfg(feature = "ext")]
     #[test]
     fn cache_serves_after_device_would_change() {
         // After preload, a cached `list` returns the snapshot even if we then
@@ -2318,6 +2329,7 @@ mod tests {
         assert!(!cached.iter().any(|e| e.name == "zzz"));
     }
 
+    #[cfg(feature = "ext")]
     #[test]
     fn invalidate_after_mutation_refills_lazily() {
         let (mut dev, mut sh) = ext_shell();
@@ -2334,6 +2346,7 @@ mod tests {
         assert!(sh.cache.as_ref().unwrap().dirs.contains_key("/"));
     }
 
+    #[cfg(feature = "ext")]
     #[test]
     fn no_cache_means_no_map() {
         let (mut dev, mut sh) = ext_shell();

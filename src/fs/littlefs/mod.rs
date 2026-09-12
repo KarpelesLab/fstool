@@ -46,10 +46,15 @@
 //! extended attributes named `user.littlefs.<type>`, where `<type>` is the
 //! attribute's 8-bit type in decimal.
 
-use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::io::Read;
-use std::path::Path;
+use crate::io::Read;
+use crate::path::Path;
+use ::alloc::boxed::Box;
+use ::alloc::collections::BTreeMap;
+use ::alloc::collections::VecDeque;
+use ::alloc::format;
+use ::alloc::string::{String, ToString};
+use ::alloc::vec;
+use ::alloc::vec::Vec;
 
 use crate::block::BlockDevice;
 use crate::fs::{
@@ -69,7 +74,7 @@ mod tests;
 
 pub use size_plan::LittleFsSizePlan;
 
-use alloc::Alloc;
+use self::alloc::Alloc;
 use mdir::{Entry, Geom, Mdir, Struct};
 
 /// Disk version 2.0 — understood by every littlefs v2 release. Images
@@ -144,7 +149,7 @@ pub struct LittleFs {
 /// pairs repeatedly (a lookup, then an insert, then a commit), and every
 /// walk would otherwise re-read and re-parse a block.
 struct MdirCache {
-    map: HashMap<[u32; 2], Mdir>,
+    map: BTreeMap<[u32; 2], Mdir>,
     order: VecDeque<[u32; 2]>,
     cap: usize,
 }
@@ -152,7 +157,7 @@ struct MdirCache {
 impl MdirCache {
     fn new(cap: usize) -> Self {
         Self {
-            map: HashMap::new(),
+            map: BTreeMap::new(),
             order: VecDeque::new(),
             cap,
         }

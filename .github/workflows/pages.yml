@@ -26,7 +26,7 @@ concurrency:
 
 env:
   # Codec features minus readline/fuse (neither builds for wasm); plus `wasm`.
-  WASM_FEATURES: "wasm,gzip,xz,lzma,lz4,zstd,lzo,cab,amiga-lzx,lha,arc,sit,sevenz,rar,dmg-bzip2,dmg-lzfse,dmg-encrypted"
+  WASM_FEATURES: "wasm,filesystems,qcow2,dmg,diskcopy,gzip,xz,lzma,lz4,zstd,lzo,cab,amiga-lzx,lha,arc,sit,sevenz,rar,dmg-bzip2,dmg-lzfse,dmg-encrypted"
 
 jobs:
   build:

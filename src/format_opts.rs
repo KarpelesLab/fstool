@@ -19,7 +19,10 @@
 //! [`take_bool`]: OptionMap::take_bool
 //! [`take_str`]: OptionMap::take_str
 
-use std::collections::BTreeMap;
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 use crate::{Error, Result};
 
@@ -176,11 +179,11 @@ impl OptionMap {
 
     /// Remove and parse a human-friendly size for `key`. Accepts the
     /// same `64MiB` / `1GiB` / bare-byte forms as
-    /// [`crate::spec::parse_size`].
+    /// [`parse_size`].
     pub fn take_size(&mut self, key: &str) -> Result<Option<u64>> {
         match self.map.remove(key) {
             None => Ok(None),
-            Some(v) => crate::spec::parse_size(&v).map(Some).map_err(|e| {
+            Some(v) => parse_size(&v).map(Some).map_err(|e| {
                 Error::InvalidArgument(format!("options: {key}={v:?} is not a valid size: {e}"))
             }),
         }
@@ -222,7 +225,7 @@ impl OptionMap {
 
 fn parse_integer<T>(key: &str, raw: &str) -> Result<T>
 where
-    T: TryFrom<u64> + std::str::FromStr,
+    T: TryFrom<u64> + core::str::FromStr,
 {
     // Try a base prefix first (0x… / 0b…); fall back to decimal.
     let trimmed = raw.trim();
@@ -254,9 +257,44 @@ where
     T::try_from(parsed).map_err(|_| {
         Error::InvalidArgument(format!(
             "options: {key}={raw:?} doesn't fit in a {}",
-            std::any::type_name::<T>()
+            core::any::type_name::<T>()
         ))
     })
+}
+
+/// Parse a human-readable size string into bytes. Accepts a bare integer
+/// (bytes), or a number followed by a unit: `KB`/`MB`/`GB`/`TB` (decimal,
+/// ×1000) or `KiB`/`MiB`/`GiB`/`TiB` (binary, ×1024). Case-insensitive.
+///
+/// Also reachable as `spec::parse_size`, where it started life; it lives
+/// here because it needs nothing of the spec engine and the `no_std` core
+/// uses it too.
+pub fn parse_size(s: &str) -> Result<u64> {
+    let s = s.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let value: u64 = num
+        .parse()
+        .map_err(|_| Error::InvalidArgument(format!("spec: bad size {s:?}")))?;
+    let mult: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "kb" => 1_000,
+        "mb" => 1_000_000,
+        "gb" => 1_000_000_000,
+        "tb" => 1_000_000_000_000,
+        "kib" | "k" => 1 << 10,
+        "mib" | "m" => 1 << 20,
+        "gib" | "g" => 1 << 30,
+        "tib" | "t" => 1 << 40,
+        other => {
+            return Err(Error::InvalidArgument(format!(
+                "spec: unknown size unit {other:?}"
+            )));
+        }
+    };
+    value
+        .checked_mul(mult)
+        .ok_or_else(|| Error::InvalidArgument(format!("spec: size {s:?} overflows u64")))
 }
 
 #[cfg(test)]

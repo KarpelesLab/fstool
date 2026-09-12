@@ -22,6 +22,11 @@
 //! other directory, with the addition of three "metadata" entries:
 //! AllocationBitmap (0x81), UpcaseTable (0x82), and VolumeLabel (0x83).
 
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
 pub mod boot;
 pub mod dir;
 pub mod fat;
@@ -991,7 +996,7 @@ impl Exfat {
         &self,
         dev: &mut dyn BlockDevice,
         chain: &[u32],
-        reader: &mut dyn std::io::Read,
+        reader: &mut dyn crate::io::Read,
         total_len: u64,
     ) -> Result<()> {
         let cb = self.boot.bytes_per_cluster() as u64;
@@ -1061,7 +1066,7 @@ impl Exfat {
         dev: &mut dyn BlockDevice,
         dir_cluster: u32,
         name: &str,
-        reader: &mut dyn std::io::Read,
+        reader: &mut dyn crate::io::Read,
         data_length: u64,
         timestamp: u32,
     ) -> Result<u32> {
@@ -1122,7 +1127,7 @@ impl Exfat {
         &mut self,
         dev: &mut dyn BlockDevice,
         path: &str,
-        reader: &mut dyn std::io::Read,
+        reader: &mut dyn crate::io::Read,
         data_length: u64,
         timestamp: u32,
     ) -> Result<u32> {
@@ -1412,7 +1417,7 @@ impl crate::fs::Filesystem for Exfat {
     fn create_file(
         &mut self,
         dev: &mut dyn BlockDevice,
-        path: &std::path::Path,
+        path: &crate::path::Path,
         src: crate::fs::FileSource,
         meta: crate::fs::FileMeta,
     ) -> Result<()> {
@@ -1427,8 +1432,8 @@ impl crate::fs::Filesystem for Exfat {
     fn create_file_streaming(
         &mut self,
         dev: &mut dyn BlockDevice,
-        path: &std::path::Path,
-        body: &mut dyn std::io::Read,
+        path: &crate::path::Path,
+        body: &mut dyn crate::io::Read,
         len: u64,
         meta: crate::fs::FileMeta,
     ) -> Result<()> {
@@ -1442,7 +1447,7 @@ impl crate::fs::Filesystem for Exfat {
     fn create_dir(
         &mut self,
         dev: &mut dyn BlockDevice,
-        path: &std::path::Path,
+        path: &crate::path::Path,
         meta: crate::fs::FileMeta,
     ) -> Result<()> {
         let s = path
@@ -1455,8 +1460,8 @@ impl crate::fs::Filesystem for Exfat {
     fn create_symlink(
         &mut self,
         _dev: &mut dyn BlockDevice,
-        _path: &std::path::Path,
-        _target: &std::path::Path,
+        _path: &crate::path::Path,
+        _target: &crate::path::Path,
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
         Err(crate::Error::Unsupported(
@@ -1467,7 +1472,7 @@ impl crate::fs::Filesystem for Exfat {
     fn create_device(
         &mut self,
         _dev: &mut dyn BlockDevice,
-        _path: &std::path::Path,
+        _path: &crate::path::Path,
         _kind: crate::fs::DeviceKind,
         _major: u32,
         _minor: u32,
@@ -1478,7 +1483,7 @@ impl crate::fs::Filesystem for Exfat {
         ))
     }
 
-    fn remove(&mut self, dev: &mut dyn BlockDevice, path: &std::path::Path) -> Result<()> {
+    fn remove(&mut self, dev: &mut dyn BlockDevice, path: &crate::path::Path) -> Result<()> {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
@@ -1488,7 +1493,7 @@ impl crate::fs::Filesystem for Exfat {
     fn list(
         &mut self,
         dev: &mut dyn BlockDevice,
-        path: &std::path::Path,
+        path: &crate::path::Path,
     ) -> Result<Vec<crate::fs::DirEntry>> {
         let s = path
             .to_str()
@@ -1501,8 +1506,8 @@ impl crate::fs::Filesystem for Exfat {
     fn read_file<'a>(
         &'a mut self,
         dev: &'a mut dyn BlockDevice,
-        path: &std::path::Path,
-    ) -> Result<Box<dyn std::io::Read + 'a>> {
+        path: &crate::path::Path,
+    ) -> Result<Box<dyn crate::io::Read + 'a>> {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
@@ -1514,7 +1519,7 @@ impl crate::fs::Filesystem for Exfat {
     fn open_file_ro<'a>(
         &'a mut self,
         dev: &'a mut dyn BlockDevice,
-        path: &std::path::Path,
+        path: &crate::path::Path,
     ) -> Result<Box<dyn crate::fs::FileReadHandle + 'a>> {
         let s = path
             .to_str()
@@ -1526,7 +1531,7 @@ impl crate::fs::Filesystem for Exfat {
     fn open_file_rw<'a>(
         &'a mut self,
         dev: &'a mut dyn BlockDevice,
-        path: &std::path::Path,
+        path: &crate::path::Path,
         flags: crate::fs::OpenFlags,
         meta: Option<crate::fs::FileMeta>,
     ) -> Result<Box<dyn crate::fs::FileHandle + 'a>> {
@@ -1546,10 +1551,10 @@ impl crate::fs::Filesystem for Exfat {
     fn getattr(
         &mut self,
         dev: &mut dyn BlockDevice,
-        path: &std::path::Path,
+        path: &crate::path::Path,
     ) -> Result<crate::fs::FileAttrs> {
         use crate::fs::{EntryKind, FileAttrs};
-        if path == std::path::Path::new("/") || path.as_os_str().is_empty() {
+        if path == crate::path::Path::new("/") || path.as_os_str().is_empty() {
             return Ok(FileAttrs::defaults_for(EntryKind::Dir, 0, 0));
         }
         let p = path
@@ -1585,7 +1590,7 @@ impl crate::fs::Filesystem for Exfat {
     fn set_attrs(
         &mut self,
         dev: &mut dyn BlockDevice,
-        path: &std::path::Path,
+        path: &crate::path::Path,
         attrs: crate::fs::SetAttrs,
     ) -> Result<()> {
         if attrs.mode.is_none() && attrs.mtime.is_none() {
@@ -1778,8 +1783,8 @@ pub struct ExfatFileReader<'a> {
     cluster_off: u64,
 }
 
-impl<'a> std::io::Read for ExfatFileReader<'a> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+impl<'a> crate::io::Read for ExfatFileReader<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> crate::io::Result<usize> {
         if self.remaining == 0 || self.cluster_idx >= self.chain.len() {
             return Ok(0);
         }
@@ -1790,7 +1795,7 @@ impl<'a> std::io::Read for ExfatFileReader<'a> {
         let off = cluster_start + self.cluster_off;
         self.dev
             .read_at(off, &mut buf[..want])
-            .map_err(std::io::Error::other)?;
+            .map_err(crate::io::Error::other)?;
         self.cluster_off += want as u64;
         self.remaining -= want as u64;
         if self.cluster_off == self.cluster_bytes {
@@ -2109,7 +2114,7 @@ mod tests {
 
     #[test]
     fn read_file_returns_contents() {
-        use std::io::Read;
+        use crate::io::Read;
         let mut dev = build_test_image();
         let fs = Exfat::open(&mut dev).unwrap();
         let mut r = fs.open_file_reader(&mut dev, "/hello.txt").unwrap();
@@ -2120,7 +2125,7 @@ mod tests {
 
     #[test]
     fn read_nested_file() {
-        use std::io::Read;
+        use crate::io::Read;
         let mut dev = build_test_image();
         let fs = Exfat::open(&mut dev).unwrap();
         let mut r = fs.open_file_reader(&mut dev, "/sub/x.bin").unwrap();
@@ -2193,7 +2198,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "hello.txt");
         assert_eq!(entries[0].kind, crate::fs::EntryKind::Regular);
-        use std::io::Read;
+        use crate::io::Read;
         let mut r = fs2.open_file_reader(&mut dev, "/hello.txt").unwrap();
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).unwrap();
@@ -2206,7 +2211,7 @@ mod tests {
     #[test]
     fn set_attrs_read_only_round_trip() {
         use crate::fs::{Filesystem, SetAttrs};
-        use std::path::Path;
+        use crate::path::Path;
 
         let (mut dev, mut fs) = fresh_volume("CHMOD");
         let payload: &[u8] = b"chmod me";
@@ -2276,7 +2281,7 @@ mod tests {
             assert_eq!(a.mtime, exp_mtime);
             // Content must be intact — we only rewrote the primary entry.
             let mut r = fs2.open_file_reader(&mut dev, "/f.txt").unwrap();
-            use std::io::Read;
+            use crate::io::Read;
             let mut buf = Vec::new();
             r.read_to_end(&mut buf).unwrap();
             assert_eq!(buf, payload);
@@ -2315,7 +2320,7 @@ mod tests {
         assert_eq!(sub.len(), 1);
         assert_eq!(sub[0].name, "x.bin");
 
-        use std::io::Read;
+        use crate::io::Read;
         let mut r = fs2.open_file_reader(&mut dev, "/sub/x.bin").unwrap();
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).unwrap();
@@ -2345,7 +2350,7 @@ mod tests {
         fs.flush(&mut dev).unwrap();
 
         let fs2 = Exfat::open(&mut dev).unwrap();
-        let listed: std::collections::HashSet<String> = fs2
+        let listed: alloc::collections::BTreeSet<String> = fs2
             .list_path(&mut dev, "/d")
             .unwrap()
             .into_iter()
@@ -2375,7 +2380,7 @@ mod tests {
         fs.flush(&mut dev).unwrap();
 
         let fs2 = Exfat::open(&mut dev).unwrap();
-        use std::io::Read;
+        use crate::io::Read;
         let mut r = fs2.open_file_reader(&mut dev, "/big.bin").unwrap();
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).unwrap();
@@ -2451,7 +2456,7 @@ mod tests {
         fs.flush(&mut dev).unwrap();
         let fs2 = Exfat::open(&mut dev).unwrap();
         // Different case, same file.
-        use std::io::Read;
+        use crate::io::Read;
         let mut r = fs2.open_file_reader(&mut dev, "/HELLO.txt").unwrap();
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).unwrap();
@@ -2531,22 +2536,28 @@ mod tests {
         let (mut dev, mut fs) = fresh_volume("TRAIT");
         let meta = crate::fs::FileMeta::default();
         let src = crate::fs::FileSource::Reader {
-            reader: Box::new(std::io::Cursor::new(b"trait-wired!".to_vec())),
+            reader: Box::new(crate::io::Cursor::new(b"trait-wired!".to_vec())),
             len: 12,
         };
-        Filesystem::create_file(&mut fs, &mut dev, std::path::Path::new("/t.txt"), src, meta)
-            .unwrap();
+        Filesystem::create_file(
+            &mut fs,
+            &mut dev,
+            crate::path::Path::new("/t.txt"),
+            src,
+            meta,
+        )
+        .unwrap();
         Filesystem::flush(&mut fs, &mut dev).unwrap();
 
         let mut fs2 = Exfat::open(&mut dev).unwrap();
-        let entries = Filesystem::list(&mut fs2, &mut dev, std::path::Path::new("/")).unwrap();
+        let entries = Filesystem::list(&mut fs2, &mut dev, crate::path::Path::new("/")).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "t.txt");
 
         assert!(fs2.supports_mutation());
-        use std::io::Read;
+        use crate::io::Read;
         let mut r =
-            Filesystem::read_file(&mut fs2, &mut dev, std::path::Path::new("/t.txt")).unwrap();
+            Filesystem::read_file(&mut fs2, &mut dev, crate::path::Path::new("/t.txt")).unwrap();
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).unwrap();
         assert_eq!(buf, b"trait-wired!");
@@ -2559,8 +2570,8 @@ mod tests {
         let err = Filesystem::create_symlink(
             &mut fs,
             &mut dev,
-            std::path::Path::new("/link"),
-            std::path::Path::new("/target"),
+            crate::path::Path::new("/link"),
+            crate::path::Path::new("/target"),
             crate::fs::FileMeta::default(),
         )
         .unwrap_err();
@@ -2604,7 +2615,7 @@ mod tests {
     use crate::fs::{FileMeta, Filesystem, OpenFlags};
 
     fn read_file_contents(fs: &mut Exfat, dev: &mut MemoryBackend, path: &str) -> Vec<u8> {
-        use std::io::Read;
+        use crate::io::Read;
         let mut r = fs.open_file_reader(dev, path).unwrap();
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).unwrap();
@@ -2613,7 +2624,7 @@ mod tests {
 
     #[test]
     fn open_file_rw_partial_write_round_trip() {
-        use std::io::{Seek, SeekFrom, Write};
+        use crate::io::{Seek, SeekFrom, Write};
         let (mut dev, mut fs) = fresh_volume("RW1");
         let payload = b"AAAAAAAAAAAAAAAAAAAA"; // 20 bytes
         let mut reader: &[u8] = payload;
@@ -2625,7 +2636,7 @@ mod tests {
             let mut h = Filesystem::open_file_rw(
                 &mut fs,
                 &mut dev,
-                std::path::Path::new("/x.bin"),
+                crate::path::Path::new("/x.bin"),
                 OpenFlags::default(),
                 None,
             )
@@ -2647,7 +2658,7 @@ mod tests {
 
     #[test]
     fn open_file_rw_extends_file() {
-        use std::io::{Seek, SeekFrom, Write};
+        use crate::io::{Seek, SeekFrom, Write};
         let (mut dev, mut fs) = fresh_volume("RW2");
         let mut reader: &[u8] = b"hello";
         fs.create_file(&mut dev, "/g.txt", &mut reader, 5, 0)
@@ -2657,7 +2668,7 @@ mod tests {
             let mut h = Filesystem::open_file_rw(
                 &mut fs,
                 &mut dev,
-                std::path::Path::new("/g.txt"),
+                crate::path::Path::new("/g.txt"),
                 OpenFlags::default(),
                 None,
             )
@@ -2685,7 +2696,7 @@ mod tests {
             let mut h = Filesystem::open_file_rw(
                 &mut fs,
                 &mut dev,
-                std::path::Path::new("/s.bin"),
+                crate::path::Path::new("/s.bin"),
                 OpenFlags::default(),
                 None,
             )
@@ -2708,7 +2719,7 @@ mod tests {
             let mut h = Filesystem::open_file_rw(
                 &mut fs,
                 &mut dev,
-                std::path::Path::new("/s.bin"),
+                crate::path::Path::new("/s.bin"),
                 OpenFlags::default(),
                 None,
             )
@@ -2724,7 +2735,7 @@ mod tests {
 
     #[test]
     fn open_file_rw_append() {
-        use std::io::Write;
+        use crate::io::Write;
         let (mut dev, mut fs) = fresh_volume("RW4");
         let mut reader: &[u8] = b"head ";
         fs.create_file(&mut dev, "/a.txt", &mut reader, 5, 0)
@@ -2734,7 +2745,7 @@ mod tests {
             let mut h = Filesystem::open_file_rw(
                 &mut fs,
                 &mut dev,
-                std::path::Path::new("/a.txt"),
+                crate::path::Path::new("/a.txt"),
                 OpenFlags {
                     create: false,
                     truncate: false,
@@ -2753,14 +2764,14 @@ mod tests {
 
     #[test]
     fn open_file_rw_create_new() {
-        use std::io::Write;
+        use crate::io::Write;
         let (mut dev, mut fs) = fresh_volume("RW5");
         // /n.txt does not exist — open with create=true.
         {
             let mut h = Filesystem::open_file_rw(
                 &mut fs,
                 &mut dev,
-                std::path::Path::new("/n.txt"),
+                crate::path::Path::new("/n.txt"),
                 OpenFlags {
                     create: true,
                     truncate: false,
@@ -2780,7 +2791,7 @@ mod tests {
 
     #[test]
     fn open_file_rw_create_existing_with_truncate() {
-        use std::io::Write;
+        use crate::io::Write;
         let (mut dev, mut fs) = fresh_volume("RW6");
         let mut reader: &[u8] = b"old content";
         fs.create_file(&mut dev, "/c.txt", &mut reader, 11, 0)
@@ -2790,7 +2801,7 @@ mod tests {
             let mut h = Filesystem::open_file_rw(
                 &mut fs,
                 &mut dev,
-                std::path::Path::new("/c.txt"),
+                crate::path::Path::new("/c.txt"),
                 OpenFlags {
                     create: false,
                     truncate: true,
@@ -2810,7 +2821,7 @@ mod tests {
 
     #[test]
     fn open_file_rw_grow_allocates_clusters() {
-        use std::io::Write;
+        use crate::io::Write;
         // Cluster size = 4 KiB. Start with an empty file, write across a
         // cluster boundary so the bitmap allocator gets exercised.
         let (mut dev, mut fs) = fresh_volume("RW7");
@@ -2828,7 +2839,7 @@ mod tests {
             let mut h = Filesystem::open_file_rw(
                 &mut fs,
                 &mut dev,
-                std::path::Path::new("/big.bin"),
+                crate::path::Path::new("/big.bin"),
                 OpenFlags::default(),
                 None,
             )
@@ -2850,7 +2861,7 @@ mod tests {
 
     #[test]
     fn open_file_rw_truncate_then_grow_reuses_clusters() {
-        use std::io::Write;
+        use crate::io::Write;
         // Create a multi-cluster file, truncate it down, then grow back
         // and verify the previously freed clusters get reused.
         let (mut dev, mut fs) = fresh_volume("RW8");
@@ -2864,7 +2875,7 @@ mod tests {
             let mut h = Filesystem::open_file_rw(
                 &mut fs,
                 &mut dev,
-                std::path::Path::new("/t.bin"),
+                crate::path::Path::new("/t.bin"),
                 OpenFlags::default(),
                 None,
             )
@@ -2884,7 +2895,7 @@ mod tests {
             let mut h = Filesystem::open_file_rw(
                 &mut fs,
                 &mut dev,
-                std::path::Path::new("/t.bin"),
+                crate::path::Path::new("/t.bin"),
                 OpenFlags::default(),
                 None,
             )
@@ -2906,7 +2917,7 @@ mod tests {
         let res = Filesystem::open_file_rw(
             &mut fs,
             &mut dev,
-            std::path::Path::new("/nope.bin"),
+            crate::path::Path::new("/nope.bin"),
             OpenFlags::default(),
             None,
         );
@@ -2922,7 +2933,7 @@ mod tests {
 
     #[test]
     fn open_file_ro_random_seek_exfat() {
-        use std::io::{Read, Seek, SeekFrom};
+        use crate::io::{Read, Seek, SeekFrom};
         let (mut dev, mut fs) = fresh_volume("RO");
         // ~10 KiB file — larger than one 4 KiB cluster, so the read path
         // exercises chain walking.
@@ -2932,7 +2943,7 @@ mod tests {
             .unwrap();
         fs.flush(&mut dev).unwrap();
 
-        let mut h = Filesystem::open_file_ro(&mut fs, &mut dev, std::path::Path::new("/ro.bin"))
+        let mut h = Filesystem::open_file_ro(&mut fs, &mut dev, crate::path::Path::new("/ro.bin"))
             .expect("open_file_ro");
         assert_eq!(h.len(), data.len() as u64);
         assert!(!h.is_empty());

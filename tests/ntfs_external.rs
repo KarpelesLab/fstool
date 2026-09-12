@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(all(unix, feature = "ntfs"))]
 //! NTFS end-to-end validation against the ntfs-3g toolset.
 //!
 //! Tests in this file cross-check fstool's NTFS writer with the canonical

@@ -22,6 +22,12 @@
 //!
 //! Reference: the public Microsoft FAT specification.
 
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::format;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
 pub mod boot;
 pub mod dir;
 pub mod fsinfo;
@@ -33,8 +39,8 @@ pub mod table;
 pub use size_plan::FatSizePlan;
 pub use table::FatKind;
 
-use std::io::Read;
-use std::path::Path;
+use crate::io::Read;
+use crate::path::Path;
 
 use boot::BootSector;
 use fsinfo::FsInfo;
@@ -287,7 +293,7 @@ pub struct Fat32 {
     /// directory is O(N²). Keeping evicted-but-flushed names here too is
     /// harmless: they really do exist (on disk), so the answer is still
     /// correct.
-    pending_names: std::collections::HashMap<u32, std::collections::HashSet<String>>,
+    pending_names: BTreeMap<u32, BTreeSet<String>>,
 }
 
 impl Fat32 {
@@ -490,7 +496,7 @@ impl Fat32 {
             // the root out of the data area entirely, so cluster 2 is free.
             next_free: if kind == FatKind::Fat32 { 3 } else { 2 },
             dir_batch: DirBatch::new(DEFAULT_CAPACITY),
-            pending_names: std::collections::HashMap::new(),
+            pending_names: BTreeMap::new(),
         };
         // Zero only the metadata, not the whole device: the reserved
         // sectors + every FAT copy + (on FAT12/16) the fixed root region —
@@ -617,6 +623,7 @@ impl Fat32 {
         self.boot.sectors_per_cluster as u64 * SECTOR as u64
     }
 
+    #[cfg(feature = "std")]
     /// Allocate `n` clusters, linking them into one chain, and return the
     /// chain. The last cluster's FAT entry is the end-of-chain marker.
     fn alloc_chain(&mut self, n: u32) -> Result<Vec<u32>> {
@@ -643,6 +650,7 @@ impl Fat32 {
         Ok(chain)
     }
 
+    #[cfg(feature = "std")]
     /// Write `data` across the cluster `chain` (the chain must be large
     /// enough). The final cluster's slack is left zero.
     fn write_chain(&self, dev: &mut dyn BlockDevice, chain: &[u32], data: &[u8]) -> Result<()> {
@@ -724,6 +732,7 @@ impl Fat32 {
     /// One-shot: format `dev` to `total_sectors` and copy a host directory
     /// tree into the root. Symlinks and device nodes in the source are
     /// skipped (FAT has no representation for them).
+    #[cfg(feature = "std")]
     pub fn build_from_host_dir(
         dev: &mut dyn BlockDevice,
         total_sectors: u32,
@@ -748,6 +757,7 @@ impl Fat32 {
     /// `src`. The volume label set at format time stays in place;
     /// callers that want to re-set it should re-format. Used by the
     /// repack flow where the destination has been formatted already.
+    #[cfg(feature = "std")]
     pub fn populate_from_host_dir(&mut self, dev: &mut dyn BlockDevice, src: &Path) -> Result<()> {
         let root_cluster = self.boot.root_cluster;
         // Root is its own "parent" placeholder; parent_cluster is unused when
@@ -761,6 +771,7 @@ impl Fat32 {
     ///
     /// `dir_cluster` must already be a one-cluster chain; the directory is
     /// extended if its entries overflow one cluster.
+    #[cfg(feature = "std")]
     fn write_dir_tree(
         &mut self,
         dev: &mut dyn BlockDevice,
@@ -850,6 +861,7 @@ impl Fat32 {
         Ok(())
     }
 
+    #[cfg(feature = "std")]
     /// Append a directory entry for `name` to `entries`, emitting LFN
     /// fragments first when the name isn't a plain 8.3 name. `mtime` is
     /// Unix epoch seconds (`0` for none).
@@ -891,6 +903,7 @@ impl Fat32 {
         entries.extend_from_slice(&entry.encode());
     }
 
+    #[cfg(feature = "std")]
     /// Write a directory's assembled entry bytes into its cluster chain,
     /// extending the chain if the entries overflow `dir_cluster`'s single
     /// cluster.
@@ -946,6 +959,7 @@ impl Fat32 {
 
     /// Stream a host file's bytes into its cluster chain. The file is read
     /// one cluster at a time — never fully resident in memory.
+    #[cfg(feature = "std")]
     fn stream_file(
         &self,
         dev: &mut dyn BlockDevice,
@@ -973,6 +987,7 @@ impl Fat32 {
         Ok(())
     }
 
+    #[cfg(feature = "std")]
     /// Return clusters allocated for a zero-length file to the free pool.
     /// Only valid for the most-recently-allocated chain (we just rewind
     /// `next_free`); used right after `alloc_chain` for empty files.
@@ -1046,7 +1061,7 @@ impl Fat32 {
             fat,
             next_free,
             dir_batch: DirBatch::new(DEFAULT_CAPACITY),
-            pending_names: std::collections::HashMap::new(),
+            pending_names: BTreeMap::new(),
         })
     }
 
@@ -1305,8 +1320,8 @@ pub struct FatFileReader<'a> {
     cluster_off: u64,
 }
 
-impl<'a> std::io::Read for FatFileReader<'a> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+impl<'a> Read for FatFileReader<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> crate::io::Result<usize> {
         if self.remaining == 0 || self.cluster_idx >= self.chain.len() {
             return Ok(0);
         }
@@ -1318,7 +1333,7 @@ impl<'a> std::io::Read for FatFileReader<'a> {
         let off = cluster_start + self.cluster_off;
         self.dev
             .read_at(off, &mut buf[..want])
-            .map_err(std::io::Error::other)?;
+            .map_err(crate::io::Error::other)?;
         self.cluster_off += want as u64;
         self.remaining -= want as u64;
         if self.cluster_off == self.cluster_bytes {
@@ -1329,6 +1344,7 @@ impl<'a> std::io::Read for FatFileReader<'a> {
     }
 }
 
+#[cfg(feature = "std")]
 /// Build a "." or ".." directory entry (11-byte raw name, directory attr).
 fn dot_entry(name_83: &[u8; 11], cluster: u32) -> [u8; dir::ENTRY_SIZE] {
     dir::DirEntry {
@@ -1377,7 +1393,7 @@ impl crate::fs::Filesystem for Fat32 {
         &mut self,
         dev: &mut dyn BlockDevice,
         path: &Path,
-        body: &mut dyn std::io::Read,
+        body: &mut dyn Read,
         len: u64,
         meta: crate::fs::FileMeta,
     ) -> Result<()> {
@@ -1594,7 +1610,7 @@ impl crate::fs::Filesystem for Fat32 {
                 // path; serialize it so its on-disk entry exists, then
                 // re-find it (the handle updates that entry in place).
                 let mtime = meta.as_ref().map(|m| m.mtime).unwrap_or(0);
-                self.add_file_from_reader(dev, s, &mut std::io::empty(), 0, mtime)?;
+                self.add_file_from_reader(dev, s, &mut crate::io::empty(), 0, mtime)?;
                 self.flush_dir_batches(dev)?;
                 self.find_entry(dev, parent_cluster, &leaf)?
                     .ok_or_else(|| {
@@ -1617,10 +1633,10 @@ impl crate::fs::Filesystem for Fat32 {
         }
         if flags.append {
             // Position at end so the first write appends.
-            use std::io::Seek as _;
+            use crate::io::Seek as _;
             let len = crate::fs::FileHandle::len(&handle);
             handle
-                .seek(std::io::SeekFrom::Start(len))
+                .seek(crate::io::SeekFrom::Start(len))
                 .map_err(crate::Error::Io)?;
         }
         Ok(Box::new(handle))
@@ -1636,7 +1652,7 @@ mod tests {
     use super::*;
     use crate::block::MemoryBackend;
     use crate::fs::{FileMeta, FileSource, Filesystem, OpenFlags};
-    use std::io::{Seek as _, SeekFrom, Write as _};
+    use crate::io::{Seek as _, SeekFrom, Write as _};
 
     /// Format a fresh 48 MiB FAT32 volume in memory; return (dev, fs).
     fn fresh_volume() -> (MemoryBackend, Fat32) {
@@ -1730,7 +1746,7 @@ mod tests {
             &mut dev,
             Path::new("hello.bin"),
             FileSource::Reader {
-                reader: Box::new(std::io::Cursor::new(initial.clone())),
+                reader: Box::new(crate::io::Cursor::new(initial.clone())),
                 len: 200,
             },
             FileMeta::default(),
@@ -1770,7 +1786,7 @@ mod tests {
             &mut dev,
             Path::new("ro.txt"),
             FileSource::Reader {
-                reader: Box::new(std::io::Cursor::new(vec![0x42u8; 64])),
+                reader: Box::new(crate::io::Cursor::new(vec![0x42u8; 64])),
                 len: 64,
             },
             FileMeta {
@@ -1830,7 +1846,7 @@ mod tests {
             &mut dev,
             Path::new("grow.bin"),
             FileSource::Reader {
-                reader: Box::new(std::io::Cursor::new(initial)),
+                reader: Box::new(crate::io::Cursor::new(initial)),
                 len: 50,
             },
             FileMeta::default(),
@@ -1870,7 +1886,7 @@ mod tests {
             &mut dev,
             Path::new("resize.bin"),
             FileSource::Reader {
-                reader: Box::new(std::io::Cursor::new(initial)),
+                reader: Box::new(crate::io::Cursor::new(initial)),
                 len: 128,
             },
             FileMeta::default(),
@@ -1924,7 +1940,7 @@ mod tests {
             &mut dev,
             Path::new("app.txt"),
             FileSource::Reader {
-                reader: Box::new(std::io::Cursor::new(initial.clone())),
+                reader: Box::new(crate::io::Cursor::new(initial.clone())),
                 len: initial.len() as u64,
             },
             FileMeta::default(),
@@ -1995,9 +2011,9 @@ mod tests {
             let body = format!("file-body-{i:03}");
             fs.create_file(
                 &mut dev,
-                &std::path::PathBuf::from(format!("/d/f{i:03}.txt")),
+                &crate::path::PathBuf::from(format!("/d/f{i:03}.txt")),
                 FileSource::Reader {
-                    reader: Box::new(std::io::Cursor::new(body.clone().into_bytes())),
+                    reader: Box::new(crate::io::Cursor::new(body.clone().into_bytes())),
                     len: body.len() as u64,
                 },
                 FileMeta::default(),
@@ -2007,7 +2023,7 @@ mod tests {
         fs.flush(&mut dev).unwrap();
 
         let mut fs2 = Fat32::open(&mut dev).unwrap();
-        let listed: std::collections::HashSet<String> =
+        let listed: BTreeSet<String> =
             crate::fs::Filesystem::list(&mut fs2, &mut dev, Path::new("/d"))
                 .unwrap()
                 .into_iter()
@@ -2024,7 +2040,7 @@ mod tests {
 
     #[test]
     fn open_file_ro_random_seek_fat() {
-        use std::io::Read as _;
+        use crate::io::Read as _;
         let (mut dev, mut fs) = fresh_volume();
         // Write a file spanning a couple clusters with a recognisable pattern.
         let data: Vec<u8> = (0..16_384u32).map(|i| (i & 0xFF) as u8).collect();
@@ -2032,7 +2048,7 @@ mod tests {
             &mut dev,
             Path::new("ro.bin"),
             FileSource::Reader {
-                reader: Box::new(std::io::Cursor::new(data.clone())),
+                reader: Box::new(crate::io::Cursor::new(data.clone())),
                 len: data.len() as u64,
             },
             FileMeta::default(),

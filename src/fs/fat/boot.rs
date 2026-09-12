@@ -62,6 +62,7 @@
 //! nothing at all — just as happily.
 
 use super::table::FatKind;
+use alloc::format;
 
 /// Bytes in a boot sector.
 pub const BOOT_SECTOR_SIZE: usize = 512;

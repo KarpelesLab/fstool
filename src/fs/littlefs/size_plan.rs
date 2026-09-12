@@ -7,7 +7,8 @@
 //! overflow; each file either rides along inline in that metadata or takes
 //! a CTZ skip-list of its own.
 
-use std::collections::HashMap;
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
 
 use crate::fs::{FsSizePlan, split_parent_name};
 
@@ -19,7 +20,7 @@ pub struct LittleFsSizePlan {
     geom: Geom,
     inline_max: u32,
     /// Metadata bytes per directory, keyed by path.
-    dirs: HashMap<String, usize>,
+    dirs: BTreeMap<String, usize>,
     /// Blocks taken by files too large to inline.
     data_blocks: u64,
 }
@@ -37,7 +38,7 @@ impl LittleFsSizePlan {
         };
         let inline_max =
             super::pick_inline_max(&geom, opts.inline_max).unwrap_or(opts.block_size / 8);
-        let mut dirs = HashMap::new();
+        let mut dirs = BTreeMap::new();
         // The root pair also carries the superblock entry: its name tag
         // plus "littlefs", and the inline-struct tag plus 24 bytes of
         // configuration.

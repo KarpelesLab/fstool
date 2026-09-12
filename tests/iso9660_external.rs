@@ -1,3 +1,4 @@
+#![cfg(feature = "iso9660")]
 //! External validation of the ISO 9660 writer against native tooling.
 //!
 //! Currently focused on the Rock Ridge `SP` (System Use Sharing

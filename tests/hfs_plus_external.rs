@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(all(unix, feature = "hfs-plus"))]
 //! HFS+ end-to-end native-tool validation.
 //!
 //! Round-trips fstool-built images through `fsck.hfs` / `fsck.hfsplus`
@@ -257,7 +257,7 @@ fn newfs_hfsplus_image_opens_via_fstool() {
 /// without corrupting the volume. Plants one of each kind under root,
 /// flushes, reopens, and confirms `getattr` surfaces the right
 /// `EntryKind` plus the `rdev` we stored — encoded the same way fstool
-/// encodes elsewhere (`ext::inode::encode_devnum`). `fsck.hfsplus`
+/// encodes elsewhere (`fs::devnum::encode_devnum`). `fsck.hfsplus`
 /// stays clean: it doesn't interpret the device-number bytes, only the
 /// surrounding catalog structure, so this proves the structural side
 /// of the encoder.
@@ -301,9 +301,7 @@ fn writer_device_nodes_round_trip() {
         };
         assert_eq!(attrs.kind, want_kind, "kind mismatch for {path}");
         let expected_rdev = match kind {
-            DeviceKind::Char | DeviceKind::Block => {
-                fstool::fs::ext::inode::encode_devnum(major, minor)
-            }
+            DeviceKind::Char | DeviceKind::Block => fstool::fs::devnum::encode_devnum(major, minor),
             _ => 0,
         };
         assert_eq!(

@@ -23,7 +23,7 @@
 //! emit and consume it.
 
 use crate::Result;
-use crate::fs::ext::xattr::Xattr;
+use crate::fs::xattr::Xattr;
 
 pub const KEY_PATH: &str = "path";
 pub const KEY_LINKPATH: &str = "linkpath";

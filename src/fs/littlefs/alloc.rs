@@ -13,6 +13,8 @@
 //! really does mean the volume is full.
 
 use crate::{Error, Result};
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// In-use bitmap over the volume's blocks.
 #[derive(Debug, Clone)]

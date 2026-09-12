@@ -20,14 +20,46 @@
 //! Determinism: the seed is fixed per backend, so a failing run is
 //! reproducible byte-for-byte; bump the seed when extending.
 
-#![cfg(unix)]
+#![cfg(all(
+    unix,
+    feature = "std",
+    any(
+        feature = "ext",
+        feature = "fat",
+        feature = "exfat",
+        feature = "hfs-plus",
+        feature = "f2fs",
+        feature = "littlefs",
+        feature = "xfs",
+        feature = "ntfs"
+    )
+))]
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use fstool::block::{BlockDevice, FileBackend, MemoryBackend};
+use fstool::block::BlockDevice;
+#[cfg(any(
+    feature = "fat",
+    feature = "exfat",
+    feature = "hfs-plus",
+    feature = "f2fs",
+    feature = "xfs",
+    feature = "ntfs"
+))]
+use fstool::block::FileBackend;
+#[cfg(any(feature = "ext", feature = "littlefs"))]
+use fstool::block::MemoryBackend;
 use fstool::fs::{FileMeta, FileSource, Filesystem, OpenFlags, ReadSeek};
+#[cfg(any(
+    feature = "fat",
+    feature = "exfat",
+    feature = "hfs-plus",
+    feature = "f2fs",
+    feature = "xfs",
+    feature = "ntfs"
+))]
 use tempfile::NamedTempFile;
 
 // ----------------------------------------------------------------------
@@ -127,6 +159,15 @@ struct Caps {
 
 impl Caps {
     /// Sensible defaults for a "real" mutable backend.
+    #[cfg(any(
+        feature = "ext",
+        feature = "fat",
+        feature = "exfat",
+        feature = "hfs-plus",
+        feature = "littlefs",
+        feature = "xfs",
+        feature = "ntfs"
+    ))]
     fn mutable_small() -> Self {
         Self {
             max_files: 8,
@@ -141,6 +182,7 @@ impl Caps {
     /// append/patch on a single file pushes past that limit. With
     /// `max_size = 4 KiB` and `max_files = 4` a 200-iter run stays
     /// inside the depth-0 limit comfortably.
+    #[cfg(feature = "ext")]
     fn ext4_tight() -> Self {
         Self {
             max_files: 4,
@@ -155,6 +197,7 @@ impl Caps {
     /// doesn't free or zero them, so a re-grow surfaces old bytes
     /// instead of zeroes). Filed for follow-up; in the meantime the
     /// fuzz exercises every *other* mutation against F2FS.
+    #[cfg(feature = "f2fs")]
     fn f2fs_no_set_len() -> Self {
         Self {
             max_files: 8,
@@ -670,6 +713,7 @@ fn preview_at(b: &[u8], at: usize) -> String {
 
 const FUZZ_ITERS: usize = 200;
 
+#[cfg(feature = "ext")]
 #[test]
 fn fuzz_ext2() {
     use fstool::fs::ext::{Ext, FormatOpts, FsKind};
@@ -695,6 +739,7 @@ fn fuzz_ext2() {
     );
 }
 
+#[cfg(feature = "ext")]
 #[test]
 fn fuzz_ext3() {
     use fstool::fs::ext::{Ext, FormatOpts, FsKind};
@@ -716,6 +761,7 @@ fn fuzz_ext3() {
     );
 }
 
+#[cfg(feature = "ext")]
 #[test]
 fn fuzz_ext4() {
     use fstool::fs::ext::{Ext, FormatOpts, FsKind};
@@ -737,6 +783,7 @@ fn fuzz_ext4() {
     );
 }
 
+#[cfg(feature = "fat")]
 #[test]
 fn fuzz_fat32() {
     use fstool::fs::fat::{Fat32, FatFormatOpts};
@@ -760,6 +807,7 @@ fn fuzz_fat32() {
     );
 }
 
+#[cfg(feature = "exfat")]
 #[test]
 fn fuzz_exfat() {
     use fstool::fs::exfat::Exfat;
@@ -780,6 +828,7 @@ fn fuzz_exfat() {
     );
 }
 
+#[cfg(feature = "hfs-plus")]
 #[test]
 fn fuzz_hfs_plus() {
     use fstool::fs::hfs_plus::{FormatOpts, HfsPlus};
@@ -799,6 +848,7 @@ fn fuzz_hfs_plus() {
     );
 }
 
+#[cfg(feature = "f2fs")]
 #[test]
 fn fuzz_f2fs() {
     use fstool::fs::f2fs::{F2fs, FormatOpts};
@@ -820,6 +870,7 @@ fn fuzz_f2fs() {
     );
 }
 
+#[cfg(feature = "littlefs")]
 #[test]
 fn fuzz_littlefs() {
     use fstool::fs::littlefs::{LittleFs, LittleFsFormatOpts};
@@ -841,6 +892,7 @@ fn fuzz_littlefs() {
     );
 }
 
+#[cfg(feature = "xfs")]
 #[test]
 fn fuzz_xfs() {
     use fstool::fs::xfs::{self, FormatOpts};
@@ -860,6 +912,7 @@ fn fuzz_xfs() {
     );
 }
 
+#[cfg(feature = "ntfs")]
 #[test]
 fn fuzz_ntfs() {
     // NTFS landed `remove` in Phase 1 today, so it now satisfies the

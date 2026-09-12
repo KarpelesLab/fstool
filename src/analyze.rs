@@ -18,6 +18,7 @@ use std::io::Read;
 
 use crate::Result;
 use crate::block::BlockDevice;
+#[cfg(feature = "ext")]
 use crate::fs::ext::{BuildPlan, FsKind};
 use crate::fs::{DeviceKind, FsSizePlan, XattrPair};
 use crate::inspect::AnyFs;
@@ -46,6 +47,7 @@ pub struct Analysis {
     pub hardlinks: u64,
     /// Sum of every regular file's size in bytes.
     pub total_file_bytes: u64,
+    #[cfg(feature = "ext")]
     pub(crate) plan: BuildPlan,
 }
 
@@ -53,12 +55,14 @@ impl Analysis {
     /// Recommended ext-style inode count for the content (reserved +
     /// every entry, rounded to the bitmap alignment). Block-size
     /// independent.
+    #[cfg(feature = "ext")]
     pub fn inode_count(&self) -> u32 {
         self.plan.inodes_count()
     }
 
     /// ext block size the analysis was computed with (affects the ext
     /// size estimate, not the counts).
+    #[cfg(feature = "ext")]
     pub fn block_size(&self) -> u32 {
         self.plan.block_size
     }
@@ -76,6 +80,7 @@ impl Analysis {
     pub fn recommended_size(&self, fs_type: &str) -> Option<u64> {
         let lower = fs_type.to_ascii_lowercase();
         match lower.as_str() {
+            #[cfg(feature = "ext")]
             "ext2" | "ext3" | "ext4" => {
                 let mut p = self.plan.clone();
                 p.kind = match lower.as_str() {
@@ -85,6 +90,7 @@ impl Analysis {
                 };
                 Some(p.blocks_count() as u64 * p.block_size as u64)
             }
+            #[cfg(feature = "fat")]
             "fat12" | "fat16" | "fat32" | "vfat" => {
                 let floor = crate::fs::fat::min_volume_bytes(&lower);
                 let needed = self.total_file_bytes.saturating_mul(2).max(floor);
@@ -97,6 +103,7 @@ impl Analysis {
     /// ext [`FormatOpts`](crate::fs::ext::FormatOpts) sized for this
     /// content as ext flavour `kind` — what the `repack`/`convert` ext
     /// write path formats the destination with.
+    #[cfg(feature = "ext")]
     pub fn ext_format_opts(&self, kind: FsKind) -> crate::fs::ext::FormatOpts {
         let mut p = self.plan.clone();
         p.kind = kind;
@@ -119,7 +126,9 @@ impl Analysis {
             devices: self.devices,
             hardlinks: self.hardlinks,
             total_file_bytes: self.total_file_bytes,
+            #[cfg(feature = "ext")]
             inode_count: self.inode_count(),
+            #[cfg(feature = "ext")]
             block_size: self.block_size(),
             recommended_size,
         }
@@ -137,7 +146,12 @@ pub struct AnalysisReport {
     pub devices: u64,
     pub hardlinks: u64,
     pub total_file_bytes: u64,
+    /// Recommended ext inode count — only present when the `ext`
+    /// backend is compiled in.
+    #[cfg(feature = "ext")]
     pub inode_count: u32,
+    /// ext block size the estimate was computed with (`ext` builds only).
+    #[cfg(feature = "ext")]
     pub block_size: u32,
     /// `fs_type` → recommended destination size in bytes. Only contains
     /// the types from the requested set that yield a size.
@@ -156,6 +170,8 @@ struct AnalysisSink {
 
 impl AnalysisSink {
     fn new(block_size: u32) -> Self {
+        #[cfg(not(feature = "ext"))]
+        let _ = block_size;
         Self {
             a: Analysis {
                 files: 0,
@@ -166,6 +182,7 @@ impl AnalysisSink {
                 total_file_bytes: 0,
                 // Seed kind is neutral: `recommended_size` overrides it
                 // per ext flavour, and the counts are kind-independent.
+                #[cfg(feature = "ext")]
                 plan: BuildPlan::new(block_size, FsKind::Ext4),
             },
         }
@@ -175,6 +192,7 @@ impl AnalysisSink {
 impl RepackSink for AnalysisSink {
     fn put_dir(&mut self, _path: &str, _meta: RepackMeta, _xattrs: &[XattrPair]) -> Result<()> {
         self.a.dirs += 1;
+        #[cfg(feature = "ext")]
         self.a.plan.add_dir();
         Ok(())
     }
@@ -188,6 +206,7 @@ impl RepackSink for AnalysisSink {
     ) -> Result<()> {
         self.a.files += 1;
         self.a.total_file_bytes = self.a.total_file_bytes.saturating_add(len);
+        #[cfg(feature = "ext")]
         self.a.plan.add_file(len);
         Ok(())
     }
@@ -199,7 +218,10 @@ impl RepackSink for AnalysisSink {
         _xattrs: &[XattrPair],
     ) -> Result<()> {
         self.a.symlinks += 1;
+        #[cfg(feature = "ext")]
         self.a.plan.add_symlink(target.len());
+        #[cfg(not(feature = "ext"))]
+        let _ = target;
         Ok(())
     }
     fn put_device(
@@ -212,6 +234,7 @@ impl RepackSink for AnalysisSink {
         _xattrs: &[XattrPair],
     ) -> Result<()> {
         self.a.devices += 1;
+        #[cfg(feature = "ext")]
         self.a.plan.add_device();
         Ok(())
     }
@@ -225,6 +248,7 @@ impl RepackSink for AnalysisSink {
         // Over-reserve one inode (matches the former PlanSink upper
         // bound — the write pass shares the target's inode).
         self.a.hardlinks += 1;
+        #[cfg(feature = "ext")]
         self.a.plan.add_file(0);
         Ok(true)
     }
@@ -320,18 +344,29 @@ impl RepackSink for SizingSink<'_> {
 /// <fs> <dir>` to size a fresh image to its content without an explicit
 /// `--size`.
 pub fn size_for_source(source: &Source, fs_type: &str) -> Result<Option<u64>> {
-    let mut plan: Box<dyn FsSizePlan> = match fs_type.to_ascii_lowercase().as_str() {
-        "fat12" => Box::new(crate::fs::fat::FatSizePlan::for_kind(
-            crate::fs::fat::FatKind::Fat12,
-        )),
-        "fat16" => Box::new(crate::fs::fat::FatSizePlan::for_kind(
-            crate::fs::fat::FatKind::Fat16,
-        )),
-        "fat32" | "vfat" => Box::new(crate::fs::fat::FatSizePlan::new()),
-        _ => return Ok(None),
+    let Some(mut plan) = size_plan_for(fs_type) else {
+        return Ok(None);
     };
     plan_size(source, plan.as_mut())?;
     Ok(Some(plan.total_size()))
+}
+
+/// The empty content-fit [`FsSizePlan`] for `fs_type`, or `None` when that
+/// filesystem has no size plan (or its backend is compiled out).
+fn size_plan_for(fs_type: &str) -> Option<Box<dyn FsSizePlan>> {
+    match fs_type.to_ascii_lowercase().as_str() {
+        #[cfg(feature = "fat")]
+        "fat12" => Some(Box::new(crate::fs::fat::FatSizePlan::for_kind(
+            crate::fs::fat::FatKind::Fat12,
+        ))),
+        #[cfg(feature = "fat")]
+        "fat16" => Some(Box::new(crate::fs::fat::FatSizePlan::for_kind(
+            crate::fs::fat::FatKind::Fat16,
+        ))),
+        #[cfg(feature = "fat")]
+        "fat32" | "vfat" => Some(Box::new(crate::fs::fat::FatSizePlan::new())),
+        _ => None,
+    }
 }
 
 /// Phase 2 of content-fit sizing: walk the static file list of `source` into an
@@ -358,7 +393,7 @@ pub fn plan_size_fs(
     Ok(plan.total_size())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ext", feature = "fat"))]
 mod tests {
     use super::*;
     use crate::repack::RepackMeta;

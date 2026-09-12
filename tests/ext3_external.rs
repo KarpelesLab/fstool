@@ -1,3 +1,4 @@
+#![cfg(feature = "ext")]
 //! ext3 (journal) end-to-end validation.
 
 use std::process::Command;

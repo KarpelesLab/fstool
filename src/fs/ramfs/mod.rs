@@ -401,7 +401,7 @@ impl Filesystem for Ramfs {
             DeviceKind::Socket => EntryKind::Socket,
         };
         // Pack rdev the same way ext does, so getattr → repack splits it back.
-        let rdev = crate::fs::ext::inode::encode_devnum(major, minor);
+        let rdev = crate::fs::devnum::encode_devnum(major, minor);
         let ino = self.alloc_ino();
         self.inodes.insert(
             ino,

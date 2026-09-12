@@ -30,13 +30,13 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::Result;
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "ext"))]
 use crate::block::BlockDevice;
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "ext"))]
 use crate::fs::ext::Ext;
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "ext"))]
 use crate::fs::ext::FsKind;
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "ext"))]
 use crate::fs::rootdevs::RootDevs;
 
 /// Top-level parsed spec. Exactly one of `filesystem` / `image` must be set.
@@ -208,55 +208,136 @@ pub fn build(spec: &Spec, output: &Path) -> Result<()> {
 
 #[cfg(feature = "spec")]
 fn build_bare_fs(fs: &FilesystemSpec, output: &Path) -> Result<()> {
+    // With no filesystem compiled in, every arm below is gone and only the
+    // error path remains, which never touches the output path.
+    #[cfg(not(any(
+        feature = "ext",
+        feature = "fat",
+        feature = "hfs-plus",
+        feature = "hfs",
+        feature = "affs",
+        feature = "littlefs",
+        feature = "ntfs",
+        feature = "f2fs",
+        feature = "squashfs",
+        feature = "xfs",
+        feature = "iso9660",
+        feature = "grf",
+        feature = "archive"
+    )))]
+    let _ = output;
     match fs.fs_type.to_ascii_lowercase().as_str() {
+        #[cfg(feature = "ext")]
         "ext2" | "ext3" | "ext4" => build_bare_ext(fs, output),
+        #[cfg(feature = "fat")]
         "fat12" | "fat16" | "fat32" | "vfat" => build_bare_fat(fs, output),
+        #[cfg(feature = "hfs-plus")]
         "hfsplus" | "hfs+" => build_bare_via_trait::<crate::fs::hfs_plus::HfsPlus>(
             fs,
             output,
             hfs_plus_format_opts(fs)?,
         ),
+        #[cfg(feature = "hfs")]
         "hfs" => build_bare_via_trait::<crate::fs::hfs::Hfs>(fs, output, hfs_format_opts(fs)?),
+        #[cfg(feature = "affs")]
         "affs" | "ffs" | "ofs" => {
             build_bare_via_trait::<crate::fs::affs::Affs>(fs, output, affs_format_opts(fs)?)
         }
+        #[cfg(feature = "littlefs")]
         "littlefs" | "lfs" => build_bare_via_trait::<crate::fs::littlefs::LittleFs>(
             fs,
             output,
             littlefs_format_opts(fs)?,
         ),
+        #[cfg(feature = "ntfs")]
         "ntfs" => build_bare_via_trait::<crate::fs::ntfs::Ntfs>(fs, output, ntfs_format_opts(fs)?),
+        #[cfg(feature = "f2fs")]
         "f2fs" => build_bare_via_trait::<crate::fs::f2fs::F2fs>(fs, output, f2fs_format_opts(fs)?),
+        #[cfg(feature = "squashfs")]
         "squashfs" => build_bare_via_trait::<crate::fs::squashfs::Squashfs>(
             fs,
             output,
             squashfs_format_opts(fs)?,
         ),
+        #[cfg(feature = "xfs")]
         "xfs" => build_bare_via_trait::<crate::fs::xfs::Xfs>(fs, output, xfs_format_opts(fs)?),
+        #[cfg(feature = "iso9660")]
         "iso" | "iso9660" => build_bare_via_trait::<crate::fs::iso9660::Iso9660>(
             fs,
             output,
             iso9660_format_opts(fs)?,
         ),
+        #[cfg(feature = "grf")]
         "grf" => build_bare_via_trait::<crate::fs::grf::Grf>(fs, output, grf_format_opts(fs)?),
+        #[cfg(feature = "archive")]
         "zip" => {
             build_bare_via_trait::<crate::fs::archive::zip::ZipFs>(fs, output, zip_format_opts(fs)?)
         }
+        #[cfg(feature = "archive")]
         "cpio" => build_bare_via_trait::<crate::fs::archive::cpio::CpioFs>(
             fs,
             output,
             cpio_format_opts(fs)?,
         ),
+        #[cfg(feature = "archive")]
         "ar" => {
             build_bare_via_trait::<crate::fs::archive::ar::ArFs>(fs, output, ar_format_opts(fs)?)
         }
-        other => Err(crate::Error::InvalidArgument(format!(
-            "spec: unknown filesystem type {other:?}"
-        ))),
+        other => Err(unknown_fs_type(other)),
     }
 }
 
+/// `(type strings, feature)` for every filesystem the spec engine knows
+/// but this build left out — each row is present only when its feature is
+/// off, so with a full build the table is empty.
 #[cfg(feature = "spec")]
+const COMPILED_OUT_FS: &[(&[&str], &str)] = &[
+    #[cfg(not(feature = "ext"))]
+    (&["ext2", "ext3", "ext4"], "ext"),
+    #[cfg(not(feature = "fat"))]
+    (&["fat12", "fat16", "fat32", "vfat"], "fat"),
+    #[cfg(not(feature = "hfs-plus"))]
+    (&["hfsplus", "hfs+"], "hfs-plus"),
+    #[cfg(not(feature = "hfs"))]
+    (&["hfs"], "hfs"),
+    #[cfg(not(feature = "affs"))]
+    (&["affs", "ffs", "ofs"], "affs"),
+    #[cfg(not(feature = "littlefs"))]
+    (&["littlefs", "lfs"], "littlefs"),
+    #[cfg(not(feature = "ntfs"))]
+    (&["ntfs"], "ntfs"),
+    #[cfg(not(feature = "f2fs"))]
+    (&["f2fs"], "f2fs"),
+    #[cfg(not(feature = "squashfs"))]
+    (&["squashfs"], "squashfs"),
+    #[cfg(not(feature = "xfs"))]
+    (&["xfs"], "xfs"),
+    #[cfg(not(feature = "iso9660"))]
+    (&["iso", "iso9660"], "iso9660"),
+    #[cfg(not(feature = "grf"))]
+    (&["grf"], "grf"),
+    #[cfg(not(feature = "archive"))]
+    (&["zip", "cpio", "ar"], "archive"),
+];
+
+/// The error for a `type = "..."` string no build arm matched: a clean
+/// `Unsupported` naming the missing Cargo feature when the type is one
+/// this build was compiled without, otherwise the unknown-type error.
+#[cfg(feature = "spec")]
+fn unknown_fs_type(lower: &str) -> crate::Error {
+    match COMPILED_OUT_FS
+        .iter()
+        .find(|(names, _)| names.contains(&lower))
+    {
+        Some((_, feature)) => crate::Error::Unsupported(format!(
+            "spec: filesystem type {lower:?} needs the `{feature}` feature, but this build of \
+             fstool was compiled without it"
+        )),
+        None => crate::Error::InvalidArgument(format!("spec: unknown filesystem type {lower:?}")),
+    }
+}
+
+#[cfg(all(feature = "spec", feature = "archive"))]
 fn zip_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::archive::zip::ZipFormatOpts> {
     let mut bag = options_bag_for(fs)?;
     // `volume_label` is meaningless for archives; drop it so check_empty
@@ -268,7 +349,7 @@ fn zip_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::archive::zip::ZipFo
     Ok(opts)
 }
 
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "archive"))]
 fn cpio_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::archive::cpio::CpioFormatOpts> {
     let mut bag = options_bag_for(fs)?;
     let _ = bag.take_str("volume_label");
@@ -278,7 +359,7 @@ fn cpio_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::archive::cpio::Cpi
     Ok(opts)
 }
 
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "archive"))]
 fn ar_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::archive::ar::ArFormatOpts> {
     let mut bag = options_bag_for(fs)?;
     let _ = bag.take_str("volume_label");
@@ -294,7 +375,22 @@ fn ar_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::archive::ar::ArForma
 /// respective helpers), then merges the optional `[filesystem.options]`
 /// table on top. Caller is responsible for `check_empty` after taking
 /// the keys it recognises.
-#[cfg(feature = "spec")]
+#[cfg(all(
+    feature = "spec",
+    any(
+        feature = "fat",
+        feature = "hfs-plus",
+        feature = "affs",
+        feature = "littlefs",
+        feature = "ntfs",
+        feature = "f2fs",
+        feature = "squashfs",
+        feature = "xfs",
+        feature = "iso9660",
+        feature = "grf",
+        feature = "archive"
+    )
+))]
 fn options_bag_for(fs: &FilesystemSpec) -> Result<crate::format_opts::OptionMap> {
     let mut bag = crate::format_opts::OptionMap::new();
     if let Some(label) = &fs.volume_label {
@@ -306,7 +402,7 @@ fn options_bag_for(fs: &FilesystemSpec) -> Result<crate::format_opts::OptionMap>
     Ok(bag)
 }
 
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "grf"))]
 fn grf_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::grf::FormatOpts> {
     let mut bag = options_bag_for(fs)?;
     let mut opts = crate::fs::grf::FormatOpts::default();
@@ -315,7 +411,7 @@ fn grf_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::grf::FormatOpts> {
     Ok(opts)
 }
 
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "iso9660"))]
 fn iso9660_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::iso9660::FormatOpts> {
     let mut bag = options_bag_for(fs)?;
     let mut opts = crate::fs::iso9660::FormatOpts {
@@ -332,7 +428,22 @@ fn iso9660_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::iso9660::Format
 /// `source`, flush" pipeline. Used for every writable FS whose
 /// destination size doesn't have to be derived from the source tree
 /// (we accept an explicit `size` in TOML, defaulting to 256 MiB).
-#[cfg(feature = "spec")]
+#[cfg(all(
+    feature = "spec",
+    any(
+        feature = "hfs-plus",
+        feature = "hfs",
+        feature = "affs",
+        feature = "littlefs",
+        feature = "ntfs",
+        feature = "f2fs",
+        feature = "squashfs",
+        feature = "xfs",
+        feature = "iso9660",
+        feature = "grf",
+        feature = "archive"
+    )
+))]
 fn build_bare_via_trait<F: crate::fs::FilesystemFactory>(
     fs: &FilesystemSpec,
     output: &Path,
@@ -364,7 +475,22 @@ fn build_bare_via_trait<F: crate::fs::FilesystemFactory>(
 
 /// Shrink an over-provisioned archive output file to its true length.
 /// No-op for block devices and qcow2 containers.
-#[cfg(feature = "spec")]
+#[cfg(all(
+    feature = "spec",
+    any(
+        feature = "hfs-plus",
+        feature = "hfs",
+        feature = "affs",
+        feature = "littlefs",
+        feature = "ntfs",
+        feature = "f2fs",
+        feature = "squashfs",
+        feature = "xfs",
+        feature = "iso9660",
+        feature = "grf",
+        feature = "archive"
+    )
+))]
 fn truncate_archive_file(output: &Path, len: u64) -> Result<()> {
     if crate::block::file::is_block_device(output)
         || output
@@ -382,9 +508,21 @@ fn truncate_archive_file(output: &Path, len: u64) -> Result<()> {
 /// In-partition variant of [`build_bare_via_trait`]: takes an already
 /// pre-sliced `dev` (just one partition's view) and formats `F` into
 /// it, optionally populating from `source`.
-#[cfg(feature = "spec")]
+#[cfg(all(
+    feature = "spec",
+    any(
+        feature = "hfs-plus",
+        feature = "hfs",
+        feature = "affs",
+        feature = "littlefs",
+        feature = "ntfs",
+        feature = "f2fs",
+        feature = "squashfs",
+        feature = "xfs"
+    )
+))]
 fn format_in_partition_via_trait<F: crate::fs::FilesystemFactory>(
-    dev: &mut dyn BlockDevice,
+    dev: &mut dyn crate::block::BlockDevice,
     fs: &FilesystemSpec,
     opts: F::FormatOpts,
 ) -> Result<()> {
@@ -397,7 +535,7 @@ fn format_in_partition_via_trait<F: crate::fs::FilesystemFactory>(
     Ok(())
 }
 
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "hfs"))]
 fn hfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::hfs::HfsFormatOpts> {
     // Classic HFS has no `[filesystem.options]` knobs yet; the volume name and
     // allocation-block size come from the flat fields.
@@ -415,7 +553,7 @@ fn hfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::hfs::HfsFormatOpts>
     })
 }
 
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "affs"))]
 fn affs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::affs::AffsFormatOpts> {
     let mut bag = options_bag_for(fs)?;
     let mut opts = crate::fs::affs::AffsFormatOpts::default();
@@ -449,7 +587,7 @@ fn affs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::affs::AffsFormatOp
 
 /// `[filesystem.options]` for littlefs: `block_size`, `block_count`,
 /// `prog_size`, `version` (`2.0` / `2.1`), `name_max`, `inline_max`.
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "littlefs"))]
 fn littlefs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::littlefs::LittleFsFormatOpts> {
     let mut bag = options_bag_for(fs)?;
     let mut opts = crate::fs::littlefs::LittleFsFormatOpts::default();
@@ -480,6 +618,7 @@ fn littlefs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::littlefs::Litt
 }
 
 /// Parse a littlefs on-disk version: `2.0` / `2.1` (or the raw `0x00020001`).
+#[cfg(feature = "littlefs")]
 pub(crate) fn parse_littlefs_version(v: &str) -> Result<u32> {
     match v.trim() {
         "2.0" | "20000" | "0x00020000" => Ok(crate::fs::littlefs::DISK_VERSION_2_0),
@@ -490,7 +629,7 @@ pub(crate) fn parse_littlefs_version(v: &str) -> Result<u32> {
     }
 }
 
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "hfs-plus"))]
 fn hfs_plus_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::hfs_plus::FormatOpts> {
     let mut bag = options_bag_for(fs)?;
     let mut opts = crate::fs::hfs_plus::FormatOpts {
@@ -502,7 +641,7 @@ fn hfs_plus_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::hfs_plus::Form
     Ok(opts)
 }
 
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "ntfs"))]
 fn ntfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::ntfs::format::FormatOpts> {
     let mut bag = options_bag_for(fs)?;
     let mut opts = crate::fs::ntfs::format::FormatOpts::default();
@@ -511,7 +650,7 @@ fn ntfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::ntfs::format::Form
     Ok(opts)
 }
 
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "f2fs"))]
 fn f2fs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::f2fs::FormatOpts> {
     let mut bag = options_bag_for(fs)?;
     let mut opts = crate::fs::f2fs::FormatOpts::default();
@@ -520,7 +659,7 @@ fn f2fs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::f2fs::FormatOpts> 
     Ok(opts)
 }
 
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "squashfs"))]
 fn squashfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::squashfs::FormatOpts> {
     let mut bag = options_bag_for(fs)?;
     let mut opts = crate::fs::squashfs::FormatOpts {
@@ -534,7 +673,7 @@ fn squashfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::squashfs::Form
     Ok(opts)
 }
 
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "xfs"))]
 fn xfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::xfs::format::FormatOpts> {
     let mut bag = options_bag_for(fs)?;
     let mut opts = crate::fs::xfs::format::FormatOpts::default();
@@ -543,7 +682,7 @@ fn xfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::xfs::format::Format
     Ok(opts)
 }
 
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "ext"))]
 fn build_bare_ext(fs: &FilesystemSpec, output: &Path) -> Result<()> {
     let kind = parse_fs_kind(&fs.fs_type)?;
     let block_size = fs.block_size.unwrap_or(1024);
@@ -555,7 +694,7 @@ fn build_bare_ext(fs: &FilesystemSpec, output: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "fat"))]
 fn build_bare_fat(fs: &FilesystemSpec, output: &Path) -> Result<()> {
     let lower = fs.fs_type.to_ascii_lowercase();
     // Sizing precedence: explicit `size` → use as-is. Otherwise size
@@ -587,9 +726,9 @@ fn build_bare_fat(fs: &FilesystemSpec, output: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "fat"))]
 fn format_fat_into(
-    dev: &mut dyn BlockDevice,
+    dev: &mut dyn crate::block::BlockDevice,
     fs: &FilesystemSpec,
     total_sectors: u32,
     volume_id: u32,
@@ -628,7 +767,24 @@ fn format_fat_into(
 /// archive (by extension) becomes `TarArchive`, and any other string
 /// — including the `disk.img:N` partition selector — falls through
 /// to `Image`.
-#[cfg(feature = "spec")]
+#[cfg(all(
+    feature = "spec",
+    any(
+        feature = "ext",
+        feature = "fat",
+        feature = "hfs-plus",
+        feature = "hfs",
+        feature = "affs",
+        feature = "littlefs",
+        feature = "ntfs",
+        feature = "f2fs",
+        feature = "squashfs",
+        feature = "xfs",
+        feature = "iso9660",
+        feature = "grf",
+        feature = "archive"
+    )
+))]
 fn source_from_spec(src: &Path) -> Result<crate::repack::Source> {
     let s = src.to_str().ok_or_else(|| {
         crate::Error::InvalidArgument(format!("spec: source path {src:?} is not valid UTF-8"))
@@ -639,7 +795,7 @@ fn source_from_spec(src: &Path) -> Result<crate::repack::Source> {
 /// Space-pad and truncate `label` to exactly 11 bytes for FAT32. ASCII only;
 /// non-ASCII bytes are replaced with `_` (FAT32 short labels are OEM-encoded;
 /// we don't try to translate code pages).
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "fat"))]
 fn fat32_volume_label(label: Option<&str>) -> [u8; 11] {
     let mut out = [b' '; 11];
     let Some(s) = label else {
@@ -661,7 +817,7 @@ fn fat32_volume_label(label: Option<&str>) -> [u8; 11] {
 /// `blocks_count_override` forces a specific block count (used to make a
 /// partition's filesystem fill the partition exactly); `None` auto-sizes
 /// from the source tree.
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "ext"))]
 fn ext_format_opts(
     fs: &FilesystemSpec,
     kind: FsKind,
@@ -715,7 +871,7 @@ fn ext_format_opts(
 }
 
 /// Format + populate an ext filesystem into `dev` from `fs`.
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "ext"))]
 fn format_ext_into(
     dev: &mut dyn BlockDevice,
     fs: &FilesystemSpec,
@@ -751,7 +907,20 @@ const ALIGN_LBA: u64 = 2048;
 
 #[cfg(feature = "spec")]
 fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &Path) -> Result<()> {
-    use crate::part::{Gpt, Mbr, Partition, PartitionTable, slice_partition};
+    #[cfg(any(
+        feature = "ext",
+        feature = "fat",
+        feature = "hfs-plus",
+        feature = "hfs",
+        feature = "affs",
+        feature = "littlefs",
+        feature = "ntfs",
+        feature = "f2fs",
+        feature = "squashfs",
+        feature = "xfs"
+    ))]
+    use crate::part::slice_partition;
+    use crate::part::{Gpt, Mbr, Partition, PartitionTable};
 
     let total_bytes = parse_size(&image.size)?;
     let total_lba = total_bytes / SECTOR;
@@ -843,6 +1012,18 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
     // Rebuild a PartitionTable trait object once so slice_partition can
     // compute each partition's byte range. (The Gpt/Mbr built above were
     // consumed by write(); rebuilding from `placed` is cheap.)
+    #[cfg(any(
+        feature = "ext",
+        feature = "fat",
+        feature = "hfs-plus",
+        feature = "hfs",
+        feature = "affs",
+        feature = "littlefs",
+        feature = "ntfs",
+        feature = "f2fs",
+        feature = "squashfs",
+        feature = "xfs"
+    ))]
     let table_obj: Box<dyn PartitionTable> = match table.as_str() {
         "gpt" => Box::new(Gpt::build(placed.clone())?),
         "mbr" => Box::new(Mbr::new(placed.clone())?),
@@ -850,13 +1031,27 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
     };
 
     // Format + populate each partition that carries a filesystem.
+    #[cfg(any(
+        feature = "ext",
+        feature = "fat",
+        feature = "hfs-plus",
+        feature = "hfs",
+        feature = "affs",
+        feature = "littlefs",
+        feature = "ntfs",
+        feature = "f2fs",
+        feature = "squashfs",
+        feature = "xfs"
+    ))]
     for (i, p) in partitions.iter().enumerate() {
         let Some(fs) = &p.filesystem else {
             continue;
         };
+        #[cfg(any(feature = "ext", feature = "fat"))]
         let part_bytes = placed[i].size_lba * SECTOR;
         let mut slice = slice_partition(table_obj.as_ref(), dev.as_mut(), i)?;
         match fs.fs_type.to_ascii_lowercase().as_str() {
+            #[cfg(feature = "ext")]
             "ext2" | "ext3" | "ext4" => {
                 let kind = parse_fs_kind(&fs.fs_type)?;
                 let block_size = fs.block_size.unwrap_or(1024);
@@ -866,6 +1061,7 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
                 let opts = ext_format_opts(fs, kind, block_size, Some(blocks))?;
                 format_ext_into(&mut slice, fs, &opts)?;
             }
+            #[cfg(feature = "fat")]
             "fat12" | "fat16" | "fat32" | "vfat" => {
                 let total_sectors: u32 = (part_bytes / SECTOR).try_into().map_err(|_| {
                     crate::Error::InvalidArgument(
@@ -876,6 +1072,7 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
                 let volume_id = fs.volume_id.unwrap_or(0);
                 format_fat_into(&mut slice, fs, total_sectors, volume_id, label)?;
             }
+            #[cfg(feature = "hfs-plus")]
             "hfsplus" | "hfs+" => {
                 format_in_partition_via_trait::<crate::fs::hfs_plus::HfsPlus>(
                     &mut slice,
@@ -883,6 +1080,7 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
                     hfs_plus_format_opts(fs)?,
                 )?;
             }
+            #[cfg(feature = "hfs")]
             "hfs" => {
                 format_in_partition_via_trait::<crate::fs::hfs::Hfs>(
                     &mut slice,
@@ -890,6 +1088,7 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
                     hfs_format_opts(fs)?,
                 )?;
             }
+            #[cfg(feature = "affs")]
             "affs" | "ffs" | "ofs" => {
                 format_in_partition_via_trait::<crate::fs::affs::Affs>(
                     &mut slice,
@@ -897,6 +1096,7 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
                     affs_format_opts(fs)?,
                 )?;
             }
+            #[cfg(feature = "littlefs")]
             "littlefs" | "lfs" => {
                 format_in_partition_via_trait::<crate::fs::littlefs::LittleFs>(
                     &mut slice,
@@ -904,6 +1104,7 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
                     littlefs_format_opts(fs)?,
                 )?;
             }
+            #[cfg(feature = "ntfs")]
             "ntfs" => {
                 format_in_partition_via_trait::<crate::fs::ntfs::Ntfs>(
                     &mut slice,
@@ -911,6 +1112,7 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
                     ntfs_format_opts(fs)?,
                 )?;
             }
+            #[cfg(feature = "f2fs")]
             "f2fs" => {
                 format_in_partition_via_trait::<crate::fs::f2fs::F2fs>(
                     &mut slice,
@@ -918,6 +1120,7 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
                     f2fs_format_opts(fs)?,
                 )?;
             }
+            #[cfg(feature = "squashfs")]
             "squashfs" => {
                 format_in_partition_via_trait::<crate::fs::squashfs::Squashfs>(
                     &mut slice,
@@ -925,6 +1128,7 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
                     squashfs_format_opts(fs)?,
                 )?;
             }
+            #[cfg(feature = "xfs")]
             "xfs" => {
                 format_in_partition_via_trait::<crate::fs::xfs::Xfs>(
                     &mut slice,
@@ -932,11 +1136,26 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
                     xfs_format_opts(fs)?,
                 )?;
             }
-            other => {
-                return Err(crate::Error::InvalidArgument(format!(
-                    "spec: unknown filesystem type {other:?}"
-                )));
-            }
+            other => return Err(unknown_fs_type(other)),
+        }
+    }
+    // No partition-capable filesystem compiled in: a partition asking
+    // for one gets the same Unsupported error the bare-FS path gives.
+    #[cfg(not(any(
+        feature = "ext",
+        feature = "fat",
+        feature = "hfs-plus",
+        feature = "hfs",
+        feature = "affs",
+        feature = "littlefs",
+        feature = "ntfs",
+        feature = "f2fs",
+        feature = "squashfs",
+        feature = "xfs"
+    )))]
+    for p in partitions {
+        if let Some(fs) = &p.filesystem {
+            return Err(unknown_fs_type(&fs.fs_type.to_ascii_lowercase()));
         }
     }
 
@@ -979,7 +1198,7 @@ pub fn parse_partition_kind(s: &str) -> Result<crate::part::PartitionKind> {
     })
 }
 
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "ext"))]
 fn parse_fs_kind(s: &str) -> Result<FsKind> {
     match s.to_ascii_lowercase().as_str() {
         "ext2" => Ok(FsKind::Ext2),
@@ -991,7 +1210,7 @@ fn parse_fs_kind(s: &str) -> Result<FsKind> {
     }
 }
 
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "ext"))]
 fn parse_rootdevs(s: Option<&str>) -> Result<RootDevs> {
     match s.map(|x| x.to_ascii_lowercase()) {
         None => Ok(RootDevs::None),
@@ -1006,41 +1225,12 @@ fn parse_rootdevs(s: Option<&str>) -> Result<RootDevs> {
     }
 }
 
-#[cfg(feature = "spec")]
+#[cfg(all(feature = "spec", feature = "ext"))]
 fn rootdevs_entry_count(kind: RootDevs) -> usize {
     crate::fs::rootdevs::device_table(kind).len()
 }
 
-/// Parse a human-readable size string into bytes. Accepts a bare integer
-/// (bytes), or a number followed by a unit: `KB`/`MB`/`GB`/`TB` (decimal,
-/// ×1000) or `KiB`/`MiB`/`GiB`/`TiB` (binary, ×1024). Case-insensitive.
-pub fn parse_size(s: &str) -> Result<u64> {
-    let s = s.trim();
-    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-    let (num, unit) = s.split_at(split);
-    let value: u64 = num
-        .parse()
-        .map_err(|_| crate::Error::InvalidArgument(format!("spec: bad size {s:?}")))?;
-    let mult: u64 = match unit.trim().to_ascii_lowercase().as_str() {
-        "" | "b" => 1,
-        "kb" => 1_000,
-        "mb" => 1_000_000,
-        "gb" => 1_000_000_000,
-        "tb" => 1_000_000_000_000,
-        "kib" | "k" => 1 << 10,
-        "mib" | "m" => 1 << 20,
-        "gib" | "g" => 1 << 30,
-        "tib" | "t" => 1 << 40,
-        other => {
-            return Err(crate::Error::InvalidArgument(format!(
-                "spec: unknown size unit {other:?}"
-            )));
-        }
-    };
-    value
-        .checked_mul(mult)
-        .ok_or_else(|| crate::Error::InvalidArgument(format!("spec: size {s:?} overflows u64")))
-}
+pub use crate::format_opts::parse_size;
 
 #[cfg(all(test, feature = "spec"))]
 mod tests {
@@ -1136,6 +1326,7 @@ mod tests {
         assert_eq!(root_fs.block_size, Some(4096));
     }
 
+    #[cfg(feature = "squashfs")]
     #[test]
     fn options_table_parses_and_flows_into_format_opts() {
         // `[filesystem.options]` is a free-form scalar table; the
@@ -1161,6 +1352,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "hfs-plus")]
     #[test]
     fn options_table_rejects_unknown_keys() {
         // hfs+'s `apply_options` doesn't know `widgetsize`, so the
@@ -1226,6 +1418,7 @@ mod tests {
     /// built image is re-opened to verify the tar's contents landed
     /// inside the ext4 root. Exercises `repack::Source::detect →
     /// TarArchive → populate_ext_from_source` in the spec path.
+    #[cfg(all(feature = "ext", feature = "tar"))]
     #[test]
     fn build_bare_ext4_from_tar_source() {
         // Stage a tar archive in a tempfile.
@@ -1268,6 +1461,7 @@ mod tests {
     /// Same idea, but the source is an *existing ext4 image* instead
     /// of a tar archive. Goes through `repack::Source::detect →
     /// Image → AnyFs walker → copy_into_ext`.
+    #[cfg(feature = "ext")]
     #[test]
     fn build_bare_ext4_from_existing_image_source() {
         let tmp_dir = std::env::temp_dir();
@@ -1325,6 +1519,7 @@ mod tests {
     /// Build a minimal ustar archive at `path` with one regular file
     /// `hello.txt` containing `"hi\n"`. Hand-rolled so the test
     /// doesn't depend on host `tar`.
+    #[cfg(all(feature = "ext", feature = "tar"))]
     fn write_minimal_tar(path: &std::path::Path) {
         use std::io::Write;
         // 512-byte ustar header + one 512-byte body block + two

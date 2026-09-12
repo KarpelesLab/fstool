@@ -233,7 +233,7 @@ fn device_node_round_trips_rdev() {
     .unwrap();
     let a = fs.getattr(&mut d, Path::new("/dev/null")).unwrap();
     assert_eq!(a.kind, EntryKind::Char);
-    assert_eq!(crate::fs::ext::inode::decode_devnum(a.rdev), (1, 3));
+    assert_eq!(crate::fs::devnum::decode_devnum(a.rdev), (1, 3));
 }
 
 #[test]
@@ -304,6 +304,7 @@ fn format_is_empty_open_is_unsupported() {
 }
 
 #[test]
+#[cfg(feature = "ext")]
 fn repack_to_ext_round_trips() {
     let mut d = dev();
     let mut fs = Ramfs::new();

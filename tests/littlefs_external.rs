@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(all(unix, feature = "std", feature = "littlefs"))]
 //! littlefs conformance against the reference C implementation.
 //!
 //! The checks here drive `littlefs-python`, which wraps the upstream C

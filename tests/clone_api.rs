@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(all(unix, feature = "ext"))]
 //! Phase 3a — the cross-backend reflink / clone API surface.
 //!
 //! `Filesystem::clone_file` works on every writable backend: by default

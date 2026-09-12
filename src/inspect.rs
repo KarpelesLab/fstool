@@ -12,29 +12,53 @@ use std::path::{Path, PathBuf};
 use crate::Result;
 use crate::block::BlockDevice;
 use crate::fs::DirEntry;
+#[cfg(feature = "affs")]
 use crate::fs::affs::Affs;
+#[cfg(feature = "apfs")]
 use crate::fs::apfs::Apfs;
+#[cfg(feature = "archive")]
 use crate::fs::archive::ar::ArFs;
+#[cfg(feature = "arc")]
 use crate::fs::archive::arc::ArcFs;
+#[cfg(feature = "cab")]
 use crate::fs::archive::cab::CabFs;
+#[cfg(feature = "archive")]
 use crate::fs::archive::cpio::CpioFs;
+#[cfg(feature = "lha")]
 use crate::fs::archive::lha::LhaFs;
+#[cfg(feature = "amiga-lzx")]
 use crate::fs::archive::lzx::LzxFs;
+#[cfg(feature = "rar")]
 use crate::fs::archive::rar::RarFs;
+#[cfg(feature = "sevenz")]
 use crate::fs::archive::sevenz::SevenZFs;
+#[cfg(feature = "sit")]
 use crate::fs::archive::sit::SitFs;
+#[cfg(feature = "archive")]
 use crate::fs::archive::zip::ZipFs;
+#[cfg(feature = "exfat")]
 use crate::fs::exfat::Exfat;
+#[cfg(feature = "ext")]
 use crate::fs::ext::Ext;
+#[cfg(feature = "f2fs")]
 use crate::fs::f2fs::F2fs;
+#[cfg(feature = "fat")]
 use crate::fs::fat::Fat32;
+#[cfg(feature = "hfs")]
 use crate::fs::hfs::Hfs;
+#[cfg(feature = "hfs-plus")]
 use crate::fs::hfs_plus::HfsPlus;
+#[cfg(feature = "littlefs")]
 use crate::fs::littlefs::LittleFs;
+#[cfg(feature = "ntfs")]
 use crate::fs::ntfs::Ntfs;
+#[cfg(feature = "ramfs")]
 use crate::fs::ramfs::Ramfs;
+#[cfg(feature = "squashfs")]
 use crate::fs::squashfs::Squashfs;
+#[cfg(feature = "tar")]
 use crate::fs::tar::Tar;
+#[cfg(feature = "xfs")]
 use crate::fs::xfs::Xfs;
 use crate::part::{Apm, Gpt, Mbr, Partition, PartitionTable, slice_partition};
 
@@ -49,62 +73,116 @@ use crate::part::{Apm, Gpt, Mbr, Partition, PartitionTable, slice_partition};
 #[non_exhaustive]
 pub enum FsKind {
     /// ext2 / ext3 / ext4 — distinguished further by feature flags.
+    #[cfg(feature = "ext")]
     Ext,
     /// The FAT family — FAT12, FAT16 and FAT32. One backend
     /// ([`crate::fs::fat::Fat32`]) drives all three; ask the opened
     /// volume's `kind()` which flavour it actually is.
+    #[cfg(feature = "fat")]
     Fat32,
     /// A tar archive treated as a read-only filesystem.
+    #[cfg(feature = "tar")]
     Tar,
     /// XFS — read-only (shortform dirs + extent files).
+    #[cfg(feature = "xfs")]
     Xfs,
     /// exFAT — read-only.
+    #[cfg(feature = "exfat")]
     Exfat,
     /// HFS+ — read-only.
+    #[cfg(feature = "hfs-plus")]
     HfsPlus,
     /// Classic HFS (Mac OS ≤ 8) — read + write (create / in-place add/remove).
+    #[cfg(feature = "hfs")]
     Hfs,
     /// Amiga OFS/FFS (AFFS) — read-only (write lands in later phases).
+    #[cfg(feature = "affs")]
     Affs,
     /// littlefs — read + write, including in-place edits.
+    #[cfg(feature = "littlefs")]
     LittleFs,
     /// APFS — read-only, single-leaf-tree case only.
+    #[cfg(feature = "apfs")]
     Apfs,
     /// NTFS — read + write (MFT, attributes, `$DATA` + ADS, indexes,
     /// `$Secure`, `$LogFile`).
+    #[cfg(feature = "ntfs")]
     Ntfs,
     /// F2FS — read + write (build-once: a re-opened image is read-only).
+    #[cfg(feature = "f2fs")]
     F2fs,
     /// SquashFS — read + write via `repack` (compressed, repack-only).
+    #[cfg(feature = "squashfs")]
     Squashfs,
     /// ISO 9660 (optical media). Read-only on this trait surface;
     /// writing happens through `repack` to a fresh image.
+    #[cfg(feature = "iso9660")]
     Iso9660,
     /// GRF — Gravity Ragnarok Online archive. Read + write + add/rm.
+    #[cfg(feature = "grf")]
     Grf,
     /// ZIP archive. Read + repack (write via `repack`).
+    #[cfg(feature = "archive")]
     Zip,
     /// cpio archive (newc / odc). Read + repack.
+    #[cfg(feature = "archive")]
     Cpio,
     /// Unix `ar` archive. Read + repack.
+    #[cfg(feature = "archive")]
     Ar,
     /// 7-Zip — detection-only scaffold.
+    #[cfg(feature = "sevenz")]
     SevenZ,
     /// RAR — detection-only scaffold.
+    #[cfg(feature = "rar")]
     Rar,
     /// SEA ARC — detection-only scaffold.
+    #[cfg(feature = "arc")]
     Arc,
     /// LHA / LZH — detection-only scaffold.
+    #[cfg(feature = "lha")]
     Lha,
     /// Amiga LZX — detection-only scaffold.
+    #[cfg(feature = "amiga-lzx")]
     Lzx,
     /// Microsoft Cabinet — detection-only scaffold.
+    #[cfg(feature = "cab")]
     Cab,
     /// StuffIt — detection-only scaffold.
+    #[cfg(feature = "sit")]
     Sit,
     /// In-memory ramfs. Has no on-disk form, so it is never returned by
     /// [`detect_fs`] — only constructed explicitly (`AnyFs::new_ramfs`).
+    #[cfg(feature = "ramfs")]
     Ramfs,
+}
+
+/// The error for a format whose on-disk signature was recognised (or whose
+/// name was asked for) but whose backend is compiled out of this build:
+/// `what` is the human-readable format name ("XFS"), `feature` the Cargo
+/// feature that brings it back. Shared by [`detect_fs`] and the
+/// name-driven dispatch sites so the message stays uniform.
+pub fn missing_feature(what: &str, feature: &str) -> crate::Error {
+    crate::Error::Unsupported(format!(
+        "{what} detected, but this build of fstool was compiled without the `{feature}` feature"
+    ))
+}
+
+/// `return Ok(FsKind::$variant)` when the backend behind `$feature` is
+/// compiled in; otherwise return the [`missing_feature`] error. The magic
+/// check itself always runs, so a recognised-but-unavailable image is
+/// reported as such instead of as "no recognised filesystem".
+macro_rules! detected {
+    ($feature:literal, $variant:ident, $what:literal) => {{
+        #[cfg(feature = $feature)]
+        {
+            return Ok(FsKind::$variant);
+        }
+        #[cfg(not(feature = $feature))]
+        {
+            return Err(missing_feature($what, $feature));
+        }
+    }};
 }
 
 /// Probe `dev` to decide which filesystem it carries. Reads only sector 0
@@ -123,15 +201,15 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
     let head = (dev.total_size()).min(512) as usize;
     dev.read_at(0, &mut bs[..head])?;
     if bs[510] == 0x55 && bs[511] == 0xAA && &bs[82..87] == b"FAT32" {
-        return Ok(FsKind::Fat32);
+        detected!("fat", Fat32, "FAT32");
     }
     // exFAT: "EXFAT   " at offset 3 of LBA 0 (also has 0x55AA at +510).
     if &bs[3..11] == b"EXFAT   " {
-        return Ok(FsKind::Exfat);
+        detected!("exfat", Exfat, "exFAT");
     }
     // NTFS: "NTFS    " at offset 3 of LBA 0.
     if &bs[3..11] == b"NTFS    " {
-        return Ok(FsKind::Ntfs);
+        detected!("ntfs", Ntfs, "NTFS");
     }
 
     // FAT12 / FAT16 have no magic string at all — their flavour follows
@@ -140,81 +218,82 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
     // because those carry a FAT-shaped sector 0 with their own signature,
     // and before the remaining checks because those key off offsets a FAT
     // boot sector doesn't use.
+    #[cfg(feature = "fat")]
     if crate::fs::fat::boot::probe(&bs).is_some() {
         return Ok(FsKind::Fat32);
     }
 
     // XFS: "XFSB" at offset 0 of LBA 0.
     if &bs[0..4] == b"XFSB" {
-        return Ok(FsKind::Xfs);
+        detected!("xfs", Xfs, "XFS");
     }
 
     // SquashFS: little-endian "hsqs" at offset 0.
     if &bs[0..4] == b"hsqs" {
-        return Ok(FsKind::Squashfs);
+        detected!("squashfs", Squashfs, "SquashFS");
     }
 
     // GRF: "Master of Magic\0" at offset 0 (16-byte magic header).
     if &bs[0..16] == b"Master of Magic\0" {
-        return Ok(FsKind::Grf);
+        detected!("grf", Grf, "GRF");
     }
 
     // littlefs: the superblock entry is always the first tag of block 0's
     // first commit, which puts the magic string at exactly offset 8.
     if &bs[8..16] == b"littlefs" {
-        return Ok(FsKind::LittleFs);
+        detected!("littlefs", LittleFs, "littlefs");
     }
 
     // Amiga OFS/FFS: boot block "DOS" + a flag byte 0..=7 at offset 0.
     // Specific enough to not shadow MBR/boot sectors (which don't begin
     // with "DOS"); the flag byte's high bits being zero rules out ASCII.
     if &bs[0..3] == b"DOS" && bs[3] <= 7 {
-        return Ok(FsKind::Affs);
+        detected!("affs", Affs, "Amiga FFS");
     }
 
     // --- archive formats (all offset 0 except lha at offset 2) ---
     // ZIP: local-file-header "PK\x03\x04" or an empty archive's EOCD
     // "PK\x05\x06".
     if &bs[0..2] == b"PK" && ((bs[2] == 3 && bs[3] == 4) || (bs[2] == 5 && bs[3] == 6)) {
-        return Ok(FsKind::Zip);
+        detected!("archive", Zip, "ZIP");
     }
     // cpio: newc "070701" / newc-crc "070702" / odc "070707".
     if &bs[0..6] == b"070701" || &bs[0..6] == b"070702" || &bs[0..6] == b"070707" {
-        return Ok(FsKind::Cpio);
+        detected!("archive", Cpio, "cpio");
     }
     // ar: "!<arch>\n".
     if &bs[0..8] == b"!<arch>\n" {
-        return Ok(FsKind::Ar);
+        detected!("archive", Ar, "ar");
     }
     // 7z: "7z\xBC\xAF\x27\x1C".
     if &bs[0..6] == b"7z\xBC\xAF\x27\x1C" {
-        return Ok(FsKind::SevenZ);
+        detected!("sevenz", SevenZ, "7-Zip");
     }
     // RAR: "Rar!\x1A\x07" then 0x00 (v4) or 0x01 (v5).
     if &bs[0..6] == b"Rar!\x1A\x07" {
-        return Ok(FsKind::Rar);
+        detected!("rar", Rar, "RAR");
     }
     // Microsoft Cabinet: "MSCF".
     if &bs[0..4] == b"MSCF" {
-        return Ok(FsKind::Cab);
+        detected!("cab", Cab, "Microsoft Cabinet");
     }
     // LHA / LZH: method tag "-lh?-" / "-lz?-" at offset 2 (bytes 0..2 are
     // header size + checksum), with the trailing '-' at offset 6.
     if &bs[2..4] == b"-l" && bs[6] == b'-' {
-        return Ok(FsKind::Lha);
+        detected!("lha", Lha, "LHA");
     }
     // Amiga LZX: "LZX\0".
     if &bs[0..4] == b"LZX\0" {
-        return Ok(FsKind::Lzx);
+        detected!("amiga-lzx", Lzx, "Amiga LZX");
     }
     // StuffIt: classic "SIT!" or SIT5 "StuffIt".
     if &bs[0..4] == b"SIT!" || &bs[0..7] == b"StuffIt" {
-        return Ok(FsKind::Sit);
+        detected!("sit", Sit, "StuffIt");
     }
 
     // Tar: "ustar\0" or "ustar " magic at offset 257 of the first block.
     if &bs[257..262] == b"ustar" {
-        return Ok(FsKind::Tar);
+        detected!("tar", Tar, "tar");
     }
 
     // ISO 9660: PVD at LBA 16 (byte 32768) starts with type=0x01,
@@ -225,13 +304,13 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
         let mut iso = [0u8; 7];
         dev.read_at(32768, &mut iso)?;
         if &iso[1..6] == b"CD001" {
-            return Ok(FsKind::Iso9660);
+            detected!("iso9660", Iso9660, "ISO 9660");
         }
     }
 
     // APFS: container superblock magic "NXSB" at offset 32 of block 0.
     if &bs[32..36] == b"NXSB" {
-        return Ok(FsKind::Apfs);
+        detected!("apfs", Apfs, "APFS");
     }
 
     // ext superblock starts at byte 1024; s_magic (0xEF53) is at offset 56.
@@ -239,7 +318,7 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
     if dev.total_size() >= 1024 + 56 + 2 {
         dev.read_at(1024 + 56, &mut sb_magic)?;
         if sb_magic == [0x53, 0xEF] {
-            return Ok(FsKind::Ext);
+            detected!("ext", Ext, "ext2/3/4");
         }
     }
 
@@ -248,11 +327,11 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
     if dev.total_size() >= 1024 + 2 {
         dev.read_at(1024, &mut hfs_sig)?;
         if &hfs_sig == b"H+" || &hfs_sig == b"HX" {
-            return Ok(FsKind::HfsPlus);
+            detected!("hfs-plus", HfsPlus, "HFS+");
         }
         // Classic HFS Master Directory Block signature `BD` at byte 1024.
         if &hfs_sig == b"BD" {
-            return Ok(FsKind::Hfs);
+            detected!("hfs", Hfs, "HFS");
         }
     }
 
@@ -262,11 +341,11 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
     if dev.total_size() >= 1024 + 0x1000 + 4 {
         dev.read_at(1024, &mut f2_magic)?;
         if u32::from_le_bytes(f2_magic) == 0xF2F5_2010 {
-            return Ok(FsKind::F2fs);
+            detected!("f2fs", F2fs, "F2FS");
         }
         dev.read_at(1024 + 0x1000, &mut f2_magic)?;
         if u32::from_le_bytes(f2_magic) == 0xF2F5_2010 {
-            return Ok(FsKind::F2fs);
+            detected!("f2fs", F2fs, "F2FS");
         }
     }
 
@@ -274,7 +353,7 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
     // 1..=11. Heuristic, so it is checked last to avoid shadowing a real
     // filesystem whose sector 0 happens to start with 0x1A.
     if bs[0] == 0x1A && (1..=11).contains(&bs[1]) {
-        return Ok(FsKind::Arc);
+        detected!("arc", Arc, "SEA ARC");
     }
 
     Err(crate::Error::InvalidImage(
@@ -292,45 +371,63 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
 /// in-crate dispatch helper they build on; matching on its variants
 /// is fine in-crate but isn't a stable surface.
 pub enum AnyFs {
+    #[cfg(feature = "ext")]
     Ext(Box<Ext>),
+    #[cfg(feature = "fat")]
     Fat32(Box<Fat32>),
     /// Tar archive — read-only via this handle.
+    #[cfg(feature = "tar")]
     Tar(Box<Tar>),
     /// XFS — read-only (shortform dirs + extent-format files).
+    #[cfg(feature = "xfs")]
     Xfs(Box<Xfs>),
     /// exFAT — read-only.
+    #[cfg(feature = "exfat")]
     Exfat(Box<Exfat>),
     /// HFS+ — read-only.
+    #[cfg(feature = "hfs-plus")]
     HfsPlus(Box<HfsPlus>),
+    #[cfg(feature = "hfs")]
     Hfs(Box<Hfs>),
     /// Amiga OFS/FFS (AFFS) — read-only.
+    #[cfg(feature = "affs")]
     Affs(Box<Affs>),
     /// littlefs — read + write (metadata pairs + CTZ skip-lists).
+    #[cfg(feature = "littlefs")]
     LittleFs(Box<LittleFs>),
     /// APFS — read-only; single-leaf trees only.
+    #[cfg(feature = "apfs")]
     Apfs(Box<Apfs>),
     /// NTFS — read + write (MFT, attributes, `$DATA` + ADS, indexes).
+    #[cfg(feature = "ntfs")]
     Ntfs(Box<Ntfs>),
     /// F2FS — read + write (build-once: a re-opened image is read-only).
+    #[cfg(feature = "f2fs")]
     F2fs(Box<F2fs>),
     /// SquashFS — read + write via `repack` (compressed, repack-only).
+    #[cfg(feature = "squashfs")]
     Squashfs(Box<Squashfs>),
     /// ISO 9660 — read-only (PVD + Joliet + Rock Ridge + El Torito).
+    #[cfg(feature = "iso9660")]
     Iso9660(Box<crate::fs::iso9660::Iso9660>),
     /// GRF — Ragnarok Online archive; full read/write/add/rm.
+    #[cfg(feature = "grf")]
     Grf(Box<crate::fs::grf::Grf>),
     /// Any archive-core backend (zip / cpio / ar / 7z / …), held behind
     /// the [`crate::fs::Filesystem`] trait with its kind tag and name.
     /// The 10 archive formats share one variant since they dispatch
     /// uniformly through the trait.
+    #[cfg(feature = "archive")]
     Archive(Box<dyn crate::fs::Filesystem>, FsKind, &'static str),
     /// In-memory ramfs — never produced by [`detect_fs`]; built explicitly
     /// via [`AnyFs::new_ramfs`] / [`AnyFs::new_ramfs_from`].
+    #[cfg(feature = "ramfs")]
     Ramfs(Box<Ramfs>),
 }
 
 impl AnyFs {
     /// A fresh, empty in-memory ramfs wrapped as an `AnyFs`.
+    #[cfg(feature = "ramfs")]
     #[must_use]
     pub fn new_ramfs() -> Self {
         Self::Ramfs(Box::default())
@@ -339,6 +436,7 @@ impl AnyFs {
     /// A ramfs pre-populated from `source` (a host dir / image / tar), built
     /// through the generic repack sink so symlinks, devices and xattrs carry
     /// over. The `dev` is the ramfs's ignored device.
+    #[cfg(feature = "ramfs")]
     pub fn new_ramfs_from(
         dev: &mut dyn BlockDevice,
         source: &crate::repack::Source,
@@ -350,68 +448,105 @@ impl AnyFs {
 
     /// Open `dev`, picking the backend automatically.
     pub fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
-        match detect_fs(dev)? {
-            FsKind::Ramfs => Err(crate::Error::Unsupported(
-                "ramfs has no on-disk form; construct it with AnyFs::new_ramfs()".into(),
-            )),
+        let kind = detect_fs(dev)?;
+        Self::open_kind(dev, kind)
+    }
+
+    /// [`Self::open`] for an already-probed `kind` — the shared dispatch
+    /// table behind `open` and [`Self::open_writable`].
+    fn open_kind(dev: &mut dyn BlockDevice, kind: FsKind) -> Result<Self> {
+        match kind {
+            #[cfg(feature = "ramfs")]
+            FsKind::Ramfs => {
+                // (`dev` is otherwise unused in a ramfs-only build.)
+                let _ = &dev;
+                Err(crate::Error::Unsupported(
+                    "ramfs has no on-disk form; construct it with AnyFs::new_ramfs()".into(),
+                ))
+            }
+            #[cfg(feature = "ext")]
             FsKind::Ext => Ok(Self::Ext(Box::new(Ext::open(dev)?))),
+            #[cfg(feature = "fat")]
             FsKind::Fat32 => Ok(Self::Fat32(Box::new(Fat32::open(dev)?))),
+            #[cfg(feature = "tar")]
             FsKind::Tar => Ok(Self::Tar(Box::new(Tar::open(dev)?))),
+            #[cfg(feature = "xfs")]
             FsKind::Xfs => Ok(Self::Xfs(Box::new(Xfs::open(dev)?))),
+            #[cfg(feature = "exfat")]
             FsKind::Exfat => Ok(Self::Exfat(Box::new(Exfat::open(dev)?))),
+            #[cfg(feature = "hfs-plus")]
             FsKind::HfsPlus => Ok(Self::HfsPlus(Box::new(HfsPlus::open(dev)?))),
+            #[cfg(feature = "hfs")]
             FsKind::Hfs => Ok(Self::Hfs(Box::new(Hfs::open(dev)?))),
+            #[cfg(feature = "affs")]
             FsKind::Affs => Ok(Self::Affs(Box::new(Affs::open(dev)?))),
+            #[cfg(feature = "littlefs")]
             FsKind::LittleFs => Ok(Self::LittleFs(Box::new(LittleFs::open(dev)?))),
+            #[cfg(feature = "apfs")]
             FsKind::Apfs => Ok(Self::Apfs(Box::new(Apfs::open(dev)?))),
+            #[cfg(feature = "ntfs")]
             FsKind::Ntfs => Ok(Self::Ntfs(Box::new(Ntfs::open(dev)?))),
+            #[cfg(feature = "f2fs")]
             FsKind::F2fs => Ok(Self::F2fs(Box::new(F2fs::open(dev)?))),
+            #[cfg(feature = "squashfs")]
             FsKind::Squashfs => Ok(Self::Squashfs(Box::new(Squashfs::open(dev)?))),
+            #[cfg(feature = "iso9660")]
             FsKind::Iso9660 => Ok(Self::Iso9660(Box::new(crate::fs::iso9660::Iso9660::open(
                 dev,
             )?))),
+            #[cfg(feature = "grf")]
             FsKind::Grf => Ok(Self::Grf(Box::new(crate::fs::grf::Grf::open_dev(dev)?))),
+            #[cfg(feature = "archive")]
             FsKind::Zip => Ok(Self::Archive(
                 Box::new(ZipFs::open(dev)?),
                 FsKind::Zip,
                 "zip",
             )),
+            #[cfg(feature = "archive")]
             FsKind::Cpio => Ok(Self::Archive(
                 Box::new(CpioFs::open(dev)?),
                 FsKind::Cpio,
                 "cpio",
             )),
+            #[cfg(feature = "archive")]
             FsKind::Ar => Ok(Self::Archive(Box::new(ArFs::open(dev)?), FsKind::Ar, "ar")),
+            #[cfg(feature = "sevenz")]
             FsKind::SevenZ => Ok(Self::Archive(
                 Box::new(SevenZFs::open(dev)?),
                 FsKind::SevenZ,
                 "7z",
             )),
+            #[cfg(feature = "rar")]
             FsKind::Rar => Ok(Self::Archive(
                 Box::new(RarFs::open(dev)?),
                 FsKind::Rar,
                 "rar",
             )),
+            #[cfg(feature = "arc")]
             FsKind::Arc => Ok(Self::Archive(
                 Box::new(ArcFs::open(dev)?),
                 FsKind::Arc,
                 "arc",
             )),
+            #[cfg(feature = "lha")]
             FsKind::Lha => Ok(Self::Archive(
                 Box::new(LhaFs::open(dev)?),
                 FsKind::Lha,
                 "lha",
             )),
+            #[cfg(feature = "amiga-lzx")]
             FsKind::Lzx => Ok(Self::Archive(
                 Box::new(LzxFs::open(dev)?),
                 FsKind::Lzx,
                 "lzx",
             )),
+            #[cfg(feature = "cab")]
             FsKind::Cab => Ok(Self::Archive(
                 Box::new(CabFs::open(dev)?),
                 FsKind::Cab,
                 "cab",
             )),
+            #[cfg(feature = "sit")]
             FsKind::Sit => Ok(Self::Archive(
                 Box::new(SitFs::open(dev)?),
                 FsKind::Sit,
@@ -431,42 +566,70 @@ impl AnyFs {
     /// re-parse, no Write-state scaffolding) and uniform across
     /// backends.
     pub fn open_writable(dev: &mut dyn BlockDevice) -> Result<Self> {
-        match detect_fs(dev)? {
-            FsKind::Apfs => Ok(Self::Apfs(Box::new(Apfs::open_writable(dev)?))),
-            // Classic HFS opens read-only by default; the in-place writer is a
-            // distinct path that loads the catalog into a mutable form.
-            FsKind::Hfs => Ok(Self::Hfs(Box::new(crate::fs::hfs::Hfs::open_writable(
-                dev,
-            )?))),
-            // AFFS, like classic HFS, opens read-only by default; the in-place
-            // writer loads the whole tree into a mutable model.
-            FsKind::Affs => Ok(Self::Affs(Box::new(Affs::open_writable(dev)?))),
-            // Every other backend's open() already returns a mutable
-            // handle (ext journals, FAT/exFAT/NTFS rewrite, …), so
-            // just defer to the existing dispatch.
-            _ => Self::open(dev),
+        // An `if` chain rather than a `match` with a `_ => open` arm: in a
+        // build whose only backends are the three below, that arm would be
+        // unreachable and warn.
+        let kind = detect_fs(dev)?;
+        #[cfg(feature = "apfs")]
+        if kind == FsKind::Apfs {
+            return Ok(Self::Apfs(Box::new(Apfs::open_writable(dev)?)));
         }
+        // Classic HFS opens read-only by default; the in-place writer is a
+        // distinct path that loads the catalog into a mutable form.
+        #[cfg(feature = "hfs")]
+        if kind == FsKind::Hfs {
+            return Ok(Self::Hfs(Box::new(crate::fs::hfs::Hfs::open_writable(
+                dev,
+            )?)));
+        }
+        // AFFS, like classic HFS, opens read-only by default; the in-place
+        // writer loads the whole tree into a mutable model.
+        #[cfg(feature = "affs")]
+        if kind == FsKind::Affs {
+            return Ok(Self::Affs(Box::new(Affs::open_writable(dev)?)));
+        }
+        // Every other backend's open() already returns a mutable
+        // handle (ext journals, FAT/exFAT/NTFS rewrite, …), so
+        // just defer to the existing dispatch.
+        Self::open_kind(dev, kind)
     }
 
     /// Which filesystem this handle is talking to.
     pub fn kind(&self) -> FsKind {
         match self {
+            #[cfg(feature = "ext")]
             Self::Ext(_) => FsKind::Ext,
+            #[cfg(feature = "fat")]
             Self::Fat32(_) => FsKind::Fat32,
+            #[cfg(feature = "tar")]
             Self::Tar(_) => FsKind::Tar,
+            #[cfg(feature = "xfs")]
             Self::Xfs(_) => FsKind::Xfs,
+            #[cfg(feature = "exfat")]
             Self::Exfat(_) => FsKind::Exfat,
+            #[cfg(feature = "hfs-plus")]
             Self::HfsPlus(_) => FsKind::HfsPlus,
+            #[cfg(feature = "hfs")]
             Self::Hfs(_) => FsKind::Hfs,
+            #[cfg(feature = "affs")]
             Self::Affs(_) => FsKind::Affs,
+            #[cfg(feature = "littlefs")]
             Self::LittleFs(_) => FsKind::LittleFs,
+            #[cfg(feature = "apfs")]
             Self::Apfs(_) => FsKind::Apfs,
+            #[cfg(feature = "ntfs")]
             Self::Ntfs(_) => FsKind::Ntfs,
+            #[cfg(feature = "f2fs")]
             Self::F2fs(_) => FsKind::F2fs,
+            #[cfg(feature = "squashfs")]
             Self::Squashfs(_) => FsKind::Squashfs,
+            #[cfg(feature = "iso9660")]
             Self::Iso9660(_) => FsKind::Iso9660,
+            #[cfg(feature = "grf")]
             Self::Grf(_) => FsKind::Grf,
+            #[cfg(feature = "archive")]
             Self::Archive(_, kind, _) => *kind,
+            #[cfg(feature = "ramfs")]
             Self::Ramfs(_) => FsKind::Ramfs,
         }
     }
@@ -476,31 +639,57 @@ impl AnyFs {
     /// (run-list bootstrap, checkpoint selection) behind their list path.
     pub fn list(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<Vec<DirEntry>> {
         match self {
+            #[cfg(feature = "ext")]
             Self::Ext(ext) => {
                 let ino = ext.path_to_inode(dev, path)?;
                 ext.list_inode(dev, ino)
             }
+            #[cfg(feature = "fat")]
             Self::Fat32(fat) => fat.list_path(dev, path),
+            #[cfg(feature = "tar")]
             Self::Tar(tar) => tar.list_path(dev, path),
+            #[cfg(feature = "xfs")]
             Self::Xfs(xfs) => xfs.list_path(dev, path),
+            #[cfg(feature = "exfat")]
             Self::Exfat(exfat) => exfat.list_path(dev, path),
+            #[cfg(feature = "hfs-plus")]
             Self::HfsPlus(hfs) => hfs.list_path(dev, path),
-            Self::Hfs(hfs) => hfs.list_path(path),
-            Self::Affs(affs) => affs.list_path(path),
+            // Classic HFS and AFFS list from their in-memory catalogue and
+            // never touch `dev`; the `let _ = &dev` keeps the parameter used
+            // in a build where they are the only backends.
+            #[cfg(feature = "hfs")]
+            Self::Hfs(hfs) => {
+                let _ = &dev;
+                hfs.list_path(path)
+            }
+            #[cfg(feature = "affs")]
+            Self::Affs(affs) => {
+                let _ = &dev;
+                affs.list_path(path)
+            }
+            #[cfg(feature = "littlefs")]
             Self::LittleFs(lfs) => {
                 use crate::fs::Filesystem;
                 lfs.list(dev, std::path::Path::new(path))
             }
+            #[cfg(feature = "apfs")]
             Self::Apfs(apfs) => apfs.list_path(dev, path),
+            #[cfg(feature = "ntfs")]
             Self::Ntfs(ntfs) => ntfs.list_path(dev, path),
+            #[cfg(feature = "f2fs")]
             Self::F2fs(f2) => f2.list_path(dev, path),
+            #[cfg(feature = "squashfs")]
             Self::Squashfs(sq) => sq.list_path(dev, path),
+            #[cfg(feature = "iso9660")]
             Self::Iso9660(iso) => iso.list_path(dev, path),
+            #[cfg(feature = "grf")]
             Self::Grf(grf) => {
                 use crate::fs::Filesystem;
                 grf.list(dev, std::path::Path::new(path))
             }
+            #[cfg(feature = "archive")]
             Self::Archive(fs, _, _) => fs.list(dev, std::path::Path::new(path)),
+            #[cfg(feature = "ramfs")]
             Self::Ramfs(r) => {
                 use crate::fs::Filesystem;
                 r.list(dev, std::path::Path::new(path))
@@ -568,64 +757,79 @@ impl AnyFs {
     ) -> Result<u64> {
         let mut buf = [0u8; 64 * 1024];
         match self {
+            #[cfg(feature = "ext")]
             Self::Ext(ext) => {
                 let ino = ext.path_to_inode(dev, path)?;
                 let mut r = ext.open_file_reader(dev, ino)?;
                 pump(&mut r, out, &mut buf)
             }
+            #[cfg(feature = "fat")]
             Self::Fat32(fat) => {
                 let mut r = fat.open_file_reader(dev, path)?;
                 pump(&mut r, out, &mut buf)
             }
+            #[cfg(feature = "tar")]
             Self::Tar(tar) => {
                 let mut r = tar.open_file_reader(dev, path)?;
                 pump(&mut r, out, &mut buf)
             }
+            #[cfg(feature = "xfs")]
             Self::Xfs(xfs) => {
                 let mut r = xfs.open_file_reader(dev, path)?;
                 pump(&mut r, out, &mut buf)
             }
+            #[cfg(feature = "exfat")]
             Self::Exfat(exfat) => {
                 let mut r = exfat.open_file_reader(dev, path)?;
                 pump(&mut r, out, &mut buf)
             }
+            #[cfg(feature = "hfs")]
             Self::Hfs(hfs) => {
                 let mut r = hfs.open_file_reader(dev, path)?;
                 pump(&mut r, out, &mut buf)
             }
+            #[cfg(feature = "affs")]
             Self::Affs(affs) => {
                 let mut r = affs.open_file_reader(dev, path)?;
                 pump(&mut r, out, &mut buf)
             }
+            #[cfg(feature = "littlefs")]
             Self::LittleFs(lfs) => {
                 use crate::fs::Filesystem;
                 let mut r = lfs.read_file(dev, std::path::Path::new(path))?;
                 pump(&mut r, out, &mut buf)
             }
+            #[cfg(feature = "hfs-plus")]
             Self::HfsPlus(hfs) => {
                 let mut r = hfs.open_file_reader(dev, path)?;
                 pump(&mut r, out, &mut buf)
             }
+            #[cfg(feature = "apfs")]
             Self::Apfs(apfs) => {
                 let mut r = apfs.open_file_reader(dev, path)?;
                 pump(&mut r, out, &mut buf)
             }
+            #[cfg(feature = "ntfs")]
             Self::Ntfs(ntfs) => {
                 let mut r = ntfs.open_file_reader(dev, path)?;
                 pump(&mut r, out, &mut buf)
             }
+            #[cfg(feature = "f2fs")]
             Self::F2fs(f2) => {
                 let mut r = f2.open_file_reader(dev, path)?;
                 pump(&mut r, out, &mut buf)
             }
+            #[cfg(feature = "squashfs")]
             Self::Squashfs(sq) => {
                 let mut r = sq.open_file_reader(dev, path)?;
                 pump(&mut r, out, &mut buf)
             }
+            #[cfg(feature = "iso9660")]
             Self::Iso9660(iso) => {
                 let mut r = iso.open_file_reader(dev, path)?;
                 pump(&mut r, out, &mut buf)
             }
+            #[cfg(feature = "grf")]
             Self::Grf(grf) => {
                 // GRF entries are full-buffer inflated; stream the
                 // bytes from a cursor over the inflated body.
@@ -637,10 +841,12 @@ impl AnyFs {
                 let mut r = std::io::Cursor::new(bytes);
                 pump(&mut r, out, &mut buf)
             }
+            #[cfg(feature = "archive")]
             Self::Archive(fs, _, _) => {
                 let mut r = fs.read_file(dev, std::path::Path::new(path))?;
                 pump(&mut r, out, &mut buf)
             }
+            #[cfg(feature = "ramfs")]
             Self::Ramfs(rfs) => {
                 use crate::fs::Filesystem;
                 let mut r = rfs.read_file(dev, std::path::Path::new(path))?;
@@ -664,26 +870,41 @@ impl AnyFs {
         path: &str,
     ) -> Result<Box<dyn std::io::Read + 'a>> {
         match self {
+            #[cfg(feature = "ext")]
             Self::Ext(ext) => {
                 let ino = ext.path_to_inode(dev, path)?;
                 Ok(Box::new(ext.open_file_reader(dev, ino)?))
             }
+            #[cfg(feature = "fat")]
             Self::Fat32(fat) => Ok(Box::new(fat.open_file_reader(dev, path)?)),
+            #[cfg(feature = "tar")]
             Self::Tar(tar) => Ok(Box::new(tar.open_file_reader(dev, path)?)),
+            #[cfg(feature = "xfs")]
             Self::Xfs(xfs) => Ok(Box::new(xfs.open_file_reader(dev, path)?)),
+            #[cfg(feature = "exfat")]
             Self::Exfat(exfat) => Ok(Box::new(exfat.open_file_reader(dev, path)?)),
+            #[cfg(feature = "hfs-plus")]
             Self::HfsPlus(hfs) => Ok(Box::new(hfs.open_file_reader(dev, path)?)),
+            #[cfg(feature = "hfs")]
             Self::Hfs(hfs) => Ok(Box::new(hfs.open_file_reader(dev, path)?)),
+            #[cfg(feature = "affs")]
             Self::Affs(affs) => Ok(Box::new(affs.open_file_reader(dev, path)?)),
+            #[cfg(feature = "littlefs")]
             Self::LittleFs(lfs) => {
                 use crate::fs::Filesystem;
                 lfs.read_file(dev, std::path::Path::new(path))
             }
+            #[cfg(feature = "apfs")]
             Self::Apfs(apfs) => Ok(Box::new(apfs.open_file_reader(dev, path)?)),
+            #[cfg(feature = "ntfs")]
             Self::Ntfs(ntfs) => Ok(Box::new(ntfs.open_file_reader(dev, path)?)),
+            #[cfg(feature = "f2fs")]
             Self::F2fs(f2) => Ok(Box::new(f2.open_file_reader(dev, path)?)),
+            #[cfg(feature = "squashfs")]
             Self::Squashfs(sq) => Ok(Box::new(sq.open_file_reader(dev, path)?)),
+            #[cfg(feature = "iso9660")]
             Self::Iso9660(iso) => Ok(Box::new(iso.open_file_reader(dev, path)?)),
+            #[cfg(feature = "grf")]
             Self::Grf(grf) => {
                 let key = path.trim_start_matches('/').to_string();
                 let entry = grf.entries.get(&key).cloned().ok_or_else(|| {
@@ -692,7 +913,9 @@ impl AnyFs {
                 let bytes = grf.read_entry(dev, &entry)?;
                 Ok(Box::new(std::io::Cursor::new(bytes)))
             }
+            #[cfg(feature = "archive")]
             Self::Archive(fs, _, _) => fs.read_file(dev, std::path::Path::new(path)),
+            #[cfg(feature = "ramfs")]
             Self::Ramfs(r) => {
                 use crate::fs::Filesystem;
                 r.read_file(dev, std::path::Path::new(path))
@@ -708,9 +931,32 @@ impl AnyFs {
         dev: &'a mut dyn BlockDevice,
         path: &str,
     ) -> Result<Box<dyn std::io::Read + 'a>> {
+        #[cfg(not(any(feature = "hfs", feature = "hfs-plus")))]
+        let _ = (dev, path);
         match self {
+            #[cfg(feature = "hfs")]
             Self::Hfs(hfs) => Ok(Box::new(hfs.open_resource_fork_reader(dev, path)?)),
+            #[cfg(feature = "hfs-plus")]
             Self::HfsPlus(hfs) => Ok(Box::new(hfs.open_resource_fork_reader(dev, path)?)),
+            // Every backend other than HFS / HFS+ — the arm is compiled out
+            // when none of those is present, since it would be unreachable.
+            #[cfg(any(
+                feature = "ext",
+                feature = "fat",
+                feature = "tar",
+                feature = "xfs",
+                feature = "exfat",
+                feature = "affs",
+                feature = "littlefs",
+                feature = "apfs",
+                feature = "ntfs",
+                feature = "f2fs",
+                feature = "squashfs",
+                feature = "iso9660",
+                feature = "grf",
+                feature = "archive",
+                feature = "ramfs",
+            ))]
             _ => Err(crate::Error::Unsupported(
                 "resource forks are only supported on HFS / HFS+".into(),
             )),
@@ -814,44 +1060,78 @@ impl AnyFs {
     /// reports [`RandomAccess`](crate::fs::AccessMode::RandomAccess).
     pub fn access_mode(&self) -> crate::fs::AccessMode {
         match self {
+            #[cfg(feature = "ext")]
             Self::Ext(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            #[cfg(feature = "fat")]
             Self::Fat32(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            #[cfg(feature = "hfs-plus")]
             Self::HfsPlus(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            #[cfg(feature = "hfs")]
             Self::Hfs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            #[cfg(feature = "affs")]
             Self::Affs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            #[cfg(feature = "littlefs")]
             Self::LittleFs(l) => crate::fs::Filesystem::access_mode(l.as_ref()),
+            #[cfg(feature = "ntfs")]
             Self::Ntfs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            #[cfg(feature = "f2fs")]
             Self::F2fs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            #[cfg(feature = "squashfs")]
             Self::Squashfs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            #[cfg(feature = "xfs")]
             Self::Xfs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            #[cfg(feature = "iso9660")]
             Self::Iso9660(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            #[cfg(feature = "tar")]
             Self::Tar(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            #[cfg(feature = "apfs")]
             Self::Apfs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            #[cfg(feature = "exfat")]
             Self::Exfat(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            #[cfg(feature = "grf")]
             Self::Grf(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            #[cfg(feature = "archive")]
             Self::Archive(fs, _, _) => crate::fs::Filesystem::access_mode(fs.as_ref()),
+            #[cfg(feature = "ramfs")]
             Self::Ramfs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
         }
     }
 
     pub fn mutation_capability(&self) -> crate::fs::MutationCapability {
         match self {
+            #[cfg(feature = "ext")]
             Self::Ext(ext) => crate::fs::Filesystem::mutation_capability(ext.as_ref()),
+            #[cfg(feature = "fat")]
             Self::Fat32(fat) => crate::fs::Filesystem::mutation_capability(fat.as_ref()),
+            #[cfg(feature = "hfs-plus")]
             Self::HfsPlus(h) => crate::fs::Filesystem::mutation_capability(h.as_ref()),
+            #[cfg(feature = "hfs")]
             Self::Hfs(h) => crate::fs::Filesystem::mutation_capability(h.as_ref()),
+            #[cfg(feature = "affs")]
             Self::Affs(a) => crate::fs::Filesystem::mutation_capability(a.as_ref()),
+            #[cfg(feature = "littlefs")]
             Self::LittleFs(l) => crate::fs::Filesystem::mutation_capability(l.as_ref()),
+            #[cfg(feature = "ntfs")]
             Self::Ntfs(n) => crate::fs::Filesystem::mutation_capability(n.as_ref()),
+            #[cfg(feature = "f2fs")]
             Self::F2fs(fs2) => crate::fs::Filesystem::mutation_capability(fs2.as_ref()),
+            #[cfg(feature = "squashfs")]
             Self::Squashfs(sq) => crate::fs::Filesystem::mutation_capability(sq.as_ref()),
+            #[cfg(feature = "xfs")]
             Self::Xfs(x) => crate::fs::Filesystem::mutation_capability(x.as_ref()),
+            #[cfg(feature = "iso9660")]
             Self::Iso9660(iso) => crate::fs::Filesystem::mutation_capability(iso.as_ref()),
+            #[cfg(feature = "tar")]
             Self::Tar(t) => crate::fs::Filesystem::mutation_capability(t.as_ref()),
+            #[cfg(feature = "apfs")]
             Self::Apfs(a) => crate::fs::Filesystem::mutation_capability(a.as_ref()),
+            #[cfg(feature = "exfat")]
             Self::Exfat(e) => crate::fs::Filesystem::mutation_capability(e.as_ref()),
+            #[cfg(feature = "grf")]
             Self::Grf(g) => crate::fs::Filesystem::mutation_capability(g.as_ref()),
+            #[cfg(feature = "archive")]
             Self::Archive(fs, _, _) => crate::fs::Filesystem::mutation_capability(fs.as_ref()),
+            #[cfg(feature = "ramfs")]
             Self::Ramfs(r) => crate::fs::Filesystem::mutation_capability(r.as_ref()),
         }
     }
@@ -865,22 +1145,39 @@ impl AnyFs {
     /// `Unsupported`.
     pub fn clone_capability(&self) -> crate::fs::CloneCapability {
         match self {
+            #[cfg(feature = "ext")]
             Self::Ext(ext) => crate::fs::Filesystem::clone_capability(ext.as_ref()),
+            #[cfg(feature = "fat")]
             Self::Fat32(fat) => crate::fs::Filesystem::clone_capability(fat.as_ref()),
+            #[cfg(feature = "hfs-plus")]
             Self::HfsPlus(h) => crate::fs::Filesystem::clone_capability(h.as_ref()),
+            #[cfg(feature = "hfs")]
             Self::Hfs(h) => crate::fs::Filesystem::clone_capability(h.as_ref()),
+            #[cfg(feature = "affs")]
             Self::Affs(a) => crate::fs::Filesystem::clone_capability(a.as_ref()),
+            #[cfg(feature = "littlefs")]
             Self::LittleFs(l) => crate::fs::Filesystem::clone_capability(l.as_ref()),
+            #[cfg(feature = "ntfs")]
             Self::Ntfs(n) => crate::fs::Filesystem::clone_capability(n.as_ref()),
+            #[cfg(feature = "f2fs")]
             Self::F2fs(fs2) => crate::fs::Filesystem::clone_capability(fs2.as_ref()),
+            #[cfg(feature = "squashfs")]
             Self::Squashfs(sq) => crate::fs::Filesystem::clone_capability(sq.as_ref()),
+            #[cfg(feature = "xfs")]
             Self::Xfs(x) => crate::fs::Filesystem::clone_capability(x.as_ref()),
+            #[cfg(feature = "iso9660")]
             Self::Iso9660(iso) => crate::fs::Filesystem::clone_capability(iso.as_ref()),
+            #[cfg(feature = "tar")]
             Self::Tar(t) => crate::fs::Filesystem::clone_capability(t.as_ref()),
+            #[cfg(feature = "apfs")]
             Self::Apfs(a) => crate::fs::Filesystem::clone_capability(a.as_ref()),
+            #[cfg(feature = "exfat")]
             Self::Exfat(e) => crate::fs::Filesystem::clone_capability(e.as_ref()),
+            #[cfg(feature = "grf")]
             Self::Grf(g) => crate::fs::Filesystem::clone_capability(g.as_ref()),
+            #[cfg(feature = "archive")]
             Self::Archive(fs, _, _) => crate::fs::Filesystem::clone_capability(fs.as_ref()),
+            #[cfg(feature = "ramfs")]
             Self::Ramfs(r) => crate::fs::Filesystem::clone_capability(r.as_ref()),
         }
     }
@@ -948,22 +1245,39 @@ impl AnyFs {
         f: impl FnOnce(&mut dyn crate::fs::Filesystem) -> Result<R>,
     ) -> Result<R> {
         match self {
+            #[cfg(feature = "ext")]
             Self::Ext(ext) => f(ext.as_mut()),
+            #[cfg(feature = "fat")]
             Self::Fat32(fat) => f(fat.as_mut()),
+            #[cfg(feature = "hfs-plus")]
             Self::HfsPlus(h) => f(h.as_mut()),
+            #[cfg(feature = "hfs")]
             Self::Hfs(h) => f(h.as_mut()),
+            #[cfg(feature = "affs")]
             Self::Affs(a) => f(a.as_mut()),
+            #[cfg(feature = "littlefs")]
             Self::LittleFs(l) => f(l.as_mut()),
+            #[cfg(feature = "ntfs")]
             Self::Ntfs(n) => f(n.as_mut()),
+            #[cfg(feature = "f2fs")]
             Self::F2fs(fs2) => f(fs2.as_mut()),
+            #[cfg(feature = "squashfs")]
             Self::Squashfs(sq) => f(sq.as_mut()),
+            #[cfg(feature = "xfs")]
             Self::Xfs(x) => f(x.as_mut()),
+            #[cfg(feature = "tar")]
             Self::Tar(t) => f(t.as_mut()),
+            #[cfg(feature = "apfs")]
             Self::Apfs(a) => f(a.as_mut()),
+            #[cfg(feature = "exfat")]
             Self::Exfat(e) => f(e.as_mut()),
+            #[cfg(feature = "iso9660")]
             Self::Iso9660(iso) => f(iso.as_mut()),
+            #[cfg(feature = "grf")]
             Self::Grf(g) => f(g.as_mut()),
+            #[cfg(feature = "archive")]
             Self::Archive(fs, _, _) => f(fs.as_mut()),
+            #[cfg(feature = "ramfs")]
             Self::Ramfs(r) => f(r.as_mut()),
         }
     }
@@ -1027,26 +1341,43 @@ impl AnyFs {
     /// instead of failing to compile.)
     pub fn kind_string(&self) -> &'static str {
         match self {
+            #[cfg(feature = "ext")]
             Self::Ext(ext) => match ext.kind {
                 crate::fs::ext::FsKind::Ext2 => "ext2",
                 crate::fs::ext::FsKind::Ext3 => "ext3",
                 crate::fs::ext::FsKind::Ext4 => "ext4",
             },
+            #[cfg(feature = "fat")]
             Self::Fat32(fat) => fat.kind().as_str(),
+            #[cfg(feature = "tar")]
             Self::Tar(_) => "tar",
+            #[cfg(feature = "xfs")]
             Self::Xfs(_) => "xfs",
+            #[cfg(feature = "exfat")]
             Self::Exfat(_) => "exfat",
+            #[cfg(feature = "hfs-plus")]
             Self::HfsPlus(_) => "hfs+",
+            #[cfg(feature = "hfs")]
             Self::Hfs(_) => "hfs",
+            #[cfg(feature = "affs")]
             Self::Affs(_) => "affs",
+            #[cfg(feature = "littlefs")]
             Self::LittleFs(_) => "littlefs",
+            #[cfg(feature = "apfs")]
             Self::Apfs(_) => "apfs",
+            #[cfg(feature = "ntfs")]
             Self::Ntfs(_) => "ntfs",
+            #[cfg(feature = "f2fs")]
             Self::F2fs(_) => "f2fs",
+            #[cfg(feature = "squashfs")]
             Self::Squashfs(_) => "squashfs",
+            #[cfg(feature = "iso9660")]
             Self::Iso9660(_) => "iso9660",
+            #[cfg(feature = "grf")]
             Self::Grf(_) => "grf",
+            #[cfg(feature = "archive")]
             Self::Archive(_, _, name) => name,
+            #[cfg(feature = "ramfs")]
             Self::Ramfs(_) => "ramfs",
         }
     }
@@ -1128,22 +1459,39 @@ impl AnyFs {
     /// (read-only backends return `Unsupported` from write methods).
     fn into_dyn_filesystem(self) -> Box<dyn crate::fs::Filesystem> {
         match self {
+            #[cfg(feature = "ext")]
             Self::Ext(b) => b,
+            #[cfg(feature = "fat")]
             Self::Fat32(b) => b,
+            #[cfg(feature = "tar")]
             Self::Tar(b) => b,
+            #[cfg(feature = "xfs")]
             Self::Xfs(b) => b,
+            #[cfg(feature = "exfat")]
             Self::Exfat(b) => b,
+            #[cfg(feature = "hfs-plus")]
             Self::HfsPlus(b) => b,
+            #[cfg(feature = "hfs")]
             Self::Hfs(b) => b,
+            #[cfg(feature = "affs")]
             Self::Affs(b) => b,
+            #[cfg(feature = "littlefs")]
             Self::LittleFs(b) => b,
+            #[cfg(feature = "apfs")]
             Self::Apfs(b) => b,
+            #[cfg(feature = "ntfs")]
             Self::Ntfs(b) => b,
+            #[cfg(feature = "f2fs")]
             Self::F2fs(b) => b,
+            #[cfg(feature = "squashfs")]
             Self::Squashfs(b) => b,
+            #[cfg(feature = "iso9660")]
             Self::Iso9660(b) => b,
+            #[cfg(feature = "grf")]
             Self::Grf(b) => b,
+            #[cfg(feature = "archive")]
             Self::Archive(fs, _, _) => fs,
+            #[cfg(feature = "ramfs")]
             Self::Ramfs(b) => b,
         }
     }
@@ -1373,9 +1721,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::{FileBackend, MemoryBackend};
+    #[cfg(feature = "ext")]
+    use crate::block::FileBackend;
+    use crate::block::MemoryBackend;
+    #[cfg(feature = "ext")]
     use crate::fs::ext::{Ext, FormatOpts};
 
+    #[cfg(feature = "ext")]
     #[test]
     fn detects_ext2_in_memory() {
         let opts = FormatOpts::default();
@@ -1384,6 +1736,7 @@ mod tests {
         assert_eq!(detect_fs(&mut dev).unwrap(), FsKind::Ext);
     }
 
+    #[cfg(feature = "fat")]
     #[test]
     fn detects_fat32_in_memory() {
         let mut dev = MemoryBackend::new(64 * 1024 * 1024);
@@ -1405,6 +1758,7 @@ mod tests {
         assert!(detect_fs(&mut dev).is_err());
     }
 
+    #[cfg(feature = "ext")]
     #[test]
     fn anyfs_lists_an_ext_image() {
         use tempfile::NamedTempFile;
@@ -1424,6 +1778,7 @@ mod tests {
         assert!(entries.iter().any(|e| e.name == "lost+found"));
     }
 
+    #[cfg(feature = "ext")]
     #[test]
     fn open_returns_dyn_filesystem() {
         let opts = FormatOpts::default();
@@ -1440,6 +1795,7 @@ mod tests {
         assert!(entries.iter().any(|e| e.name == "lost+found"));
     }
 
+    #[cfg(feature = "ext")]
     #[test]
     fn summary_reports_kind_and_mutability() {
         let opts = FormatOpts::default();
@@ -1457,6 +1813,7 @@ mod tests {
     /// `Error::Streaming`, not the generic `Unsupported` and not the
     /// `Immutable` variant that's reserved for write-once
     /// random-access formats (ISO 9660, SquashFS).
+    #[cfg(feature = "tar")]
     #[test]
     fn add_on_streaming_fs_returns_streaming_error() {
         use crate::fs::tar::{TarEntryMeta, TarStreamWriter};

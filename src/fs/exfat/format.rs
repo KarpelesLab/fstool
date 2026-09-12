@@ -30,6 +30,10 @@
 
 use crate::Result;
 use crate::block::BlockDevice;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
 
 use super::dir::{ATTR_DIRECTORY, ENTRY_SIZE};
 

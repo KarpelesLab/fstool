@@ -22,6 +22,10 @@
 //! *immediately before* the 8.3 entry, in reverse order — each carries 13
 //! UTF-16 code units and a checksum tying it to the 8.3 name.
 
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
 /// Size of one directory entry.
 pub const ENTRY_SIZE: usize = 32;
 

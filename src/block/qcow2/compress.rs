@@ -469,6 +469,8 @@ pub fn write_compressed_image(
 
 #[cfg(test)]
 mod tests {
+    // Every test here needs a codec; without one the module is empty.
+    #[allow(unused_imports)]
     use super::*;
 
     #[cfg(feature = "gzip")]
