@@ -29,9 +29,10 @@
 //!   a data key and a tweak key), `cbc`, `ctr` and `ecb`.
 //! - **IV generators** — `plain`, `plain64`, `plain64be`, `benbi`,
 //!   `null`, and `essiv:<hash>` for `sha1` / `sha256` / `sha512` /
-//!   `ripemd160`. XTS takes the sector index directly as its tweak and
-//!   ignores the IV generator, which is why `aes-xts-plain64` and
-//!   `aes-xts-plain` decrypt identically.
+//!   `ripemd160`. Under XTS the generated IV *is* the tweak block, as in
+//!   dm-crypt — so `aes-xts-plain64` is the bare sector index, while
+//!   `aes-xts-plain` wraps at 2^32 sectors and `plain64be`, `benbi`,
+//!   `essiv` and `null` each tweak differently.
 //!
 //! ## Integrity
 //!
@@ -201,9 +202,11 @@ impl CipherSpec {
         };
 
         // ECB takes no IV generator; every other mode requires one, except
-        // XTS which tolerates a missing one (the tweak is the sector index).
+        // XTS, where a missing one means the plain64 tweak (the bare sector
+        // index) that `aes-xts` has always meant here.
         let ivgen = match ivspec.as_str() {
-            "" if matches!(mode, Mode::Ecb | Mode::Xts) => IvGen::Null,
+            "" if mode == Mode::Ecb => IvGen::Null,
+            "" if mode == Mode::Xts => IvGen::Plain64,
             "" => {
                 return Err(crate::Error::InvalidImage(format!(
                     "crypt: spec `{spec}` names mode `{}` but no IV generator",
@@ -552,15 +555,20 @@ impl SectorCipher {
     fn apply_one(&self, index: u64, sector: &mut [u8], encrypt: bool) -> Result<()> {
         match self.spec.mode {
             Mode::Xts => {
-                // XTS takes the sector index as its tweak directly; the IV
-                // generator named in the spec is inert (dm-crypt behaves the
-                // same way, which is why `aes-xts-plain` and
-                // `aes-xts-plain64` are interchangeable in practice).
+                // dm-crypt hands the generated IV to XTS as its tweak block,
+                // so the generator matters here as much as under CBC:
+                // `plain` wraps at 2^32 sectors, `plain64be` and `benbi`
+                // place the counter differently, `essiv` encrypts it and
+                // `null` uses one tweak throughout. purecrypto builds its
+                // tweak from the little-endian bytes of the index, so
+                // reading the IV back that way feeds it verbatim — and
+                // leaves `plain64` bit-identical to the bare sector index.
+                let tweak = u128::from_le_bytes(self.iv(index));
                 let xts = self.xts.as_ref().expect("xts keyed for Mode::Xts");
                 if encrypt {
-                    xts.encrypt_sector(index as u128, sector)
+                    xts.encrypt_sector(tweak, sector)
                 } else {
-                    xts.decrypt_sector(index as u128, sector)
+                    xts.decrypt_sector(tweak, sector)
                 }
             }
             Mode::Cbc => {
@@ -728,6 +736,63 @@ mod tests {
             c.encrypt(0, &mut buf),
             Err(crate::Error::InvalidArgument(_))
         ));
+    }
+
+    /// The IV generator drives the XTS tweak, as it does in dm-crypt. It
+    /// used to be ignored, so every XTS spec but `plain64` (and `plain`
+    /// below 2^32 sectors) decrypted a real volume to garbage.
+    #[test]
+    fn xts_honours_the_iv_generator() {
+        let key: Vec<u8> = (0..64u8)
+            .map(|i| i.wrapping_mul(13).wrapping_add(5))
+            .collect();
+        let enc = |spec: &str, sector: u64| {
+            let c = SectorCipher::new(CipherSpec::parse(spec, 64).unwrap(), &key, 512).unwrap();
+            let mut buf = vec![0u8; 512];
+            c.encrypt(sector, &mut buf).unwrap();
+            buf
+        };
+        // A bare `aes-xts` is plain64, and plain64 is the bare sector index
+        // — the same bytes purecrypto produces from the index directly.
+        assert_eq!(enc("aes-xts", 7), enc("aes-xts-plain64", 7));
+        let direct = {
+            use purecrypto::cipher::{Aes256, Xts};
+            let d: &[u8; 32] = key[..32].try_into().unwrap();
+            let t: &[u8; 32] = key[32..].try_into().unwrap();
+            let x = Xts::new(Aes256::new(d), Aes256::new(t));
+            let mut buf = vec![0u8; 512];
+            x.encrypt_sector(7, &mut buf).unwrap();
+            buf
+        };
+        assert_eq!(enc("aes-xts-plain64", 7), direct);
+
+        // `plain` is the 32-bit generator: equal below 2^32, wrapping above.
+        assert_eq!(enc("aes-xts-plain", 7), enc("aes-xts-plain64", 7));
+        assert_eq!(enc("aes-xts-plain", 1 << 32), enc("aes-xts-plain64", 0));
+        assert_ne!(enc("aes-xts-plain64", 1 << 32), enc("aes-xts-plain64", 0));
+
+        // The other generators place (or transform) the counter differently.
+        for spec in [
+            "aes-xts-plain64be",
+            "aes-xts-benbi",
+            "aes-xts-essiv:sha256",
+            "aes-xts-null",
+        ] {
+            assert_ne!(enc(spec, 1), enc("aes-xts-plain64", 1), "{spec} was inert");
+        }
+        // `null` is one tweak for the whole volume.
+        assert_eq!(enc("aes-xts-null", 1), enc("aes-xts-null", 99));
+        // `plain64be` at sector 1 sets the IV's last byte, i.e. tweak 1 << 120.
+        let direct_be = {
+            use purecrypto::cipher::{Aes256, Xts};
+            let d: &[u8; 32] = key[..32].try_into().unwrap();
+            let t: &[u8; 32] = key[32..].try_into().unwrap();
+            let x = Xts::new(Aes256::new(d), Aes256::new(t));
+            let mut buf = vec![0u8; 512];
+            x.encrypt_sector(1u128 << 120, &mut buf).unwrap();
+            buf
+        };
+        assert_eq!(enc("aes-xts-plain64be", 1), direct_be);
     }
 
     /// IEEE 1619-2007 XTS-AES-128 vector 1 (all-zero key, tweak 0), via the
