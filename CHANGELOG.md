@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.29](https://github.com/KarpelesLab/fstool/compare/v0.4.28...v0.4.29) - 2026-09-12
+
+### Added
+
+- *(fat)* FAT12/16/32 with no allocator at all
+
+### Fixed
+
+- *(fat)* six bugs an independent review found in the no-alloc driver
+- *(fat)* bound every cluster-chain walk in the no-alloc driver, and fuzz it
+- *(exfat)* validate the name inside make_file_entry_set
+- *(exfat)* refuse a read-write handle on a volume with no allocation bitmap
+- *(exfat)* bound ClusterCount by the spec maximum
+- *(fat)* widen the backup-boot-sector bound check so 0xFFFF cannot wrap
+- *(littlefs)* bound the rw handle's pending write buffer
+- *(exfat)* keep a grown directory's DataLength current in its parent
+- *(exfat)* size files by DataLength and read zeros past ValidDataLength
+- *(exfat)* reject names longer than 255 UTF-16 units
+- *(fat)* ignore the reserved cluster-high half on FAT12/16; cap names at 255 units
+- *(fat)* require every path-prefix component to be a directory in resolve_entry
+- *(exfat)* patch entry sets via the flat directory buffer; refuse duplicate names
+- *(fat)* unique generated short names per directory; forget removed names
+- *(fat)* reject files of 4 GiB or more instead of storing the size modulo 2^32
+- *(exfat)* free the whole contiguous run when removing a NoFatChain file
+- *(exfat)* compute the rw handle's cluster requirement in u64
+- *(fat)* validate FSInfo / backup boot sector numbers before flush writes them
+- *(fat)* reject a FAT too small to map every cluster, and index the table safely
+- *(exfat)* size the allocation bitmap in clusters at format time
+- *(exfat)* allocate from the allocation bitmap, not the FAT
+
+### Other
+
+- fix the two tests CI caught and local runs could not
+- apfs/hfs/hfs+/affs fixes (journal byte order, hashed drec keys, HFSX collation, bitmap extents)
+- name alloc in the default feature list
+- *(features)* [**breaking**] make no-alloc the floor and `alloc` additive
+- ntfs + f2fs fixes (USA stride, index VCNs, LZNT1, NAT layout, device nodes)
+- ext + xfs fixes (inode bitmap, whole-inode checksum, uninit_bg, HTree seed; xfs rdev/attr forks/bmbt root)
+- fat/exfat/littlefs fixes (bitmap-authoritative exFAT allocation, FAT geometry validation)
+- *(littlefs)* move truncate above the test module
+- *(fat)* skip the metadata rewrite on flush when no FAT entry changed
+
 ### Added
 
 - *(fat)* an allocation-free FAT12/FAT16/FAT32 driver, in `fs::fat`
