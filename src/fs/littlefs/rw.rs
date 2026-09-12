@@ -140,6 +140,13 @@ struct Dirty {
     buf: Vec<u8>,
 }
 
+/// Once the pending region holds this many bytes (or one block, if that
+/// is larger) it is applied, so a long sequential write costs a bounded
+/// amount of RAM instead of buffering the whole file. Each apply rewrites
+/// only the skip-list from the first changed block onwards, so the total
+/// work stays linear in the file size.
+const DIRTY_APPLY_BYTES: usize = 64 * 1024;
+
 /// Read + write handle over a file.
 pub struct FileWriter<'a> {
     fs: &'a mut LittleFs,
@@ -393,6 +400,15 @@ impl Write for FileWriter<'_> {
         }
         self.pos += data.len() as u64;
         self.size = self.size.max(self.pos);
+        // Bound the buffer: land a region that has grown large.
+        let threshold = DIRTY_APPLY_BYTES.max(self.fs.geom.block_size as usize);
+        if self
+            .dirty
+            .as_ref()
+            .is_some_and(|d| d.buf.len() >= threshold)
+        {
+            self.apply().map_err(|e| io::Error::other(e.to_string()))?;
+        }
         Ok(data.len())
     }
 
@@ -419,11 +435,12 @@ impl FileHandle for FileWriter<'_> {
             return Ok(());
         }
         if new_len > self.size {
-            // Grow by writing the zero fill through the normal path.
-            let gap = new_len - self.size;
+            // Grow through the normal apply path with an empty region
+            // ending at the new length: the rebuild source zero-fills the
+            // gap as it streams, so no buffer of the gap's size is needed.
             self.dirty = Some(Dirty {
-                start: self.size,
-                buf: vec![0u8; gap as usize],
+                start: new_len,
+                buf: Vec::new(),
             });
             self.pos = new_len;
             return self.apply();
@@ -500,6 +517,17 @@ pub(super) fn open_rw<'a>(
     flags: OpenFlags,
     meta: Option<FileMeta>,
 ) -> Result<Box<dyn FileHandle + 'a>> {
+    Ok(Box::new(open_writer(fs, dev, path, flags, meta)?))
+}
+
+/// [`open_rw`] returning the concrete writer.
+fn open_writer<'a>(
+    fs: &'a mut LittleFs,
+    dev: &'a mut dyn BlockDevice,
+    path: &Path,
+    flags: OpenFlags,
+    meta: Option<FileMeta>,
+) -> Result<FileWriter<'a>> {
     let size = match fs.try_resolve(dev, path)? {
         Some(Resolved::Entry { mdir, id }) => {
             let e = &mdir.entries[id];
@@ -548,7 +576,7 @@ pub(super) fn open_rw<'a>(
     if flags.append {
         h.pos = h.size;
     }
-    Ok(Box::new(h))
+    Ok(h)
 }
 
 /// Resize the file at `path`, the path-flavoured [`FileHandle::set_len`].
@@ -561,4 +589,119 @@ pub(super) fn truncate(
     let mut h = open_rw(fs, dev, path, OpenFlags::default(), None)?;
     h.set_len(new_size)?;
     h.sync()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::LittleFsFormatOpts;
+    use super::*;
+    use crate::block::MemoryBackend;
+    use crate::fs::Filesystem;
+
+    fn fresh(size: u64) -> (MemoryBackend, LittleFs) {
+        let mut dev = MemoryBackend::new(size);
+        let fs = LittleFs::format(&mut dev, &LittleFsFormatOpts::default()).unwrap();
+        (dev, fs)
+    }
+
+    fn read_back(fs: &mut LittleFs, dev: &mut dyn BlockDevice, path: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        fs.read_file(dev, Path::new(path))
+            .unwrap()
+            .read_to_end(&mut out)
+            .unwrap();
+        out
+    }
+
+    fn create_flags() -> OpenFlags {
+        OpenFlags {
+            create: true,
+            ..Default::default()
+        }
+    }
+
+    /// A long sequential write must not accumulate the whole file in the
+    /// pending region: it is applied every `DIRTY_APPLY_BYTES`.
+    #[test]
+    fn sequential_writes_are_applied_in_bounded_chunks() {
+        let (mut dev, mut fs) = fresh(2 * 1024 * 1024);
+        let data: Vec<u8> = (0..300 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let threshold = DIRTY_APPLY_BYTES.max(fs.geom.block_size as usize);
+        let mut applies = 0;
+        {
+            let mut w = open_writer(
+                &mut fs,
+                &mut dev,
+                Path::new("/seq.bin"),
+                create_flags(),
+                Some(FileMeta::default()),
+            )
+            .unwrap();
+            for chunk in data.chunks(4096) {
+                let before = w.dirty.as_ref().map_or(0, |d| d.buf.len());
+                w.write_all(chunk).unwrap();
+                let after = w.dirty.as_ref().map_or(0, |d| d.buf.len());
+                assert!(after < threshold, "pending region grew to {after} bytes");
+                if after < before {
+                    applies += 1;
+                }
+            }
+            w.sync().unwrap();
+        }
+        assert!(
+            applies >= 3,
+            "expected several intermediate applies, got {applies}"
+        );
+        assert_eq!(read_back(&mut fs, &mut dev, "/seq.bin"), data);
+    }
+
+    /// Growing with `set_len` streams zeros into the gap instead of
+    /// materialising it, and the result reads back as zeros.
+    #[test]
+    fn set_len_grow_zero_fills_without_a_gap_buffer() {
+        let (mut dev, mut fs) = fresh(2 * 1024 * 1024);
+        let grown = 200 * 1024u64;
+        {
+            let mut w = open_writer(
+                &mut fs,
+                &mut dev,
+                Path::new("/grow.bin"),
+                create_flags(),
+                Some(FileMeta::default()),
+            )
+            .unwrap();
+            w.write_all(b"abc").unwrap();
+            w.set_len(grown).unwrap();
+            assert!(w.dirty.is_none());
+            assert_eq!(w.len(), grown);
+            // A write after the gap lands past the zeros.
+            w.seek(SeekFrom::End(0)).unwrap();
+            w.write_all(b"xyz").unwrap();
+            w.sync().unwrap();
+        }
+        let got = read_back(&mut fs, &mut dev, "/grow.bin");
+        assert_eq!(got.len() as u64, grown + 3);
+        assert_eq!(&got[..3], b"abc");
+        assert!(got[3..grown as usize].iter().all(|&b| b == 0));
+        assert_eq!(&got[grown as usize..], b"xyz");
+
+        // Growing an inline file within the inline limit stays inline
+        // and zero-extends too.
+        {
+            let mut w = open_writer(
+                &mut fs,
+                &mut dev,
+                Path::new("/small.bin"),
+                create_flags(),
+                Some(FileMeta::default()),
+            )
+            .unwrap();
+            w.write_all(b"hi").unwrap();
+            w.set_len(16).unwrap();
+            w.sync().unwrap();
+        }
+        let mut expect = b"hi".to_vec();
+        expect.resize(16, 0);
+        assert_eq!(read_back(&mut fs, &mut dev, "/small.bin"), expect);
+    }
 }

@@ -294,6 +294,10 @@ pub struct Fat32 {
     /// harmless: they really do exist (on disk), so the answer is still
     /// correct.
     pending_names: BTreeMap<u32, BTreeSet<String>>,
+    /// Per-directory set of the 8.3 names of entries staged this session,
+    /// so a generated short name can be checked for uniqueness against
+    /// siblings that are not on disk yet (the on-disk ones are scanned).
+    pending_shorts: BTreeMap<u32, BTreeSet<[u8; 11]>>,
 }
 
 impl Fat32 {
@@ -497,6 +501,7 @@ impl Fat32 {
             next_free: if kind == FatKind::Fat32 { 3 } else { 2 },
             dir_batch: DirBatch::new(DEFAULT_CAPACITY),
             pending_names: BTreeMap::new(),
+            pending_shorts: BTreeMap::new(),
         };
         // Zero only the metadata, not the whole device: the reserved
         // sectors + every FAT copy + (on FAT12/16) the fixed root region —
@@ -670,18 +675,29 @@ impl Fat32 {
     /// backup boot sector and both FSInfo sectors, neither of which
     /// FAT12/FAT16 has. Free-cluster accounting is derived from the current
     /// FAT, so this works for both fresh-format and modify-in-place flows.
+    ///
+    /// Everything written here is a function of the in-memory FAT (the
+    /// boot sector never changes after format; FSInfo is derived from the
+    /// FAT), so when no entry changed since the last flush the whole pass
+    /// is skipped — a handle `sync` or a read-only session costs no
+    /// metadata rewrite.
     pub fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         // Serialize pending directory batches first — they may allocate
         // clusters, which the FAT written below must reflect.
         self.flush_dir_batches(dev)?;
+        if !self.fat.is_dirty() {
+            return Ok(());
+        }
         let boot_bytes = self.boot.encode();
         dev.write_at(0, &boot_bytes)?;
 
         if self.boot.kind == FatKind::Fat32 {
-            dev.write_at(
-                self.boot.backup_boot_sector as u64 * SECTOR as u64,
-                &boot_bytes,
-            )?;
+            // `BootSector::decode` guarantees these sector numbers lie inside
+            // the reserved region; a backup of 0 means the volume has none.
+            let backup = self.boot.backup_boot_sector;
+            if backup != 0 {
+                dev.write_at(backup as u64 * SECTOR as u64, &boot_bytes)?;
+            }
 
             let clusters = self.boot.cluster_count();
             let free_count = self.count_free_clusters();
@@ -700,10 +716,9 @@ impl Fat32 {
                 &fsinfo_bytes,
             )?;
             // The backup boot region also carries a backup FSInfo at +1.
-            dev.write_at(
-                (self.boot.backup_boot_sector as u64 + 1) * SECTOR as u64,
-                &fsinfo_bytes,
-            )?;
+            if backup != 0 {
+                dev.write_at((backup as u64 + 1) * SECTOR as u64, &fsinfo_bytes)?;
+            }
         }
 
         let fat_bytes = self.fat.encode();
@@ -713,6 +728,7 @@ impl Fat32 {
                 * SECTOR as u64;
             dev.write_at(off, &fat_bytes)?;
         }
+        self.fat.mark_clean();
         Ok(())
     }
 
@@ -821,6 +837,13 @@ impl Fat32 {
             let mtime = mutate::host_mtime_secs(&meta);
             if ft.is_file() {
                 let size = meta.len();
+                if size > u64::from(u32::MAX) {
+                    return Err(crate::Error::InvalidArgument(format!(
+                        "{}: {} is {size} bytes; FAT files cannot exceed 4 GiB",
+                        self.boot.kind.as_str(),
+                        path.display()
+                    )));
+                }
                 let cb = self.cluster_bytes();
                 let n_clusters = size.div_ceil(cb).max(1) as u32;
                 let chain = self.alloc_chain(n_clusters)?;
@@ -1062,6 +1085,7 @@ impl Fat32 {
             next_free,
             dir_batch: DirBatch::new(DEFAULT_CAPACITY),
             pending_names: BTreeMap::new(),
+            pending_shorts: BTreeMap::new(),
         })
     }
 
@@ -1200,6 +1224,11 @@ impl Fat32 {
                         "fat32: no such entry {part:?} under {path:?}"
                     ))
                 })?;
+            if next.1.attr & dir::ATTR_DIRECTORY == 0 {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "fat32: {part:?} is not a directory"
+                )));
+            }
             cluster = if next.1.first_cluster == 0 {
                 self.boot.root_cluster
             } else {
@@ -1216,6 +1245,18 @@ impl Fat32 {
                 ))
             })?;
         Ok((found.1, cluster))
+    }
+
+    /// The first-cluster value to use from a decoded 8.3 entry. Bytes
+    /// 20..22 of the entry (the high 16 bits) are only defined on FAT32;
+    /// FAT12/16 leave them reserved and readers must ignore whatever a
+    /// previous writer left there.
+    pub(super) fn first_cluster_for_kind(&self, raw: u32) -> u32 {
+        if self.boot.kind == FatKind::Fat32 {
+            raw
+        } else {
+            raw & 0xFFFF
+        }
     }
 
     /// Read every 32-byte slot of the directory at `dir_cluster` — walking
@@ -1245,7 +1286,7 @@ impl Fat32 {
                 dir::RawSlot::Lfn(frag) => {
                     lfn_run.push(frag);
                 }
-                dir::RawSlot::ShortEntry(entry) => {
+                dir::RawSlot::ShortEntry(mut entry) => {
                     if entry.attr & dir::ATTR_VOLUME_ID != 0
                         && entry.attr & dir::ATTR_DIRECTORY == 0
                     {
@@ -1253,6 +1294,7 @@ impl Fat32 {
                         lfn_run.clear();
                         continue;
                     }
+                    entry.first_cluster = self.first_cluster_for_kind(entry.first_cluster);
                     let short_name = entry.short_name_string();
                     if short_name == "." || short_name == ".." {
                         lfn_run.clear();
@@ -1735,6 +1777,411 @@ mod tests {
             Err(crate::Error::InvalidImage(_)) => {}
             other => panic!("expected InvalidImage, got {other:?}"),
         }
+    }
+
+    /// A boot sector whose FAT is too short to map every cluster used to
+    /// open fine and then index past the in-memory table on the first
+    /// allocation or flush. It must be rejected up front.
+    #[test]
+    fn open_rejects_fat_too_small_for_cluster_count() {
+        let (mut dev, _fs) = fresh_volume();
+        let mut bs = [0u8; 512];
+        dev.read_at(0, &mut bs).unwrap();
+        bs[36..40].copy_from_slice(&1u32.to_le_bytes()); // fat_size_32 = 1 sector
+        dev.write_at(0, &bs).unwrap();
+        match Fat32::open(&mut dev) {
+            Err(crate::Error::InvalidImage(msg)) => assert!(msg.contains("cannot map"), "{msg}"),
+            other => panic!("expected InvalidImage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn names_longer_than_255_units_are_rejected() {
+        let (mut dev, mut fs) = fresh_volume();
+        let ok = "n".repeat(255);
+        let too_long = "n".repeat(256);
+        fs.add_file_from_reader(&mut dev, &format!("/{ok}"), &mut crate::io::empty(), 0, 0)
+            .unwrap();
+        for r in [
+            fs.add_file_from_reader(
+                &mut dev,
+                &format!("/{too_long}"),
+                &mut crate::io::empty(),
+                0,
+                0,
+            ),
+            fs.add_dir(&mut dev, &format!("/{too_long}"), 0),
+        ] {
+            match r {
+                Err(crate::Error::InvalidArgument(msg)) => assert!(msg.contains("limit"), "{msg}"),
+                other => panic!("expected InvalidArgument, got {other:?}"),
+            }
+        }
+        fs.flush(&mut dev).unwrap();
+        let mut fs2 = Fat32::open(&mut dev).unwrap();
+        let listed = fs2.list(&mut dev, Path::new("/")).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, ok);
+    }
+
+    /// On FAT12/16 bytes 20..22 of an 8.3 entry are reserved, not the high
+    /// half of the first cluster; a reader must ignore whatever is there.
+    #[test]
+    fn fat12_ignores_high_first_cluster_bits() {
+        use crate::io::Read as _;
+        let mut dev = MemoryBackend::new(1440 * 1024);
+        let opts = FatFormatOpts {
+            kind: FatKind::Fat12,
+            total_sectors: 2880,
+            ..Default::default()
+        };
+        let mut fs = Fat32::format(&mut dev, &opts).unwrap();
+        assert_eq!(fs.kind(), FatKind::Fat12);
+        fs.add_file_from_reader(&mut dev, "/a.txt", &mut &b"abc"[..], 3, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+        // Scribble on the reserved high half of the entry's cluster field.
+        let (parent, leaf) = fs.resolve_parent(&mut dev, "/a.txt").unwrap();
+        let found = fs.find_entry(&mut dev, parent, &leaf).unwrap().unwrap();
+        let off = found.layout.offset_of(found.entry_pos);
+        dev.write_at(off + 20, &0xABCDu16.to_le_bytes()).unwrap();
+
+        let mut fs2 = Fat32::open(&mut dev).unwrap();
+        let (entry, _) = fs2.resolve_entry(&mut dev, "/a.txt").unwrap();
+        assert!(entry.first_cluster < 0x1_0000, "{:#x}", entry.first_cluster);
+        assert_eq!(read_all(&mut fs2, &mut dev, "/a.txt"), b"abc");
+        let mut h = fs2.open_file_ro(&mut dev, Path::new("/a.txt")).unwrap();
+        let mut got = Vec::new();
+        h.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"abc");
+    }
+
+    /// A file's cluster chain must not be walked as if it were a directory
+    /// when it appears as a prefix component.
+    #[test]
+    fn resolve_entry_rejects_a_file_as_a_path_prefix() {
+        let (mut dev, mut fs) = fresh_volume();
+        fs.create_file(
+            &mut dev,
+            Path::new("/a.txt"),
+            FileSource::Reader {
+                reader: Box::new(crate::io::Cursor::new(b"abc".to_vec())),
+                len: 3,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+        match fs.resolve_entry(&mut dev, "/a.txt/b") {
+            Err(crate::Error::InvalidArgument(msg)) => {
+                assert!(msg.contains("not a directory"), "{msg}")
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        assert!(fs.open_file_reader(&mut dev, "/a.txt/b").is_err());
+    }
+
+    /// A block device that counts positional writes, to show a flush with
+    /// nothing to persist touches nothing.
+    struct CountingDev {
+        inner: MemoryBackend,
+        writes: usize,
+    }
+
+    impl crate::io::Read for CountingDev {
+        fn read(&mut self, buf: &mut [u8]) -> crate::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl crate::io::Write for CountingDev {
+        fn write(&mut self, buf: &[u8]) -> crate::io::Result<usize> {
+            self.writes += 1;
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> crate::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl crate::io::Seek for CountingDev {
+        fn seek(&mut self, pos: SeekFrom) -> crate::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    impl BlockDevice for CountingDev {
+        fn block_size(&self) -> u32 {
+            self.inner.block_size()
+        }
+
+        fn total_size(&self) -> u64 {
+            self.inner.total_size()
+        }
+
+        fn sync(&mut self) -> Result<()> {
+            self.inner.sync()
+        }
+
+        fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
+            self.writes += 1;
+            self.inner.write_at(offset, buf)
+        }
+    }
+
+    /// `flush` rewrites the boot sectors, FSInfo and every FAT copy only
+    /// when an entry changed; a handle sync or a read-only session must
+    /// not rewrite the metadata.
+    #[test]
+    fn flush_is_a_no_op_when_the_fat_is_clean() {
+        let (mem, _fs) = fresh_volume();
+        let mut dev = CountingDev {
+            inner: mem,
+            writes: 0,
+        };
+        let mut fs = Fat32::open(&mut dev).unwrap();
+        assert!(!fs.fat().is_dirty());
+        fs.flush(&mut dev).unwrap();
+        assert_eq!(dev.writes, 0, "clean flush wrote to the device");
+
+        // A change is written once, then the table is clean again.
+        fs.add_file_from_reader(&mut dev, "/a.txt", &mut &b"abc"[..], 3, 0)
+            .unwrap();
+        assert!(fs.fat().is_dirty());
+        fs.flush(&mut dev).unwrap();
+        assert!(!fs.fat().is_dirty());
+        let after_first = dev.writes;
+        assert!(after_first > 0);
+        fs.flush(&mut dev).unwrap();
+        assert_eq!(dev.writes, after_first, "second flush rewrote metadata");
+
+        // A read-only handle's drop / sync leaves it untouched as well.
+        {
+            let mut h = fs.open_file_ro(&mut dev, Path::new("/a.txt")).unwrap();
+            let mut buf = [0u8; 3];
+            crate::io::Read::read_exact(&mut h, &mut buf).unwrap();
+            assert_eq!(&buf, b"abc");
+        }
+        assert_eq!(dev.writes, after_first);
+
+        let mut fs2 = Fat32::open(&mut dev).unwrap();
+        assert_eq!(read_all(&mut fs2, &mut dev, "/a.txt"), b"abc");
+    }
+
+    /// Short name of the entry at `path`, via the on-disk lookup.
+    fn short_name_of(fs: &mut Fat32, dev: &mut dyn BlockDevice, path: &str) -> [u8; 11] {
+        fs.flush_dir_batches(dev).unwrap();
+        let (parent, leaf) = fs.resolve_parent(dev, path).unwrap();
+        fs.find_entry(dev, parent, &leaf)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{path} not found"))
+            .entry
+            .name_83
+    }
+
+    /// Every empty long-named file used to get the short name `FT000000`
+    /// (its first cluster, 0, was the sequence number), so only the first
+    /// one in a directory was reachable by short name and the LFN
+    /// checksums of the rest tied to a duplicate 8.3 entry.
+    #[test]
+    fn empty_long_named_files_get_distinct_short_names() {
+        use crate::io::Read as _;
+        let (mut dev, mut fs) = fresh_volume();
+        let names = ["readme-one.txt", "readme-two.txt", "readme-three.txt"];
+        for n in names {
+            fs.add_file_from_reader(&mut dev, &format!("/{n}"), &mut crate::io::empty(), 0, 0)
+                .unwrap();
+        }
+        // Shorts are unique while still staged...
+        let staged: BTreeSet<[u8; 11]> = fs.pending_shorts[&fs.boot.root_cluster].clone();
+        assert_eq!(staged.len(), 3, "{staged:?}");
+        fs.flush(&mut dev).unwrap();
+
+        // ...and on disk after re-open.
+        let mut fs2 = Fat32::open(&mut dev).unwrap();
+        let shorts: BTreeSet<[u8; 11]> = names
+            .iter()
+            .map(|n| short_name_of(&mut fs2, &mut dev, &format!("/{n}")))
+            .collect();
+        assert_eq!(shorts.len(), 3, "{shorts:?}");
+        assert!(!shorts.contains(b"FT000000   "), "{shorts:?}");
+
+        // Each long name still resolves to its own entry: write distinct
+        // bodies through the rw handle and read them back by long name.
+        for (i, n) in names.iter().enumerate() {
+            let mut h = fs2
+                .open_file_rw(
+                    &mut dev,
+                    Path::new(&format!("/{n}")),
+                    OpenFlags::default(),
+                    None,
+                )
+                .unwrap();
+            h.write_all(format!("body {i}").as_bytes()).unwrap();
+            h.sync().unwrap();
+        }
+        for (i, n) in names.iter().enumerate() {
+            let mut got = Vec::new();
+            fs2.read_file(&mut dev, Path::new(&format!("/{n}")))
+                .unwrap()
+                .read_to_end(&mut got)
+                .unwrap();
+            assert_eq!(got, format!("body {i}").into_bytes(), "{n}");
+        }
+    }
+
+    /// The probe steps past a short name that is already taken.
+    #[test]
+    fn generated_short_name_probes_past_collisions() {
+        let (_dev, fs) = fresh_volume();
+        let name = "some long name.bin";
+        let seed = dir::short_name_seed(name);
+        let mut taken = BTreeSet::new();
+        assert_eq!(
+            fs.unique_short_name(name, 0, &taken).unwrap().0,
+            dir::generate_83(name, seed)
+        );
+        taken.insert(dir::generate_83(name, seed));
+        taken.insert(dir::generate_83(name, seed.wrapping_add(1)));
+        assert_eq!(
+            fs.unique_short_name(name, 0, &taken).unwrap().0,
+            dir::generate_83(name, seed.wrapping_add(2))
+        );
+        // A non-empty file seeds from its cluster and probes the same way.
+        taken.insert(dir::generate_83(name, 77));
+        assert_eq!(
+            fs.unique_short_name(name, 77, &taken).unwrap().0,
+            dir::generate_83(name, 78)
+        );
+        // A plain 8.3 name is used as-is.
+        assert_eq!(
+            fs.unique_short_name("HELLO.TXT", 0, &taken).unwrap(),
+            (*b"HELLO   TXT", false)
+        );
+    }
+
+    /// A removed name must be creatable again in the same session — the
+    /// session-wide name index used to keep it forever.
+    #[test]
+    fn removed_name_can_be_recreated_in_the_same_session() {
+        use crate::io::Read as _;
+        let (mut dev, mut fs) = fresh_volume();
+        let body = |s: &str| FileSource::Reader {
+            reader: Box::new(crate::io::Cursor::new(s.as_bytes().to_vec())),
+            len: s.len() as u64,
+        };
+        fs.create_file(
+            &mut dev,
+            Path::new("/again.txt"),
+            body("first"),
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+        fs.remove(&mut dev, "/again.txt").unwrap();
+        fs.create_file(
+            &mut dev,
+            Path::new("/again.txt"),
+            body("second"),
+            FileMeta::default(),
+        )
+        .expect("re-create after remove");
+        // Without a flush in between, too.
+        fs.remove(&mut dev, "/again.txt").unwrap();
+        fs.create_file(
+            &mut dev,
+            Path::new("/again.txt"),
+            body("third"),
+            FileMeta::default(),
+        )
+        .expect("re-create after unflushed remove");
+        fs.flush(&mut dev).unwrap();
+
+        let mut fs2 = Fat32::open(&mut dev).unwrap();
+        let listed = fs2.list(&mut dev, Path::new("/")).unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        let mut got = Vec::new();
+        fs2.read_file(&mut dev, Path::new("/again.txt"))
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
+        assert_eq!(got, b"third");
+    }
+
+    /// A file of 4 GiB or more cannot be represented (the 8.3 entry has a
+    /// 32-bit size) and must be refused up front, not stored modulo 2^32.
+    #[test]
+    fn files_of_4gib_or_more_are_rejected() {
+        let (mut dev, mut fs) = fresh_volume();
+        let free_before = fs.count_free_clusters();
+        let err = fs
+            .add_file_from_reader(&mut dev, "/big.bin", &mut crate::io::empty(), 1u64 << 32, 0)
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidArgument(_)), "{err:?}");
+        assert_eq!(fs.count_free_clusters(), free_before);
+        assert!(!fs.pending_names.contains_key(&fs.boot.root_cluster));
+
+        // The rw handle refuses a write that would cross the limit.
+        let mut h = fs
+            .open_file_rw(
+                &mut dev,
+                Path::new("/h.bin"),
+                OpenFlags {
+                    create: true,
+                    ..Default::default()
+                },
+                Some(FileMeta::default()),
+            )
+            .unwrap();
+        h.seek(SeekFrom::Start(u64::from(u32::MAX) - 1)).unwrap();
+        let err = h.write(b"abcd").unwrap_err();
+        assert_eq!(err.kind(), crate::io::ErrorKind::InvalidInput, "{err}");
+        assert_eq!(h.len(), 0);
+    }
+
+    /// With `backup_boot_sector == 0` (no backup region) flush must not
+    /// write a boot-sector copy or backup FSInfo anywhere.
+    #[test]
+    fn flush_skips_backup_boot_region_when_absent() {
+        let (mut dev, _fs) = fresh_volume();
+        let mut bs = [0u8; 512];
+        dev.read_at(0, &mut bs).unwrap();
+        bs[50..52].copy_from_slice(&0u16.to_le_bytes()); // backup_boot_sector = 0
+        dev.write_at(0, &bs).unwrap();
+        // Scrub where the backup used to live so a stray write shows up.
+        dev.zero_range(6 * 512, 2 * 512).unwrap();
+
+        let mut fs = Fat32::open(&mut dev).unwrap();
+        assert_eq!(fs.boot_sector().backup_boot_sector, 0);
+        fs.create_file(
+            &mut dev,
+            Path::new("/a.txt"),
+            FileSource::Reader {
+                reader: Box::new(crate::io::Cursor::new(b"abc".to_vec())),
+                len: 3,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        let mut scrubbed = [0u8; 2 * 512];
+        dev.read_at(6 * 512, &mut scrubbed).unwrap();
+        assert!(
+            scrubbed.iter().all(|&b| b == 0),
+            "backup region was written"
+        );
+        // The primary boot sector is intact and FSInfo went to sector 1.
+        let mut head = [0u8; 512];
+        dev.read_at(0, &mut head).unwrap();
+        assert_eq!(&head[510..512], &[0x55, 0xAA]);
+        assert_eq!(&head[82..87], b"FAT32");
+        let mut fsinfo = [0u8; 4];
+        dev.read_at(512, &mut fsinfo).unwrap();
+        assert_eq!(fsinfo, *b"RRaA");
+        let mut fs2 = Fat32::open(&mut dev).unwrap();
+        assert_eq!(read_all(&mut fs2, &mut dev, "/a.txt"), b"abc");
     }
 
     #[test]

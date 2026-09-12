@@ -165,6 +165,9 @@ pub struct Fat {
     /// alone doesn't determine it.
     byte_len: usize,
     entries: Vec<u32>,
+    /// True when an entry changed since the table was last written (or
+    /// since it was built — a fresh table has never been written).
+    dirty: bool,
 }
 
 impl Fat {
@@ -179,7 +182,19 @@ impl Fat {
             kind,
             byte_len,
             entries,
+            dirty: true,
         }
+    }
+
+    /// Whether an entry changed since [`Fat::mark_clean`] (or since a
+    /// fresh table was built).
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Record that the table has been written out as it is now.
+    pub fn mark_clean(&mut self) {
+        self.dirty = false;
     }
 
     /// The entry width this table was built for.
@@ -203,14 +218,30 @@ impl Fat {
     }
 
     /// Read the entry for `cluster`.
+    ///
+    /// A cluster past the table's capacity reads as the bad-cluster
+    /// marker: never free (so the allocator won't hand it out) and never
+    /// end-of-chain (so a chain walk reports it instead of stopping
+    /// quietly). `BootSector::decode` guarantees the table covers every
+    /// real cluster, so this only fires on a corrupt cluster number.
     pub fn get(&self, cluster: u32) -> u32 {
-        self.entries[cluster as usize] & self.kind.entry_mask()
+        match self.entries.get(cluster as usize) {
+            Some(&e) => e & self.kind.entry_mask(),
+            None => self.kind.bad_cluster(),
+        }
     }
 
     /// Set the entry for `cluster`. Only the meaningful bits are stored;
-    /// on FAT32 the reserved top 4 bits are kept zero.
+    /// on FAT32 the reserved top 4 bits are kept zero. A cluster past the
+    /// table's capacity is ignored rather than panicking.
     pub fn set(&mut self, cluster: u32, value: u32) {
-        self.entries[cluster as usize] = value & self.kind.entry_mask();
+        if let Some(slot) = self.entries.get_mut(cluster as usize) {
+            let value = value & self.kind.entry_mask();
+            if *slot != value {
+                *slot = value;
+                self.dirty = true;
+            }
+        }
     }
 
     /// Encode into the on-disk byte image of one FAT copy.
@@ -287,6 +318,7 @@ impl Fat {
             kind,
             byte_len: bytes.len(),
             entries,
+            dirty: false,
         }
     }
 
@@ -410,6 +442,20 @@ mod tests {
         assert_eq!(FatKind::from_cluster_count(4085), FatKind::Fat16);
         assert_eq!(FatKind::from_cluster_count(65524), FatKind::Fat16);
         assert_eq!(FatKind::from_cluster_count(65525), FatKind::Fat32);
+    }
+
+    #[test]
+    fn out_of_range_get_and_set_do_not_panic() {
+        // One sector of FAT32 = 128 entries.
+        let mut fat = Fat::new(FatKind::Fat32, 512, 0xF8);
+        assert_eq!(fat.capacity(), 128);
+        fat.set(5000, 7); // ignored
+        assert_eq!(fat.get(5000), FatKind::Fat32.bad_cluster());
+        assert!(!fat.is_eoc(fat.get(5000)));
+        assert_ne!(fat.get(5000), FREE);
+        // A chain that points past the table is an error, not a panic.
+        fat.set(2, 5000);
+        assert!(fat.chain(2, 10_000).is_err());
     }
 
     #[test]

@@ -239,6 +239,14 @@ impl<'a> FatFileHandle<'a> {
         }
         let cb = self.cb();
         let new_end = self.pos + buf.len() as u64;
+        // The 8.3 entry stores the size in 32 bits (`seek` already caps
+        // the cursor, but a write can still run past it).
+        if new_end > u64::from(u32::MAX) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fat32: write would push the file past the 4 GiB limit",
+            ));
+        }
         let needed_clusters = new_end.div_ceil(cb) as u32;
         // If we're writing past EOF and EOF isn't on a cluster boundary, the
         // remainder of the EOF cluster is already zeroed (we always zero new

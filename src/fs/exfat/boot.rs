@@ -40,6 +40,13 @@ use alloc::format;
 /// care about lives in the first 120 bytes).
 pub const BOOT_SECTOR_PARSE_SIZE: usize = 512;
 
+/// Largest legal `ClusterCount` (2^32 - 11), per the exFAT specification.
+/// The eleven excluded values leave room for the two reserved FAT entries
+/// and the end-of-chain / bad-cluster markers, and guarantee that
+/// `cluster_count + 2` — the exclusive end of the data-cluster range —
+/// fits in a `u32`.
+pub const MAX_CLUSTER_COUNT: u32 = u32::MAX - 10;
+
 /// Parsed exFAT boot sector. Field names follow the Microsoft spec.
 #[derive(Debug, Clone)]
 pub struct BootSector {
@@ -134,6 +141,15 @@ impl BootSector {
                 "exfat: NumberOfFats {number_of_fats} (must be 1 or 2)"
             )));
         }
+        // ClusterCount is capped at 2^32 - 11 by the spec. Enforcing it
+        // here means `cluster_count + 2` — the exclusive end of the data
+        // range, computed all over this module — can never overflow.
+        let cluster_count = u32::from_le_bytes(b[92..96].try_into().unwrap());
+        if cluster_count > MAX_CLUSTER_COUNT {
+            return Err(crate::Error::InvalidImage(format!(
+                "exfat: ClusterCount {cluster_count} exceeds the maximum {MAX_CLUSTER_COUNT}"
+            )));
+        }
         let fs_revision = u16::from_le_bytes(b[104..106].try_into().unwrap());
         Ok(Self {
             partition_offset: u64::from_le_bytes(b[64..72].try_into().unwrap()),
@@ -141,7 +157,7 @@ impl BootSector {
             fat_offset: u32::from_le_bytes(b[80..84].try_into().unwrap()),
             fat_length: u32::from_le_bytes(b[84..88].try_into().unwrap()),
             cluster_heap_offset: u32::from_le_bytes(b[88..92].try_into().unwrap()),
-            cluster_count: u32::from_le_bytes(b[92..96].try_into().unwrap()),
+            cluster_count,
             first_cluster_of_root_directory: u32::from_le_bytes(b[96..100].try_into().unwrap()),
             volume_serial_number: u32::from_le_bytes(b[100..104].try_into().unwrap()),
             fs_revision_major: (fs_revision >> 8) as u8,
@@ -185,6 +201,26 @@ mod tests {
         b[510] = 0x55;
         b[511] = 0xAA;
         b
+    }
+
+    /// A ClusterCount near `u32::MAX` would overflow the `cluster_count + 2`
+    /// end-of-range arithmetic used throughout the module (and make the
+    /// allocator's `clamp(2, max)` panic once the sum wrapped below 2).
+    #[test]
+    fn rejects_cluster_count_above_the_spec_maximum() {
+        let mut b = make_boot_sector();
+        b[92..96].copy_from_slice(&MAX_CLUSTER_COUNT.to_le_bytes());
+        assert_eq!(
+            BootSector::decode(&b).unwrap().cluster_count,
+            MAX_CLUSTER_COUNT
+        );
+        for over in [MAX_CLUSTER_COUNT + 1, u32::MAX - 1, u32::MAX] {
+            b[92..96].copy_from_slice(&over.to_le_bytes());
+            assert!(
+                BootSector::decode(&b).is_err(),
+                "ClusterCount {over} should be rejected"
+            );
+        }
     }
 
     #[test]

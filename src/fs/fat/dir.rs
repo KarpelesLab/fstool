@@ -438,6 +438,19 @@ pub fn assemble_lfn(fragments: &[LfnFragment], short_name_83: &[u8; 11]) -> Opti
 /// directly. `seq` is a per-directory counter making the result unique.
 /// Form: `FT` + 6 hex digits of `seq` as the base, plus the upper-cased
 /// first three valid extension characters.
+/// A stable, case-insensitive seed for [`generate_83`] derived from the
+/// long name (FNV-1a over its ASCII-lowercased bytes). Used for entries
+/// that own no cluster — an empty file has no cluster number to make its
+/// short name unique with.
+pub fn short_name_seed(long: &str) -> u32 {
+    let mut h: u32 = 0x811C_9DC5;
+    for b in long.bytes() {
+        h ^= u32::from(b.to_ascii_lowercase());
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
 pub fn generate_83(long: &str, seq: u32) -> [u8; 11] {
     let mut out = [b' '; 11];
     let base = format!("FT{:06X}", seq & 0xFF_FFFF);
