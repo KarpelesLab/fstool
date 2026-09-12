@@ -390,14 +390,9 @@ impl<'a> Ext2FileHandle<'a> {
         let bs = self.ext.layout.block_size as u64;
         let mut data = 0u64;
         for r in &state.runs {
-            let len = if r.len > MAX_LEN_PER_EXTENT {
-                // Uninitialized extents (not emitted by us; tolerate on
-                // read). The length encoded in ee_len - 32768.
-                (r.len - MAX_LEN_PER_EXTENT) as u64
-            } else {
-                r.len as u64
-            };
-            data += len;
+            // Unwritten extents are preallocated, so their blocks still
+            // count toward i_blocks; `actual_len` undoes the ee_len bias.
+            data += r.actual_len() as u64;
         }
         let meta = state.meta_blocks.len() as u64;
         let sectors = (data + meta) * (bs / 512);
@@ -406,17 +401,19 @@ impl<'a> Ext2FileHandle<'a> {
     }
 
     /// Resolve logical block `n` against the extent tree without
-    /// allocating. Returns 0 for a sparse hole (no extent covers `n`).
+    /// allocating. Returns 0 for a sparse hole (no extent covers `n`)
+    /// and — like the kernel — for an *unwritten* extent, whose
+    /// preallocated blocks read back as zeroes rather than as whatever
+    /// the disk still holds there.
     /// Reads the leaf block on demand when the tree is depth-1.
     fn read_logical_block_extent(&mut self, n: u32) -> Result<u32> {
         let runs = self.read_extent_runs()?;
         for r in &runs {
-            let len = if r.len > MAX_LEN_PER_EXTENT {
-                r.len - MAX_LEN_PER_EXTENT
-            } else {
-                r.len
-            };
+            let len = r.actual_len();
             if n >= r.logical && n < r.logical + len as u32 {
+                if r.is_unwritten() {
+                    return Ok(0);
+                }
                 let phys = r.physical + (n - r.logical) as u64;
                 return Ok(phys as u32);
             }
@@ -434,16 +431,54 @@ impl<'a> Ext2FileHandle<'a> {
         let mut runs = state.runs.clone();
 
         // Already mapped?
-        for r in &runs {
-            let len = if r.len > MAX_LEN_PER_EXTENT {
-                r.len - MAX_LEN_PER_EXTENT
-            } else {
-                r.len
-            };
+        let mut unwritten_at = None;
+        for (i, r) in runs.iter().enumerate() {
+            let len = r.actual_len();
             if n >= r.logical && n < r.logical + len as u32 {
+                if r.is_unwritten() {
+                    unwritten_at = Some(i);
+                    break;
+                }
                 let phys = r.physical + (n - r.logical) as u64;
                 return Ok(phys as u32);
             }
+        }
+        // The block sits inside a preallocated (unwritten) extent. Its
+        // physical block is already ours, but the range reads as zeroes
+        // until the extent is marked initialized, so a write through it
+        // would be invisible to Linux. Split the extent the way
+        // `ext4_split_extent_at` does — unwritten head, one initialized
+        // block, unwritten tail — and zero the block first, since what
+        // is on disk there is stale data the old owner freed.
+        if let Some(i) = unwritten_at {
+            let r = runs[i];
+            let len = r.actual_len() as u32;
+            let off = n - r.logical;
+            let phys = r.physical + off as u64;
+            self.zero_block_on_disk(phys as u32)?;
+            let mut repl: Vec<ExtentRun> = Vec::with_capacity(3);
+            if off > 0 {
+                repl.push(ExtentRun {
+                    logical: r.logical,
+                    len: off as u16 + MAX_LEN_PER_EXTENT,
+                    physical: r.physical,
+                });
+            }
+            repl.push(ExtentRun {
+                logical: n,
+                len: 1,
+                physical: phys,
+            });
+            if off + 1 < len {
+                repl.push(ExtentRun {
+                    logical: n + 1,
+                    len: (len - off - 1) as u16 + MAX_LEN_PER_EXTENT,
+                    physical: phys + 1,
+                });
+            }
+            runs.splice(i..=i, repl);
+            self.write_extent_runs_with_state(&runs, &state)?;
+            return Ok(phys as u32);
         }
 
         // Need a fresh physical block.
@@ -501,11 +536,7 @@ impl<'a> Ext2FileHandle<'a> {
         let mut i = 0;
         while i + 1 < runs.len() {
             let (a, b) = (runs[i], runs[i + 1]);
-            let a_len = if a.len > MAX_LEN_PER_EXTENT {
-                a.len - MAX_LEN_PER_EXTENT
-            } else {
-                a.len
-            };
+            let a_len = a.actual_len();
             if a.len < MAX_LEN_PER_EXTENT
                 && a.logical + a_len as u32 == b.logical
                 && a.physical + a_len as u64 == b.physical
@@ -531,11 +562,7 @@ impl<'a> Ext2FileHandle<'a> {
         let mut kept: Vec<ExtentRun> = Vec::with_capacity(state.runs.len());
         for r in &state.runs {
             let r = *r;
-            let len = if r.len > MAX_LEN_PER_EXTENT {
-                r.len - MAX_LEN_PER_EXTENT
-            } else {
-                r.len
-            };
+            let len = r.actual_len();
             if r.logical >= from {
                 // Entirely beyond the new EOF — free the whole run.
                 for off in 0..len as u32 {
@@ -548,7 +575,15 @@ impl<'a> Ext2FileHandle<'a> {
                     self.ext.free_block((r.physical + off as u64) as u32);
                 }
                 let mut shortened = r;
-                shortened.len = new_len as u16;
+                // Keep the unwritten bias: truncating a preallocated
+                // extent must not turn its surviving head into
+                // initialized data.
+                shortened.len = new_len as u16
+                    + if r.is_unwritten() {
+                        MAX_LEN_PER_EXTENT
+                    } else {
+                        0
+                    };
                 kept.push(shortened);
             } else {
                 // Entirely below `from` — keep as is.

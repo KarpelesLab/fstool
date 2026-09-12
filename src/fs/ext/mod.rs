@@ -4503,7 +4503,18 @@ impl Ext {
             )));
         }
         // Fast (inline) symlink: target is in the 60 bytes of block[].
-        if size <= 60 && inode.blocks_512 == 0 {
+        // The kernel's test (`ext4_inode_is_fast_symlink`) is
+        // `i_blocks - ea_blocks == 0`, where `ea_blocks` is the one
+        // cluster charged for an external xattr block. A symlink that
+        // carries xattrs therefore still has its target in `i_block`
+        // even though `i_blocks` is non-zero; treating it as a slow
+        // symlink made us read the xattr block as the target.
+        let ea_blocks_512 = if inode.file_acl != 0 {
+            self.layout.block_size / 512
+        } else {
+            0
+        };
+        if size <= 60 && inode.blocks_512.saturating_sub(ea_blocks_512) == 0 {
             let mut bytes = [0u8; 60];
             for (i, &w) in inode.block.iter().enumerate() {
                 bytes[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
@@ -5231,12 +5242,18 @@ fn pick_idx_for_logical(indices: &[extent::ExtentIdx], n: u32) -> Option<u32> {
 
 fn resolve_logical_in_runs(runs: &[extent::ExtentRun], n: u32) -> u32 {
     for r in runs {
-        let len = if r.len > extent::MAX_LEN_PER_EXTENT {
-            r.len - extent::MAX_LEN_PER_EXTENT
-        } else {
-            r.len
-        };
+        let len = r.actual_len();
         if n >= r.logical && n < r.logical + len as u32 {
+            // An *unwritten* extent (`ee_len > 32768`) is preallocated
+            // but never written: the kernel zero-fills it on read and
+            // never exposes the underlying blocks
+            // (`ext4_ext_handle_unwritten_extents`). Report it as a hole
+            // so every caller serves zeroes instead of stale disk
+            // contents — which, for a preallocated range, can be another
+            // file's freed data.
+            if r.is_unwritten() {
+                return 0;
+            }
             let phys = r.physical + (n - r.logical) as u64;
             return phys as u32;
         }

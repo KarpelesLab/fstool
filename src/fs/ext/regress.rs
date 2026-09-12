@@ -710,3 +710,135 @@ fn flush_preserves_unmodelled_superblock_fields() {
     );
     let _ = constants::SUPERBLOCK_OFFSET;
 }
+
+// ───────── finding 11: fast symlinks that carry an xattr block ─────────
+
+/// A short symlink keeps its target in `i_block` even when an external
+/// xattr block bumps `i_blocks` — the kernel's test is
+/// `i_blocks - ea_blocks == 0`, not `i_blocks == 0`. Reading such a
+/// symlink used to take the slow path and return the xattr block's
+/// bytes instead of the target.
+#[test]
+fn fast_symlink_with_xattr_block_still_reads_from_i_block() {
+    let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+    let mut ext = Ext::format_with(&mut dev, &ext4_opts()).unwrap();
+    let ino = ext
+        .add_symlink_to(
+            &mut dev,
+            INO_ROOT_DIR,
+            b"link",
+            b"../target/of/the/symlink",
+            FileMeta::with_mode(0o777),
+        )
+        .unwrap();
+    ext.set_xattrs(
+        &mut dev,
+        ino,
+        &[super::xattr::Xattr {
+            name: "user.tag".into(),
+            value: b"value".to_vec(),
+        }],
+    )
+    .unwrap();
+    ext.flush(&mut dev).unwrap();
+
+    let re = Ext::open(&mut dev).unwrap();
+    let inode = re.read_inode(&mut dev, ino).unwrap();
+    assert_ne!(inode.file_acl, 0, "test needs an external xattr block");
+    assert_ne!(inode.blocks_512, 0, "xattr block must be charged");
+    assert_eq!(
+        re.read_symlink_target(&mut dev, ino).unwrap(),
+        "../target/of/the/symlink"
+    );
+}
+
+// ───────────── finding 12: unwritten (preallocated) extents ─────────────
+
+/// Flip the first inline leaf extent of `ino` to "unwritten" by adding
+/// the 32768 bias to its `ee_len`, the way `fallocate(2)` leaves a
+/// preallocated range. `i_block` starts at offset 40 of the inode; the
+/// extent header is 12 bytes, so the first leaf record's `ee_len` sits
+/// at 40 + 12 + 4 = 56.
+fn mark_first_extent_unwritten(ext: &Ext, dev: &mut MemoryBackend, ino: u32) -> u16 {
+    let ipg = ext.layout.inodes_per_group;
+    let g = ((ino - 1) / ipg) as usize;
+    let idx = (ino - 1) % ipg;
+    let bs = ext.layout.block_size as u64;
+    let isz = ext.layout.inode_size as u64;
+    let off = ext.layout.groups[g].inode_table as u64 * bs + idx as u64 * isz;
+    let mut len = [0u8; 2];
+    dev.read_at(off + 56, &mut len).unwrap();
+    let len = u16::from_le_bytes(len);
+    assert!(len > 0 && len <= super::extent::MAX_LEN_PER_EXTENT);
+    dev.write_at(
+        off + 56,
+        &(len + super::extent::MAX_LEN_PER_EXTENT).to_le_bytes(),
+    )
+    .unwrap();
+    len
+}
+
+/// `ee_len > 32768` marks a preallocated-but-never-written extent.
+/// The kernel serves zeroes for it; we used to hand back whatever the
+/// physical blocks still contained — i.e. another file's freed data.
+#[test]
+fn unwritten_extent_reads_as_zeroes() {
+    let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+    let mut ext = Ext::format_with(&mut dev, &ext4_opts()).unwrap();
+    let body = vec![0xA7u8; 3 * 4096];
+    let ino = add_file(&mut ext, &mut dev, INO_ROOT_DIR, b"prealloc", &body);
+    ext.flush(&mut dev).unwrap();
+    let len = mark_first_extent_unwritten(&ext, &mut dev, ino);
+    assert_eq!(len, 3);
+
+    let re = Ext::open(&mut dev).unwrap();
+    assert_eq!(read_path(&re, &mut dev, "/prealloc"), vec![0u8; 3 * 4096]);
+}
+
+/// Writing into an unwritten extent must split it and mark the written
+/// block initialized (`ext4_split_extent_at`). Otherwise the bytes land
+/// on disk but Linux keeps reporting zeroes for the whole range.
+#[test]
+fn writing_into_an_unwritten_extent_initialises_it() {
+    use crate::fs::{Filesystem, OpenFlags};
+    let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+    let mut ext = Ext::format_with(&mut dev, &ext4_opts()).unwrap();
+    let body = vec![0xA7u8; 3 * 4096];
+    let ino = add_file(&mut ext, &mut dev, INO_ROOT_DIR, b"prealloc", &body);
+    ext.flush(&mut dev).unwrap();
+    mark_first_extent_unwritten(&ext, &mut dev, ino);
+
+    let mut re = Ext::open(&mut dev).unwrap();
+    {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        let mut h = re
+            .open_file_rw(
+                &mut dev,
+                std::path::Path::new("/prealloc"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+        h.seek(SeekFrom::Start(4096)).unwrap();
+        h.write_all(b"hello").unwrap();
+        h.flush().unwrap();
+    }
+    re.flush(&mut dev).unwrap();
+
+    let re2 = Ext::open(&mut dev).unwrap();
+    let got = read_path(&re2, &mut dev, "/prealloc");
+    assert_eq!(got.len(), 3 * 4096);
+    let mut want = vec![0u8; 3 * 4096];
+    want[4096..4096 + 5].copy_from_slice(b"hello");
+    assert_eq!(got, want, "only the written block may become visible");
+
+    // The middle block is now its own initialized extent; the head and
+    // tail must still be unwritten.
+    let inode = re2.read_inode(&mut dev, ino).unwrap();
+    let iblock = super::extent::iblock_to_bytes(&inode.block);
+    let (_, runs) = super::extent::decode_depth0_iblock(&iblock).unwrap();
+    assert_eq!(runs.len(), 3, "{runs:?}");
+    assert!(runs[0].is_unwritten() && runs[0].actual_len() == 1);
+    assert!(!runs[1].is_unwritten() && runs[1].actual_len() == 1);
+    assert!(runs[2].is_unwritten() && runs[2].actual_len() == 1);
+}
