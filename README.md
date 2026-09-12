@@ -637,7 +637,7 @@ none of the other 130 000 lines.
 | `xfs`, `ntfs`, `f2fs`, `affs`, `iso9660`, `squashfs` | as named | |
 | `hfs`, `hfs-plus` | classic HFS, HFS+ / HFSX | |
 | `apfs` | APFS | pulls `intl` for the directory-record hash |
-| `grf` | GRF | pulls `charcode` for CP949 names |
+| `grf` | GRF | pulls `charcode` for CP949 names; implies `gzip` (every member is zlib-compressed) |
 | `tar` | tar (streaming reader / writer, tar-as-filesystem) | |
 | `archive` | zip / cpio / ar, plus the per-format readers | pulls `charcode`; `cab`, `lha`, `arc`, `sit`, `sevenz`, `rar`, `amiga-lzx` each imply it |
 | `ramfs` | the in-memory scratch filesystem `repack` / `merge` / FUSE build on | |

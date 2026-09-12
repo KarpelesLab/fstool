@@ -150,8 +150,9 @@ affs = ["std"]
 iso9660 = ["std"]
 # SquashFS (reads decode through the codec features).
 squashfs = ["std"]
-# GRF (Gravity Ragnarok Online archive). `charcode` decodes its CP949 names.
-grf = ["std", "dep:charcode"]
+# GRF (Gravity Ragnarok Online archive). `charcode` decodes its CP949 names;
+# every member is zlib-compressed, so the writer needs the `gzip` codec.
+grf = ["std", "dep:charcode", "gzip"]
 # tar — the streaming reader / writer and the tar-as-filesystem view.
 tar = ["std"]
 # The archive core: zip / cpio / ar, plus the per-format readers below

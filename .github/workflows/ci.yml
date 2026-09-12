@@ -114,16 +114,16 @@ jobs:
           cargo test --no-default-features --features codecs,containers
 
       # The leanest hosted configuration: every filesystem, no CLI, no
-      # serialization, no logging, no Unix ioctls, no codecs. It must
-      # build, lint and pass its tests, and its resolve must be the crates
-      # below and their transitive tail. This is the floor the feature
-      # gating promises a `std` consumer.
+      # serialization, no logging, no Unix ioctls, and no codecs beyond
+      # the zlib that `grf` cannot write without. It must build, lint and
+      # pass its tests, and its resolve must be free of the crates below.
+      # This is the floor the feature gating promises a `std` consumer.
       - name: leanest std build
         run: |
           set -euo pipefail
           cargo clippy --no-default-features --features std,filesystems --all-targets -- -D warnings
           cargo test --no-default-features --features std,filesystems
-          for crate in serde serde_json tomlproc clap rustyline log compcol purecrypto; do
+          for crate in serde serde_json tomlproc clap rustyline log purecrypto; do
             if cargo tree -e normal --no-default-features --features std,filesystems \
                  --prefix none | grep -qw "$crate"; then
               echo "::error::$crate leaked into the leanest std build"; exit 1
