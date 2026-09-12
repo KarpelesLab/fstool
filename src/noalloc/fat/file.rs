@@ -21,6 +21,11 @@ impl<D: SectorDriver, const S: usize> Volume<D, S> {
     /// them).
     fn read_sectors_direct(&mut self, first: u32, buf: &mut [u8]) -> Result<(), Error<D::Error>> {
         let count = (buf.len() / self.bps()) as u32;
+        // These two are the only paths that do not go through `load`, so
+        // they carry its bounds check themselves: the `SectorDriver`
+        // contract promises a driver never sees a request past the end of
+        // the medium.
+        self.check_range(first, count)?;
         self.invalidate(first, count)?;
         let abs = self.abs(first);
         self.dev.read_sectors(abs, buf).map_err(Error::Io)
@@ -29,6 +34,7 @@ impl<D: SectorDriver, const S: usize> Volume<D, S> {
     /// Write whole sectors straight from the caller's buffer.
     fn write_sectors_direct(&mut self, first: u32, buf: &[u8]) -> Result<(), Error<D::Error>> {
         let count = (buf.len() / self.bps()) as u32;
+        self.check_range(first, count)?;
         self.invalidate(first, count)?;
         let abs = self.abs(first);
         self.dev.write_sectors(abs, buf).map_err(Error::Io)
@@ -129,6 +135,11 @@ impl File {
                 None => return Ok(None),
             }
         }
+        // Every hop above came through `next_cluster`, which validates;
+        // the starting cluster came off the directory entry and has not.
+        if !vol.geom.is_data_cluster(cluster) {
+            return Err(Error::CorruptChain);
+        }
         self.cur_cluster = cluster;
         self.cur_index = at;
         Ok(Some(cluster))
@@ -165,6 +176,11 @@ impl File {
         } else {
             (self.first_cluster, 0)
         };
+        // As in `cluster_at`: the first cluster is whatever the entry
+        // said, so check it before it reaches `cluster_first_sector`.
+        if !vol.geom.is_data_cluster(cluster) {
+            return Err(Error::CorruptChain);
+        }
         while at < index {
             cluster = match vol.next_cluster(cluster)? {
                 Some(next) => next,
@@ -262,10 +278,8 @@ impl File {
             self.zero_extend(vol, gap_to)?;
             self.pos = gap_to;
         }
-        let end = self
-            .pos
-            .checked_add(buf.len() as u32)
-            .ok_or(Error::FileTooLarge)?;
+        let len = u32::try_from(buf.len()).map_err(|_| Error::FileTooLarge)?;
+        let end = self.pos.checked_add(len).ok_or(Error::FileTooLarge)?;
 
         let bps = vol.bps();
         let spc = vol.geom.sectors_per_cluster;

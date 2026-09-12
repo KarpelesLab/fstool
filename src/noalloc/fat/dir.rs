@@ -606,10 +606,20 @@ impl<D: SectorDriver, const S: usize> Volume<D, S> {
                 // names our target, or its own 8.3 name might.
                 let hit = run.matched(&raw) || short_name_matches(&raw, name);
                 if hit && !Attributes(raw[11]).is_volume_id() {
+                    // The run belongs to this entry whenever its checksum
+                    // says so — whether or not it is the name we searched
+                    // by. Keyed on the search instead, removing a file by
+                    // the short name this driver generated for it would
+                    // leave its long-name entries behind, and the next
+                    // file to land on that slot would inherit them.
+                    let owns = run.valid
+                        && run.expect == 0
+                        && run.checksum
+                            == lfn_checksum(raw[..11].try_into().expect("11 of 32 bytes"));
                     return Ok(Some(Found {
                         meta: decode_short(&raw, self.geom.kind, loc),
                         slots: run.slots,
-                        slot_count: if run.matched(&raw) { run.slot_count } else { 0 },
+                        slot_count: if owns { run.slot_count } else { 0 },
                     }));
                 }
                 run.reset();
@@ -655,7 +665,10 @@ impl<D: SectorDriver, const S: usize> Volume<D, S> {
             Some((p, l)) => (p, l),
             None => ("", trimmed),
         };
-        if leaf.is_empty() {
+        // `.` and `..` name a directory's own entries. Letting them through
+        // means `remove_dir("/a/.")` frees the cluster `/a` is still using,
+        // and the next allocation hands it to another file.
+        if leaf.is_empty() || leaf == "." || leaf == ".." {
             return Err(Error::InvalidPath);
         }
         let dir = self.open_dir(parent_path)?;
@@ -1099,9 +1112,13 @@ impl<D: SectorDriver, const S: usize> Volume<D, S> {
     }
 }
 
+/// 8 base and 3 extension characters, each up to three UTF-8 bytes once
+/// CP437's upper half is decoded, plus the separating dot.
+const MAX_SHORT_NAME_BYTES: usize = 8 * 3 + 1 + 3 * 3;
+
 /// Case-insensitive comparison of an entry's 8.3 name against `name`.
 fn short_name_matches(raw: &[u8; ENTRY], name: &str) -> bool {
-    let mut buf = [0u8; 13];
+    let mut buf = [0u8; MAX_SHORT_NAME_BYTES];
     let len = short_name(raw, &mut buf);
     let Ok(text) = core::str::from_utf8(&buf[..len]) else {
         return false;

@@ -8,16 +8,20 @@
 //! other — the strongest evidence that this driver agrees with something
 //! independently validated against `fsck.vfat`.
 
+use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use super::*;
 
-/// A RAM-backed card.
+/// A RAM-backed card that counts the sector transfers it is asked for,
+/// so a test can pin how much traffic an operation costs a real card.
 #[derive(Debug)]
 struct RamCard {
     data: Vec<u8>,
     sector_size: u32,
+    reads: u32,
+    writes: u32,
 }
 
 impl RamCard {
@@ -25,6 +29,8 @@ impl RamCard {
         Self {
             data,
             sector_size: 512,
+            reads: 0,
+            writes: 0,
         }
     }
 }
@@ -42,12 +48,14 @@ impl SectorDriver for RamCard {
 
     fn read_sectors(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
         let at = lba as usize * self.sector_size as usize;
+        self.reads += (buf.len() / self.sector_size as usize) as u32;
         buf.copy_from_slice(&self.data[at..at + buf.len()]);
         Ok(())
     }
 
     fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), Self::Error> {
         let at = lba as usize * self.sector_size as usize;
+        self.writes += (buf.len() / self.sector_size as usize) as u32;
         self.data[at..at + buf.len()].copy_from_slice(buf);
         Ok(())
     }
@@ -902,4 +910,243 @@ mod cross {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// Regressions for the findings of the first review of this module.
+// ---------------------------------------------------------------------
+
+/// `remove_dir("/a/.")` used to free the cluster `/a` was still using,
+/// leaving the directory listed and its cluster on the free list — the
+/// next allocation cross-linked them.
+#[test]
+fn dot_and_dotdot_are_not_paths_you_can_remove() {
+    let mut vol = mount(fat16());
+    vol.create_dir("/a").unwrap();
+    let cluster = vol.metadata("/a").unwrap().first_cluster;
+    let free = vol.free_clusters().unwrap();
+
+    for path in ["/a/.", "/a/..", "/a/./", "/."] {
+        assert_eq!(
+            vol.remove_dir(path).unwrap_err(),
+            Error::InvalidPath,
+            "remove_dir({path})"
+        );
+        assert_eq!(vol.remove_file(path).unwrap_err(), Error::InvalidPath);
+        assert_eq!(vol.create_file(path).unwrap_err(), Error::InvalidPath);
+    }
+    assert_eq!(vol.free_clusters().unwrap(), free, "a cluster was freed");
+    assert_eq!(vol.metadata("/a").unwrap().first_cluster, cluster);
+
+    // The directory still holds exactly `.` and `..`.
+    let dir = vol.open_dir("/a").unwrap();
+    let mut dots = 0;
+    let mut it = vol.iter_dir(dir);
+    while let Some(e) = it.next().unwrap() {
+        assert!(e.is_dot(), "unexpected entry {}", e.name());
+        dots += 1;
+    }
+    assert_eq!(dots, 2);
+}
+
+/// Patch the first root-directory entry's first-cluster field.
+fn patch_root_first_cluster(vol: &mut Vol, cluster: u32) {
+    let g = *vol.geometry();
+    let sector = g.root_dir_first_sector() as usize;
+    let card = vol.driver_mut();
+    let at = sector * 512;
+    card.data[at + 26..at + 28].copy_from_slice(&(cluster as u16).to_le_bytes());
+    card.data[at + 20..at + 22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
+}
+
+/// A first cluster read straight off a corrupt entry used to reach the
+/// sector arithmetic unchecked: cluster 1 underflowed, and a cluster past
+/// the end of the volume sent the driver off the medium.
+#[test]
+fn a_corrupt_first_cluster_is_refused_rather_than_followed() {
+    for bad in [1u32, 0xFFF0, 0xFFFF] {
+        let mut vol = mount(fat16());
+        let mut f = vol.create_file("/F.BIN").unwrap();
+        f.write_all(&mut vol, &[b'x'; 4096]).unwrap();
+        f.flush(&mut vol).unwrap();
+        patch_root_first_cluster(&mut vol, bad);
+
+        let mut vol = remount(vol);
+        let mut f = vol.open_file("/F.BIN").unwrap();
+        let mut buf = [0u8; 1024];
+        assert_eq!(
+            f.read(&mut vol, &mut buf).unwrap_err(),
+            Error::CorruptChain,
+            "reading cluster {bad}"
+        );
+        let mut f = vol.open_file("/F.BIN").unwrap();
+        assert_eq!(
+            f.write(&mut vol, &[1u8; 1024]).unwrap_err(),
+            Error::CorruptChain,
+            "writing cluster {bad}"
+        );
+        // Nothing reached the card outside its own sectors.
+        let sectors = vol.driver().sector_count();
+        assert!(sectors > 0);
+    }
+}
+
+/// Removing a file by the short name this driver generated for it used to
+/// leave its long-name entries behind; the next file to take that slot
+/// then inherited the deleted file's name.
+#[test]
+fn removing_by_short_name_takes_the_long_name_with_it() {
+    let mut vol = mount(fat16());
+    let mut f = vol.create_file("/hello world.txt").unwrap();
+    f.write_all(&mut vol, b"first").unwrap();
+    f.flush(&mut vol).unwrap();
+
+    // The generated short name is what a FAT driver without long-name
+    // support would see.
+    vol.remove_file("/HELLOW~1.TXT").unwrap();
+    assert!(!vol.exists("/hello world.txt").unwrap());
+
+    let mut f = vol.create_file("/HELLOW~1.TXT").unwrap();
+    f.write_all(&mut vol, b"second").unwrap();
+    f.flush(&mut vol).unwrap();
+
+    let mut vol = remount(vol);
+    let root = vol.root();
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    let mut it = vol.iter_dir(root);
+    while let Some(e) = it.next().unwrap() {
+        names.push(e.name().as_bytes().to_vec());
+    }
+    assert_eq!(
+        names,
+        [b"HELLOW~1.TXT".to_vec()],
+        "an orphaned long-name run renamed the new file"
+    );
+}
+
+/// One FAT entry must cost one cached sector per FAT copy. Walking the
+/// copies inside the bytes instead evicted the cache on every byte, which
+/// is eight sector writes per FAT32 entry and eight times the flash wear.
+#[test]
+fn allocation_does_not_amplify_writes() {
+    for (card, label, budget) in [(fat16(), "fat16", 700u32), (fat32(), "fat32", 700)] {
+        let mut vol = mount(card);
+        let payload = vec![0u8; 64 * 1024];
+        vol.driver_mut().writes = 0;
+        vol.driver_mut().reads = 0;
+
+        let mut f = vol.create_file("/big.bin").unwrap();
+        f.write_all(&mut vol, &payload).unwrap();
+        f.flush(&mut vol).unwrap();
+
+        let writes = vol.driver().writes;
+        // 128 sectors of payload; the rest is FAT, directory and FSInfo.
+        assert!(
+            writes < budget,
+            "{label}: {writes} sector writes for a 64 KiB file (budget {budget})"
+        );
+    }
+}
+
+/// A short name is up to 12 characters, but CP437's upper half decodes to
+/// three UTF-8 bytes each, so the comparison buffer has to hold 34.
+#[test]
+fn short_names_outside_ascii_match_their_decoded_form() {
+    let mut vol = mount(fat16());
+    // Hand-write an 8.3 entry whose every name byte is CP437 0xB0 ('░').
+    {
+        let g = *vol.geometry();
+        let at = g.root_dir_first_sector() as usize * 512;
+        let card = vol.driver_mut();
+        card.data[at..at + 8].fill(0xB0);
+        card.data[at + 8..at + 11].copy_from_slice(b"TXT");
+        card.data[at + 11] = Attributes::ARCHIVE;
+        card.data[at + 28..at + 32].copy_from_slice(&7u32.to_le_bytes());
+    }
+    let mut vol = remount(vol);
+
+    let root = vol.root();
+    let listed = {
+        let mut it = vol.iter_dir(root);
+        let e = it.next().unwrap().unwrap();
+        e.name().to_string()
+    };
+    assert_eq!(listed, "░░░░░░░░.TXT");
+    // The name the listing gave must be the name that opens it…
+    assert_eq!(vol.metadata(&listed).unwrap().len, 7);
+    // …and a truncation of it must not.
+    assert!(vol.metadata("/░░░░.").unwrap_err().is_not_found());
+}
+
+/// A FAT32 volume cannot address more clusters than a 28-bit entry names:
+/// past 0x0FFFFFF6 the allocator would hand out a number every reader
+/// treats as end-of-chain.
+#[test]
+fn a_fat32_volume_claiming_the_whole_entry_space_is_refused() {
+    // 270_532_633 sectors of 512 bytes with one 2 GiB FAT: enough data
+    // sectors to claim 268_435_449 clusters.
+    let mut boot = vec![0u8; 512];
+    boot[0..3].copy_from_slice(&[0xEB, 0x58, 0x90]);
+    boot[11..13].copy_from_slice(&512u16.to_le_bytes());
+    boot[13] = 1;
+    boot[14..16].copy_from_slice(&32u16.to_le_bytes());
+    boot[16] = 1;
+    boot[32..36].copy_from_slice(&270_532_633u32.to_le_bytes());
+    boot[36..40].copy_from_slice(&2_097_152u32.to_le_bytes());
+    boot[44..48].copy_from_slice(&2u32.to_le_bytes());
+    boot[510] = 0x55;
+    boot[511] = 0xAA;
+
+    let device_bytes = 270_532_633u64 * 512;
+    let err = Geometry::parse::<core::convert::Infallible>(&boot, 0, device_bytes).unwrap_err();
+    assert_eq!(err, Error::NotFat);
+}
+
+/// A volume dropped without an explicit flush still writes back its
+/// cached sector, rather than losing the last thing written through it.
+/// (A `File`'s size lives in the handle until `File::flush`, so this is
+/// about the volume's own cache: directory entries and FAT updates.)
+#[test]
+fn dropping_a_volume_flushes_its_cache() {
+    use alloc::rc::Rc;
+    use core::cell::RefCell;
+
+    /// A card whose bytes outlive the volume, so the test can look at
+    /// them after `Drop` has run.
+    #[derive(Debug, Clone)]
+    struct SharedCard(Rc<RefCell<Vec<u8>>>);
+
+    impl SectorDriver for SharedCard {
+        type Error = core::convert::Infallible;
+        fn sector_size(&self) -> u32 {
+            512
+        }
+        fn sector_count(&self) -> u64 {
+            self.0.borrow().len() as u64 / 512
+        }
+        fn read_sectors(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
+            let at = lba as usize * 512;
+            buf.copy_from_slice(&self.0.borrow()[at..at + buf.len()]);
+            Ok(())
+        }
+        fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), Self::Error> {
+            let at = lba as usize * 512;
+            self.0.borrow_mut()[at..at + buf.len()].copy_from_slice(buf);
+            Ok(())
+        }
+    }
+
+    let card = SharedCard(Rc::new(RefCell::new(fat16().data)));
+    {
+        let mut vol = Volume::<_, 512>::mount(card.clone()).unwrap();
+        vol.create_dir("/made").unwrap();
+        // No `vol.flush()`, no `unmount()`: the entry and the FAT link
+        // are sitting in the one-sector cache.
+    }
+
+    let mut vol = Volume::<_, 512>::mount(card.clone()).unwrap();
+    assert!(
+        vol.exists("/made").unwrap(),
+        "the cached sector was discarded on drop"
+    );
 }

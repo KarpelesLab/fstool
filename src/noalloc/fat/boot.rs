@@ -155,6 +155,14 @@ impl Geometry {
             FatKind::Fat32
         };
 
+        // A FAT32 entry is 28 bits wide and 0x0FFFFFF7..=0x0FFFFFFF are the
+        // bad-cluster and end-of-chain marks, so 0x0FFFFFF6 is the highest
+        // cluster a volume can name. Past that the allocator would hand out
+        // a cluster number that every reader treats as the end of a chain.
+        if kind == FatKind::Fat32 && cluster_count > 0x0FFF_FFF5 {
+            return Err(Error::NotFat);
+        }
+
         // The FAT has to be able to map every cluster, or a perfectly
         // ordinary lookup walks off the end of it.
         let needed_bytes = match kind {

@@ -472,7 +472,10 @@ impl<D: SectorDriver, const SECTOR: usize> Volume<D, SECTOR> {
     /// partitioned.
     pub fn mount_auto(mut dev: D) -> Result<Self, Error<D::Error>> {
         Self::check_scratch(&dev)?;
-        let mut first = [0u8; MAX_SECTOR_SIZE];
+        // `SECTOR` is already known to be at least the driver's sector
+        // size, so sizing the scratch by it keeps a 512-byte-sector build
+        // off a 4 KiB stack frame.
+        let mut first = [0u8; SECTOR];
         let ss = dev.sector_size() as usize;
         Self::read_raw(&mut dev, 0, &mut first[..ss])?;
 
@@ -501,7 +504,7 @@ impl<D: SectorDriver, const SECTOR: usize> Volume<D, SECTOR> {
     pub fn mount_at(mut dev: D, start_lba: u64) -> Result<Self, Error<D::Error>> {
         Self::check_scratch(&dev)?;
         let ss = dev.sector_size() as usize;
-        let mut sector = [0u8; MAX_SECTOR_SIZE];
+        let mut sector = [0u8; SECTOR];
         Self::read_raw(&mut dev, start_lba, &mut sector[..ss])?;
 
         let device_bytes = Self::device_bytes(&dev);
@@ -533,11 +536,9 @@ impl<D: SectorDriver, const SECTOR: usize> Volume<D, SECTOR> {
         if index == 0 || index > 4 {
             return Err(Error::NoSuchPartition);
         }
+        Self::check_scratch(dev)?;
         let ss = dev.sector_size() as usize;
-        if ss > MAX_SECTOR_SIZE {
-            return Err(Error::NotFat);
-        }
-        let mut sector = [0u8; MAX_SECTOR_SIZE];
+        let mut sector = [0u8; SECTOR];
         Self::read_raw(dev, 0, &mut sector[..ss])?;
         boot::parse_mbr(&sector[..ss])
             .and_then(|t| t[index as usize - 1])
@@ -610,8 +611,14 @@ impl<D: SectorDriver, const SECTOR: usize> Volume<D, SECTOR> {
 
     /// Flush and give the device back.
     pub fn unmount(mut self) -> Result<D, Error<D::Error>> {
+        // Flush first, so a failure is reported rather than swallowed by
+        // the `Drop` below; on that path `self` drops normally.
         self.flush()?;
-        Ok(self.dev)
+        let me = core::mem::ManuallyDrop::new(self);
+        // SAFETY: `me` is a `ManuallyDrop`, so its destructor never runs
+        // and the device is not dropped twice. Nothing reads `me` after
+        // this.
+        Ok(unsafe { core::ptr::read(&me.dev) })
     }
 
     /// Set the timestamp stamped on entries created or modified from here
@@ -690,6 +697,15 @@ impl<D: SectorDriver, const SECTOR: usize> Volume<D, SECTOR> {
                     .map_err(Error::Io)?;
             }
             self.cache_dirty = false;
+        }
+        Ok(())
+    }
+
+    /// Refuse a transfer that would run past the end of the volume.
+    pub(crate) fn check_range(&self, first: u32, count: u32) -> Result<(), Error<D::Error>> {
+        let end = first as u64 + count as u64;
+        if end > self.geom.total_sectors as u64 {
+            return Err(Error::CorruptChain);
         }
         Ok(())
     }
@@ -773,54 +789,63 @@ impl<D: SectorDriver, const SECTOR: usize> Volume<D, SECTOR> {
         }
     }
 
-    /// Write one byte into every FAT copy that must carry it.
-    fn set_fat_byte(&mut self, off: u64, f: impl Fn(u8) -> u8) -> Result<(), Error<D::Error>> {
+    /// Set `cluster`'s FAT entry to `value`.
+    ///
+    /// The bytes of one entry share a sector (except at a FAT12 straddle),
+    /// and a mirrored volume keeps every FAT copy identical. Walking the
+    /// copies *outside* the bytes is what keeps that to one cached sector
+    /// per copy: the other way round, each byte alternates between copies,
+    /// evicting and reloading the single-sector cache every time — eight
+    /// sector writes per FAT32 entry instead of one.
+    fn set_fat_entry(&mut self, cluster: u32, value: u32) -> Result<(), Error<D::Error>> {
+        if !self.geom.is_data_cluster(cluster) {
+            return Err(Error::CorruptChain);
+        }
+        let off = self.fat_offset(cluster);
+        // (byte offset, bits kept from the old byte, bits to set).
+        let mut edits = [(0u64, 0u8, 0u8); 4];
+        let n = match self.geom.kind {
+            FatKind::Fat12 => {
+                let v = value & 0x0FFF;
+                if cluster & 1 == 0 {
+                    edits[0] = (off, 0x00, (v & 0xFF) as u8);
+                    edits[1] = (off + 1, 0xF0, (v >> 8) as u8 & 0x0F);
+                } else {
+                    edits[0] = (off, 0x0F, ((v & 0x0F) as u8) << 4);
+                    edits[1] = (off + 1, 0x00, (v >> 4) as u8);
+                }
+                2
+            }
+            FatKind::Fat16 => {
+                let b = ((value & 0xFFFF) as u16).to_le_bytes();
+                edits[0] = (off, 0, b[0]);
+                edits[1] = (off + 1, 0, b[1]);
+                2
+            }
+            FatKind::Fat32 => {
+                // The top four bits are reserved; the spec says preserve
+                // them rather than zero them.
+                let b = (value & 0x0FFF_FFFF).to_le_bytes();
+                edits[0] = (off, 0, b[0]);
+                edits[1] = (off + 1, 0, b[1]);
+                edits[2] = (off + 2, 0, b[2]);
+                edits[3] = (off + 3, 0xF0, b[3] & 0x0F);
+                4
+            }
+        };
+
         let bps = self.bps() as u64;
         let copies = if self.geom.mirrored {
             0..self.geom.num_fats
         } else {
             self.geom.active_fat..self.geom.active_fat + 1
         };
-        for n in copies {
-            let sector = self.fat_start(n) + (off / bps) as u32;
-            let at = (off % bps) as usize;
-            let buf = self.sector_mut(sector)?;
-            buf[at] = f(buf[at]);
-        }
-        Ok(())
-    }
-
-    /// Set `cluster`'s FAT entry to `value`.
-    fn set_fat_entry(&mut self, cluster: u32, value: u32) -> Result<(), Error<D::Error>> {
-        if !self.geom.is_data_cluster(cluster) {
-            return Err(Error::CorruptChain);
-        }
-        let off = self.fat_offset(cluster);
-        match self.geom.kind {
-            FatKind::Fat12 => {
-                let v = value & 0x0FFF;
-                if cluster & 1 == 0 {
-                    self.set_fat_byte(off, |_| (v & 0xFF) as u8)?;
-                    self.set_fat_byte(off + 1, |old| (old & 0xF0) | ((v >> 8) as u8 & 0x0F))?;
-                } else {
-                    self.set_fat_byte(off, |old| (old & 0x0F) | (((v & 0x0F) as u8) << 4))?;
-                    self.set_fat_byte(off + 1, |_| (v >> 4) as u8)?;
-                }
-            }
-            FatKind::Fat16 => {
-                let v = (value & 0xFFFF) as u16;
-                let b = v.to_le_bytes();
-                self.set_fat_byte(off, |_| b[0])?;
-                self.set_fat_byte(off + 1, |_| b[1])?;
-            }
-            FatKind::Fat32 => {
-                // The top four bits are reserved; the spec says preserve
-                // them rather than zero them.
-                let b = (value & 0x0FFF_FFFF).to_le_bytes();
-                self.set_fat_byte(off, |_| b[0])?;
-                self.set_fat_byte(off + 1, |_| b[1])?;
-                self.set_fat_byte(off + 2, |_| b[2])?;
-                self.set_fat_byte(off + 3, |old| (old & 0xF0) | (b[3] & 0x0F))?;
+        for copy in copies {
+            for &(at_off, keep, set) in &edits[..n] {
+                let sector = self.fat_start(copy) + (at_off / bps) as u32;
+                let at = (at_off % bps) as usize;
+                let buf = self.sector_mut(sector)?;
+                buf[at] = (buf[at] & keep) | set;
             }
         }
         Ok(())
@@ -994,6 +1019,18 @@ impl<D: SectorDriver, const SECTOR: usize> Volume<D, SECTOR> {
         }
         self.fsinfo_dirty = false;
         Ok(())
+    }
+}
+
+impl<D: SectorDriver, const SECTOR: usize> Drop for Volume<D, SECTOR> {
+    /// Write back the cached sector and FSInfo.
+    ///
+    /// Best effort: a caller who needs to know whether it worked calls
+    /// [`Volume::flush`] or [`Volume::unmount`], which report it. Losing
+    /// the last write of a session because nobody remembered to flush
+    /// would be a worse default than an ignored error here.
+    fn drop(&mut self) {
+        let _ = self.flush();
     }
 }
 
