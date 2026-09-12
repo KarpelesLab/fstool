@@ -59,7 +59,6 @@ required-features = ["std"]
 default = [
     "std",
     "filesystems",
-    "fat-noalloc",
     "containers",
     "codecs",
     "spec",
@@ -88,19 +87,24 @@ default = [
 # GUIDs from you instead.
 std = ["alloc", "uuid/std", "uuid/v4"]
 
-# The `alloc` crate. Implied by every backend below and by `std`, because
-# the hosted API hands back `Vec`s and `String`s throughout — so this is
-# not a feature you normally name. Its purpose is the *other* direction:
-# with `alloc` off, nothing that can allocate is compiled, and the crate
-# links on a target with no global allocator at all. Today exactly one
-# backend stands on that floor — `fat-noalloc`, the allocator-free FAT
-# driver — so the heapless configuration is spelled
+# The `alloc` crate — a heap. On by default (through `std`), and what
+# most backends are built on: the hosted API hands back `Vec`s and
+# `String`s throughout, and a driver that holds its allocation tables in
+# memory needs somewhere to put them.
+#
+# The floor beneath it is a build with `alloc` off, where nothing that
+# can allocate is compiled and the crate links on a target with no
+# `#[global_allocator]` at all. `alloc` is additive from there: turning
+# it on adds the hosted layers and the backends that require them, and
+# never takes anything away. A backend that works either way — today
+# `fat` — gives you its allocation-free driver in both configurations,
+# so the heapless build of a FAT reader is spelled
 #
 #     fstool = { version = "0.4", default-features = false,
-#                features = ["fat-noalloc"] }
+#                features = ["fat"] }
 #
-# and reads and writes an SD card through the `SectorDriver` you implement
-# over your card driver. See `noalloc::fat`.
+# and reads and writes an SD card through the `SectorDriver` you
+# implement over your card driver. See `noalloc::fat`.
 alloc = []
 
 # Everything the library reads and writes, with no command-line surface.
@@ -139,18 +143,22 @@ filesystems = [
     "tar",
     "xfs",
 ]
-# FAT12 / FAT16 / FAT32. The embedded floor: `no_std` + `alloc`.
-fat = ["alloc"]
-# exFAT. Shares the allocation-table code with `fat`.
-exfat = ["fat"]
-# FAT12 / FAT16 / FAT32 with **no allocator** — `noalloc::fat`, a second,
-# independent driver for targets that have no heap. It shares no code with
-# `fat`: every buffer is a fixed array or comes from the caller, the FAT is
-# read a sector at a time from the device instead of being held in RAM, and
-# it carries its own `SectorDriver` trait and error type (the hosted ones
-# return `crate::Error`, which owns a `String`). Reads and writes; MBR
-# partitions; long names. Independent of `fat`, and of `std` and `alloc`.
-fat-noalloc = []
+# FAT12 / FAT16 / FAT32, in both configurations — the one backend that
+# needs neither `std` nor `alloc`.
+#
+# On its own it compiles `noalloc::fat`, the allocation-free driver: a
+# `SectorDriver` you implement, one sector of scratch RAM, and the
+# allocation table read from the card rather than held in memory. Reads
+# and writes, long names, subdirectories, MBR partitions.
+#
+# With `alloc` (so, in any default or `std` build) it *also* compiles
+# `fs::fat`, the hosted driver, which speaks the crate's `Filesystem`
+# trait, formats volumes and builds images. The two share no code and
+# can be used together.
+fat = []
+# exFAT. Shares the allocation-table code with the hosted `fat` driver,
+# so unlike `fat` it needs a heap.
+exfat = ["fat", "alloc"]
 # littlefs (the embedded-flash filesystem, `lfs2` disk versions 2.0 + 2.1).
 littlefs = ["alloc"]
 # ext2 / ext3 / ext4.

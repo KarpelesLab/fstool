@@ -43,11 +43,10 @@ extern crate alloc;
 extern crate std;
 
 // An empty crate is never what the caller meant.
-#[cfg(not(any(feature = "alloc", feature = "fat-noalloc")))]
+#[cfg(not(any(feature = "alloc", feature = "fat")))]
 compile_error!(
-    "fstool: enable at least one feature — `std` (or `default-features = false` \
-     with a backend such as `fat`) for the library, or `fat-noalloc` for the \
-     allocator-free FAT driver"
+    "fstool: enable at least one feature — `std` for the full library, or a \
+     backend such as `fat` (which needs no allocator) for a slimmer one"
 );
 
 #[cfg(all(
@@ -149,7 +148,7 @@ macro_rules! fstool_log {
 
 /// Allocator-free backends: everything here works with no heap at all,
 /// on a target with no global allocator. See [`noalloc::fat`].
-#[cfg(feature = "fat-noalloc")]
+#[cfg(feature = "fat")]
 pub mod noalloc;
 
 #[cfg(feature = "alloc")]

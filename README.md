@@ -630,8 +630,7 @@ none of the other 130 000 lines.
 
 | Feature | Backend | Notes |
 |---------|---------|-------|
-| `fat` | FAT12 / FAT16 / FAT32 | `no_std`-clean |
-| `fat-noalloc` | FAT12 / FAT16 / FAT32 with **no allocator** | a separate driver ([below](#no-allocator-at-all)); needs neither `std` nor `alloc` |
+| `fat` | FAT12 / FAT16 / FAT32 | needs neither `std` nor `alloc`: on its own it is the heapless driver ([below](#no-allocator-at-all)), and `alloc` adds the hosted one beside it |
 | `exfat` | exFAT | `no_std`-clean; implies `fat` (shared allocation-table code) |
 | `littlefs` | littlefs 2.0 / 2.1 | `no_std`-clean |
 | `ext` | ext2 / ext3 / ext4 | |
@@ -645,8 +644,8 @@ none of the other 130 000 lines.
 | `qcow2`, `dmg`, `diskcopy` | disk-image containers | `qcow2-crypto` implies `qcow2`; `dmg-encrypted` / `dmg-bzip2` / `dmg-lzfse` imply `dmg` |
 | `luks` | LUKS1 / LUKS2 | pulls `purecrypto`; implies `json` (LUKS2 metadata is JSON) |
 
-Every feature in the table except the four `no_std` ones implies
-`std`, and every one except `fat-noalloc` implies `alloc`. The dispatch layers (`inspect`, `repack`, the TOML spec,
+Every feature in the table except the three `no_std` ones implies
+`std`, and every one except `fat` implies `alloc`. The dispatch layers (`inspect`, `repack`, the TOML spec,
 `memconv`, the CLI) are gated per backend as well: a format that was
 compiled out is still *recognised* by its magic and refused with an error
 naming the feature to enable, never mistaken for an unknown image. The
@@ -747,8 +746,8 @@ fn read_config(card: SdCard) -> fstool::Result<alloc::vec::Vec<u8>> {
 
 What it costs: a `#![no_std] #![no_main]` program for a Cortex-M4F
 (`thumbv7em-none-eabihf`) that formats a FAT volume, creates a file,
-lists the root and reads the file back links to **~45 KB of flash**
-(`opt-level = "z"`, fat LTO, `panic = "abort"`; ~49 KB at `"s"`, ~60 KB
+lists the root and reads the file back links to **~50 KB of flash**
+(`opt-level = "z"`, fat LTO, `panic = "abort"`; ~54 KB at `"s"`, ~65 KB
 at `3`), bump allocator included. RAM is whatever your allocator hands
 out: the FAT driver keeps the allocation table resident, so budget
 roughly the FAT's size plus a cluster for a mounted volume. The only
@@ -765,19 +764,24 @@ of the core run in the `no_std` configuration too
 ### No allocator at all
 
 The core above still wants a heap, because the hosted API hands back
-`Vec`s and `String`s and the FAT driver keeps the whole allocation table
-resident. For targets with no allocator, `fat-noalloc` compiles a second,
-independent FAT12/16/32 driver — `fstool::noalloc::fat` — that has none of
-those needs:
+`Vec`s and `String`s and its FAT driver keeps the whole allocation table
+resident. Underneath it is a floor with no heap at all: `alloc` is itself
+a (default) feature, and turning it off removes the layers that need one.
+What is left today is `fstool::noalloc::fat`, a second, independent
+FAT12/16/32 driver:
 
 ```toml
 [dependencies]
-fstool = { version = "0.4", default-features = false, features = ["fat-noalloc"] }
+fstool = { version = "0.4", default-features = false, features = ["fat"] }
 ```
 
-With `alloc` off, nothing that can allocate is compiled, so the crate
-links on a target with no `#[global_allocator]` — a guarantee CI checks by
-linking exactly such a binary on every push. Every buffer is a fixed array
+That is the *same* `fat` feature a hosted build uses — FAT needs no
+allocator, so it does not ask for one, and `alloc` only ever adds the
+hosted driver beside this one. (Every other backend still requires
+`alloc` today and says so in its feature.) With `alloc` off nothing that
+can allocate is compiled, so the crate links on a target with no
+`#[global_allocator]` — a guarantee CI checks by linking exactly such a
+binary on every push. Every buffer is a fixed array
 or comes from the caller; the FAT is read a sector at a time from the
 device, so mounting a 32 GB card costs one sector of RAM rather than the
 four megabytes its table would occupy. It reads *and writes*: create,

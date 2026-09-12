@@ -13,13 +13,13 @@ fstool = { path = "../..", default-features = false }
 
 [features]
 default = ["alloc-demo"]
-# The allocator-backed FAT driver (src/main.rs).
-alloc-demo = ["fstool/fat"]
+# The allocator-backed FAT driver (src/main.rs): `fat` plus a heap.
+alloc-demo = ["fstool/fat", "fstool/alloc"]
 # The allocator-free one (src/heapless.rs). Deliberately does NOT enable
-# `fat`: the point of that binary is that nothing in the graph pulls in
+# `alloc`: the point of that binary is that nothing in the graph pulls in
 # the `alloc` crate, so the absence of a `#[global_allocator]` is a link
 # error if anything regresses.
-heapless = ["fstool/fat-noalloc"]
+heapless = ["fstool/fat"]
 
 [[bin]]
 name = "fstool-embedded-cortex-m"

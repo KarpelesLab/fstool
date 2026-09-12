@@ -9,18 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- *(fat)* `noalloc::fat` — a second FAT12/FAT16/FAT32 driver that needs **no
-  allocator at all**, behind the new `fat-noalloc` feature. It shares no
-  code with `fs::fat`: every buffer is a fixed array or comes from the
-  caller, the allocation table is read a sector at a time from the device
-  instead of being held in RAM, and it carries its own `SectorDriver`
-  trait and error type. Reads and writes, long names, subdirectories and
-  MBR partitions. A heapless build is
-  `default-features = false, features = ["fat-noalloc"]`; the new
+- *(fat)* `noalloc::fat` — a second FAT12/FAT16/FAT32 driver that needs
+  **no allocator at all**. It shares no code with `fs::fat`: every buffer
+  is a fixed array or comes from the caller, the allocation table is read
+  a sector at a time from the device instead of being held in RAM, and it
+  carries its own `SectorDriver` trait and error type. Reads and writes,
+  long names, subdirectories and MBR partitions. The new
   `examples/embedded-cortex-m` binary links it for a Cortex-M4F with no
-  `#[global_allocator]` at all, which CI checks on every push.
-- *(features)* `alloc`, implied by `std` and by every backend that needs
-  it. With it off the crate compiles to just the allocator-free surface.
+  `#[global_allocator]` at all — a compile-time proof CI runs on every
+  push — in ~19 KB of flash and under 1 KiB of RAM per mounted volume.
+- *(features)* `alloc`, a default feature that the `std` build and every
+  backend needing a heap imply. It is additive: turning it off removes
+  the layers that require one and leaves the allocation-free floor;
+  turning it on never takes anything away.
+
+### Changed
+
+- *(features)* `fat` no longer implies `alloc`. On its own it is now the
+  allocation-free driver, so `default-features = false, features = ["fat"]`
+  builds for a target with no heap; with `alloc` (any `std` or default
+  build) it additionally compiles the hosted `fs::fat` exactly as before.
+  `exfat`, which shares the hosted driver's allocation-table code, now
+  names `alloc` explicitly. No hosted build changes.
 
 ## [0.4.28](https://github.com/KarpelesLab/fstool/compare/v0.4.27...v0.4.28) - 2026-09-12
 

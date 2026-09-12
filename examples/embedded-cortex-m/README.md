@@ -5,14 +5,14 @@ FAT drivers. Both format a volume on a RAM-backed "card", create a file,
 list the root and read the file back. They exist to prove the crate builds
 and links for a real microcontroller target, and to measure what it costs.
 
-| binary | feature | driver | heap |
-|--------|---------|--------|------|
-| `fstool-embedded-cortex-m` | `alloc-demo` (default) | `fstool::fs::fat` | 64 KiB bump allocator |
-| `fstool-embedded-heapless` | `heapless` | `fstool::noalloc::fat` | **none** |
+| binary | feature | fstool features | driver | heap |
+|--------|---------|-----------------|--------|------|
+| `fstool-embedded-cortex-m` | `alloc-demo` (default) | `fat`, `alloc` | `fstool::fs::fat` | 64 KiB bump allocator |
+| `fstool-embedded-heapless` | `heapless` | `fat` | `fstool::noalloc::fat` | **none** |
 
 The second one is the interesting one: it defines no `#[global_allocator]`
-and never links the `alloc` crate, so if anything behind the
-`fat-noalloc` feature ever started allocating, it would stop linking.
+and never links the `alloc` crate, so if anything reachable behind the
+`fat` feature ever started allocating, it would stop linking.
 That is a compile-time guarantee, not a runtime check, and CI builds it on
 every push.
 
@@ -32,9 +32,13 @@ format + create + list + read, `core::fmt`, and a 64 KiB bump allocator:
 
 | opt-level | `.text` |
 |-----------|---------|
-| `"z"`     | ~45 KB  |
-| `"s"`     | ~49 KB  |
-| `3`       | ~60 KB  |
+| `"z"`     | ~50 KB  |
+| `"s"`     | ~54 KB  |
+| `3`       | ~65 KB  |
+
+(The heapless driver is compiled into this build too — `fat` enables both
+— but nothing references it, so LTO drops every byte: the binary carries
+no `noalloc` symbols at all.)
 
 `.bss` is the 64 KiB allocator arena plus a few words; the driver itself
 keeps the allocation table and one cluster resident.

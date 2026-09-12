@@ -9,8 +9,9 @@
 //!
 //! * **No allocation, anywhere.** Every buffer is a fixed-size array or
 //!   comes from the caller. With `default-features = false, features =
-//!   ["fat-noalloc"]` the crate compiles and links on a target with no
-//!   global allocator at all.
+//!   ["fat"]` the crate compiles and links on a target with no global
+//!   allocator at all; the hosted driver appears only when `alloc` is
+//!   also on.
 //! * **The FAT stays on the card.** Entries are read (and written) one
 //!   sector at a time through a single-sector write-back cache, so mounting
 //!   a 32 GB volume costs one sector of RAM, not the four megabytes its

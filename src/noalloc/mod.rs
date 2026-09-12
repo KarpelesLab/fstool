@@ -8,15 +8,16 @@
 //! Build it with
 //!
 //! ```toml
-//! fstool = { version = "0.4", default-features = false, features = ["fat-noalloc"] }
+//! fstool = { version = "0.4", default-features = false, features = ["fat"] }
 //! ```
 //!
 //! which compiles the crate as `#![no_std]` with nothing that can
-//! allocate. The same code is also compiled into hosted builds, where it
-//! sits beside the allocator-backed drivers.
+//! allocate. `alloc` is additive from there: a build that has it keeps
+//! everything here and gains the hosted drivers beside it, so the same
+//! code is compiled into every configuration.
 //!
 //! Today this is [`crate::noalloc::fat`] — FAT12/FAT16/FAT32, read and
 //! write.
 
-#[cfg(feature = "fat-noalloc")]
+#[cfg(feature = "fat")]
 pub mod fat;

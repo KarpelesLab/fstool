@@ -1,9 +1,9 @@
 //! Tests for the allocator-free FAT driver.
 //!
 //! These run in every configuration, including `--no-default-features
-//! --features fat-noalloc`, so the volumes they work on are laid out by a
-//! small formatter right here rather than by [`crate::fs::fat`], which
-//! that configuration does not compile. Where the hosted driver *is*
+//! --features fat`, the heapless one, so the volumes they work on are
+//! laid out by a small formatter right here rather than by
+//! [`crate::fs::fat`], which that configuration does not compile. Where the hosted driver *is*
 //! available, the last tests in the file cross-check the two against each
 //! other — the strongest evidence that this driver agrees with something
 //! independently validated against `fsck.vfat`.
@@ -747,18 +747,24 @@ fn an_entry_handle_opens_without_a_second_lookup() {
 
 // ---------------------------------------------------------------------
 // Cross-checks against the hosted driver, which is itself validated
-// against `fsck.vfat` / `mtools` in CI. Only compiled when both are in
-// the build.
+// against `fsck.vfat` / `mtools` in CI. `fat` alone is the heapless
+// build and has no hosted driver to compare against, so these appear
+// only once `alloc` is on too.
 // ---------------------------------------------------------------------
 
-#[cfg(feature = "fat")]
+// The hosted driver exists only when `alloc` does.
+#[cfg(feature = "alloc")]
 mod cross {
     use super::*;
     use crate::block::MemoryBackend;
     use crate::fs::fat::{Fat32, FatFormatOpts, FatKind as HostedKind};
     use crate::fs::{FileMeta, FileSource, Filesystem};
     use alloc::boxed::Box;
-    use std::path::Path;
+    // The crate's own `Path` / `Cursor`, which are `std`'s on a hosted
+    // build and stand-ins without one — so these tests compile in the
+    // `alloc`-but-no-`std` configuration too.
+    use crate::io::Cursor;
+    use crate::path::Path;
 
     const SECTORS: u32 = 128 * 1024; // 64 MiB, comfortably FAT32
 
@@ -802,7 +808,7 @@ mod cross {
             &mut dev,
             Path::new("/sub/a long name.txt"),
             FileSource::Reader {
-                reader: Box::new(std::io::Cursor::new(body.clone())),
+                reader: Box::new(Cursor::new(body.clone())),
                 len: body.len() as u64,
             },
             FileMeta::default(),

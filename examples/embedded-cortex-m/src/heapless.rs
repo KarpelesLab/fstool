@@ -2,7 +2,7 @@
 //! all**.
 //!
 //! There is no `extern crate alloc` and no `#[global_allocator]` here, and
-//! fstool is pulled in with only `fat-noalloc`. If any reachable line of
+//! fstool is pulled in with `fat` but not `alloc`. If any reachable line of
 //! the driver could allocate, this would not link — rustc refuses a binary
 //! that needs the `alloc` crate without an allocator to back it. That
 //! failure mode is the point of this program: it is a compile-time proof,
