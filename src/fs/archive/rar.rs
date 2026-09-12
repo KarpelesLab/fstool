@@ -502,10 +502,14 @@ mod imp {
                 None => break,
             };
             let header_start = pos + 4 + hs_len as u64;
-            let header_end = header_start + head_size;
-            if header_end > dev_len {
+            // `head_size` is an untrusted vint (up to u64::MAX): a wrapped
+            // sum would slip past the bounds check and read out of range.
+            let Some(header_end) = header_start
+                .checked_add(head_size)
+                .filter(|&end| end <= dev_len)
+            else {
                 break;
-            }
+            };
             let hdr = read_at(dev, header_start, head_size as usize)?;
             let mut c = Cur { b: &hdr, p: 0 };
             let htype = c.vint()?;
@@ -587,7 +591,14 @@ mod imp {
                 }
             }
 
-            pos = header_end + data_size;
+            // `data_size` is untrusted too; a wrapped position would either
+            // panic or re-read earlier headers forever. Past-the-end data
+            // just ends the scan (the member is already indexed; reads of
+            // it fail on their own bounds check).
+            let Some(next) = header_end.checked_add(data_size).filter(|&n| n <= dev_len) else {
+                break;
+            };
+            pos = next;
         }
 
         // Finalise groups into the per-file table + solid-group vector.
@@ -893,6 +904,21 @@ mod tests {
         let mut out = Vec::new();
         r.read_to_end(&mut out).map_err(crate::Error::from)?;
         Ok(out)
+    }
+
+    /// A 10-byte vint can carry bit 63, so a crafted `head_size` of
+    /// `u64::MAX` wrapped `header_start + head_size` past the bounds check
+    /// and drove an enormous read. It must end the scan cleanly instead.
+    #[test]
+    fn wrapped_header_size_ends_scan() {
+        let mut arc = b"Rar!\x1A\x07\x01\x00".to_vec();
+        arc.extend_from_slice(&[0u8; 4]); // header CRC (unchecked here)
+        arc.extend_from_slice(&[0xFF; 9]); // vint continuation bytes
+        arc.push(0x01); // final byte: sets bit 63 → head_size = u64::MAX
+        arc.resize(64, 0);
+        let mut dev = dev_from(&arc);
+        let mut fs = RarFs::open(&mut dev).unwrap();
+        assert!(fs.list(&mut dev, Path::new("/")).unwrap().is_empty());
     }
 
     #[test]
