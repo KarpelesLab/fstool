@@ -115,6 +115,11 @@ impl File {
         } else {
             (self.first_cluster, 0)
         };
+        // A chain cannot be longer than the volume has clusters; anything
+        // more means it loops back on itself.
+        if index > vol.geom.cluster_count {
+            return Err(Error::CorruptChain);
+        }
         while at < index {
             match vol.next_cluster(cluster)? {
                 Some(next) => {
@@ -151,6 +156,9 @@ impl File {
             self.cur_cluster = cluster;
             self.cur_index = 0;
             self.dirty = true;
+        }
+        if index > vol.geom.cluster_count {
+            return Err(Error::CorruptChain);
         }
         let (mut cluster, mut at) = if index >= self.cur_index && self.cur_cluster != 0 {
             (self.cur_cluster, self.cur_index)

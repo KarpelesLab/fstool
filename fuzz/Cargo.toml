@@ -33,3 +33,10 @@ path = "fuzz_targets/littlefs_open.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "noalloc_fat"
+path = "fuzz_targets/noalloc_fat.rs"
+test = false
+doc = false
+bench = false

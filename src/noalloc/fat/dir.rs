@@ -372,6 +372,10 @@ pub(crate) struct DirSectors {
     cluster: u32,
     in_cluster: u32,
     done: bool,
+    /// Cluster hops taken. A corrupt FAT can point a chain back at
+    /// itself; without this the walk would never end, which on a
+    /// microcontroller means a watchdog reset rather than an error.
+    hops: u32,
 }
 
 impl DirSectors {
@@ -383,6 +387,7 @@ impl DirSectors {
             cluster: dir.first_cluster,
             in_cluster: 0,
             done: dir.first_cluster == 0 && !dir.fixed_root,
+            hops: 0,
         }
     }
 
@@ -406,6 +411,11 @@ impl DirSectors {
         }
         let spc = vol.geom.sectors_per_cluster;
         if self.in_cluster == spc {
+            // A chain longer than the volume has clusters is a cycle.
+            self.hops += 1;
+            if self.hops > vol.geom.cluster_count {
+                return Err(Error::CorruptChain);
+            }
             match vol.next_cluster(self.cluster)? {
                 Some(next) => {
                     self.cluster = next;
@@ -708,8 +718,13 @@ impl<D: SectorDriver, const S: usize> Volume<D, S> {
         if !self.geom.is_data_cluster(last) {
             return Err(Error::CorruptChain);
         }
+        let mut hops = 0u32;
         while let Some(next) = self.next_cluster(last)? {
             last = next;
+            hops += 1;
+            if hops > self.geom.cluster_count {
+                return Err(Error::CorruptChain);
+            }
         }
         let cluster = self.alloc_zeroed_cluster(Some(last))?;
         Ok(self.geom.cluster_first_sector(cluster))
