@@ -553,6 +553,77 @@ impl Catalog {
 
     /// Look up the record with exactly the given key. Returns the
     /// decoded record body, or `None` if no exact match exists.
+    /// Index of the leaf node that would hold `wanted`, i.e. the first
+    /// leaf whose key range reaches it. Used to start a directory
+    /// listing at the right place instead of walking the leaf chain
+    /// from the very first leaf — on a big catalog that difference is
+    /// the whole tree versus a handful of nodes.
+    ///
+    /// Returns `None` for an empty tree.
+    pub fn leaf_for_key(
+        &self,
+        dev: &mut dyn BlockDevice,
+        wanted: &CatalogKey,
+    ) -> Result<Option<u32>> {
+        let node_size = u32::from(self.header.node_size);
+        let mut node_idx = self.header.root_node;
+        if node_idx == 0 {
+            return Ok(None);
+        }
+        // Same descent guard as `lookup`: a malicious index record can
+        // point at itself or past the end of the tree.
+        let max_descent = self.header.tree_depth.max(1) as usize + 1;
+        for _ in 0..max_descent {
+            if node_idx >= self.header.total_nodes {
+                return Err(crate::Error::InvalidImage(format!(
+                    "hfs+: catalog child node {node_idx} >= total_nodes {}",
+                    self.header.total_nodes
+                )));
+            }
+            let node = read_node(dev, &self.fork, node_idx, node_size)?;
+            let desc = NodeDescriptor::decode(&node)?;
+            if desc.kind == KIND_LEAF {
+                return Ok(Some(node_idx));
+            }
+            if desc.kind != KIND_INDEX {
+                return Err(crate::Error::InvalidImage(format!(
+                    "hfs+: unexpected B-tree node kind {} in catalog traversal",
+                    desc.kind
+                )));
+            }
+            let offs = record_offsets(&node, desc.num_records)?;
+            let mut child: Option<u32> = None;
+            for i in 0..desc.num_records as usize {
+                let rec = record_bytes(&node, &offs, i);
+                let key = CatalogKey::decode(rec)?;
+                let pointer_off = align2(key.encoded_len);
+                if pointer_off + 4 > rec.len() {
+                    return Err(crate::Error::InvalidImage(
+                        "hfs+: index record missing child pointer".into(),
+                    ));
+                }
+                let next =
+                    u32::from_be_bytes(rec[pointer_off..pointer_off + 4].try_into().unwrap());
+                match key.compare(wanted, self.case_sensitive) {
+                    Ordering::Less | Ordering::Equal => child = Some(next),
+                    // `wanted` sorts before every key in this node, so
+                    // it belongs in the leftmost subtree.
+                    Ordering::Greater => {
+                        child.get_or_insert(next);
+                        break;
+                    }
+                }
+            }
+            node_idx = match child {
+                Some(c) => c,
+                None => return Ok(None),
+            };
+        }
+        Err(crate::Error::InvalidImage(
+            "hfs+: catalog B-tree descent exceeded tree depth (cycle?)".into(),
+        ))
+    }
+
     pub fn lookup(
         &self,
         dev: &mut dyn BlockDevice,

@@ -1114,3 +1114,106 @@ fn writer_folds_non_latin_names_the_way_fsck_does() {
         eprintln!("skipping fsck oracle: not installed");
     }
 }
+
+/// The allocation bitmap used to be read and written through the
+/// allocation file's *first* extent only. On a volume whose allocation
+/// file is fragmented (anything we didn't format ourselves, or one
+/// that grew) that splices unrelated blocks into the in-memory bitmap
+/// and then writes the bitmap straight over them. Here the allocation
+/// file's first two extents are deliberately put out of order on disk,
+/// which a first-extent-only read gets wrong.
+#[test]
+fn fragmented_allocation_file_round_trips() {
+    use fstool::fs::hfs_plus::volume_header::read_volume_header;
+    use std::os::unix::fs::FileExt;
+
+    let tmp = NamedTempFile::new().unwrap();
+    let opts = FormatOpts {
+        volume_name: "FragBM".into(),
+        block_size: 512,
+        ..FormatOpts::default()
+    };
+    {
+        let (mut dev, mut hfs) = fresh_image(&tmp, &opts);
+        hfs.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+
+    let (start, count, bs) = {
+        let mut dev = FileBackend::open(tmp.path()).unwrap();
+        let vh = read_volume_header(&mut dev).unwrap();
+        let e = vh.allocation_file.extents[0];
+        (e.start_block, e.block_count, u64::from(vh.block_size))
+    };
+    assert!(
+        count >= 3,
+        "test needs a multi-block allocation file (got {count})"
+    );
+
+    // Swap the first two allocation-file blocks on disk and describe
+    // them in the volume header in swapped order, so the fork's logical
+    // bytes are unchanged but its extents are no longer contiguous.
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tmp.path())
+        .unwrap();
+    let mut a = vec![0u8; bs as usize];
+    let mut b = vec![0u8; bs as usize];
+    f.read_exact_at(&mut a, u64::from(start) * bs).unwrap();
+    f.read_exact_at(&mut b, u64::from(start + 1) * bs).unwrap();
+    f.write_at(&b, u64::from(start) * bs).unwrap();
+    f.write_at(&a, u64::from(start + 1) * bs).unwrap();
+    // HFSPlusForkData at VH offset 0x070: logicalSize(8) clumpSize(4)
+    // totalBlocks(4), then 8 × (startBlock u32, blockCount u32).
+    let ext_off = 1024 + 0x070 + 16;
+    let descriptors: [(u32, u32); 3] = [(start + 1, 1), (start, 1), (start + 2, count - 2)];
+    for (i, (sb, bc)) in descriptors.iter().enumerate() {
+        f.write_at(&sb.to_be_bytes(), ext_off + (i as u64) * 8)
+            .unwrap();
+        f.write_at(&bc.to_be_bytes(), ext_off + (i as u64) * 8 + 4)
+            .unwrap();
+    }
+    f.sync_all().unwrap();
+
+    {
+        let mut dev = FileBackend::open(tmp.path()).unwrap();
+        let mut hfs = HfsPlus::open(&mut dev).unwrap();
+        let body = b"fragmented bitmap\n".repeat(64);
+        let mut src = Cursor::new(body.clone());
+        hfs.create_file(
+            &mut dev,
+            "/f.txt",
+            &mut src,
+            body.len() as u64,
+            0o644,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        hfs.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+
+    let mut dev = FileBackend::open(tmp.path()).unwrap();
+    let hfs = HfsPlus::open(&mut dev).unwrap();
+    let mut got = Vec::new();
+    hfs.open_file_reader(&mut dev, "/f.txt")
+        .unwrap()
+        .read_to_end(&mut got)
+        .unwrap();
+    assert_eq!(got, b"fragmented bitmap\n".repeat(64));
+    // The extents must still be the swapped pair we planted — flush
+    // rewrote the bitmap, not the fork layout.
+    let vh = read_volume_header(&mut dev).unwrap();
+    assert_eq!(vh.allocation_file.extents[0].start_block, start + 1);
+    assert_eq!(vh.allocation_file.extents[1].start_block, start);
+    drop(dev);
+
+    if let Some((fsck, label)) = find_fsck_hfs() {
+        assert_fsck_clean(&fsck, label, tmp.path());
+    } else {
+        eprintln!("skipping fsck oracle: not installed");
+    }
+}

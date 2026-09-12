@@ -1129,16 +1129,29 @@ impl HfsPlus {
         })
     }
 
-    /// Enumerate the direct children of folder `cnid` by scanning
-    /// every leaf node of the catalog from the first leaf onwards
-    /// and collecting entries whose key.parentID matches.
+    /// Enumerate the direct children of folder `cnid`.
+    ///
+    /// Catalog keys sort by `parentID` first, so every child of `cnid`
+    /// is contiguous in the leaf chain. Descend the B-tree to the leaf
+    /// that would hold `(cnid, "")` and walk forward from there,
+    /// stopping at the first key with a larger parent — walking from
+    /// the *first* leaf instead makes every listing cost the whole
+    /// catalog.
     fn list_cnid(&self, dev: &mut dyn BlockDevice, cnid: u32) -> Result<Vec<crate::fs::DirEntry>> {
         use crate::fs::{DirEntry as FsDirEntry, EntryKind};
 
         let mut out = Vec::new();
         let node_size = u32::from(self.catalog.header.node_size);
         let total_nodes = self.catalog.header.total_nodes;
-        let mut node_idx = self.catalog.header.first_leaf_node;
+        let start_key = CatalogKey {
+            parent_id: cnid,
+            name: crate::fs::hfs_plus::catalog::UniStr::default(),
+            encoded_len: 0,
+        };
+        let mut node_idx = match self.catalog.leaf_for_key(dev, &start_key)? {
+            Some(n) => n,
+            None => return Ok(out),
+        };
         // Bound the leaf-chain walk by the catalog node count: a malicious
         // `fLink` cycle would otherwise loop forever.
         let mut steps_left = total_nodes as usize;
@@ -2115,6 +2128,103 @@ mod tests {
     /// at its path with byte-exact contents, and the original file must
     /// still be intact. Locks down the open-as-writable path used by
     /// `fstool add` on an already-flushed HFS+ image.
+    /// The reserved head of an HFS+ volume is bytes 0..1024 plus the
+    /// 512-byte volume header at 1024..1536 — one allocation block at
+    /// 4 KiB but two at 1 KiB and three at 512 bytes. Laying the
+    /// special files out from block 1 regardless put the allocation
+    /// bitmap straight on top of the volume header on any volume with
+    /// a sub-2-KiB block size. The tail is the mirror case: the
+    /// alternate volume header's last 1 KiB spans two 512-byte blocks.
+    #[test]
+    fn small_block_sizes_do_not_clobber_the_volume_headers() {
+        for bs in [512u32, 1024, 2048, 4096] {
+            let mut dev = crate::block::MemoryBackend::new(8 * 1024 * 1024);
+            let opts = writer::FormatOpts {
+                block_size: bs,
+                volume_name: format!("BS{bs}"),
+                ..writer::FormatOpts::default()
+            };
+            let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+            let body = b"payload\n".repeat(100);
+            hfs.create_file(
+                &mut dev,
+                "/f.txt",
+                &mut std::io::Cursor::new(body.clone()),
+                body.len() as u64,
+                0o644,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+            hfs.flush(&mut dev).unwrap();
+
+            let hfs = HfsPlus::open(&mut dev)
+                .unwrap_or_else(|e| panic!("block_size {bs}: reopen failed: {e}"));
+            assert_eq!(hfs.volume_name, format!("BS{bs}"), "block_size {bs}");
+            let mut got = Vec::new();
+            std::io::Read::read_to_end(
+                &mut hfs.open_file_reader(&mut dev, "/f.txt").unwrap(),
+                &mut got,
+            )
+            .unwrap();
+            assert_eq!(got, body, "block_size {bs}");
+        }
+    }
+
+    /// Listings descend the catalog B-tree to the leaf holding
+    /// `(cnid, "")` instead of walking from the first leaf. The
+    /// entries of a directory whose CNID sorts late must still come
+    /// back complete — including the boundary cases of a child that is
+    /// the very first record of a leaf and one that is the very last.
+    #[test]
+    fn list_descends_to_the_right_leaf() {
+        let mut dev = crate::block::MemoryBackend::new(16 * 1024 * 1024);
+        let opts = writer::FormatOpts {
+            catalog_nodes: 64,
+            ..writer::FormatOpts::default()
+        };
+        let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+        // Several sibling directories so the catalog spans many leaves
+        // and the interesting parent is nowhere near the first one.
+        for d in 0..8 {
+            hfs.create_dir(&mut dev, &format!("/d{d}"), 0o755, 0, 0, 0)
+                .unwrap();
+            for i in 0..40 {
+                hfs.create_file(
+                    &mut dev,
+                    &format!("/d{d}/f{i:03}.txt"),
+                    &mut std::io::Cursor::new(b"x".to_vec()),
+                    1,
+                    0o644,
+                    0,
+                    0,
+                    0,
+                )
+                .unwrap();
+            }
+        }
+        hfs.flush(&mut dev).unwrap();
+
+        let hfs = HfsPlus::open(&mut dev).unwrap();
+        assert!(
+            hfs.catalog.header.tree_depth >= 2,
+            "test needs a multi-level catalog"
+        );
+        for d in 0..8 {
+            let names: Vec<String> = hfs
+                .list_path(&mut dev, &format!("/d{d}"))
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect();
+            assert_eq!(names.len(), 40, "/d{d} listing is short: {names:?}");
+            assert!(names.contains(&"f000.txt".to_string()));
+            assert!(names.contains(&"f039.txt".to_string()));
+        }
+        assert_eq!(hfs.list_path(&mut dev, "/").unwrap().len(), 8);
+    }
+
     #[test]
     fn reopen_writable_round_trip_add_file() {
         let mut dev = crate::block::MemoryBackend::new(8 * 1024 * 1024);

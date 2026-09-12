@@ -1291,8 +1291,15 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
     }
     let total_blocks = total_blocks_u64 as u32;
 
-    // ---- layout: place special files starting at block 1.
-    let mut cursor: u32 = 1;
+    // ---- layout: place special files after the volume header.
+    //
+    // The reserved area is bytes 0..1024 plus the 512-byte volume
+    // header at 1024..1536 — one allocation block at the usual 4 KiB,
+    // but three at 512 bytes and two at 1 KiB. Starting at block 1
+    // unconditionally puts the allocation bitmap straight on top of the
+    // volume header on any volume with a block size below 2 KiB.
+    let head_reserved = 1536u64.div_ceil(u64::from(bs)) as u32;
+    let mut cursor: u32 = head_reserved;
 
     // Allocation bitmap: one bit per allocation block, rounded up to a
     // whole number of blocks.
@@ -1380,13 +1387,14 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
         let by = (b / 8) as usize;
         bitmap[by] |= 1u8 << (7 - (b & 7));
     }
-    // Mark the very last block as used too: we reserve it for the
-    // alternate volume header.
+    // Mark the tail blocks used too: the alternate volume header sits
+    // in the volume's last 1 KiB, which is one block at 4 KiB but two
+    // at 512 bytes.
+    let tail_reserved = 1024u64.div_ceil(u64::from(bs)) as u32;
     let last_block = total_blocks - 1;
-    let by = (last_block / 8) as usize;
-    let mask = 1u8 << (7 - (last_block & 7));
-    if bitmap[by] & mask == 0 {
-        bitmap[by] |= mask;
+    for b in total_blocks.saturating_sub(tail_reserved)..total_blocks {
+        let by = (b / 8) as usize;
+        bitmap[by] |= 1u8 << (7 - (b & 7));
     }
 
     // Zero only the metadata regions, not the whole device. The special
@@ -1404,10 +1412,9 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
 
     let mut free_blocks = total_blocks - cursor;
     if total_blocks > 0 {
-        // Account for alternate volume header (block last_block).
-        if last_block >= cursor {
-            free_blocks = free_blocks.saturating_sub(1);
-        }
+        // Account for the alternate volume header's tail blocks.
+        let tail_start = total_blocks.saturating_sub(tail_reserved).max(cursor);
+        free_blocks = free_blocks.saturating_sub(total_blocks - tail_start);
     }
 
     let volume_name_unistr = UniStr::from_str_lossy(&opts.volume_name);
@@ -2650,20 +2657,44 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
     )?;
 
     // 3. Allocation bitmap.
-    let bm_off =
-        u64::from(writer.allocation_file.extents[0].start_block) * u64::from(writer.block_size);
-    sink.write_at(bm_off, &writer.bitmap)?;
+    //
     // TN1150: when the bitmap has more bits than allocation blocks (the last
     // byte is partial), the bits beyond `total_blocks` must read as **zero** on
     // disk. The in-memory bitmap keeps those padding bits set to 1 so the
-    // allocator never hands them out; clear them in the last on-disk byte so
+    // allocator never hands them out; clear them in the copy we write so
     // `fsck.hfsplus` doesn't flag "Volume Bit Map needs minor repair".
+    let mut on_disk_bitmap = writer.bitmap.clone();
     if !writer.total_blocks.is_multiple_of(8) {
         let last = (writer.total_blocks / 8) as usize;
-        if last < writer.bitmap.len() {
+        if last < on_disk_bitmap.len() {
             let valid = writer.total_blocks % 8;
-            let corrected = writer.bitmap[last] & ((!0u8) << (8 - valid));
-            sink.write_at(bm_off + last as u64, &[corrected])?;
+            on_disk_bitmap[last] &= (!0u8) << (8 - valid);
+        }
+    }
+    // Write it back across the allocation file's extents. A fragmented
+    // allocation file (possible on a volume we didn't format) would
+    // otherwise get its tail written straight over whatever follows the
+    // first extent.
+    {
+        let mut written = 0usize;
+        for ext in writer.allocation_file.extents.iter() {
+            if written >= on_disk_bitmap.len() {
+                break;
+            }
+            if ext.block_count == 0 {
+                continue;
+            }
+            let span = (u64::from(ext.block_count) * u64::from(writer.block_size)) as usize;
+            let take = span.min(on_disk_bitmap.len() - written);
+            let off = u64::from(ext.start_block) * u64::from(writer.block_size);
+            sink.write_at(off, &on_disk_bitmap[written..written + take])?;
+            written += take;
+        }
+        if written < on_disk_bitmap.len() {
+            return Err(crate::Error::Unsupported(format!(
+                "hfs+ writer: allocation file's inline extents cover {written} of                  {} bitmap bytes (extents-overflow allocation file is not supported)",
+                on_disk_bitmap.len()
+            )));
         }
     }
     // Pad the rest of the allocation-file blocks with zero already done
@@ -2885,15 +2916,23 @@ pub fn open_writable(
     }
 
     // ---- 1. Load the allocation bitmap.
+    //
+    // Read it through the allocation file's whole extent list, not just
+    // its first extent: a volume formatted elsewhere (or grown) can
+    // have a fragmented allocation file, and reading straight off the
+    // first extent would splice unrelated blocks into the bitmap and
+    // then, on flush, write the bitmap over them. `from_inline` also
+    // refuses an allocation file that spills into the
+    // extents-overflow tree, which the flush path could not write back.
     let bitmap_bytes = (total_blocks as u64).div_ceil(8) as usize;
     let mut bitmap = vec![0u8; bitmap_bytes];
-    if let Some(first) = vh.allocation_file.extents.first()
-        && first.block_count > 0
-    {
-        let off = u64::from(first.start_block) * u64::from(block_size);
-        // The on-disk bitmap may span more bytes than the live size
-        // (rounded up to a whole block); only read what we need.
-        dev.read_at(off, &mut bitmap)?;
+    if vh.allocation_file.extents.iter().any(|e| e.block_count > 0) {
+        let bm_fork = ForkReader::from_inline(
+            &vh.allocation_file,
+            block_size,
+            "allocation bitmap (writable open)",
+        )?;
+        bm_fork.read(dev, 0, &mut bitmap)?;
     }
     let free_blocks = count_free_bits(&bitmap, total_blocks);
 
