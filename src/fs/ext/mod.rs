@@ -1783,22 +1783,53 @@ impl Ext {
     }
 
     /// Reserve the next available inode. Inode `N` lives in group
-    /// `(N-1) / inodes_per_group` at bitmap bit `(N-1) % inodes_per_group`,
-    /// so a monotonic `next_inode` counter spans all groups.
+    /// `(N-1) / inodes_per_group` at bitmap bit `(N-1) % inodes_per_group`.
+    ///
+    /// `next_inode` is only a scan cursor: every candidate is tested
+    /// against the inode bitmap before being handed out, so an opened
+    /// image whose live inodes are interleaved with freed slots (or whose
+    /// later groups already hold inodes) never gets a live inode
+    /// overwritten. The scan runs `next_inode..=inodes_count` first and
+    /// wraps to `first_ino..next_inode` so freed slots are reused.
     fn alloc_inode(&mut self) -> Result<u32> {
-        if self.next_inode > self.layout.inodes_count {
-            return Err(crate::Error::Unsupported(format!(
-                "ext: out of inodes (allocated {}, max {})",
-                self.next_inode - 1,
-                self.layout.inodes_count
-            )));
+        let first = self.sb.first_ino.max(1);
+        let last = self.layout.inodes_count;
+        let cursor = self.next_inode.clamp(first, last.saturating_add(1));
+        if let Some(ino) = self.scan_free_inode(cursor, last) {
+            return Ok(ino);
         }
-        let ino = self.next_inode;
-        let g = self.inode_group(ino);
-        let idx = (ino - 1) % self.layout.inodes_per_group;
-        set_bit(&mut self.groups[g].inode_bitmap, idx);
-        self.next_inode += 1;
-        Ok(ino)
+        if let Some(ino) = self.scan_free_inode(first, cursor.saturating_sub(1)) {
+            return Ok(ino);
+        }
+        Err(crate::Error::Unsupported(format!(
+            "ext: out of inodes (max {})",
+            self.layout.inodes_count
+        )))
+    }
+
+    /// Find, mark and return the first inode in `lo..=hi` whose bitmap
+    /// bit is clear; advances `next_inode` past it. `None` when the
+    /// range is fully allocated.
+    fn scan_free_inode(&mut self, lo: u32, hi: u32) -> Option<u32> {
+        let ipg = self.layout.inodes_per_group;
+        let mut ino = lo;
+        while ino <= hi {
+            let g = ((ino - 1) / ipg) as usize;
+            let idx = (ino - 1) % ipg;
+            let bm = &self.groups[g].inode_bitmap;
+            // Skip a fully-allocated byte in one step.
+            if idx.is_multiple_of(8) && bm[(idx / 8) as usize] == 0xFF && ino + 7 <= hi {
+                ino += 8;
+                continue;
+            }
+            if !test_bit(bm, idx) {
+                set_bit(&mut self.groups[g].inode_bitmap, idx);
+                self.next_inode = ino + 1;
+                return Some(ino);
+            }
+            ino += 1;
+        }
+        None
     }
 
     /// Which block group owns `ino`. Inode numbers are 1-based, so the
@@ -3377,10 +3408,14 @@ impl Ext {
         }
     }
 
-    /// Clear the inode-bitmap bit for an inode number.
+    /// Clear the inode-bitmap bit for an inode number and rewind the
+    /// allocation cursor so the slot is reused by the next `alloc_inode`.
     fn free_inode(&mut self, ino: u32) {
         let (g, idx) = self.inode_location(ino);
         group::clear_bit(&mut self.groups[g as usize].inode_bitmap, idx);
+        if ino < self.next_inode {
+            self.next_inode = ino;
+        }
     }
 
     /// Remove the named entry from a directory's first data block by
@@ -3725,14 +3760,10 @@ impl Ext {
             });
         }
 
-        // next_inode: first clear bit in group 0's inode bitmap past the
-        // reserved range. (Subsequent groups can be tackled later.)
-        let mut next_inode = sb.first_ino;
-        while next_inode <= layout.inodes_per_group
-            && test_bit(&groups[0].inode_bitmap, next_inode - 1)
-        {
-            next_inode += 1;
-        }
+        // `next_inode` is only a scan cursor; `alloc_inode` tests the
+        // bitmap of every candidate across all groups, so starting at
+        // the first non-reserved inode is always safe.
+        let next_inode = sb.first_ino;
 
         // Infer kind from feature flags on the parsed superblock so reads
         // post-open know whether to expect extent trees or indirect blocks.

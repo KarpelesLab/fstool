@@ -7,7 +7,7 @@
 
 use std::io::Read as _;
 
-use super::constants::INO_ROOT_DIR;
+use super::constants::{self, INO_ROOT_DIR};
 use super::{Ext, FormatOpts, FsKind};
 use crate::block::{BlockDevice, MemoryBackend};
 use crate::fs::FileMeta;
@@ -24,7 +24,6 @@ fn add_file(ext: &mut Ext, dev: &mut MemoryBackend, parent: u32, name: &[u8], bo
     .expect("add file")
 }
 
-#[allow(dead_code)]
 fn read_path(ext: &Ext, dev: &mut MemoryBackend, path: &str) -> Vec<u8> {
     let ino = ext.path_to_inode(dev, path).expect("path");
     let mut out = Vec::new();
@@ -33,6 +32,118 @@ fn read_path(ext: &Ext, dev: &mut MemoryBackend, path: &str) -> Vec<u8> {
         .read_to_end(&mut out)
         .expect("read");
     out
+}
+
+fn ext4_opts() -> FormatOpts {
+    FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 4096,
+        blocks_count: 16 * 1024,
+        inodes_count: 1024,
+        sparse_super: true,
+        ..FormatOpts::default()
+    }
+}
+
+// ───────────────────────── finding 1: alloc_inode ─────────────────────────
+
+/// Format, create files, remove one in the middle, reopen, create two
+/// more: the new inodes must land on free slots only, every original
+/// file must still read back with its original content, and no two
+/// live files may share an inode.
+#[test]
+fn alloc_inode_on_reopened_image_never_reuses_live_inodes() {
+    let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+    let mut ext = Ext::format_with(&mut dev, &ext4_opts()).unwrap();
+    let mut inos = Vec::new();
+    for i in 0..8 {
+        let name = format!("f{i}");
+        let body = format!("body-{i}").repeat(10);
+        inos.push(add_file(
+            &mut ext,
+            &mut dev,
+            INO_ROOT_DIR,
+            name.as_bytes(),
+            body.as_bytes(),
+        ));
+    }
+    ext.remove_path(&mut dev, "/f3").unwrap();
+    ext.flush(&mut dev).unwrap();
+
+    let mut re = Ext::open(&mut dev).unwrap();
+    let a = add_file(&mut re, &mut dev, INO_ROOT_DIR, b"new_a", b"AAAA");
+    let b = add_file(&mut re, &mut dev, INO_ROOT_DIR, b"new_b", b"BBBB");
+    re.flush(&mut dev).unwrap();
+
+    let live: Vec<u32> = inos
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != 3)
+        .map(|(_, ino)| *ino)
+        .collect();
+    assert!(!live.contains(&a), "new_a reused live inode {a}");
+    assert!(!live.contains(&b), "new_b reused live inode {b}");
+    assert_ne!(a, b);
+    // The freed slot (f3's inode) is the first candidate again.
+    assert_eq!(a, inos[3], "freed inode should be reused first");
+
+    let re = Ext::open(&mut dev).unwrap();
+    for i in 0..8 {
+        if i == 3 {
+            continue;
+        }
+        let want = format!("body-{i}").repeat(10);
+        assert_eq!(read_path(&re, &mut dev, &format!("/f{i}")), want.as_bytes());
+    }
+    assert_eq!(read_path(&re, &mut dev, "/new_a"), b"AAAA");
+    assert_eq!(read_path(&re, &mut dev, "/new_b"), b"BBBB");
+}
+
+/// Inodes allocated in a later group (group 0 exhausted) must be
+/// respected after a reopen: the allocator has to scan every group's
+/// bitmap, not only group 0's.
+#[test]
+fn alloc_inode_respects_bitmaps_of_later_groups() {
+    // 1 KiB blocks, 4 groups, 32 inodes per group.
+    let mut dev = MemoryBackend::new(32 * 1024 * 1024);
+    let opts = FormatOpts {
+        kind: FsKind::Ext2,
+        block_size: 1024,
+        blocks_count: 32 * 1024,
+        inodes_count: 128,
+        ..FormatOpts::default()
+    };
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    assert_eq!(ext.layout.inodes_per_group, 32);
+    // Fill group 0 and spill 10 inodes into group 1.
+    let mut inos = Vec::new();
+    for i in 0..40 {
+        let name = format!("g{i}");
+        inos.push(add_file(
+            &mut ext,
+            &mut dev,
+            INO_ROOT_DIR,
+            name.as_bytes(),
+            format!("content {i}").as_bytes(),
+        ));
+    }
+    assert!(inos.iter().any(|&i| i > 32), "test must spill into group 1");
+    ext.flush(&mut dev).unwrap();
+
+    // Manually clear the on-disk inode bitmap bits of two group-0
+    // inodes (simulating an external tool freeing them) so the reopened
+    // allocator starts handing out slots before the group-1 ones.
+    let mut re = Ext::open(&mut dev).unwrap();
+    let new = add_file(&mut re, &mut dev, INO_ROOT_DIR, b"late", b"late");
+    assert!(!inos.contains(&new), "late file reused a live inode {new}");
+    re.flush(&mut dev).unwrap();
+    let re = Ext::open(&mut dev).unwrap();
+    for i in 0..40 {
+        assert_eq!(
+            read_path(&re, &mut dev, &format!("/g{i}")),
+            format!("content {i}").as_bytes()
+        );
+    }
 }
 
 // ─────────────────── finding 2: superblock raw carry ───────────────────
@@ -56,8 +167,10 @@ fn flush_preserves_unmodelled_superblock_fields() {
     add_file(&mut ext, &mut dev, INO_ROOT_DIR, b"a", b"a");
     ext.flush(&mut dev).unwrap();
 
-    // Patch: s_hash_seed (0xEC), s_mmp_block (0x1D0), s_usr_quota_inum
-    // (0x240), s_jnl_blocks[0] (0x10C), s_last_orphan (0xE8).
+    // Patch: s_hash_seed (0xEC), s_reserved_gdt_blocks (0xCE — keep 0
+    // here so the layout is unchanged, patch s_mmp_block instead),
+    // s_mmp_block (0x1D0), s_usr_quota_inum (0x240), s_jnl_blocks[0]
+    // (0x10C), s_last_orphan (0xE8).
     let mut sb = vec![0u8; 1024];
     dev.read_at(1024, &mut sb).unwrap();
     sb[0xEC..0xFC].copy_from_slice(&[0x5A; 16]);
@@ -115,4 +228,5 @@ fn flush_preserves_unmodelled_superblock_fields() {
         &backup[0x1D0..0x1D8],
         &0x0102_0304_0506_0708u64.to_le_bytes()
     );
+    let _ = constants::SUPERBLOCK_OFFSET;
 }
