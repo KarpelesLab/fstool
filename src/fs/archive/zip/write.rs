@@ -78,6 +78,19 @@ impl Write for CursorSink<'_> {
     }
 }
 
+/// Ceiling on what DEFLATE can emit for `n` input bytes: worst case
+/// every block is stored, which costs a 5-byte block header per 65535
+/// bytes, plus slack for the final block and any encoder framing.
+///
+/// The local file header is written *before* the body, so the ZIP64
+/// decision has to be made on this bound rather than on the real
+/// compressed size — an input just under 4 GiB can deflate to just
+/// over it, and a truncated 32-bit size in the local header is a
+/// corrupt member.
+fn deflate_max_output(n: u64) -> u64 {
+    n.saturating_add(n / 65535 * 5).saturating_add(64)
+}
+
 fn push_u16(v: &mut Vec<u8>, n: u16) {
     v.extend_from_slice(&n.to_le_bytes());
 }
@@ -153,7 +166,11 @@ impl ZipWriter {
         };
         let utf8 = encoding::needs_utf8_flag(name);
         let (dos_date, dos_time) = super::unix_to_dos(u64::from(meta.mtime));
-        let entry_zip64 = uncomp >= U32_MAX;
+        let worst_comp = match method {
+            Compression::Stored => uncomp,
+            Compression::Deflate => deflate_max_output(uncomp),
+        };
+        let entry_zip64 = uncomp >= U32_MAX || worst_comp >= U32_MAX;
         let local_offset = self.cursor.position();
         let name_bytes = name.as_bytes();
 
@@ -355,14 +372,18 @@ impl ArchiveBuilder for ZipWriter {
         let records = std::mem::take(&mut self.central);
 
         for r in &records {
+            // The ZIP64 extra carries the fields whose fixed slot holds
+            // 0xFFFFFFFF, in a fixed order — so when only the
+            // compressed size overflows, the uncompressed one has to
+            // move with it or a reader would mis-assign the first u64.
+            let sizes_zip64 = r.uncomp_size >= U32_MAX || r.comp_size >= U32_MAX;
+            let offset_zip64 = r.local_offset >= U32_MAX;
             let mut zip64 = Vec::new();
-            if r.uncomp_size >= U32_MAX {
+            if sizes_zip64 {
                 push_u64(&mut zip64, r.uncomp_size);
-            }
-            if r.comp_size >= U32_MAX {
                 push_u64(&mut zip64, r.comp_size);
             }
-            if r.local_offset >= U32_MAX {
+            if offset_zip64 {
                 push_u64(&mut zip64, r.local_offset);
             }
             let name_bytes = r.name.as_bytes();
@@ -377,8 +398,11 @@ impl ArchiveBuilder for ZipWriter {
             push_u16(&mut rec, r.dos_time);
             push_u16(&mut rec, r.dos_date);
             push_u32(&mut rec, r.crc);
-            push_u32(&mut rec, r.comp_size.min(U32_MAX) as u32);
-            push_u32(&mut rec, r.uncomp_size.min(U32_MAX) as u32);
+            let fixed = |v: u64, overflowed: bool| {
+                if overflowed { U32_MAX as u32 } else { v as u32 }
+            };
+            push_u32(&mut rec, fixed(r.comp_size, sizes_zip64));
+            push_u32(&mut rec, fixed(r.uncomp_size, sizes_zip64));
             push_u16(&mut rec, name_bytes.len() as u16);
             push_u16(
                 &mut rec,
@@ -392,7 +416,7 @@ impl ArchiveBuilder for ZipWriter {
             push_u16(&mut rec, 0); // disk start
             push_u16(&mut rec, 0); // internal attrs
             push_u32(&mut rec, external_attr);
-            push_u32(&mut rec, r.local_offset.min(U32_MAX) as u32);
+            push_u32(&mut rec, fixed(r.local_offset, offset_zip64));
             rec.extend_from_slice(name_bytes);
             if !zip64.is_empty() {
                 push_u16(&mut rec, 0x0001);
@@ -447,5 +471,29 @@ impl ArchiveBuilder for ZipWriter {
 
     fn position(&self) -> u64 {
         self.cursor.position()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DEFLATE can grow an incompressible body, so an input a little
+    /// under 4 GiB can produce a compressed size above it. The local
+    /// file header commits to 32-bit sizes before the body is written,
+    /// so the bound has to leave that room.
+    #[test]
+    fn deflate_bound_crosses_u32_before_the_input_does() {
+        // Worst-case expansion is ~5 bytes per 65535-byte stored block.
+        let n = U32_MAX - 1024;
+        assert!(n < U32_MAX);
+        assert!(
+            deflate_max_output(n) >= U32_MAX,
+            "a {n}-byte body must be treated as ZIP64"
+        );
+        // Well clear of the limit, the bound stays 32-bit.
+        assert!(deflate_max_output(1 << 20) < U32_MAX);
+        // And it never wraps.
+        assert_eq!(deflate_max_output(u64::MAX), u64::MAX);
     }
 }
