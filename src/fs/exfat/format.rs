@@ -105,6 +105,10 @@ pub struct Geometry {
     pub fat_length_sectors: u32,
     pub cluster_heap_offset_sectors: u32,
     pub cluster_count: u32,
+    /// Clusters the Allocation Bitmap occupies — `ceil(cluster_count / 8)`
+    /// bytes rounded up to whole clusters. It starts at cluster 2; the
+    /// Up-case Table and the root directory follow it.
+    pub bitmap_clusters: u32,
     pub first_cluster_of_root_directory: u32,
     pub volume_serial_number: u32,
 }
@@ -217,16 +221,24 @@ pub fn compute_geometry(total_bytes: u64, opts: &FormatOpts) -> Result<Geometry>
     }
     let cluster_count = u32::try_from(cluster_count_est)
         .map_err(|_| crate::Error::InvalidArgument("exfat: cluster_count exceeds u32".into()))?;
-    if cluster_count < 5 {
-        // We need at least clusters for Bitmap + Upcase + Root + a bit of
-        // slack to put a user file in. Fail loud rather than producing a
-        // unusable volume.
+    // One bit per data cluster, rounded up to whole clusters. With 4 KiB
+    // clusters a single cluster covers 32768 clusters (128 MiB); larger
+    // volumes need a multi-cluster bitmap.
+    let bitmap_bytes = u64::from(cluster_count).div_ceil(8);
+    let bitmap_clusters = u32::try_from(bitmap_bytes.div_ceil(u64::from(bytes_per_cluster)))
+        .map_err(|_| crate::Error::InvalidArgument("exfat: bitmap size overflows u32".into()))?
+        .max(1);
+    // Bitmap + Up-case + Root, plus a couple of clusters of slack so a
+    // user file fits. Fail loud rather than producing an unusable volume.
+    let min_clusters = bitmap_clusters + 4;
+    if cluster_count < min_clusters {
         return Err(crate::Error::InvalidArgument(format!(
-            "exfat: only {cluster_count} clusters available; need >= 5"
+            "exfat: only {cluster_count} clusters available; need >= {min_clusters}"
         )));
     }
 
-    // We hand-pick the root cluster: 2 = bitmap, 3 = up-case, 4 = root.
+    // Layout of the metadata clusters: 2.. = bitmap, then up-case, then
+    // root.
     Ok(Geometry {
         bytes_per_sector,
         sectors_per_cluster,
@@ -236,7 +248,8 @@ pub fn compute_geometry(total_bytes: u64, opts: &FormatOpts) -> Result<Geometry>
         fat_length_sectors,
         cluster_heap_offset_sectors,
         cluster_count,
-        first_cluster_of_root_directory: 4,
+        bitmap_clusters,
+        first_cluster_of_root_directory: 2 + bitmap_clusters + 1,
         volume_serial_number: opts.volume_serial_number,
     })
 }

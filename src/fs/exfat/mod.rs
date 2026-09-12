@@ -209,22 +209,27 @@ impl Exfat {
         format::write_boot_region(dev, &geom, 0)?;
         format::write_boot_region(dev, &geom, 12 * ss as u64)?;
 
-        // --- 2. FAT. Initialise reserved entries and chain entries for
-        //        bitmap (2), upcase (3), root (4) as one-cluster EOC.
+        // --- 2. FAT. Initialise reserved entries; chain the bitmap's
+        //        clusters (2..) and make the up-case table and root each a
+        //        one-cluster EOC chain after it.
         let mut fat = Fat::new_blank(geom.cluster_count as usize + 2);
         const CL_BITMAP: u32 = 2;
-        const CL_UPCASE: u32 = 3;
-        const CL_ROOT: u32 = 4;
-        fat.set_raw(CL_BITMAP, fat::EOC);
-        fat.set_raw(CL_UPCASE, fat::EOC);
-        fat.set_raw(CL_ROOT, fat::EOC);
+        let cl_upcase: u32 = CL_BITMAP + geom.bitmap_clusters;
+        let cl_root: u32 = cl_upcase + 1;
+        debug_assert_eq!(cl_root, geom.first_cluster_of_root_directory);
+        for c in CL_BITMAP..cl_upcase {
+            let next = if c + 1 == cl_upcase { fat::EOC } else { c + 1 };
+            fat.set_raw(c, next);
+        }
+        fat.set_raw(cl_upcase, fat::EOC);
+        fat.set_raw(cl_root, fat::EOC);
 
         // --- 3. Allocation bitmap. -------------------------------------
         let bitmap_byte_len = (geom.cluster_count as u64).div_ceil(8);
         let mut bitmap = vec![0u8; bitmap_byte_len as usize];
-        set_bitmap_bit(&mut bitmap, CL_BITMAP, true);
-        set_bitmap_bit(&mut bitmap, CL_UPCASE, true);
-        set_bitmap_bit(&mut bitmap, CL_ROOT, true);
+        for c in CL_BITMAP..=cl_root {
+            set_bitmap_bit(&mut bitmap, c, true);
+        }
 
         // --- 4. Up-case table. -----------------------------------------
         let (upcase_bytes, upcase_csum) = format::make_ascii_upcase_table();
@@ -238,7 +243,7 @@ impl Exfat {
         root.extend_from_slice(&format::make_bitmap_entry(CL_BITMAP, bitmap_byte_len));
         root.extend_from_slice(&format::make_upcase_entry(
             upcase_csum,
-            CL_UPCASE,
+            cl_upcase,
             upcase_bytes.len() as u64,
         ));
 
@@ -256,16 +261,14 @@ impl Exfat {
         fat_image[..n_copy].copy_from_slice(&fat_bytes[..n_copy]);
         dev.write_at(fat_byte_off, &fat_image)?;
 
-        // Zero the bitmap and upcase clusters first, then overwrite the
-        // populated prefix.
-        let bpc = geom.bytes_per_cluster as usize;
+        // Zero the whole metadata run (bitmap clusters, up-case, root)
+        // first, then overwrite the populated prefix of each. The bitmap's
+        // clusters are contiguous on disk, so one write covers its chain.
+        let bpc = geom.bytes_per_cluster as u64;
         let bm_off = geom.cluster_byte_offset(CL_BITMAP);
-        let up_off = geom.cluster_byte_offset(CL_UPCASE);
-        let root_off = geom.cluster_byte_offset(CL_ROOT);
-        let zero_cluster = vec![0u8; bpc];
-        dev.write_at(bm_off, &zero_cluster)?;
-        dev.write_at(up_off, &zero_cluster)?;
-        dev.write_at(root_off, &zero_cluster)?;
+        let up_off = geom.cluster_byte_offset(cl_upcase);
+        let root_off = geom.cluster_byte_offset(cl_root);
+        dev.zero_range(bm_off, (geom.bitmap_clusters as u64 + 2) * bpc)?;
 
         dev.write_at(bm_off, &bitmap)?;
         dev.write_at(up_off, &upcase_bytes)?;
@@ -285,7 +288,7 @@ impl Exfat {
             bitmap,
             bitmap_first_cluster: CL_BITMAP,
             bitmap_data_length: bitmap_byte_len,
-            next_free_hint: 5, // first free cluster after metadata
+            next_free_hint: cl_root + 1, // first free cluster after metadata
             fat_dirty: false,
             bitmap_dirty: false,
             dir_batch: DirBatch::new(DEFAULT_CAPACITY),
@@ -2287,6 +2290,91 @@ mod tests {
         let (mut dev, _fs) = fresh_volume("");
         let fs2 = Exfat::open(&mut dev).unwrap();
         assert_eq!(fs2.volume_label(), "");
+    }
+
+    /// Format a volume whose allocation bitmap needs more than one cluster
+    /// and verify the bitmap neither clobbers the up-case table / root
+    /// directory nor gets truncated on re-open.
+    fn check_multi_cluster_bitmap(total_bytes: u64, spc_shift: u8) {
+        use crate::io::Read;
+        let mut dev = MemoryBackend::new(total_bytes);
+        let opts = FormatOpts {
+            bytes_per_sector_shift: 9,
+            sectors_per_cluster_shift: spc_shift,
+            volume_serial_number: 1,
+            volume_label: "BIGBM".to_string(),
+        };
+        let mut fs = Exfat::format(&mut dev, &opts).unwrap();
+        let cb = fs.cluster_size() as u64;
+        let bm_bytes = (fs.boot.cluster_count as u64).div_ceil(8);
+        let bm_clusters = bm_bytes.div_ceil(cb) as u32;
+        assert!(
+            bm_clusters > 1,
+            "test needs a multi-cluster bitmap (got {bm_clusters})"
+        );
+        let cl_upcase = 2 + bm_clusters;
+        let cl_root = cl_upcase + 1;
+        assert_eq!(fs.root_directory_cluster(), cl_root);
+        assert_eq!(fs.bitmap.len() as u64, bm_bytes);
+        assert_eq!(fs.dir_chain(2).unwrap().len(), bm_clusters as usize);
+
+        let n = 5u32;
+        for i in 0..n {
+            let body = format!("body-{i}");
+            let mut reader: &[u8] = body.as_bytes();
+            let first = fs
+                .create_file(
+                    &mut dev,
+                    &format!("/f{i}.txt"),
+                    &mut reader,
+                    body.len() as u64,
+                    0,
+                )
+                .unwrap();
+            assert!(first > cl_root, "file landed on metadata cluster {first}");
+        }
+        fs.flush(&mut dev).unwrap();
+
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        assert_eq!(fs2.volume_label(), "BIGBM");
+        assert_eq!(fs2.root_directory_cluster(), cl_root);
+        assert_eq!(fs2.bitmap.len() as u64, bm_bytes);
+        assert_eq!(fs2.bitmap, fs.bitmap);
+        for c in 2..=cl_root {
+            assert_eq!(fs2.bitmap_bit(c), Some(true), "metadata cluster {c}");
+        }
+        // The up-case table on disk is still the one the formatter wrote.
+        let (upcase_bytes, _) = format::make_ascii_upcase_table();
+        let mut on_disk = vec![0u8; upcase_bytes.len()];
+        dev.read_at(fs2.boot.cluster_byte_offset(cl_upcase), &mut on_disk)
+            .unwrap();
+        assert_eq!(on_disk, upcase_bytes, "up-case table was overwritten");
+
+        let listed = fs2.list_path(&mut dev, "/").unwrap();
+        assert_eq!(listed.len(), n as usize);
+        for i in 0..n {
+            let mut got = Vec::new();
+            fs2.open_file_reader(&mut dev, &format!("/f{i}.txt"))
+                .unwrap()
+                .read_to_end(&mut got)
+                .unwrap();
+            assert_eq!(got, format!("body-{i}").into_bytes());
+        }
+    }
+
+    #[test]
+    fn format_multi_cluster_bitmap_with_small_clusters() {
+        // 4 MiB with 512 B clusters: ~8000 clusters → ~1000-byte bitmap →
+        // two clusters.
+        check_multi_cluster_bitmap(4 * 1024 * 1024, 0);
+    }
+
+    #[test]
+    fn format_512mib_volume_has_four_cluster_bitmap() {
+        // 512 MiB with 4 KiB clusters: ~131k clusters → 16 KiB bitmap →
+        // four clusters. The backing Vec is zero-allocated, so only the
+        // touched pages cost anything.
+        check_multi_cluster_bitmap(512 * 1024 * 1024, 3);
     }
 
     #[test]
