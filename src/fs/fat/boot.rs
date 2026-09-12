@@ -290,6 +290,16 @@ impl BootSector {
             ));
         }
         let kind = FatKind::from_cluster_count(clusters);
+        // Cap the count at what the entry width can actually address. This
+        // also keeps the allocator's two-sweep bound (`2 * clusters`) and
+        // the `clusters + 2` end-of-range arithmetic inside `u32`.
+        if clusters > kind.max_clusters() {
+            return Err(crate::Error::InvalidImage(format!(
+                "{}: {clusters} data clusters exceeds the maximum {} for this entry width",
+                kind.as_str(),
+                kind.max_clusters()
+            )));
+        }
         // Every data cluster needs a FAT entry (plus the two reserved ones)
         // or a chain walk / allocation would index past the table.
         let fat_bytes = u64::from(fat_size) * u64::from(bytes_per_sector);
@@ -350,14 +360,18 @@ impl BootSector {
             // followed by a backup FSInfo at +1, and neither may overlap
             // the boot sector or the primary FSInfo.
             if backup_boot_sector != 0 {
-                if backup_boot_sector + 1 >= reserved_sector_count {
+                // Both operands are `u16` and `backup_boot_sector` comes
+                // straight off disk: 0xFFFF would wrap `+ 1` to 0, passing
+                // every check below and letting `flush` write a boot-sector
+                // copy into the data area. Widen before adding.
+                let backup_end = u32::from(backup_boot_sector) + 1;
+                if backup_end >= u32::from(reserved_sector_count) {
                     return Err(crate::Error::InvalidImage(format!(
                         "fat32: backup_boot_sector {backup_boot_sector} (+1 for its FSInfo) is \
                          outside the reserved region (1..{reserved_sector_count})"
                     )));
                 }
-                if backup_boot_sector == fs_info_sector || backup_boot_sector + 1 == fs_info_sector
-                {
+                if backup_boot_sector == fs_info_sector || backup_end == u32::from(fs_info_sector) {
                     return Err(crate::Error::InvalidImage(format!(
                         "fat32: backup boot region at sector {backup_boot_sector} overlaps \
                          fs_info_sector {fs_info_sector}"
@@ -548,6 +562,46 @@ mod tests {
         let mut none = bs.clone();
         none.backup_boot_sector = 0;
         assert_eq!(decode(&none).unwrap().backup_boot_sector, 0);
+
+        // The `+ 1` must not wrap: 0xFFFF used to overflow the u16 add,
+        // panicking in debug and — worse — wrapping to 0 in release so the
+        // value was accepted and `flush` scribbled a boot-sector copy into
+        // the data area at sector 65535.
+        for near_max in [u16::MAX, u16::MAX - 1] {
+            let mut bad = bs.clone();
+            bad.backup_boot_sector = near_max;
+            assert!(
+                matches!(decode(&bad), Err(crate::Error::InvalidImage(_))),
+                "backup_boot_sector {near_max} must be rejected"
+            );
+        }
+    }
+
+    /// A hostile BPB can describe far more clusters than the entry width
+    /// can address. Left unchecked, `cluster_count()` above 2^31 made the
+    /// allocator's `2 * clusters` sweep bound overflow `u32`.
+    #[test]
+    fn rejects_more_clusters_than_the_entry_width_can_address() {
+        // 512-byte sectors, 1 sector per cluster, a huge sector count: the
+        // data area alone claims ~2^32 clusters.
+        let mut bs = BootSector::defaults_for(FatKind::Fat32);
+        bs.sectors_per_cluster = 1;
+        bs.fat_size = 1;
+        bs.total_sectors = u32::MAX;
+        match BootSector::decode(&bs.encode()) {
+            Err(crate::Error::InvalidImage(msg)) => {
+                assert!(msg.contains("exceeds the maximum"), "{msg}")
+            }
+            other => panic!("expected InvalidImage, got {other:?}"),
+        }
+        // The bound is not so tight that it rejects a real volume: a 512 MiB
+        // FAT32 image with 4 KiB clusters decodes fine.
+        let mut ok = BootSector::defaults_for(FatKind::Fat32);
+        ok.sectors_per_cluster = 8;
+        ok.fat_size = 1024;
+        ok.total_sectors = 1024 * 1024;
+        let decoded = BootSector::decode(&ok.encode()).unwrap();
+        assert!(decoded.cluster_count() <= decoded.kind.max_clusters());
     }
 
     #[test]
