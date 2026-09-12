@@ -93,7 +93,9 @@ pub fn decode_records(body: &[u8]) -> Result<Vec<Record>> {
                 "tar: PAX record length {len} too small"
             )));
         }
-        if pos + len > body.len() {
+        // `pos + len` can wrap for a 20-digit length; compare against the
+        // bytes left instead.
+        if len > body.len() - pos {
             return Err(crate::Error::InvalidImage(
                 "tar: PAX record length runs past end".into(),
             ));
@@ -218,6 +220,22 @@ mod tests {
         assert_eq!(decoded[0].key, "path");
         assert_eq!(decoded[1].key, "SCHILY.xattr.user.foo");
         assert_eq!(decoded[1].value, b"hello");
+    }
+
+    /// A record length near `usize::MAX` used to wrap `pos + len` and
+    /// slice out of bounds; it must be a clean error.
+    #[test]
+    fn huge_record_length_is_rejected() {
+        let body = format!("{} x=y\n", usize::MAX).into_bytes();
+        assert!(matches!(
+            decode_records(&body),
+            Err(crate::Error::InvalidImage(_))
+        ));
+        let body = b"6 a=b\n18446744073709551610 x=y\n".to_vec();
+        assert!(matches!(
+            decode_records(&body),
+            Err(crate::Error::InvalidImage(_))
+        ));
     }
 
     #[test]

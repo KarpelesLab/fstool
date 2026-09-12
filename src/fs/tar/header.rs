@@ -194,8 +194,19 @@ fn write_string(dst: &mut [u8], s: &str) {
     // (remaining bytes were already zero)
 }
 
-/// Parse an octal numeric field. Spaces and NULs are treated as
-/// terminators. Empty fields parse as 0.
+/// Largest size the 12-byte ustar `size` field can hold as octal: 11
+/// digits plus the terminator, i.e. 8 GiB − 1. Anything larger needs a
+/// PAX `size` record (or GNU base-256, which we don't emit).
+pub const USTAR_MAX_SIZE: u64 = 0o777_7777_7777;
+
+/// Whether `size` can be stored in the plain ustar `size` field.
+pub fn size_fits_ustar(size: u64) -> bool {
+    size <= USTAR_MAX_SIZE
+}
+
+/// Parse an octal numeric field. Leading blanks are skipped (some old
+/// writers right-align the digits); spaces and NULs after the digits are
+/// treated as terminators. Empty fields parse as 0.
 pub fn parse_octal_u64(bytes: &[u8]) -> Result<u64> {
     // GNU tar's "base-256 binary" extension uses the top bit; we don't
     // emit it but we accept it on read for big sizes.
@@ -208,8 +219,9 @@ pub fn parse_octal_u64(bytes: &[u8]) -> Result<u64> {
         }
         return Ok(acc);
     }
+    let start = bytes.iter().position(|&b| b != b' ').unwrap_or(bytes.len());
     let mut acc: u64 = 0;
-    for &b in bytes {
+    for &b in &bytes[start..] {
         if b == 0 || b == b' ' {
             break;
         }
@@ -276,6 +288,23 @@ mod tests {
         assert_eq!(parse_octal_u64(b"0001000\0").unwrap(), 0o1000);
         assert_eq!(parse_octal_u64(b"123 \0\0\0\0\0").unwrap(), 0o123);
         assert!(parse_octal_u64(b"99\0").is_err());
+        // Right-aligned digits with leading blanks (old BSD / V7 writers).
+        assert_eq!(parse_octal_u64(b"    644 ").unwrap(), 0o644);
+        assert_eq!(parse_octal_u64(b"   1000\0").unwrap(), 0o1000);
+        assert_eq!(parse_octal_u64(b"        ").unwrap(), 0);
+    }
+
+    /// The ustar size field holds 11 octal digits: 8 GiB − 1 fits, 8 GiB
+    /// does not and must go through PAX.
+    #[test]
+    fn ustar_size_limit_is_eleven_octal_digits() {
+        let mut dst = [0u8; 12];
+        assert!(write_octal(&mut dst, USTAR_MAX_SIZE, 11).is_ok());
+        assert_eq!(parse_octal_u64(&dst).unwrap(), USTAR_MAX_SIZE);
+        assert!(write_octal(&mut dst, USTAR_MAX_SIZE + 1, 11).is_err());
+        assert!(size_fits_ustar(USTAR_MAX_SIZE));
+        assert!(!size_fits_ustar(8 << 30));
+        assert!(!size_fits_ustar(10 << 30));
     }
 
     #[test]
