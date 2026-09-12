@@ -430,6 +430,30 @@ impl crate::fs::Filesystem for Iso9660 {
         self.open_file_reader(dev, p)
     }
 
+    /// Symlinks exist on ISO 9660 only through Rock Ridge `SL` entries;
+    /// the target is whatever the record's System Use Area spells out.
+    fn read_symlink(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<std::path::PathBuf> {
+        let p = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("iso9660: non-UTF-8 path".into()))?;
+        let rec = self.resolve_path(dev, p)?;
+        if !self.rock_ridge {
+            return Err(crate::Error::Unsupported(
+                "iso9660: symlinks require Rock Ridge extensions".into(),
+            ));
+        }
+        match rock_ridge::parse_system_use(dev, &rec.system_use).and_then(|rr| rr.symlink_target) {
+            Some(target) => Ok(std::path::PathBuf::from(target)),
+            None => Err(crate::Error::InvalidArgument(format!(
+                "iso9660: {p:?} is not a symlink"
+            ))),
+        }
+    }
+
     fn getattr(
         &mut self,
         dev: &mut dyn BlockDevice,
