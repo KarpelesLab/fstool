@@ -104,6 +104,11 @@ pub enum Method {
     /// A method id we can name but not decode. Indexing still succeeds;
     /// reading the body returns `Unsupported`.
     Unsupported(u16),
+    /// The body is encrypted (zip general-purpose bit 0 / bit 6). We
+    /// have no key handling; indexing succeeds, reading returns
+    /// `Unsupported` naming the cause instead of feeding ciphertext to
+    /// a decompressor.
+    Encrypted,
 }
 
 /// Where an entry's bytes live on the device and how to decode them.

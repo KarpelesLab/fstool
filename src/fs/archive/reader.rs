@@ -51,6 +51,7 @@ pub fn open<'a>(dev: &'a mut dyn BlockDevice, loc: DataLocator) -> Result<Box<dy
         Method::Deflate => deflate_reader(bounded),
         Method::Codec(algo) => crate::compression::make_reader(algo, bounded),
         Method::Unsupported(id) => Err(unsupported_method(id)),
+        Method::Encrypted => Err(encrypted_method()),
     }
 }
 
@@ -76,6 +77,12 @@ fn unsupported_method(id: u16) -> crate::Error {
     ))
 }
 
+fn encrypted_method() -> crate::Error {
+    crate::Error::Unsupported(
+        "archive: member is encrypted — fstool has no passphrase handling".into(),
+    )
+}
+
 /// Open a random-access (`Read + Seek`) handle over one entry. Only
 /// `Stored` members are genuinely seekable — they map to a cheap
 /// bounded view over the device.
@@ -97,6 +104,7 @@ pub fn open_ro<'a>(
             pos: 0,
         })),
         Method::Unsupported(id) => Err(unsupported_method(id)),
+        Method::Encrypted => Err(encrypted_method()),
         _ => Err(crate::Error::Unsupported(
             "archive: member is compressed; only forward reads are supported \
              (use read_file / open_file_reader)"
