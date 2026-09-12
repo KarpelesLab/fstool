@@ -480,6 +480,12 @@ impl Exfat {
         flags: crate::fs::OpenFlags,
         meta: Option<crate::fs::FileMeta>,
     ) -> Result<Box<dyn FileHandle + 'a>> {
+        // Without an allocation bitmap there is no way to tell a free
+        // cluster from one owned by a NoFatChain file, so neither growing
+        // nor shrinking a file can be done safely. Refuse the handle
+        // outright rather than hand back one that fails partway through a
+        // write, or that frees clusters the bitmap still marks in use.
+        self.require_allocation_bitmap()?;
         // This path locates directory entries on disk (and the handle
         // updates them in place), so serialize any staged entries first.
         self.flush_dir_batches(dev)?;

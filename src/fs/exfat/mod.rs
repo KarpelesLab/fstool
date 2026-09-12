@@ -701,6 +701,20 @@ impl Exfat {
         self.bitmap_bit(cluster) == Some(false) && self.fat.raw(cluster) == Some(fat::FREE)
     }
 
+    /// Error out unless the volume has a readable allocation bitmap.
+    ///
+    /// Every write path depends on one: it is the only record of which
+    /// clusters a NoFatChain file owns, so without it the allocator cannot
+    /// tell free space from live data and `free_*` cannot release anything.
+    pub(super) fn require_allocation_bitmap(&self) -> Result<()> {
+        if self.bitmap_first_cluster < 2 || self.bitmap.is_empty() {
+            return Err(crate::Error::InvalidImage(
+                "exfat: volume has no allocation bitmap; refusing to modify it".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Allocate one free cluster, mark it used in the FAT (as a one-cluster
     /// EOC chain) and in the allocation bitmap. Returns the cluster number.
     ///
@@ -708,11 +722,7 @@ impl Exfat {
     /// it there is no way to tell a free cluster from one owned by a
     /// NoFatChain file.
     fn alloc_cluster(&mut self) -> Result<u32> {
-        if self.bitmap_first_cluster < 2 || self.bitmap.is_empty() {
-            return Err(crate::Error::InvalidImage(
-                "exfat: volume has no allocation bitmap; refusing to allocate clusters".into(),
-            ));
-        }
+        self.require_allocation_bitmap()?;
         let max = self.boot.cluster_count + 2;
         let start = self.next_free_hint.clamp(2, max);
         // Scan from the hint to the end, then wrap to cluster 2.
@@ -1318,7 +1328,7 @@ impl Exfat {
             data_length,
             timestamp,
             self.name_hash_for(name),
-        );
+        )?;
         self.stage_dir_entry(
             dev,
             dir_cluster,
@@ -1377,7 +1387,7 @@ impl Exfat {
             cb as u64,
             timestamp,
             self.name_hash_for(name),
-        );
+        )?;
         self.note_parent(new_cluster, dir_cluster);
         self.stage_dir_entry(
             dev,
@@ -2406,6 +2416,18 @@ mod tests {
         match fs.create_file(&mut dev, "/x.txt", &mut reader, 1, 0) {
             Err(crate::Error::InvalidImage(_)) => {}
             other => panic!("expected InvalidImage, got {other:?}"),
+        }
+        // A read-write handle is refused too: it could grow the file (no
+        // way to find free clusters) or shrink it (no way to record the
+        // release), so there is nothing safe for it to do.
+        match fs.open_rw(
+            &mut dev,
+            "/hello.txt",
+            crate::fs::OpenFlags::default(),
+            None,
+        ) {
+            Err(crate::Error::InvalidImage(_)) => {}
+            other => panic!("expected InvalidImage from open_rw, got {:?}", other.err()),
         }
     }
 
