@@ -245,3 +245,140 @@ fn leaf_xattr_namespaces_round_trip_on_disk() {
     assert_eq!(attrs.get("trusted.t"), Some(&big));
     assert_eq!(attrs.get("security.s"), Some(&big));
 }
+
+// ---------------------------------------------------------------------
+// Finding 24 — inode rebuilds must carry the attribute fork through.
+// ---------------------------------------------------------------------
+
+#[test]
+fn file_xattr_survives_a_read_write_handle_writeback() {
+    use crate::fs::OpenFlags;
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    let (mut dev, mut xfs) = fresh(64 * 1024 * 1024);
+    let root = xfs.superblock().rootino;
+    let mut src = std::io::Cursor::new(vec![b'a'; 4096]);
+    let ino = xfs
+        .add_file(&mut dev, root, "f", EntryMeta::default(), 4096, &mut src)
+        .unwrap();
+    xfs.add_xattr(&mut dev, ino, "user.keep", b"me").unwrap();
+    xfs.add_xattr(&mut dev, ino, "security.selinux", b"ctx")
+        .unwrap();
+    xfs.flush_writes(&mut dev).unwrap();
+
+    // Write through the rw handle — this goes through `XfsFileHandle::persist`.
+    let mut xfs = Xfs::open(&mut dev).unwrap();
+    {
+        let mut h = Filesystem::open_file_rw(
+            &mut xfs,
+            &mut dev,
+            std::path::Path::new("/f"),
+            OpenFlags::default(),
+            None,
+        )
+        .unwrap();
+        h.seek(SeekFrom::Start(0)).unwrap();
+        h.write_all(b"ZZZZ").unwrap();
+        h.sync().unwrap();
+    }
+
+    let xfs = Xfs::open(&mut dev).unwrap();
+    let attrs = xfs.read_xattrs(&mut dev, ino).unwrap();
+    assert_eq!(attrs.get("user.keep"), Some(&b"me".to_vec()));
+    assert_eq!(attrs.get("security.selinux"), Some(&b"ctx".to_vec()));
+}
+
+#[test]
+fn leaf_form_file_xattr_survives_writeback_with_aformat_intact() {
+    use crate::fs::OpenFlags;
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    let (mut dev, mut xfs) = fresh(64 * 1024 * 1024);
+    let root = xfs.superblock().rootino;
+    let mut src = std::io::Cursor::new(vec![b'a'; 4096]);
+    let ino = xfs
+        .add_file(&mut dev, root, "f", EntryMeta::default(), 4096, &mut src)
+        .unwrap();
+    let big = vec![b'v'; 300];
+    xfs.add_xattr(&mut dev, ino, "user.big", &big).unwrap();
+    xfs.flush_writes(&mut dev).unwrap();
+    // Confirm we really are exercising the leaf (EXTENTS) attr fork.
+    {
+        let off = xfs.ino_byte_offset(ino).unwrap();
+        let mut buf = vec![0u8; xfs.inode_size() as usize];
+        dev.read_at(off, &mut buf).unwrap();
+        assert_eq!(buf[83], 2, "aformat");
+        assert_eq!(u16::from_be_bytes(buf[80..82].try_into().unwrap()), 1);
+    }
+
+    let mut xfs = Xfs::open(&mut dev).unwrap();
+    {
+        let mut h = Filesystem::open_file_rw(
+            &mut xfs,
+            &mut dev,
+            std::path::Path::new("/f"),
+            OpenFlags::default(),
+            None,
+        )
+        .unwrap();
+        h.seek(SeekFrom::Start(10)).unwrap();
+        h.write_all(b"QQQQ").unwrap();
+        h.sync().unwrap();
+    }
+
+    // aformat / anextents must still describe the leaf fork.
+    let xfs = Xfs::open(&mut dev).unwrap();
+    let off = xfs.ino_byte_offset(ino).unwrap();
+    let mut buf = vec![0u8; xfs.inode_size() as usize];
+    dev.read_at(off, &mut buf).unwrap();
+    assert_eq!(buf[83], 2, "aformat clobbered to LOCAL");
+    assert_eq!(
+        u16::from_be_bytes(buf[80..82].try_into().unwrap()),
+        1,
+        "di_anextents zeroed"
+    );
+    let attrs = xfs.read_xattrs(&mut dev, ino).unwrap();
+    assert_eq!(attrs.get("user.big"), Some(&big));
+}
+
+#[test]
+fn directory_xattr_survives_entry_add_and_remove() {
+    let (mut dev, mut xfs) = fresh(64 * 1024 * 1024);
+    let root = xfs.superblock().rootino;
+    let dir = xfs
+        .add_dir(&mut dev, root, "d", EntryMeta::default())
+        .unwrap();
+    xfs.add_xattr(&mut dev, dir, "user.dirattr", b"yes")
+        .unwrap();
+    xfs.add_xattr(&mut dev, dir, "trusted.t", b"1").unwrap();
+    xfs.flush_writes(&mut dev).unwrap();
+
+    // Adding entries rewrites the directory inode via `rebuild_dir_inode`.
+    for i in 0..8 {
+        let mut src = std::io::Cursor::new(vec![b'x'; 8]);
+        xfs.add_file(
+            &mut dev,
+            dir,
+            &format!("child{i}"),
+            EntryMeta::default(),
+            8,
+            &mut src,
+        )
+        .unwrap();
+    }
+    xfs.flush_writes(&mut dev).unwrap();
+    {
+        let attrs = xfs.read_xattrs(&mut dev, dir).unwrap();
+        assert_eq!(attrs.get("user.dirattr"), Some(&b"yes".to_vec()));
+        assert_eq!(attrs.get("trusted.t"), Some(&b"1".to_vec()));
+    }
+
+    // Removing an entry goes down the `remove()` parent-rewrite path.
+    xfs.remove(&mut dev, dir, "child3").unwrap();
+    xfs.flush_writes(&mut dev).unwrap();
+
+    let xfs = Xfs::open(&mut dev).unwrap();
+    let attrs = xfs.read_xattrs(&mut dev, dir).unwrap();
+    assert_eq!(attrs.get("user.dirattr"), Some(&b"yes".to_vec()));
+    assert_eq!(attrs.get("trusted.t"), Some(&b"1".to_vec()));
+}

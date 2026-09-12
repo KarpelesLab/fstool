@@ -162,6 +162,37 @@ impl EntryMeta {
 }
 
 /// In-memory state of an active inode chunk within a single AG.
+/// An inode's attribute fork, lifted off disk so a rebuild of the data
+/// fork can write it back unchanged. See
+/// [`Xfs::attr_fork_copy`](super::Xfs::attr_fork_copy).
+#[derive(Debug, Clone)]
+struct AttrFork {
+    /// `di_aformat` to restore.
+    aformat: u8,
+    /// `di_anextents` to restore.
+    anextents: u16,
+    /// The fork payload, exactly `bytes.len()` bytes long.
+    bytes: Vec<u8>,
+}
+
+impl AttrFork {
+    /// Pick the `di_forkoff` (in 8-byte words) for a rebuilt inode whose
+    /// data fork now needs `data_len` bytes. Never shrinks below the
+    /// inode's previous boundary — an unchanged fork layout is the common
+    /// case and keeps the rewrite byte-stable.
+    fn forkoff_for(&self, data_len: usize, prev_forkoff: u8, lit_size: usize) -> Result<u8> {
+        let want = data_len.div_ceil(8).max(prev_forkoff as usize).max(1);
+        if want * 8 + self.bytes.len() > lit_size {
+            return Err(crate::Error::Unsupported(format!(
+                "xfs: data fork ({data_len} bytes) and attribute fork ({} bytes) \
+                 do not both fit in the {lit_size}-byte inode literal area",
+                self.bytes.len()
+            )));
+        }
+        Ok(want as u8)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct InodeChunk {
     /// AG-relative inode number of slot 0.
@@ -688,6 +719,7 @@ impl Xfs {
                 nblocks: 0,
                 extsize: 0,
                 nextents: 0,
+                anextents: 0,
                 forkoff: 0,
                 aformat: 0,
                 flags: 0,
@@ -770,19 +802,97 @@ impl Xfs {
         builder: V3DinodeBuilder,
         literal: &[u8],
     ) -> Result<()> {
+        self.write_inode_forks(dev, ino, builder, literal, &[])
+    }
+
+    /// Like [`write_inode`](Self::write_inode) but also lays an attribute
+    /// fork down at the `di_forkoff` boundary the builder carries. Used by
+    /// the rebuild paths so an inode that already had xattrs keeps them.
+    fn write_inode_forks(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        ino: u64,
+        builder: V3DinodeBuilder,
+        data_fork: &[u8],
+        attr_fork: &[u8],
+    ) -> Result<()> {
         let off = self.ino_byte_offset(ino)?;
+        let forkoff = builder.forkoff as usize;
         let mut buf = builder.build();
         let lit_max = (XFS_INODESIZE as usize) - 176;
-        if literal.len() > lit_max {
-            return Err(crate::Error::InvalidArgument(format!(
-                "xfs: literal area {} > {lit_max}",
-                literal.len()
+        // With an attribute fork present the data fork may only use the
+        // first `di_forkoff * 8` bytes of the literal area.
+        let data_max = if forkoff == 0 { lit_max } else { forkoff * 8 };
+        if data_fork.len() > data_max {
+            return Err(crate::Error::Unsupported(format!(
+                "xfs: data fork {} bytes > {data_max} available (di_forkoff = {forkoff})",
+                data_fork.len()
             )));
         }
-        buf[176..176 + literal.len()].copy_from_slice(literal);
+        buf[176..176 + data_fork.len()].copy_from_slice(data_fork);
+        if !attr_fork.is_empty() {
+            let attr_off = 176 + forkoff * 8;
+            if forkoff == 0 || attr_off + attr_fork.len() > XFS_INODESIZE as usize {
+                return Err(crate::Error::Unsupported(format!(
+                    "xfs: attribute fork ({} bytes at di_forkoff = {forkoff}) overruns the inode",
+                    attr_fork.len()
+                )));
+            }
+            buf[attr_off..attr_off + attr_fork.len()].copy_from_slice(attr_fork);
+        }
         stamp_v3_inode_crc(&mut buf);
         dev.write_at(off, &buf)?;
         Ok(())
+    }
+
+    /// Copy an inode's attribute fork out of its on-disk bytes so a
+    /// rebuild of the *data* fork can put it back untouched. Returns
+    /// `None` when the inode carries no attribute fork (`di_forkoff == 0`).
+    ///
+    /// The payload length is derived from `di_aformat`: a shortform
+    /// (LOCAL) fork states its own `totsize` in its first two bytes, an
+    /// EXTENTS fork is `di_anextents` packed 16-byte records. A BTREE
+    /// attr fork is refused rather than silently mangled.
+    fn attr_fork_copy(
+        &self,
+        ino_buf: &[u8],
+        core: &super::inode::DinodeCore,
+    ) -> Result<Option<AttrFork>> {
+        if core.forkoff == 0 {
+            return Ok(None);
+        }
+        let inodesize = self.sb.inodesize as usize;
+        let attr_off = core.literal_offset + (core.forkoff as usize) * 8;
+        if attr_off >= inodesize || attr_off >= ino_buf.len() {
+            return Ok(None);
+        }
+        let avail = &ino_buf[attr_off..inodesize.min(ino_buf.len())];
+        let len = match core.aformat {
+            // LOCAL — shortform attribute area, self-describing.
+            1 => {
+                if avail.len() < 2 {
+                    return Ok(None);
+                }
+                (u16::from_be_bytes(avail[0..2].try_into().unwrap()) as usize).min(avail.len())
+            }
+            // EXTENTS — packed bmbt records pointing at leaf blocks.
+            2 => ((core.anextents as usize) * 16).min(avail.len()),
+            // BTREE — we cannot size (or relocate) this safely.
+            3 => {
+                return Err(crate::Error::Unsupported(
+                    "xfs: inode has a BTREE-format attribute fork; rebuild would drop it".into(),
+                ));
+            }
+            _ => 0,
+        };
+        if len == 0 {
+            return Ok(None);
+        }
+        Ok(Some(AttrFork {
+            aformat: core.aformat,
+            anextents: core.anextents,
+            bytes: avail[..len].to_vec(),
+        }))
     }
 
     /// Read the parent-directory inode, append a new directory entry,
@@ -890,6 +1000,7 @@ impl Xfs {
             self.rebuild_dir_inode(
                 dev,
                 parent_ino,
+                &parent_buf,
                 &parent_core,
                 nlink,
                 atime,
@@ -1028,6 +1139,7 @@ impl Xfs {
         self.rebuild_dir_inode(
             dev,
             parent_ino,
+            &parent_buf,
             &parent_core,
             nlink,
             atime,
@@ -1044,10 +1156,12 @@ impl Xfs {
     /// Rewrite a directory inode in EXTENTS format with the given extent
     /// list and metadata. `extents` must be sorted by logical offset.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn rebuild_dir_inode(
         &mut self,
         dev: &mut dyn BlockDevice,
         ino: u64,
+        ino_buf: &[u8],
         core: &super::inode::DinodeCore,
         nlink: u32,
         atime: XfsTimestamp,
@@ -1058,6 +1172,24 @@ impl Xfs {
         extents: &[Extent],
         uuid: &[u8; 16],
     ) -> Result<()> {
+        let mut lit = Vec::with_capacity(extents.len() * 16);
+        for ext in extents {
+            lit.extend_from_slice(&ext.encode());
+        }
+        // A directory can carry xattrs too; the rebuild must not drop
+        // them. Lift the attribute fork off the inode we just read and
+        // put it back at (at least) the same di_forkoff boundary.
+        let attr = self.attr_fork_copy(ino_buf, core)?;
+        let lit_size = (XFS_INODESIZE as usize) - 176;
+        let (forkoff, aformat, anextents, attr_bytes) = match &attr {
+            Some(a) => (
+                a.forkoff_for(lit.len(), core.forkoff, lit_size)?,
+                a.aformat,
+                a.anextents,
+                a.bytes.as_slice(),
+            ),
+            None => (0u8, 2u8, 0u16, &[][..]),
+        };
         let builder = V3DinodeBuilder {
             inodesize: XFS_INODESIZE as usize,
             mode: core.mode,
@@ -1073,19 +1205,16 @@ impl Xfs {
             nblocks,
             extsize: 0,
             nextents: extents.len() as u32,
-            forkoff: 0,
-            aformat: 2,
+            anextents,
+            forkoff,
+            aformat,
             flags: core.flags,
             generation: core.generation,
             di_ino: ino,
             uuid: *uuid,
-            flags2: 0,
+            flags2: core.flags2,
         };
-        let mut lit = Vec::with_capacity(extents.len() * 16);
-        for ext in extents {
-            lit.extend_from_slice(&ext.encode());
-        }
-        self.write_inode(dev, ino, builder, &lit)
+        self.write_inode_forks(dev, ino, builder, &lit, attr_bytes)
     }
 
     /// Serialize every pending directory batch (at flush, or before a
@@ -1208,6 +1337,7 @@ impl Xfs {
             nblocks: nblocks as u64,
             extsize: 0,
             nextents: if nblocks > 0 { 1 } else { 0 },
+            anextents: 0,
             forkoff: 0,
             aformat: 2,
             flags: 0,
@@ -1267,6 +1397,7 @@ impl Xfs {
             nblocks: 1,
             extsize: 0,
             nextents: 1,
+            anextents: 0,
             forkoff: 0,
             aformat: 2,
             flags: 0,
@@ -1320,6 +1451,7 @@ impl Xfs {
                 nblocks: 0,
                 extsize: 0,
                 nextents: 0,
+                anextents: 0,
                 forkoff: 0,
                 aformat: 2,
                 flags: 0,
@@ -1367,6 +1499,7 @@ impl Xfs {
                 nblocks: 1,
                 extsize: 0,
                 nextents: 1,
+                anextents: 0,
                 forkoff: 0,
                 aformat: 2,
                 flags: 0,
@@ -1428,6 +1561,7 @@ impl Xfs {
             nblocks: 0,
             extsize: 0,
             nextents: 0,
+            anextents: 0,
             forkoff: 0,
             aformat: 2,
             flags: 0,
@@ -1558,6 +1692,20 @@ impl Xfs {
             parent_core.nlink
         };
         let (atime, mtime, ctime) = (parent_core.atime, parent_core.mtime, parent_core.ctime);
+        let mut lit = Vec::with_capacity(16);
+        lit.extend_from_slice(&parent_self_extent.encode());
+        // Keep the parent's attribute fork across the rewrite.
+        let attr = self.attr_fork_copy(&parent_buf, &parent_core)?;
+        let lit_size = (XFS_INODESIZE as usize) - 176;
+        let (forkoff, aformat, anextents, attr_bytes) = match &attr {
+            Some(a) => (
+                a.forkoff_for(lit.len(), parent_core.forkoff, lit_size)?,
+                a.aformat,
+                a.anextents,
+                a.bytes.as_slice(),
+            ),
+            None => (0u8, 2u8, 0u16, &[][..]),
+        };
         let builder = V3DinodeBuilder {
             inodesize: XFS_INODESIZE as usize,
             mode: parent_core.mode,
@@ -1573,17 +1721,16 @@ impl Xfs {
             nblocks: 1,
             extsize: 0,
             nextents: 1,
-            forkoff: 0,
-            aformat: 2,
+            anextents,
+            forkoff,
+            aformat,
             flags: parent_core.flags,
             generation: parent_core.generation,
             di_ino: parent_ino,
             uuid,
-            flags2: 0,
+            flags2: parent_core.flags2,
         };
-        let mut lit = Vec::with_capacity(16);
-        lit.extend_from_slice(&parent_self_extent.encode());
-        self.write_inode(dev, parent_ino, builder, &lit)?;
+        self.write_inode_forks(dev, parent_ino, builder, &lit, attr_bytes)?;
 
         Ok(target_ino)
     }
@@ -1814,6 +1961,7 @@ impl Xfs {
             nblocks: new_nblocks,
             extsize: 0,
             nextents: core.nextents,
+            anextents,
             forkoff,
             aformat,
             flags: core.flags,
@@ -1830,8 +1978,6 @@ impl Xfs {
             let attr_off = (forkoff as usize) * 8;
             buf[176 + attr_off..176 + attr_off + attr_payload.len()].copy_from_slice(&attr_payload);
         }
-        // di_anextents at offset 80..82.
-        buf[80..82].copy_from_slice(&anextents.to_be_bytes());
         stamp_v3_inode_crc(&mut buf);
         let ino_off = self.ino_byte_offset(ino)?;
         dev.write_at(ino_off, &buf)?;
@@ -2430,6 +2576,7 @@ impl Xfs {
             nblocks: src_core.nblocks,
             extsize: src_extsize,
             nextents: src_core.nextents,
+            anextents: 0,
             forkoff: src_core.forkoff,
             aformat: src_aformat,
             flags: src_core.flags,

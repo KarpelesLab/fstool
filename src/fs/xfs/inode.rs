@@ -150,9 +150,17 @@ pub struct DinodeCore {
     pub size: u64,
     pub nblocks: u64,
     pub nextents: u32,
+    /// `di_anextents` — number of extents in the attribute fork.
+    pub anextents: u16,
     pub forkoff: u8,
+    /// `di_aformat` — attribute-fork format (same encoding as
+    /// `di_format`). Meaningless when `forkoff == 0`.
+    pub aformat: u8,
     pub flags: u16,
     pub generation: u32,
+    /// `di_flags2` (v3 only; 0 on v2 inodes). Carries REFLINK / BIGTIME /
+    /// COWEXTSIZE / DAX.
+    pub flags2: u64,
     /// v3 (CRC) only: self-reference inode number.
     pub di_ino: Option<u64>,
     /// Byte offset within the inode where the data-fork literal area begins.
@@ -186,20 +194,23 @@ impl DinodeCore {
         let size = u64::from_be_bytes(buf[56..64].try_into().unwrap());
         let nblocks = u64::from_be_bytes(buf[64..72].try_into().unwrap());
         let nextents = u32::from_be_bytes(buf[76..80].try_into().unwrap());
+        let anextents = u16::from_be_bytes(buf[80..82].try_into().unwrap());
         let forkoff = buf[82];
+        let aformat = buf[83];
         let flags = u16::from_be_bytes(buf[90..92].try_into().unwrap());
         let generation = u32::from_be_bytes(buf[92..96].try_into().unwrap());
 
-        let (literal_offset, di_ino) = if version >= 3 {
+        let (literal_offset, di_ino, flags2) = if version >= 3 {
             if buf.len() < 176 {
                 return Err(crate::Error::InvalidImage(
                     "xfs: v3 inode buffer too small for core".into(),
                 ));
             }
             let ino = u64::from_be_bytes(buf[152..160].try_into().unwrap());
-            (176, Some(ino))
+            let f2 = u64::from_be_bytes(buf[120..128].try_into().unwrap());
+            (176, Some(ino), f2)
         } else {
-            (96, None)
+            (96, None, 0)
         };
 
         if let DiFormat::Unknown(b) = format {
@@ -222,9 +233,12 @@ impl DinodeCore {
             size,
             nblocks,
             nextents,
+            anextents,
             forkoff,
+            aformat,
             flags,
             generation,
+            flags2,
             di_ino,
             literal_offset,
         })
@@ -281,6 +295,9 @@ pub struct V3DinodeBuilder {
     pub nblocks: u64,
     pub extsize: u32,
     pub nextents: u32,
+    /// `di_anextents` — extent count of the attribute fork. Zero for a
+    /// shortform (LOCAL) attr fork and for an inode with no attrs.
+    pub anextents: u16,
     pub forkoff: u8,
     pub aformat: u8,
     pub flags: u16,
@@ -321,6 +338,7 @@ impl V3DinodeBuilder {
         buf[64..72].copy_from_slice(&self.nblocks.to_be_bytes());
         buf[72..76].copy_from_slice(&self.extsize.to_be_bytes());
         buf[76..80].copy_from_slice(&self.nextents.to_be_bytes());
+        buf[80..82].copy_from_slice(&self.anextents.to_be_bytes());
         buf[82] = self.forkoff;
         buf[83] = self.aformat;
         buf[90..92].copy_from_slice(&self.flags.to_be_bytes());

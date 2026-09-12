@@ -219,6 +219,13 @@ pub struct XfsFileHandle<'a> {
     pub(crate) keep_ctime: XfsTimestamp,
     pub(crate) keep_crtime: XfsTimestamp,
     pub(crate) keep_forkoff: u8,
+    /// `di_aformat` / `di_anextents` as found on disk. The writeback path
+    /// restores both verbatim: an inode whose xattrs spilled to a leaf
+    /// block is EXTENTS-format with one attr extent, not LOCAL.
+    pub(crate) keep_aformat: u8,
+    pub(crate) keep_anextents: u16,
+    /// `di_flags2` as found on disk (REFLINK / BIGTIME / …).
+    pub(crate) keep_flags2: u64,
     /// Bytes the attr fork occupies (forkoff*8 .. literal_end). Read off
     /// disk so we can restore it byte-for-byte on writeback.
     pub(crate) attr_bytes: Vec<u8>,
@@ -502,13 +509,14 @@ impl<'a> XfsFileHandle<'a> {
             nblocks,
             extsize: 0,
             nextents: self.extents.len() as u32,
+            anextents: self.keep_anextents,
             forkoff: self.keep_forkoff,
-            aformat: 1, // LOCAL (only attr-fork format we round-trip)
+            aformat: self.keep_aformat,
             flags: self.keep_flags,
             generation: self.keep_generation,
             di_ino: self.ino,
             uuid: self.fs.sb.uuid,
-            flags2: 0,
+            flags2: self.keep_flags2,
         };
         let mut buf = builder.build();
         let data_end = 176 + lit.len();
@@ -517,6 +525,17 @@ impl<'a> XfsFileHandle<'a> {
             return Err(crate::Error::Unsupported(format!(
                 "xfs: encoded extent list ({} bytes) overruns inode literal area",
                 lit.len()
+            )));
+        }
+        // With an attribute fork present the data fork may only occupy the
+        // first `di_forkoff * 8` bytes — growing past that would corrupt
+        // the xattrs sitting right after it.
+        if self.keep_forkoff != 0 && lit.len() > (self.keep_forkoff as usize) * 8 {
+            return Err(crate::Error::Unsupported(format!(
+                "xfs: extent list ({} bytes) would overrun the attribute fork at \
+                 di_forkoff = {} — bmbt promotion not implemented",
+                lit.len(),
+                self.keep_forkoff
             )));
         }
         buf[176..data_end].copy_from_slice(&lit);
@@ -805,6 +824,9 @@ impl Xfs {
             keep_ctime: core.ctime,
             keep_crtime: crtime,
             keep_forkoff: core.forkoff,
+            keep_aformat: if core.forkoff == 0 { 2 } else { core.aformat },
+            keep_anextents: core.anextents,
+            keep_flags2: core.flags2,
             attr_bytes,
         };
         // Keep S_IFREG referenced so its import isn't flagged dead.

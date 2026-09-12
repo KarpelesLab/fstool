@@ -460,6 +460,7 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Xfs> {
         nblocks: 1,
         extsize: 0,
         nextents: 1,
+        anextents: 0,
         forkoff: 0,
         aformat: 2, // extents (unused)
         flags: 0,
@@ -502,6 +503,7 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Xfs> {
             nblocks: 0,
             extsize: 0,
             nextents: 0,
+            anextents: 0,
             forkoff: 0,
             aformat: 2,
             flags: 0,
