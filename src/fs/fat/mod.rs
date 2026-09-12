@@ -678,10 +678,12 @@ impl Fat32 {
         dev.write_at(0, &boot_bytes)?;
 
         if self.boot.kind == FatKind::Fat32 {
-            dev.write_at(
-                self.boot.backup_boot_sector as u64 * SECTOR as u64,
-                &boot_bytes,
-            )?;
+            // `BootSector::decode` guarantees these sector numbers lie inside
+            // the reserved region; a backup of 0 means the volume has none.
+            let backup = self.boot.backup_boot_sector;
+            if backup != 0 {
+                dev.write_at(backup as u64 * SECTOR as u64, &boot_bytes)?;
+            }
 
             let clusters = self.boot.cluster_count();
             let free_count = self.count_free_clusters();
@@ -700,10 +702,9 @@ impl Fat32 {
                 &fsinfo_bytes,
             )?;
             // The backup boot region also carries a backup FSInfo at +1.
-            dev.write_at(
-                (self.boot.backup_boot_sector as u64 + 1) * SECTOR as u64,
-                &fsinfo_bytes,
-            )?;
+            if backup != 0 {
+                dev.write_at((backup as u64 + 1) * SECTOR as u64, &fsinfo_bytes)?;
+            }
         }
 
         let fat_bytes = self.fat.encode();
@@ -1751,6 +1752,50 @@ mod tests {
             Err(crate::Error::InvalidImage(msg)) => assert!(msg.contains("cannot map"), "{msg}"),
             other => panic!("expected InvalidImage, got {other:?}"),
         }
+    }
+
+    /// With `backup_boot_sector == 0` (no backup region) flush must not
+    /// write a boot-sector copy or backup FSInfo anywhere.
+    #[test]
+    fn flush_skips_backup_boot_region_when_absent() {
+        let (mut dev, _fs) = fresh_volume();
+        let mut bs = [0u8; 512];
+        dev.read_at(0, &mut bs).unwrap();
+        bs[50..52].copy_from_slice(&0u16.to_le_bytes()); // backup_boot_sector = 0
+        dev.write_at(0, &bs).unwrap();
+        // Scrub where the backup used to live so a stray write shows up.
+        dev.zero_range(6 * 512, 2 * 512).unwrap();
+
+        let mut fs = Fat32::open(&mut dev).unwrap();
+        assert_eq!(fs.boot_sector().backup_boot_sector, 0);
+        fs.create_file(
+            &mut dev,
+            Path::new("/a.txt"),
+            FileSource::Reader {
+                reader: Box::new(crate::io::Cursor::new(b"abc".to_vec())),
+                len: 3,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        let mut scrubbed = [0u8; 2 * 512];
+        dev.read_at(6 * 512, &mut scrubbed).unwrap();
+        assert!(
+            scrubbed.iter().all(|&b| b == 0),
+            "backup region was written"
+        );
+        // The primary boot sector is intact and FSInfo went to sector 1.
+        let mut head = [0u8; 512];
+        dev.read_at(0, &mut head).unwrap();
+        assert_eq!(&head[510..512], &[0x55, 0xAA]);
+        assert_eq!(&head[82..87], b"FAT32");
+        let mut fsinfo = [0u8; 4];
+        dev.read_at(512, &mut fsinfo).unwrap();
+        assert_eq!(fsinfo, *b"RRaA");
+        let mut fs2 = Fat32::open(&mut dev).unwrap();
+        assert_eq!(read_all(&mut fs2, &mut dev, "/a.txt"), b"abc");
     }
 
     #[test]

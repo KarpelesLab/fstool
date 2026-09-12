@@ -335,6 +335,36 @@ impl BootSector {
                 }
                 (0, 0, 0, b[36])
             };
+        if kind == FatKind::Fat32 {
+            // `flush` rewrites the FSInfo sector and (optionally) the backup
+            // boot region at these sector numbers, so both must lie inside
+            // the reserved area — sector 0 would clobber the boot sector,
+            // anything at or past `reserved_sector_count` the first FAT.
+            if fs_info_sector == 0 || fs_info_sector >= reserved_sector_count {
+                return Err(crate::Error::InvalidImage(format!(
+                    "fat32: fs_info_sector {fs_info_sector} is outside the reserved region \
+                     (1..{reserved_sector_count})"
+                )));
+            }
+            // A backup boot sector of 0 means "none". Otherwise it is
+            // followed by a backup FSInfo at +1, and neither may overlap
+            // the boot sector or the primary FSInfo.
+            if backup_boot_sector != 0 {
+                if backup_boot_sector + 1 >= reserved_sector_count {
+                    return Err(crate::Error::InvalidImage(format!(
+                        "fat32: backup_boot_sector {backup_boot_sector} (+1 for its FSInfo) is \
+                         outside the reserved region (1..{reserved_sector_count})"
+                    )));
+                }
+                if backup_boot_sector == fs_info_sector || backup_boot_sector + 1 == fs_info_sector
+                {
+                    return Err(crate::Error::InvalidImage(format!(
+                        "fat32: backup boot region at sector {backup_boot_sector} overlaps \
+                         fs_info_sector {fs_info_sector}"
+                    )));
+                }
+            }
+        }
         Ok(Self {
             kind,
             bytes_per_sector,
@@ -484,6 +514,40 @@ mod tests {
             Err(crate::Error::InvalidImage(msg)) => assert!(msg.contains("cannot map"), "{msg}"),
             other => panic!("expected InvalidImage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fat32_fsinfo_and_backup_sectors_must_stay_in_the_reserved_region() {
+        let mut bs = BootSector::defaults_for(FatKind::Fat32);
+        bs.total_sectors = 131072;
+        bs.fat_size = 1009;
+        assert_eq!(bs.reserved_sector_count, 32);
+        let decode = |bs: &BootSector| BootSector::decode(&bs.encode());
+        assert!(decode(&bs).is_ok());
+
+        // FSInfo at sector 0 would overwrite the boot sector on flush.
+        let mut bad = bs.clone();
+        bad.fs_info_sector = 0;
+        assert!(matches!(decode(&bad), Err(crate::Error::InvalidImage(_))));
+        // FSInfo at or past the reserved region would overwrite the FAT.
+        bad.fs_info_sector = 32;
+        assert!(matches!(decode(&bad), Err(crate::Error::InvalidImage(_))));
+
+        // Backup boot sector: its FSInfo copy at +1 must fit too.
+        let mut bad = bs.clone();
+        bad.backup_boot_sector = 31;
+        assert!(matches!(decode(&bad), Err(crate::Error::InvalidImage(_))));
+        // ...and it must not overlap the primary FSInfo.
+        bad.backup_boot_sector = 1;
+        assert!(matches!(decode(&bad), Err(crate::Error::InvalidImage(_))));
+        bad.fs_info_sector = 7;
+        bad.backup_boot_sector = 6;
+        assert!(matches!(decode(&bad), Err(crate::Error::InvalidImage(_))));
+
+        // 0 means "no backup" and is fine.
+        let mut none = bs.clone();
+        none.backup_boot_sector = 0;
+        assert_eq!(decode(&none).unwrap().backup_boot_sector, 0);
     }
 
     #[test]
