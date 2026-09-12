@@ -7,7 +7,29 @@ publish = false
 description = "Bare-metal smoke test + size probe for fstool's no_std FAT core on a Cortex-M4F"
 
 [dependencies]
-fstool = { path = "../..", default-features = false, features = ["fat"] }
+# Which driver is linked is chosen by the features below, so the two
+# binaries can pull in different halves of the crate.
+fstool = { path = "../..", default-features = false }
+
+[features]
+default = ["alloc-demo"]
+# The allocator-backed FAT driver (src/main.rs).
+alloc-demo = ["fstool/fat"]
+# The allocator-free one (src/heapless.rs). Deliberately does NOT enable
+# `fat`: the point of that binary is that nothing in the graph pulls in
+# the `alloc` crate, so the absence of a `#[global_allocator]` is a link
+# error if anything regresses.
+heapless = ["fstool/fat-noalloc"]
+
+[[bin]]
+name = "fstool-embedded-cortex-m"
+path = "src/main.rs"
+required-features = ["alloc-demo"]
+
+[[bin]]
+name = "fstool-embedded-heapless"
+path = "src/heapless.rs"
+required-features = ["heapless"]
 
 # Size-optimised, the way an MCU firmware is built. `panic = "abort"` is
 # required: there is no unwinder without std.

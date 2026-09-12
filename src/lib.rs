@@ -15,13 +15,25 @@
 //! High-level entry points: [`spec::build`] builds an image from a TOML
 //! spec, [`inspect`] opens and walks an existing one, [`repack`] converts
 //! between formats, and [`memconv`] / [`memedit`] do both in memory.
+//!
+//! Beside that stack sits [`noalloc`], for targets with no heap: drivers
+//! that allocate nothing and depend on none of the layers above. Today
+//! that is [`noalloc::fat`], a second FAT12/16/32 implementation that
+//! reads and writes a card through one sector of scratch RAM.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
-// The `alloc` crate is the floor: every layer hands back `Vec`s and
-// `String`s, so an embedded consumer brings a global allocator (as it
-// already does for `alloc` itself). With `std` on, this is just `std`'s
-// own `alloc` under another name.
+// The `alloc` crate is the floor for the hosted API: every layer hands
+// back `Vec`s and `String`s, so a consumer of it brings a global
+// allocator (as it already does for `alloc` itself). With `std` on, this
+// is just `std`'s own `alloc` under another name.
+//
+// With the `alloc` feature off, none of that is compiled and the crate
+// links on a target with no global allocator; what remains is
+// [`noalloc`]. Host unit tests always have `alloc` available, so test
+// code can still build fixtures with a `Vec` while the code under test
+// cannot.
+#[cfg(any(feature = "alloc", test))]
 extern crate alloc;
 
 // The unit tests run on a host, and reach for `std` (temp files,
@@ -29,6 +41,14 @@ extern crate alloc;
 #[cfg(test)]
 #[macro_use]
 extern crate std;
+
+// An empty crate is never what the caller meant.
+#[cfg(not(any(feature = "alloc", feature = "fat-noalloc")))]
+compile_error!(
+    "fstool: enable at least one feature — `std` (or `default-features = false` \
+     with a backend such as `fat`) for the library, or `fat-noalloc` for the \
+     allocator-free FAT driver"
+);
 
 #[cfg(all(
     feature = "std",
@@ -61,19 +81,24 @@ compile_error!(
 pub mod analyze;
 #[cfg(feature = "std")]
 pub mod base64;
+#[cfg(feature = "alloc")]
 pub mod block;
 #[cfg(feature = "std")]
 pub mod compression;
 #[cfg(feature = "ext")]
 pub mod concurrent;
 pub mod crc;
+#[cfg(feature = "alloc")]
 pub mod error;
+#[cfg(feature = "alloc")]
 pub mod format_opts;
+#[cfg(feature = "alloc")]
 pub mod fs;
 #[cfg(feature = "fuse")]
 pub mod fuse_adapter;
 #[cfg(feature = "std")]
 pub mod inspect;
+#[cfg(feature = "alloc")]
 pub mod io;
 #[cfg(feature = "std")]
 pub mod macroman;
@@ -83,7 +108,9 @@ pub mod memconv;
 pub mod memedit;
 #[cfg(feature = "std")]
 pub mod merge;
+#[cfg(feature = "alloc")]
 pub mod part;
+#[cfg(feature = "alloc")]
 pub mod path;
 #[cfg(feature = "std")]
 pub mod path_style;
@@ -120,4 +147,10 @@ macro_rules! fstool_log {
     }};
 }
 
+/// Allocator-free backends: everything here works with no heap at all,
+/// on a target with no global allocator. See [`noalloc::fat`].
+#[cfg(feature = "fat-noalloc")]
+pub mod noalloc;
+
+#[cfg(feature = "alloc")]
 pub use error::{Error, Result};

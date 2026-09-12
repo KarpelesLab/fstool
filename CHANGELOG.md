@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(fat)* `noalloc::fat` — a second FAT12/FAT16/FAT32 driver that needs **no
+  allocator at all**, behind the new `fat-noalloc` feature. It shares no
+  code with `fs::fat`: every buffer is a fixed array or comes from the
+  caller, the allocation table is read a sector at a time from the device
+  instead of being held in RAM, and it carries its own `SectorDriver`
+  trait and error type. Reads and writes, long names, subdirectories and
+  MBR partitions. A heapless build is
+  `default-features = false, features = ["fat-noalloc"]`; the new
+  `examples/embedded-cortex-m` binary links it for a Cortex-M4F with no
+  `#[global_allocator]` at all, which CI checks on every push.
+- *(features)* `alloc`, implied by `std` and by every backend that needs
+  it. With it off the crate compiles to just the allocator-free surface.
+
 ## [0.4.28](https://github.com/KarpelesLab/fstool/compare/v0.4.27...v0.4.28) - 2026-09-12
 
 ### Added

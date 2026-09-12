@@ -141,6 +141,7 @@ jobs:
           for feats in std,fat std,ext std,exfat std,littlefs std,tar std,archive \
                        std,hfs std,hfs-plus std,apfs std,xfs std,ntfs std,f2fs \
                        std,iso9660 std,squashfs std,grf std,affs std,ramfs \
+                       std,fat,fat-noalloc \
                        std,fat,qcow2 std,ext,luks std,ext,tar,ramfs \
                        cli,readline,fat cli,readline,ext,spec cli,readline,filesystems,containers,codecs; do
             echo "::group::--features $feats"
@@ -170,6 +171,12 @@ jobs:
           cargo clippy --lib --no-default-features --features fat,exfat,littlefs \
             --target thumbv7em-none-eabihf -- -D warnings
           cargo test --lib --no-default-features --features fat,exfat,littlefs
+          # And the floor below that: FAT with no allocator at all.
+          cargo rustc --lib --crate-type rlib --no-default-features --features fat-noalloc \
+            --target thumbv7em-none-eabihf -- -D warnings
+          cargo clippy --lib --no-default-features --features fat-noalloc \
+            --target thumbv7em-none-eabihf -- -D warnings
+          cargo test --lib --no-default-features --features fat-noalloc
           if cargo tree -e normal --no-default-features --features fat,exfat,littlefs \
                --target thumbv7em-none-eabihf --prefix none | grep -Ew 'getrandom|libc|std'; then
             echo "::error::an OS dependency leaked into the no_std core"; exit 1
@@ -195,6 +202,19 @@ jobs:
           text=$("$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-size "$bin" | awk 'NR==2 {print $1}')
           if [ "$text" -lt 20000 ]; then
             echo "::error::the no_std example linked to only $text bytes of .text"; exit 1
+          fi
+          # The same program against the allocator-free driver, with no
+          # `#[global_allocator]` anywhere: rustc refuses to link a binary
+          # that needs the `alloc` crate without one, so this step failing
+          # means something behind `fat-noalloc` started allocating.
+          (cd examples/embedded-cortex-m && \
+             RUSTFLAGS="-D warnings -C link-arg=-Tlink.x -C link-arg=--nmagic" \
+             cargo build --release --no-default-features --features heapless)
+          heapless=examples/embedded-cortex-m/target/thumbv7em-none-eabihf/release/fstool-embedded-heapless
+          "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-size "$heapless"
+          text=$("$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-size "$heapless" | awk 'NR==2 {print $1}')
+          if [ "$text" -lt 8000 ]; then
+            echo "::error::the heapless example linked to only $text bytes of .text"; exit 1
           fi
 
   # macOS proves the lib + CLI compile and unit-test cleanly on a

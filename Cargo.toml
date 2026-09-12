@@ -59,6 +59,7 @@ required-features = ["std"]
 default = [
     "std",
     "filesystems",
+    "fat-noalloc",
     "containers",
     "codecs",
     "spec",
@@ -85,7 +86,22 @@ default = [
 # driver. `uuid` is the one dependency left; its random-GUID generator
 # (GPT formatting) is `std`-only, and `Gpt::build_with_guids` takes the
 # GUIDs from you instead.
-std = ["uuid/std", "uuid/v4"]
+std = ["alloc", "uuid/std", "uuid/v4"]
+
+# The `alloc` crate. Implied by every backend below and by `std`, because
+# the hosted API hands back `Vec`s and `String`s throughout — so this is
+# not a feature you normally name. Its purpose is the *other* direction:
+# with `alloc` off, nothing that can allocate is compiled, and the crate
+# links on a target with no global allocator at all. Today exactly one
+# backend stands on that floor — `fat-noalloc`, the allocator-free FAT
+# driver — so the heapless configuration is spelled
+#
+#     fstool = { version = "0.4", default-features = false,
+#                features = ["fat-noalloc"] }
+#
+# and reads and writes an SD card through the `SectorDriver` you implement
+# over your card driver. See `noalloc::fat`.
+alloc = []
 
 # Everything the library reads and writes, with no command-line surface.
 # This is the set a library consumer wants:
@@ -124,11 +140,19 @@ filesystems = [
     "xfs",
 ]
 # FAT12 / FAT16 / FAT32. The embedded floor: `no_std` + `alloc`.
-fat = []
+fat = ["alloc"]
 # exFAT. Shares the allocation-table code with `fat`.
 exfat = ["fat"]
+# FAT12 / FAT16 / FAT32 with **no allocator** — `noalloc::fat`, a second,
+# independent driver for targets that have no heap. It shares no code with
+# `fat`: every buffer is a fixed array or comes from the caller, the FAT is
+# read a sector at a time from the device instead of being held in RAM, and
+# it carries its own `SectorDriver` trait and error type (the hosted ones
+# return `crate::Error`, which owns a `String`). Reads and writes; MBR
+# partitions; long names. Independent of `fat`, and of `std` and `alloc`.
+fat-noalloc = []
 # littlefs (the embedded-flash filesystem, `lfs2` disk versions 2.0 + 2.1).
-littlefs = []
+littlefs = ["alloc"]
 # ext2 / ext3 / ext4.
 ext = ["std"]
 # XFS.

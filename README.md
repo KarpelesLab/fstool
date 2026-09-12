@@ -631,6 +631,7 @@ none of the other 130 000 lines.
 | Feature | Backend | Notes |
 |---------|---------|-------|
 | `fat` | FAT12 / FAT16 / FAT32 | `no_std`-clean |
+| `fat-noalloc` | FAT12 / FAT16 / FAT32 with **no allocator** | a separate driver ([below](#no-allocator-at-all)); needs neither `std` nor `alloc` |
 | `exfat` | exFAT | `no_std`-clean; implies `fat` (shared allocation-table code) |
 | `littlefs` | littlefs 2.0 / 2.1 | `no_std`-clean |
 | `ext` | ext2 / ext3 / ext4 | |
@@ -644,8 +645,8 @@ none of the other 130 000 lines.
 | `qcow2`, `dmg`, `diskcopy` | disk-image containers | `qcow2-crypto` implies `qcow2`; `dmg-encrypted` / `dmg-bzip2` / `dmg-lzfse` imply `dmg` |
 | `luks` | LUKS1 / LUKS2 | pulls `purecrypto`; implies `json` (LUKS2 metadata is JSON) |
 
-Every feature in the table except the three marked `no_std`-clean
-implies `std`. The dispatch layers (`inspect`, `repack`, the TOML spec,
+Every feature in the table except the four `no_std` ones implies
+`std`, and every one except `fat-noalloc` implies `alloc`. The dispatch layers (`inspect`, `repack`, the TOML spec,
 `memconv`, the CLI) are gated per backend as well: a format that was
 compiled out is still *recognised* by its magic and refused with an error
 naming the feature to enable, never mistaken for an unknown image. The
@@ -760,6 +761,66 @@ The rest of the crate — every other filesystem, the containers, `inspect`
 it; enabling any of those features turns `std` back on. The unit tests
 of the core run in the `no_std` configuration too
 (`cargo test --lib --no-default-features --features fat,exfat,littlefs`).
+
+### No allocator at all
+
+The core above still wants a heap, because the hosted API hands back
+`Vec`s and `String`s and the FAT driver keeps the whole allocation table
+resident. For targets with no allocator, `fat-noalloc` compiles a second,
+independent FAT12/16/32 driver — `fstool::noalloc::fat` — that has none of
+those needs:
+
+```toml
+[dependencies]
+fstool = { version = "0.4", default-features = false, features = ["fat-noalloc"] }
+```
+
+With `alloc` off, nothing that can allocate is compiled, so the crate
+links on a target with no `#[global_allocator]` — a guarantee CI checks by
+linking exactly such a binary on every push. Every buffer is a fixed array
+or comes from the caller; the FAT is read a sector at a time from the
+device, so mounting a 32 GB card costs one sector of RAM rather than the
+four megabytes its table would occupy. It reads *and writes*: create,
+remove, append, extend, truncate, subdirectories, long names, and volumes
+inside MBR partitions.
+
+It carries its own `SectorDriver` trait (the hosted `SectorIo` returns a
+`crate::Error`, which owns a `String`) and its own error type, generic
+over your driver's:
+
+```rust
+use fstool::noalloc::fat::{SectorDriver, Volume};
+
+struct SdCard { /* your driver */ }
+
+impl SectorDriver for SdCard {
+    type Error = MyDriverError;
+    fn sector_size(&self) -> u32 { 512 }
+    fn sector_count(&self) -> u64 { /* CSD capacity */ 0 }
+    fn read_sectors(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), MyDriverError> { todo!() }
+    fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), MyDriverError> { todo!() }
+}
+
+fn log_boot(card: SdCard) -> Result<(), fstool::noalloc::fat::Error<MyDriverError>> {
+    // Mounts the whole card, or its first FAT partition if it has an MBR.
+    let mut vol = Volume::<_, 512>::mount_auto(card)?;
+
+    let mut cfg = vol.open_file("/config/wifi.txt")?;
+    let mut buf = [0u8; 256];
+    let n = cfg.read(&mut vol, &mut buf)?;
+    let _ = &buf[..n];
+
+    let mut log = vol.open_or_create_file("/boot.log")?;
+    log.seek_to_end(&mut vol)?;
+    log.write_all(&mut vol, b"booted\n")?;
+    log.flush(&mut vol)
+}
+```
+
+The same program on a Cortex-M4F links to **~19 KB of flash** and needs
+well under 1 KiB of RAM for the volume, whatever the size of the card.
+Both drivers can be compiled together (the default build has both), and
+`examples/embedded-cortex-m` builds the same demo against each.
 
 ## Compression
 

@@ -1,15 +1,26 @@
 # fstool on a Cortex-M4F, without an OS
 
-A `#![no_std] #![no_main]` program that pulls in fstool with only the `fat`
-feature, formats a FAT12 volume on a RAM-backed "card", creates a file,
-lists the root and reads the file back. It exists to prove the `no_std`
-core builds and links for a real microcontroller target, and to measure
-what it costs.
+Two `#![no_std] #![no_main]` programs, each pulling in one of fstool's two
+FAT drivers. Both format a volume on a RAM-backed "card", create a file,
+list the root and read the file back. They exist to prove the crate builds
+and links for a real microcontroller target, and to measure what it costs.
+
+| binary | feature | driver | heap |
+|--------|---------|--------|------|
+| `fstool-embedded-cortex-m` | `alloc-demo` (default) | `fstool::fs::fat` | 64 KiB bump allocator |
+| `fstool-embedded-heapless` | `heapless` | `fstool::noalloc::fat` | **none** |
+
+The second one is the interesting one: it defines no `#[global_allocator]`
+and never links the `alloc` crate, so if anything behind the
+`fat-noalloc` feature ever started allocating, it would stop linking.
+That is a compile-time guarantee, not a runtime check, and CI builds it on
+every push.
 
 ```sh
 rustup target add thumbv7em-none-eabihf
 cd examples/embedded-cortex-m
-cargo build --release
+cargo build --release                                   # the allocator one
+cargo build --release --no-default-features --features heapless
 # with the llvm-tools component (or arm-none-eabi-size / cargo-binutils):
 $(rustc --print sysroot)/lib/rustlib/*/bin/llvm-size \
     target/thumbv7em-none-eabihf/release/fstool-embedded-cortex-m
@@ -27,6 +38,13 @@ format + create + list + read, `core::fmt`, and a 64 KiB bump allocator:
 
 `.bss` is the 64 KiB allocator arena plus a few words; the driver itself
 keeps the allocation table and one cluster resident.
+
+The heapless binary, measured the same way on 2026-09-13, is **~19 KB** of
+`.text` — it carries the FAT12 layout code this example writes by hand as
+well as the driver — and its `.bss` is just the 512 KiB RAM card. The
+driver's own state is one sector of scratch plus the handles you hold, so
+on real hardware reading an SD card it costs well under 1 KiB of RAM
+regardless of how large the card is.
 
 There is no board support here: `reset` is the entry point named in
 `link.x`, the vector table is left to you, and the allocator is the
