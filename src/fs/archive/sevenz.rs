@@ -313,8 +313,9 @@ mod imp {
         }
         fn bytes(&mut self, n: usize) -> Result<&'a [u8]> {
             let s = self
-                .b
-                .get(self.p..self.p + n)
+                .p
+                .checked_add(n)
+                .and_then(|end| self.b.get(self.p..end))
                 .ok_or_else(|| Error::InvalidImage("7z: truncated header field".into()))?;
             self.p += n;
             Ok(s)
@@ -684,7 +685,15 @@ mod imp {
             dev: &'a mut dyn BlockDevice,
             loc: &FileLoc,
         ) -> Result<Box<dyn Read + 'a>> {
-            let run = &self.folders[loc.folder];
+            // Zero-length members (kEmptyStream + kEmptyFile) own no folder
+            // at all; `loc.folder` is a sentinel there, never an index.
+            if loc.len == 0 {
+                return Ok(Box::new(io::empty()));
+            }
+            let run = self
+                .folders
+                .get(loc.folder)
+                .ok_or_else(|| Error::InvalidImage("7z: file references missing folder".into()))?;
             if let Some(reason) = &run.decodable {
                 return Err(Error::Unsupported(reason.clone()));
             }
@@ -720,7 +729,9 @@ mod imp {
                 },
             });
         }
-        if header_at + next_size > dev_len {
+        // `header_at + next_size` can wrap on a crafted start header; compare
+        // against the space left instead so the check cannot be bypassed.
+        if header_at > dev_len || next_size > dev_len - header_at {
             return Err(Error::InvalidImage("7z: header past end of file".into()));
         }
         let mut header = read_at(dev, header_at, next_size as usize)?;
@@ -880,6 +891,13 @@ mod imp {
                 break;
             }
             let size = c.usize_num()?;
+            // A property's declared size must fit in the header that remains;
+            // `c.p + size` must not wrap and must not run past the buffer.
+            if size > c.remaining() {
+                return Err(Error::InvalidImage(
+                    "7z: file property exceeds header size".into(),
+                ));
+            }
             let end = c.p + size;
             match prop {
                 K_EMPTY_STREAM => {
@@ -896,7 +914,10 @@ mod imp {
                             "7z: external names not supported".into(),
                         ));
                     }
-                    let raw = c.bytes(end - c.p)?;
+                    let n = end.checked_sub(c.p).ok_or_else(|| {
+                        Error::InvalidImage("7z: kName property too short".into())
+                    })?;
+                    let raw = c.bytes(n)?;
                     names = decode_names(raw, num_files)?;
                 }
                 _ => {
@@ -1185,5 +1206,85 @@ mod tests {
                 "reader vs 7z mismatch for {name}"
             );
         }
+    }
+
+    /// Build a 7z start header pointing at `header` (uncompressed kHeader
+    /// bytes placed right after the 32-byte signature). CRCs are left zero;
+    /// the reader does not verify them.
+    fn with_header(header: &[u8]) -> Vec<u8> {
+        with_header_at(0, header.len() as u64, header)
+    }
+
+    fn with_header_at(next_off: u64, next_size: u64, header: &[u8]) -> Vec<u8> {
+        let mut v = b"7z\xBC\xAF\x27\x1C\x00\x04".to_vec();
+        v.extend_from_slice(&[0u8; 4]); // start header CRC (unchecked)
+        v.extend_from_slice(&next_off.to_le_bytes());
+        v.extend_from_slice(&next_size.to_le_bytes());
+        v.extend_from_slice(&[0u8; 4]); // next header CRC (unchecked)
+        v.extend_from_slice(header);
+        v
+    }
+
+    /// A zero-length member is recorded with a sentinel folder index; reading
+    /// it used to index `folders[usize::MAX]` and panic.
+    #[test]
+    fn empty_member_reads_as_empty() {
+        let header: Vec<u8> = vec![
+            0x01, // kHeader
+            0x05, // kFilesInfo
+            0x01, // numFiles = 1
+            0x0E, 0x01, 0x80, // kEmptyStream: [true]
+            0x0F, 0x01, 0x80, // kEmptyFile: [true]
+            0x11, 0x05, 0x00, b'a', 0x00, 0x00, 0x00, // kName: "a\0"
+            0x00, // end of file properties
+            0x00, // end of kHeader
+        ];
+        let arc = with_header(&header);
+        assert_eq!(names(&arc), vec!["a".to_string()]);
+        assert_eq!(read_file(&arc, "/a").unwrap(), Vec::<u8>::new());
+    }
+
+    /// `header_at + next_size` wrapping past zero must not bypass the
+    /// "header inside the file" check.
+    #[test]
+    fn header_offset_overflow_is_rejected() {
+        let arc = with_header_at(u64::MAX - 40, 100, &[0u8; 64]);
+        let mut dev = dev_from(&arc);
+        assert!(matches!(
+            SevenZFs::open(&mut dev),
+            Err(crate::Error::InvalidImage(_))
+        ));
+    }
+
+    /// A FilesInfo property whose size would wrap the cursor must be a clean
+    /// error, not an arithmetic panic / out-of-range slice.
+    #[test]
+    fn files_info_property_size_overflow_is_rejected() {
+        let mut header: Vec<u8> = vec![
+            0x01, // kHeader
+            0x05, // kFilesInfo
+            0x01, // numFiles = 1
+            0x0E, // kEmptyStream with an absurd size (REAL_UINT64 = u64::MAX)
+            0xFF,
+        ];
+        header.extend_from_slice(&u64::MAX.to_le_bytes());
+        header.extend_from_slice(&[0x80, 0x00, 0x00]);
+        let arc = with_header(&header);
+        let mut dev = dev_from(&arc);
+        assert!(matches!(
+            SevenZFs::open(&mut dev),
+            Err(crate::Error::InvalidImage(_))
+        ));
+
+        // A kName property shorter than its mandatory `external` byte.
+        let header: Vec<u8> = vec![
+            0x01, 0x05, 0x01, // kHeader, kFilesInfo, numFiles = 1
+            0x0E, 0x01, 0x80, // kEmptyStream: [true]
+            0x11, 0x00, // kName with size 0
+            0x00, 0x00,
+        ];
+        let arc = with_header(&header);
+        let mut dev = dev_from(&arc);
+        assert!(SevenZFs::open(&mut dev).is_err());
     }
 }
