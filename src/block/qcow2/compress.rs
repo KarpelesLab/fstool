@@ -204,7 +204,8 @@ fn zstd_encode(_plain: &[u8]) -> Result<Vec<u8>> {
 /// Serialise the whole virtual disk read from `src` into a fresh
 /// **compressed** qcow2 v3 image at `path`. Each non-zero cluster is
 /// compressed once (all-zero clusters stay unallocated, so the output is
-/// sparse); the compressed payloads are packed byte-granularly and the L1/L2
+/// sparse; a cluster that does not shrink is stored plain, as qemu does);
+/// the compressed payloads are packed byte-granularly and the L1/L2
 /// tables, refcount table/blocks, and header are built to match — including
 /// exact refcounts for host clusters shared between adjacent compressed
 /// clusters, so `qemu-img check` is clean. Returns the output file size.
@@ -242,6 +243,9 @@ pub fn write_compressed_image(
     struct Comp {
         vcluster: u64,
         bytes: Vec<u8>,
+        /// Stored as an ordinary cluster-aligned data cluster rather than
+        /// a packed compressed payload.
+        plain: bool,
     }
     let mut comps: Vec<Comp> = Vec::new();
     let mut cluster_buf = vec![0u8; cs as usize];
@@ -257,10 +261,27 @@ pub fn write_compressed_image(
         if cluster_buf.iter().all(|&b| b == 0) {
             continue; // sparse: leave unallocated
         }
-        comps.push(Comp {
-            vcluster: vc,
-            bytes: compress_cluster(ctype, &cluster_buf, level)?,
-        });
+        let bytes = compress_cluster(ctype, &cluster_buf, level)?;
+        // A cluster that does not get smaller is stored plain, as qemu
+        // does. Beyond saving space this keeps the compressed L2 entry
+        // encodable: its sector-count field holds `cluster_size / 256`
+        // sectors at most, and a byte-packed payload of up to
+        // `cluster_size` bytes spans at most `cluster_size / 512 + 1` — a
+        // longer one could not be described (with 512-byte clusters the
+        // field is a single bit).
+        if bytes.len() >= cs as usize {
+            comps.push(Comp {
+                vcluster: vc,
+                bytes: cluster_buf.clone(),
+                plain: true,
+            });
+        } else {
+            comps.push(Comp {
+                vcluster: vc,
+                bytes,
+                plain: false,
+            });
+        }
     }
 
     // Which L1 entries are used → that many L2 tables.
@@ -272,8 +293,13 @@ pub fn write_compressed_image(
     // Layout (clusters): 0 header, 1 refcount table, then refcount blocks,
     // L1, L2 tables, and finally the packed compressed data. The refcount
     // block count depends on the total cluster count, so converge it.
-    let data_bytes: u64 = comps.iter().map(|c| c.bytes.len() as u64).sum();
-    let data_clusters = data_bytes.div_ceil(cs);
+    let data_bytes: u64 = comps
+        .iter()
+        .filter(|c| !c.plain)
+        .map(|c| c.bytes.len() as u64)
+        .sum();
+    let plain_clusters = comps.iter().filter(|c| c.plain).count() as u64;
+    let data_clusters = data_bytes.div_ceil(cs) + plain_clusters;
     let fixed = 2 + l1_clusters + n_l2; // header + rct + L1 + L2s
     let mut rcb_count = 1u64;
     loop {
@@ -321,9 +347,10 @@ pub fn write_compressed_image(
         bump(&mut refcount, c);
     }
 
+    let sec_mask = (1u64 << (cluster_bits - 8)) - 1; // (nb_sectors - 1) field
     let mut packed: Vec<(u64, &[u8])> = Vec::with_capacity(comps.len()); // (host_offset, bytes)
     let mut running = data_start_byte;
-    for c in &comps {
+    for c in comps.iter().filter(|c| !c.plain) {
         let host_offset = running;
         let len = c.bytes.len() as u64;
         if len == 0 {
@@ -338,6 +365,14 @@ pub fn write_compressed_image(
         let first_sec = host_offset / 512;
         let last_sec = (host_offset + len - 1) / 512;
         let nb_sectors = last_sec - first_sec + 1;
+        if nb_sectors - 1 > sec_mask {
+            // Unreachable while payloads are capped below `cluster_size`
+            // (see pass 1); guard the field rather than corrupt the entry.
+            return Err(Error::Unsupported(format!(
+                "qcow2: compressed cluster spans {nb_sectors} sectors, more than the \
+                 L2 entry can describe at cluster_bits {cluster_bits}"
+            )));
+        }
         let entry = COMPRESSED | host_offset | ((nb_sectors - 1) << x);
         let l1i = c.vcluster / l2_entries;
         let l2 = l2_tables
@@ -351,7 +386,20 @@ pub fn write_compressed_image(
         }
         packed.push((host_offset, &c.bytes));
     }
-    let file_len = running.div_ceil(cs).max(data_start_cluster) * cs;
+    // Plain clusters follow the packed payloads, each on its own cluster.
+    let mut next_plain = running.div_ceil(cs) * cs;
+    for c in comps.iter().filter(|c| c.plain) {
+        let host_offset = next_plain;
+        next_plain += cs;
+        let l1i = c.vcluster / l2_entries;
+        let l2 = l2_tables
+            .entry(l1i)
+            .or_insert_with(|| vec![0u64; l2_entries as usize]);
+        l2[(c.vcluster % l2_entries) as usize] = host_offset | COPIED;
+        bump(&mut refcount, host_offset / cs);
+        packed.push((host_offset, &c.bytes));
+    }
+    let file_len = next_plain.max(data_start_cluster * cs);
 
     // Build the L1 table.
     let mut l1 = vec![0u64; l1_size as usize];

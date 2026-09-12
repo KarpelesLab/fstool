@@ -342,6 +342,73 @@ fn write_compressed_zstd_roundtrip() {
     write_compressed_roundtrip(1);
 }
 
+/// Incompressible data at the smallest cluster size. A compressed L2 entry
+/// at 512-byte clusters has a one-bit sector-count field, and a payload
+/// that does not shrink used to overflow it (corrupting the entry); such
+/// clusters are now stored plain, which qemu-img check and our own reader
+/// both have to agree with.
+#[cfg(feature = "gzip")]
+#[test]
+fn write_compressed_512_byte_clusters_with_incompressible_data() {
+    // 64 KiB of LCG noise plus one compressible cluster and one hole.
+    let mut data = vec![0u8; 64 * 1024];
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    for b in data.iter_mut() {
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *b = (x >> 56) as u8;
+    }
+    data[4096..4608].fill(b'z');
+    data[8192..8704].fill(0);
+    let raw = NamedTempFile::new().unwrap();
+    std::fs::write(raw.path(), &data).unwrap();
+
+    let out = NamedTempFile::new().unwrap();
+    let mut src: Box<dyn BlockDevice> =
+        Box::new(fstool::block::FileBackend::open(raw.path()).unwrap());
+    fstool::block::qcow2::compress::write_compressed_image(src.as_mut(), out.path(), 512, 0, 6)
+        .unwrap();
+
+    let mut ours = Qcow2Backend::open(out.path()).unwrap();
+    let mut all = Vec::new();
+    ours.read_to_end(&mut all).unwrap();
+    assert_eq!(all, data, "our reader mismatch on 512-byte-cluster image");
+
+    if !which("qemu-img") {
+        eprintln!("skipping qemu-img validation: not installed");
+        return;
+    }
+    let check = Command::new("qemu-img")
+        .arg("check")
+        .arg(out.path())
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "qemu-img check failed:\n{}\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let back = NamedTempFile::new().unwrap();
+    let conv = Command::new("qemu-img")
+        .args(["convert", "-O", "raw"])
+        .arg(out.path())
+        .arg(back.path())
+        .output()
+        .unwrap();
+    assert!(
+        conv.status.success(),
+        "qemu-img convert -O raw failed:\n{}",
+        String::from_utf8_lossy(&conv.stderr)
+    );
+    assert_eq!(
+        std::fs::read(back.path()).unwrap(),
+        data,
+        "qemu round-trip mismatch"
+    );
+}
+
 /// Qcow2Backend::create makes a fresh image that qemu-img validates.
 #[test]
 fn create_then_qemu_img_check() {
