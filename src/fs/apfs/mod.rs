@@ -93,7 +93,7 @@ use jrec::{
     DT_REG, DrecKey, DrecVal, FileExtentVal, InodeVal, OBJ_ID_MASK, OBJ_TYPE_SHIFT,
 };
 use obj::{OBJECT_TYPE_MASK, ObjPhys};
-use omap::{OmapPhys, lookup as omap_lookup};
+use omap::{OmapKey, OmapPhys, OmapVal, lookup as omap_lookup};
 use snap::{SnapMetaVal, decode_snap_meta_key};
 use superblock::{ApfsSuperblock, NX_MAGIC, NxSuperblock};
 
@@ -192,6 +192,18 @@ pub(crate) struct WriteState {
     /// hashing — so "Foo.txt" and "foo.txt" sort to the same hash
     /// bucket and the kernel treats them as the same name.
     pub(crate) drec_case_fold: bool,
+    /// Raw bytes of the live APSB. The checkpoint writer patches a copy
+    /// of these rather than synthesising a superblock from a fixed
+    /// template, so volume state we don't model — feature flags,
+    /// `apfs_incompatible_features`, `apfs_extentref_tree_oid`,
+    /// `apfs_snap_meta_tree_oid`, role, encryption state — survives a
+    /// write instead of being zeroed.
+    pub(crate) apsb_template: Vec<u8>,
+    /// Raw bytes of the live NXSB, patched the same way.
+    pub(crate) nxsb_template: Vec<u8>,
+    /// Which `nx_fs_oid[]` slot this volume occupies, so the patched
+    /// NXSB updates the right entry.
+    pub(crate) volume_index: usize,
 }
 
 /// Read-mode caches: everything needed to walk the fs-tree.
@@ -213,6 +225,9 @@ pub(crate) struct ReadState {
     /// Drec layout (hashed vs plain) chosen at open time based on
     /// `apfs_incompatible_features` flags.
     drec_layout: DrecKeyLayout,
+    /// Whether the volume is case-insensitive, so lookups fold case the
+    /// way the volume's own comparator does.
+    drec_case_fold: bool,
 }
 
 /// Pending-write buffer: an ordered list of `create_*` operations
@@ -291,10 +306,59 @@ impl std::fmt::Debug for Apfs {
 /// case-insensitive and the writer applies Unicode default case
 /// folding before hashing the drec name.
 const APFS_INCOMPAT_CASE_INSENSITIVE: u64 = 0x0000_0001;
-/// `APFS_INCOMPAT_NORMALIZATION_INSENSITIVE` — when set, drec keys use
-/// the hashed layout (`j_drec_hashed_key_t`); otherwise the plain
+/// `APFS_INCOMPAT_NORMALIZATION_INSENSITIVE` — when set (or when
+/// `APFS_INCOMPAT_CASE_INSENSITIVE` is set), drec keys use the hashed
+/// layout (`j_drec_hashed_key_t`); otherwise the plain
 /// layout (`j_drec_key_t`) is in use.
 const APFS_INCOMPAT_NORMALIZATION_INSENSITIVE: u64 = 0x0000_0008;
+
+/// Whether a volume with these `apfs_incompatible_features` stores its
+/// directory entries with `j_drec_hashed_key_t`. Per the Apple File
+/// System Reference the hashed key is used when *either* the
+/// case-insensitive or the normalization-insensitive flag is set — a
+/// macOS default volume carries only `CASE_INSENSITIVE` (0x1) and is
+/// hashed.
+fn is_hashed_drec_layout(incompatible_features: u64) -> bool {
+    incompatible_features
+        & (APFS_INCOMPAT_CASE_INSENSITIVE | APFS_INCOMPAT_NORMALIZATION_INSENSITIVE)
+        != 0
+}
+
+/// Compare a directory-entry name found on disk with the one a caller
+/// asked for, the way the volume itself does: byte-exact on plain-key
+/// volumes; on hashed-key volumes after NFD normalization, plus full
+/// Unicode case folding when the volume is case-insensitive (the same
+/// pipeline the on-disk hash is computed over, so names that collide
+/// in the hash also compare equal here).
+pub(crate) fn drec_names_match(
+    stored: &str,
+    wanted: &str,
+    layout: DrecKeyLayout,
+    case_fold: bool,
+) -> bool {
+    if stored == wanted {
+        return true;
+    }
+    if layout == DrecKeyLayout::Plain {
+        return false;
+    }
+    use intl::unicode::{case, normalize};
+    if case_fold {
+        case::fold(normalize::nfd(stored.chars())).eq(case::fold(normalize::nfd(wanted.chars())))
+    } else {
+        normalize::nfd(stored.chars()).eq(normalize::nfd(wanted.chars()))
+    }
+}
+
+/// Decode a drec key in the volume's layout. Never guesses: a plain
+/// decoder run over a hashed key (or vice versa) can "succeed" with a
+/// garbage name, so the layout picked at open time is authoritative.
+fn decode_drec_key(kb: &[u8], layout: DrecKeyLayout) -> Result<DrecKey> {
+    match layout {
+        DrecKeyLayout::Hashed => DrecKey::decode_hashed(kb),
+        DrecKeyLayout::Plain => DrecKey::decode_plain(kb),
+    }
+}
 
 /// Bundle of container-level state used by every volume opener so we
 /// don't have to re-scan the checkpoint descriptor area on each call.
@@ -312,6 +376,11 @@ struct ContainerCtx {
     /// when no valid NXSB was found in the xp_desc area (fresh image
     /// with only the label NXSB at block 0).
     live_xp_desc_offset: Option<u64>,
+    /// Raw bytes of the live NXSB block. The checkpoint writer patches
+    /// a copy of these instead of building a superblock from a fixed
+    /// template, so container state we don't model (feature flags,
+    /// reaper/keybag oids, the rest of `nx_fs_oid[]`) survives a write.
+    live_sb_block: Vec<u8>,
 }
 
 /// Public summary of one populated `nx_fs_oid[]` slot, returned by
@@ -465,15 +534,46 @@ impl Apfs {
         // For a fresh image with no live NXSB in the xp_desc area
         // (label NXSB at block 0 only), start at slot 1 (the
         // canonical first NXSB slot = `NXSB_LIVE_PADDR`).
-        let blocks = ctx.live_sb.xp_desc_blocks as u64;
-        let nxsb_slots = blocks.saturating_sub(1).max(1); // skip slot 0
-        let next_offset = match ctx.live_xp_desc_offset {
-            Some(off) if off >= 1 => ((off - 1 + 1) % nxsb_slots) + 1,
-            // Live NXSB came from slot 0 somehow, or no live NXSB at
-            // all — start at the first NXSB slot.
-            _ => 1,
+        // A checkpoint spans `CHECKPOINT_DESC_SLOTS` consecutive
+        // descriptor slots — its map block then its superblock — so the
+        // ring advances a pair at a time and the superblock always
+        // lands on an odd offset. Advancing one slot at a time would
+        // put the new checkpoint's map block on top of the previous
+        // checkpoint's superblock.
+        let slots_per_ckpt = write::CHECKPOINT_DESC_SLOTS as u64;
+        let pairs = (ctx.live_sb.xp_desc_blocks as u64 / slots_per_ckpt).max(1);
+        let live_pair = match ctx.live_xp_desc_offset {
+            Some(off) if off >= 1 => (off - 1) / slots_per_ckpt,
+            _ => pairs - 1,
         };
+        let next_pair = (live_pair + 1) % pairs;
+        let next_offset = next_pair * slots_per_ckpt + 1;
         let next_xp_desc_slot = ctx.live_sb.xp_desc_base + next_offset;
+
+        // A checkpoint rebuilds the container omap from scratch with a
+        // single volume entry and reuses our own fixed xp_desc /
+        // spaceman geometry. On a container laid out differently
+        // (multi-volume, or a descriptor area that isn't ours) that
+        // would silently drop the other volumes, so refuse instead of
+        // corrupting an image we didn't format. Read access via
+        // `Apfs::open` keeps working.
+        let populated_volumes = ctx.live_sb.fs_oid.iter().filter(|&&o| o != 0).count();
+        if populated_volumes > 1 {
+            return Err(crate::Error::Unsupported(format!(
+                "apfs: writing a {populated_volumes}-volume container is not supported                  (the checkpoint writer rebuilds the container omap with one volume);                  open it read-only"
+            )));
+        }
+        if ctx.live_sb.xp_desc_base != write::CHKMAP_PADDR
+            || ctx.live_sb.xp_desc_blocks != write::XP_DESC_BLOCKS
+        {
+            return Err(crate::Error::Unsupported(format!(
+                "apfs: checkpoint descriptor area (base {}, {} blocks) isn't the layout                  fstool writes (base {}, {} blocks); this container was formatted                  elsewhere — open it read-only",
+                ctx.live_sb.xp_desc_base,
+                ctx.live_sb.xp_desc_blocks,
+                write::CHKMAP_PADDR,
+                write::XP_DESC_BLOCKS,
+            )));
+        }
 
         // Read the APSB to capture volume_uuid + counters + next_oid.
         let (vol_index, apsb_paddr) = find_volume_paddr(dev, &ctx)?;
@@ -490,12 +590,11 @@ impl Apfs {
         // default) need the 22-bit CRC32C hash threaded through every
         // drec we emit — see write::apfs_drec_name_len_and_hash for the
         // best-effort caveats around Apple's Unicode tables.
-        let drec_layout =
-            if apsb.incompatible_features & APFS_INCOMPAT_NORMALIZATION_INSENSITIVE != 0 {
-                DrecKeyLayout::Hashed
-            } else {
-                DrecKeyLayout::Plain
-            };
+        let drec_layout = if is_hashed_drec_layout(apsb.incompatible_features) {
+            DrecKeyLayout::Hashed
+        } else {
+            DrecKeyLayout::Plain
+        };
         let drec_case_fold = apsb.incompatible_features & APFS_INCOMPAT_CASE_INSENSITIVE != 0;
 
         // Use the spaceman's used-block accounting as the bump-allocator
@@ -503,7 +602,19 @@ impl Apfs {
         // spaceman can't be parsed: assume the whole front half of the
         // disk is in use. Honest: this means we lose half the capacity,
         // but it's safe.
-        let bump_high_water = read_spaceman_high_water(dev, &ctx).unwrap_or(total_blocks / 2);
+        // The spaceman only ever records the *format-time* mark (a
+        // checkpoint deliberately leaves the previous spaceman in
+        // place), so take the larger of it and the mark derived from
+        // what the live checkpoint actually references. Without that
+        // second term every reopen restarts the bump allocator at the
+        // same block and a second write session overwrites the first
+        // session's extents.
+        let spaceman_hw = read_spaceman_high_water(dev, &ctx);
+        let derived_hw = derive_bump_high_water(dev, &ctx, apsb_paddr, &apsb_block);
+        let bump_high_water = match spaceman_hw {
+            Some(hw) => hw.max(derived_hw),
+            None => derived_hw.max(total_blocks / 2),
+        };
 
         // Build the write state, embedding the read-mode bits we just
         // parsed via Apfs::open above.
@@ -511,7 +622,6 @@ impl Apfs {
             ApfsState::Read(r) => r,
             _ => unreachable!("Apfs::open always returns Read"),
         };
-        let _ = vol_index;
         Ok(Self {
             block_size,
             total_bytes,
@@ -531,6 +641,9 @@ impl Apfs {
                 drec_layout,
                 drec_case_fold,
                 bump_high_water,
+                apsb_template: apsb_block,
+                nxsb_template: ctx.live_sb_block.clone(),
+                volume_index: vol_index,
             }),
         })
     }
@@ -689,12 +802,12 @@ impl Apfs {
             )));
         }
 
-        let drec_layout =
-            if apsb.incompatible_features & APFS_INCOMPAT_NORMALIZATION_INSENSITIVE != 0 {
-                DrecKeyLayout::Hashed
-            } else {
-                DrecKeyLayout::Plain
-            };
+        let drec_layout = if is_hashed_drec_layout(apsb.incompatible_features) {
+            DrecKeyLayout::Hashed
+        } else {
+            DrecKeyLayout::Plain
+        };
+        let drec_case_fold = apsb.incompatible_features & APFS_INCOMPAT_CASE_INSENSITIVE != 0;
 
         let fs_ctx = FsTreeCtx::new(vol_omap_root, omap_xid, block_size as usize);
 
@@ -708,6 +821,7 @@ impl Apfs {
                 fsroot_block,
                 fs_ctx: std::cell::RefCell::new(fs_ctx),
                 drec_layout,
+                drec_case_fold,
             }),
         })
     }
@@ -867,6 +981,40 @@ impl Apfs {
         Ok(out)
     }
 
+    /// Read a symbolic link's target.
+    ///
+    /// APFS keeps the target in the `com.apple.fs.symlink` xattr on the
+    /// link's inode, as a NUL-terminated path; the inode itself has no
+    /// data stream. Images written by fstool before that was understood
+    /// stored the target as a one-extent file body instead, so fall
+    /// back to reading the inode's data when the xattr is absent.
+    pub fn read_symlink(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<String> {
+        let xattrs = self.read_xattrs(dev, path)?;
+        if let Some(raw) = xattrs.get(write::APFS_SYMLINK_XATTR) {
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            return String::from_utf8(raw[..end].to_vec()).map_err(|e| {
+                crate::Error::InvalidImage(format!(
+                    "apfs: symlink target for {path:?} is not valid UTF-8: {e}"
+                ))
+            });
+        }
+        // Legacy fstool layout: the target as the inode's file body.
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut self.open_file_reader(dev, path)?, &mut buf)?;
+        if buf.is_empty() {
+            return Err(crate::Error::InvalidImage(format!(
+                "apfs: {path:?} has no symlink target (no {} xattr and no file body)",
+                write::APFS_SYMLINK_XATTR
+            )));
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8(buf[..end].to_vec()).map_err(|e| {
+            crate::Error::InvalidImage(format!(
+                "apfs: symlink target for {path:?} is not valid UTF-8: {e}"
+            ))
+        })
+    }
+
     /// Open a regular file for streaming reads. The returned reader
     /// borrows `dev` so it can fetch data blocks lazily.
     pub fn open_file_reader<'a>(
@@ -998,14 +1146,16 @@ impl Apfs {
     /// stay on disk — the COW allocator never frees, only forgets).
     /// Refuses non-empty directories.
     pub fn remove_path(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<()> {
+        let (layout, case_fold) = self.drec_layout_for_writes();
         let (parent_oid, name) = self.resolve_parent_and_name(dev, path)?;
         rw::commit_with_mutator(self, dev, |cx| {
             let records = &mut *cx.records;
-            let (target_oid, dtype) = find_drec(records, parent_oid, &name).ok_or_else(|| {
-                crate::Error::InvalidArgument(format!(
-                    "apfs: no such entry {name:?} under inode {parent_oid}"
-                ))
-            })?;
+            let (target_oid, dtype) = find_drec(records, parent_oid, &name, layout, case_fold)
+                .ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!(
+                        "apfs: no such entry {name:?} under inode {parent_oid}"
+                    ))
+                })?;
             // Empty-dir check for directories.
             if dtype == DT_DIR && drec_count_for(records, target_oid) > 0 {
                 return Err(crate::Error::InvalidArgument(format!(
@@ -1013,7 +1163,7 @@ impl Apfs {
                 )));
             }
             // Always drop the dirent.
-            remove_drec(records, parent_oid, &name);
+            remove_drec(records, parent_oid, &name, layout, case_fold);
             // For dirs: drop the inode (always — POSIX dirs never
             // hardlink); decrement parent's nchildren.
             if dtype == DT_DIR {
@@ -1069,18 +1219,18 @@ impl Apfs {
         let (layout, case_fold) = self.drec_layout_for_writes();
         rw::commit_with_mutator(self, dev, |cx| {
             let records = &mut *cx.records;
-            let (target_oid, dtype) =
-                find_drec(records, old_parent, &old_name).ok_or_else(|| {
+            let (target_oid, dtype) = find_drec(records, old_parent, &old_name, layout, case_fold)
+                .ok_or_else(|| {
                     crate::Error::InvalidArgument(format!(
                         "apfs: rename source {old_name:?} not found"
                     ))
                 })?;
-            if find_drec(records, new_parent, &new_name).is_some() {
+            if find_drec(records, new_parent, &new_name, layout, case_fold).is_some() {
                 return Err(crate::Error::InvalidArgument(format!(
                     "apfs: rename target {new_name:?} already exists"
                 )));
             }
-            remove_drec(records, old_parent, &old_name);
+            remove_drec(records, old_parent, &old_name, layout, case_fold);
             let (k, v) = write::build_drec_record(
                 new_parent, &new_name, target_oid, dtype, layout, case_fold,
             )?;
@@ -1136,7 +1286,7 @@ impl Apfs {
         let (layout, case_fold) = self.drec_layout_for_writes();
         rw::commit_with_mutator(self, dev, |cx| {
             let records = &mut *cx.records;
-            if find_drec(records, new_parent, &new_name).is_some() {
+            if find_drec(records, new_parent, &new_name, layout, case_fold).is_some() {
                 return Err(crate::Error::InvalidArgument(format!(
                     "apfs: link target {new_name:?} already exists"
                 )));
@@ -1208,7 +1358,7 @@ impl Apfs {
         let (parent_oid, name) = self.resolve_parent_and_name(dev, path)?;
         let (layout, case_fold) = self.drec_layout_for_writes();
         rw::commit_with_mutator(self, dev, |cx| {
-            if find_drec(cx.records, parent_oid, &name).is_some() {
+            if find_drec(cx.records, parent_oid, &name, layout, case_fold).is_some() {
                 return Err(crate::Error::InvalidArgument(format!(
                     "apfs: create_file: {name:?} already exists under inode {parent_oid}"
                 )));
@@ -1265,7 +1415,7 @@ impl Apfs {
         let (parent_oid, name) = self.resolve_parent_and_name(dev, path)?;
         let (layout, case_fold) = self.drec_layout_for_writes();
         rw::commit_with_mutator(self, dev, |cx| {
-            if find_drec(cx.records, parent_oid, &name).is_some() {
+            if find_drec(cx.records, parent_oid, &name, layout, case_fold).is_some() {
                 return Err(crate::Error::InvalidArgument(format!(
                     "apfs: create_dir: {name:?} already exists under inode {parent_oid}"
                 )));
@@ -1294,8 +1444,9 @@ impl Apfs {
 
     /// Create a symbolic link at `path` pointing at `target` (the
     /// raw string is stored verbatim — APFS doesn't normalise it).
-    /// Symlink targets are stored as a single-extent file body, the
-    /// same way `Apfs::read_symlink` reads them back.
+    /// The target goes into the `com.apple.fs.symlink` xattr, which is
+    /// where APFS keeps it and the only place macOS looks; see
+    /// [`Apfs::read_symlink`].
     pub fn create_symlink_at(
         &mut self,
         dev: &mut dyn BlockDevice,
@@ -1314,27 +1465,18 @@ impl Apfs {
         }
         let (layout, case_fold) = self.drec_layout_for_writes();
         rw::commit_with_mutator(self, dev, |cx| {
-            if find_drec(cx.records, parent_oid, &name).is_some() {
+            if find_drec(cx.records, parent_oid, &name, layout, case_fold).is_some() {
                 return Err(crate::Error::InvalidArgument(format!(
                     "apfs: create_symlink: {name:?} already exists under inode {parent_oid}"
                 )));
             }
             let oid = cx.alloc_oid();
             let bs = cx.block_size();
-            let paddr = cx.alloc_extent(size)?;
-            cx.write_extent_bytes(paddr, target_bytes)?;
-            for (k, v) in write::build_file_extent_records(oid, 0, size, paddr, bs) {
-                cx.records.push((k, v));
-            }
-            let (ik, iv) = write::build_inode_record(
-                oid,
-                parent_oid,
-                write::mode_lnk(mode),
-                size,
-                bs,
-                mtime_ns,
-            );
+            let (ik, iv) =
+                write::build_inode_record(oid, parent_oid, write::mode_lnk(mode), 0, bs, mtime_ns);
             cx.records.push((ik, iv));
+            let (xk, xv) = write::build_symlink_xattr_record(oid, target)?;
+            cx.records.push((xk, xv));
             let (dk, dv) =
                 write::build_drec_record(parent_oid, &name, oid, DT_LNK, layout, case_fold)?;
             cx.records.push((dk, dv));
@@ -1511,6 +1653,7 @@ impl Apfs {
     ) -> Result<Option<u64>> {
         let rs = self.read_state()?;
         let layout = rs.drec_layout;
+        let case_fold = rs.drec_case_fold;
         let target = FsKeyTarget {
             oid: parent_oid,
             kind: APFS_TYPE_DIR_REC,
@@ -1525,15 +1668,8 @@ impl Apfs {
         while let Some((kb, vb)) = scan.next(&mut ctx, &mut |paddr, buf| {
             read_at_paddr(dev, paddr, block_size, buf)
         })? {
-            let key = match layout {
-                DrecKeyLayout::Hashed => {
-                    DrecKey::decode_hashed(&kb).or_else(|_| DrecKey::decode_plain(&kb))?
-                }
-                DrecKeyLayout::Plain => {
-                    DrecKey::decode_plain(&kb).or_else(|_| DrecKey::decode_hashed(&kb))?
-                }
-            };
-            if key.name == name {
+            let key = decode_drec_key(&kb, layout)?;
+            if drec_names_match(&key.name, name, layout, case_fold) {
                 let val = DrecVal::decode(&vb)?;
                 return Ok(Some(val.file_id));
             }
@@ -1566,19 +1702,8 @@ impl Apfs {
         while let Some((kb, vb)) = scan.next(&mut ctx, &mut |paddr, buf| {
             read_at_paddr(dev, paddr, block_size, buf)
         })? {
-            let key = match layout {
-                DrecKeyLayout::Hashed => {
-                    match DrecKey::decode_hashed(&kb).or_else(|_| DrecKey::decode_plain(&kb)) {
-                        Ok(k) => k,
-                        Err(_) => continue,
-                    }
-                }
-                DrecKeyLayout::Plain => {
-                    match DrecKey::decode_plain(&kb).or_else(|_| DrecKey::decode_hashed(&kb)) {
-                        Ok(k) => k,
-                        Err(_) => continue,
-                    }
-                }
+            let Ok(key) = decode_drec_key(&kb, layout) else {
+                continue;
             };
             let val = match DrecVal::decode(&vb) {
                 Ok(v) => v,
@@ -1697,6 +1822,19 @@ impl Apfs {
 /// [`write::ApfsWriter`]. After `flush` the [`Apfs`] is in read mode
 /// and behaves like a freshly-opened image.
 impl crate::fs::Filesystem for Apfs {
+    fn read_symlink(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<std::path::PathBuf> {
+        let path_str = path.to_str().ok_or_else(|| {
+            crate::Error::InvalidArgument("apfs: non-UTF-8 path in read_symlink".into())
+        })?;
+        Ok(std::path::PathBuf::from(Apfs::read_symlink(
+            self, dev, path_str,
+        )?))
+    }
+
     fn create_file(
         &mut self,
         dev: &mut dyn BlockDevice,
@@ -2519,32 +2657,45 @@ where
     }
 }
 
+/// Does raw drec key `k` sit under `parent_oid` and carry `name` (in
+/// the volume's own comparison semantics)? Decodes the key in the
+/// volume's `layout` — plain `hdr(8) + name_len(2) + name + NUL` or
+/// hashed `hdr(8) + name_len_and_hash(4) + name + NUL`.
+fn drec_key_matches(
+    k: &[u8],
+    parent_oid: u64,
+    name: &str,
+    layout: DrecKeyLayout,
+    case_fold: bool,
+) -> bool {
+    if k.len() < 8 {
+        return false;
+    }
+    let hdr = u64::from_le_bytes(k[0..8].try_into().unwrap());
+    let oid = hdr & OBJ_ID_MASK;
+    let kind = (hdr >> OBJ_TYPE_SHIFT) as u8;
+    if oid != parent_oid || kind != APFS_TYPE_DIR_REC {
+        return false;
+    }
+    match decode_drec_key(k, layout) {
+        Ok(key) => drec_names_match(&key.name, name, layout, case_fold),
+        Err(_) => false,
+    }
+}
+
 /// Find the drec record under `parent_oid` with `name`, returning
-/// `(target_oid, dtype)`. Uses the plain-layout drec key format
-/// (`hdr(8) + name_len(2) + name + NUL`); hashed-layout images
-/// already get normalized to plain when our writer emits them.
+/// `(target_oid, dtype)`. `layout` / `case_fold` come from the
+/// volume's `apfs_incompatible_features` (see
+/// [`Apfs::drec_layout_for_writes`]).
 pub(crate) fn find_drec(
     records: &[(Vec<u8>, Vec<u8>)],
     parent_oid: u64,
     name: &str,
+    layout: DrecKeyLayout,
+    case_fold: bool,
 ) -> Option<(u64, u16)> {
     for (k, v) in records {
-        if k.len() < 10 {
-            continue;
-        }
-        let hdr = u64::from_le_bytes(k[0..8].try_into().unwrap());
-        let oid = hdr & OBJ_ID_MASK;
-        let kind = (hdr >> OBJ_TYPE_SHIFT) as u8;
-        if oid != parent_oid || kind != APFS_TYPE_DIR_REC {
-            continue;
-        }
-        let nlen = u16::from_le_bytes(k[8..10].try_into().unwrap()) as usize;
-        if k.len() < 10 + nlen || nlen == 0 {
-            continue;
-        }
-        // The name is stored with a trailing NUL inside `nlen`.
-        let stored = &k[10..10 + nlen - 1];
-        if stored != name.as_bytes() {
+        if !drec_key_matches(k, parent_oid, name, layout, case_fold) {
             continue;
         }
         if v.len() < 18 {
@@ -2559,24 +2710,14 @@ pub(crate) fn find_drec(
 
 /// Remove the drec under `parent_oid` matching `name`. No-op when
 /// not found.
-pub(crate) fn remove_drec(records: &mut Vec<(Vec<u8>, Vec<u8>)>, parent_oid: u64, name: &str) {
-    records.retain(|(k, _)| {
-        if k.len() < 10 {
-            return true;
-        }
-        let hdr = u64::from_le_bytes(k[0..8].try_into().unwrap());
-        let oid = hdr & OBJ_ID_MASK;
-        let kind = (hdr >> OBJ_TYPE_SHIFT) as u8;
-        if oid != parent_oid || kind != APFS_TYPE_DIR_REC {
-            return true;
-        }
-        let nlen = u16::from_le_bytes(k[8..10].try_into().unwrap()) as usize;
-        if k.len() < 10 + nlen || nlen == 0 {
-            return true;
-        }
-        let stored = &k[10..10 + nlen - 1];
-        stored != name.as_bytes()
-    });
+pub(crate) fn remove_drec(
+    records: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    parent_oid: u64,
+    name: &str,
+    layout: DrecKeyLayout,
+    case_fold: bool,
+) {
+    records.retain(|(k, _)| !drec_key_matches(k, parent_oid, name, layout, case_fold));
 }
 
 /// Count direct children of a directory inode by scanning drec
@@ -2678,6 +2819,17 @@ fn load_container(dev: &mut dyn BlockDevice) -> Result<ContainerCtx> {
         Some((sb, off)) => (sb, Some(off)),
         None => (label_sb.clone(), None),
     };
+    // Keep the live superblock's bytes so a checkpoint can be written
+    // as a patch of the real container rather than a fresh template.
+    let live_sb_block = match live_xp_desc_offset {
+        Some(off) => {
+            let paddr = label_sb.xp_desc_base.saturating_add(off);
+            let mut buf = vec![0u8; block_size as usize];
+            dev.read_at(paddr.saturating_mul(block_size as u64), &mut buf)?;
+            buf
+        }
+        None => block0.clone(),
+    };
 
     let total_bytes = live_sb.block_count.saturating_mul(block_size as u64);
 
@@ -2695,6 +2847,7 @@ fn load_container(dev: &mut dyn BlockDevice) -> Result<ContainerCtx> {
         block_size,
         total_bytes,
         live_xp_desc_offset,
+        live_sb_block,
     })
 }
 
@@ -2722,6 +2875,142 @@ fn find_volume_paddr(dev: &mut dyn BlockDevice, ctx: &ContainerCtx) -> Result<(u
         ))
     })?;
     Ok((vol_index, val.paddr))
+}
+
+/// Walk every node of the omap B-tree rooted at `tree_paddr`, pushing
+/// each node's own physical block and every `omap_val.paddr` it maps
+/// onto `out`. Bounded by `budget` node visits so a corrupted (or
+/// cyclic) tree can't spin forever; a malformed node ends the walk
+/// early rather than failing the open.
+fn collect_omap_paddrs(
+    dev: &mut dyn BlockDevice,
+    block_size: u32,
+    tree_paddr: u64,
+    out: &mut Vec<u64>,
+) {
+    let mut budget = 4096usize;
+    let mut stack = vec![tree_paddr];
+    let mut buf = vec![0u8; block_size as usize];
+    while let Some(paddr) = stack.pop() {
+        if budget == 0 {
+            return;
+        }
+        budget -= 1;
+        out.push(paddr);
+        let off = match paddr.checked_mul(block_size as u64) {
+            Some(o) if o + block_size as u64 <= dev.total_size() => o,
+            _ => continue,
+        };
+        if dev.read_at(off, &mut buf).is_err() {
+            continue;
+        }
+        let Ok(node) = btree::BTreeNode::decode(&buf) else {
+            continue;
+        };
+        if node.is_leaf() {
+            for i in 0..node.nkeys {
+                let Ok((_, vb)) = node.entry_at(i, OmapKey::SIZE, OmapVal::SIZE) else {
+                    break;
+                };
+                if let Ok(val) = OmapVal::decode(vb) {
+                    out.push(val.paddr);
+                }
+            }
+        } else {
+            for i in 0..node.nkeys {
+                let Ok((_, child)) = node.child_entry_at(i, OmapKey::SIZE) else {
+                    break;
+                };
+                stack.push(child);
+            }
+        }
+    }
+}
+
+/// Highest physical block that the live checkpoint still references,
+/// plus one — i.e. the first block a new checkpoint may bump-allocate
+/// without clobbering live data.
+///
+/// The spaceman is only rewritten at format time (a checkpoint leaves
+/// the previous one in place so the older checkpoint stays bootable),
+/// so [`read_spaceman_high_water`] reports the *format-time* mark
+/// forever. Trusting it alone means every reopen restarts the bump
+/// allocator at the same address and the second write session
+/// overwrites the first session's extents. Deriving the mark from what
+/// the live checkpoint actually points at keeps successive sessions
+/// from colliding.
+///
+/// Scans, in order: the APSB block itself, the container omap tree,
+/// the volume omap tree (which registers every fs-tree node), and every
+/// `FILE_EXTENT` record inside the fs-tree leaves those omap entries
+/// resolve to. Best-effort: unreadable or malformed blocks are skipped
+/// rather than failing the open, and the caller combines the result
+/// with the spaceman's value via `max`.
+fn derive_bump_high_water(
+    dev: &mut dyn BlockDevice,
+    ctx: &ContainerCtx,
+    apsb_paddr: u64,
+    apsb_block: &[u8],
+) -> u64 {
+    let bs = ctx.block_size;
+    let mut paddrs: Vec<u64> = vec![apsb_paddr];
+    // Container omap: omap_phys block + its whole tree.
+    let cont_omap_paddr = ctx.live_sb.omap_oid;
+    paddrs.push(cont_omap_paddr);
+    if let Ok(phys) = read_object(dev, cont_omap_paddr, bs, OmapPhys::decode) {
+        collect_omap_paddrs(dev, bs, phys.tree_oid, &mut paddrs);
+    }
+    // Volume omap: `apfs_omap_oid` at offset 128 is physical for the
+    // volume superblock.
+    let fs_node_start = paddrs.len();
+    if apsb_block.len() >= 136 {
+        let vol_omap_paddr = u64::from_le_bytes(apsb_block[128..136].try_into().unwrap());
+        paddrs.push(vol_omap_paddr);
+        if let Ok(phys) = read_object(dev, vol_omap_paddr, bs, OmapPhys::decode) {
+            collect_omap_paddrs(dev, bs, phys.tree_oid, &mut paddrs);
+        }
+    }
+    // Every fs-tree node the volume omap maps may carry FILE_EXTENT
+    // records pointing at data blocks past the last metadata block.
+    let mut hw = paddrs.iter().copied().max().unwrap_or(0).saturating_add(1);
+    let fs_nodes: Vec<u64> = paddrs[fs_node_start..].to_vec();
+    let mut buf = vec![0u8; bs as usize];
+    for paddr in fs_nodes {
+        let off = match paddr.checked_mul(bs as u64) {
+            Some(o) if o + bs as u64 <= dev.total_size() => o,
+            _ => continue,
+        };
+        if dev.read_at(off, &mut buf).is_err() {
+            continue;
+        }
+        let Ok(node) = btree::BTreeNode::decode(&buf) else {
+            continue;
+        };
+        if !node.is_leaf() {
+            continue;
+        }
+        for i in 0..node.nkeys {
+            let Ok((kb, vb)) = node.entry_at(i, 0, 0) else {
+                break;
+            };
+            if kb.len() < 8 {
+                continue;
+            }
+            let hdr = u64::from_le_bytes(kb[0..8].try_into().unwrap());
+            if (hdr >> OBJ_TYPE_SHIFT) as u8 != APFS_TYPE_FILE_EXTENT {
+                continue;
+            }
+            let Ok(ext) = FileExtentVal::decode(vb) else {
+                continue;
+            };
+            if ext.phys_block_num == 0 {
+                continue; // sparse / hole
+            }
+            let blocks = ext.length.div_ceil(bs as u64);
+            hw = hw.max(ext.phys_block_num.saturating_add(blocks));
+        }
+    }
+    hw.min(ctx.live_sb.block_count)
 }
 
 /// Read the spaceman_phys_t and return the bump-allocator high-water mark
@@ -2784,6 +3073,14 @@ fn find_live_nxsb(
             if mw != NX_MAGIC {
                 continue;
             }
+        }
+        // A stale descriptor slot can still carry a syntactically
+        // valid NXSB from a torn or half-written checkpoint. Only the
+        // Fletcher-64 in `o_cksum` distinguishes it from a good one,
+        // and picking a torn superblock means mounting a checkpoint
+        // whose trees were never fully written.
+        if !checksum::verify(&buf) {
+            continue;
         }
         let sb = match NxSuperblock::decode(&buf) {
             Ok(s) => s,

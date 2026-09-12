@@ -247,6 +247,23 @@ fn apfs_writer_passes_fsck_apfs() {
                         o.status.signal()
                     );
                 }
+                // The container layer — superblock, checkpoint
+                // descriptor area, checkpoint map, and both object maps
+                // — must validate. (The space manager still doesn't:
+                // our internal pool and free queues are a stub, which
+                // is why hdiutil won't mount these images.) Lock the
+                // container in so it can't regress.
+                for bad in [
+                    "Container superblock is invalid",
+                    "Most recent checkpoint is invalid",
+                    "no valid checkpoint",
+                    "failed consistency check",
+                ] {
+                    assert!(
+                        !so.contains(bad) && !se.contains(bad),
+                        "fsck_apfs rejected the container on {dev}: {bad}\n{so}\n{se}"
+                    );
+                }
             }
             Err(e) => eprintln!("fsck_apfs {dev} could not run: {e}"),
         }
@@ -351,6 +368,10 @@ fn apfs_writer_round_trips_through_macos_mount() {
         let mut r = Cursor::new(payload.as_ref());
         w.add_file_from_reader(2, "rt.txt", 0o644, &mut r, payload.len() as u64)
             .unwrap();
+        // macOS only follows a symlink whose target lives in the
+        // `com.apple.fs.symlink` xattr; a target stored as a file body
+        // reads back as an empty link.
+        w.add_symlink(2, "rt.link", 0o777, "rt.txt").unwrap();
         w.finish().unwrap();
         dev.sync().unwrap();
     }
@@ -419,9 +440,14 @@ fn apfs_writer_round_trips_through_macos_mount() {
         }
     };
 
-    // ls + cat through the macOS VFS.
+    // ls + cat through the macOS VFS, plus readlink + cat *through*
+    // the symlink so the kernel has to resolve it.
     let ls = Command::new("ls").arg(&mp).output();
     let cat = Command::new("cat").arg(format!("{mp}/rt.txt")).output();
+    let readlink = Command::new("readlink")
+        .arg(format!("{mp}/rt.link"))
+        .output();
+    let cat_link = Command::new("cat").arg(format!("{mp}/rt.link")).output();
     hdiutil_detach(&whole);
 
     let ls = ls.expect("ls failed to spawn");
@@ -444,6 +470,27 @@ fn apfs_writer_round_trips_through_macos_mount() {
     assert_eq!(
         cat.stdout, payload,
         "macOS VFS returned different bytes than we wrote"
+    );
+    let readlink = readlink.expect("readlink failed to spawn");
+    assert!(
+        readlink.status.success(),
+        "readlink {mp}/rt.link failed:\n{}",
+        String::from_utf8_lossy(&readlink.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&readlink.stdout).trim_end(),
+        "rt.txt",
+        "macOS VFS resolved our symlink to the wrong target"
+    );
+    let cat_link = cat_link.expect("cat failed to spawn");
+    assert!(
+        cat_link.status.success(),
+        "cat {mp}/rt.link failed:\n{}",
+        String::from_utf8_lossy(&cat_link.stderr)
+    );
+    assert_eq!(
+        cat_link.stdout, payload,
+        "reading through our symlink returned the wrong bytes"
     );
 }
 
@@ -937,10 +984,26 @@ fn apfs_write_state_create_symlink_round_trips() {
     }
     let mut dev = FileBackend::open(img.path()).unwrap();
     let fs = Apfs::open(&mut dev).unwrap();
-    let mut r = fs.open_file_reader(&mut dev, "/link").unwrap();
-    let mut target = String::new();
-    std::io::Read::read_to_string(&mut r, &mut target).unwrap();
-    assert_eq!(target, "/usr/bin/sh", "symlink target wrong");
+    assert_eq!(
+        fs.read_symlink(&mut dev, "/link").unwrap(),
+        "/usr/bin/sh",
+        "symlink target wrong"
+    );
+    // Stored exactly the way macOS stores it: an embedded,
+    // filesystem-owned xattr holding the NUL-terminated target, and no
+    // data stream on the inode.
+    let xattrs = fs.read_xattrs(&mut dev, "/link").unwrap();
+    assert_eq!(
+        xattrs.get("com.apple.fs.symlink").map(Vec::as_slice),
+        Some(&b"/usr/bin/sh\0"[..])
+    );
+    let entry = fs
+        .list_path(&mut dev, "/")
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "link")
+        .unwrap();
+    assert_eq!(entry.size, 0, "an APFS symlink inode has no data stream");
 }
 
 /// Write-state set_xattr + remove_xattr: set on a fresh file, verify
@@ -1524,6 +1587,17 @@ fn apfs_filesystem_list_xattrs_sorted() {
 /// must sort into the same B-tree bucket the reader's comparator
 /// uses.
 fn synthesize_hashed_key_volume(path: &std::path::Path, also_case_insensitive: bool) {
+    let mut flags = 0x0000_0008u64; // NORMALIZATION_INSENSITIVE
+    if also_case_insensitive {
+        flags |= 0x0000_0001; // CASE_INSENSITIVE
+    }
+    synthesize_volume_with_incompat(path, flags);
+}
+
+/// Format a plain volume with `ApfsWriter`, then OR `incompat` into the
+/// APSB's `apfs_incompatible_features` so the reader/writer treat it
+/// as a foreign-flagged volume.
+fn synthesize_volume_with_incompat(path: &std::path::Path, incompat_flags: u64) {
     use std::os::unix::fs::FileExt;
     let bs = 4096u64;
     let total = 4096u64;
@@ -1554,11 +1628,7 @@ fn synthesize_hashed_key_volume(path: &std::path::Path, also_case_insensitive: b
     let paddr = apsb_paddr.expect("no APSB found in image");
     let mut incompat = [0u8; 8];
     f.read_exact_at(&mut incompat, paddr * bs + 56).unwrap();
-    let mut v = u64::from_le_bytes(incompat);
-    v |= 0x0000_0008; // NORMALIZATION_INSENSITIVE
-    if also_case_insensitive {
-        v |= 0x0000_0001; // CASE_INSENSITIVE
-    }
+    let v = u64::from_le_bytes(incompat) | incompat_flags;
     f.write_at(&v.to_le_bytes(), paddr * bs + 56).unwrap();
     f.sync_all().unwrap();
 }
@@ -1719,60 +1789,60 @@ fn apfs_drec_hash_known_vectors() {
 fn apfs_drec_hash_absolute_vectors() {
     use fstool::fs::apfs::write::apfs_drec_name_len_and_hash;
     const VECTORS: &[(&str, bool, u32)] = &[
-        ("foo", false, 0x568a8804),
-        ("foo", true, 0x568a8804),
-        ("Foo", false, 0x184a1004),
-        ("Foo", true, 0x568a8804),
-        ("lost+found", false, 0x3c48000b),
-        ("lost+found", true, 0x3c48000b),
-        ("caf\u{00E9}", false, 0x5e5c7806),
-        ("caf\u{00E9}", true, 0x5e5c7806),
-        ("stra\u{00DF}e", false, 0x019b0808),
-        ("stra\u{00DF}e", true, 0xae4df008),
-        ("STRASSE", false, 0xedbb8c08),
-        ("STRASSE", true, 0xae4df008),
-        ("\u{FB01}le", false, 0x4741b006),
-        ("\u{FB01}le", true, 0xc60e7806),
-        ("file", false, 0xc60e7805),
-        ("file", true, 0xc60e7805),
-        ("\u{0130}stanbul", false, 0x3b52940a),
-        ("\u{0130}stanbul", true, 0xc2540c0a),
+        ("foo", false, 0xa9757404),
+        ("foo", true, 0xa9757404),
+        ("Foo", false, 0xe7b5ec04),
+        ("Foo", true, 0xa9757404),
+        ("lost+found", false, 0xc3b7fc0b),
+        ("lost+found", true, 0xc3b7fc0b),
+        ("caf\u{00E9}", false, 0xa1a38406),
+        ("caf\u{00E9}", true, 0xa1a38406),
+        ("stra\u{00DF}e", false, 0xfe64f408),
+        ("stra\u{00DF}e", true, 0x51b20c08),
+        ("STRASSE", false, 0x12447008),
+        ("STRASSE", true, 0x51b20c08),
+        ("\u{FB01}le", false, 0xb8be4c06),
+        ("\u{FB01}le", true, 0x39f18406),
+        ("file", false, 0x39f18405),
+        ("file", true, 0x39f18405),
+        ("\u{0130}stanbul", false, 0xc4ad680a),
+        ("\u{0130}stanbul", true, 0x3dabf00a),
         (
             "\u{03A3}\u{038A}\u{03A3}\u{03A5}\u{03A6}\u{039F}\u{03A3}",
             false,
-            0xa108480f,
+            0x5ef7b40f,
         ),
         (
             "\u{03A3}\u{038A}\u{03A3}\u{03A5}\u{03A6}\u{039F}\u{03A3}",
             true,
-            0x54d4200f,
+            0xab2bdc0f,
         ),
         (
             "\u{03C3}\u{03AF}\u{03C3}\u{03C5}\u{03C6}\u{03BF}\u{03C2}",
             false,
-            0x427ec00f,
+            0xbd813c0f,
         ),
         (
             "\u{03C3}\u{03AF}\u{03C3}\u{03C5}\u{03C6}\u{03BF}\u{03C2}",
             true,
-            0x54d4200f,
+            0xab2bdc0f,
         ),
-        ("\u{13A3}\u{13B3}\u{13A9}", false, 0x90c6940a),
-        ("\u{13A3}\u{13B3}\u{13A9}", true, 0x90c6940a),
-        ("\u{65E5}\u{672C}\u{8A9E}", false, 0xfb62080a),
-        ("\u{65E5}\u{672C}\u{8A9E}", true, 0xfb62080a),
-        ("\u{1F600}", false, 0x41528c05),
-        ("\u{1F600}", true, 0x41528c05),
-        ("\u{10400}", false, 0x6ddea805),
-        ("\u{10400}", true, 0xe8031c05),
-        ("\u{10428}", false, 0xe8031c05),
-        ("\u{10428}", true, 0xe8031c05),
-        ("\u{00C5}", false, 0x66122c03),
-        ("\u{00C5}", true, 0x67844803),
-        ("\u{01C5}", false, 0x1f50a803),
-        ("\u{01C5}", true, 0x95744c03),
-        ("\u{00DF}", false, 0x06dc3803),
-        ("\u{00DF}", true, 0x7f865003),
+        ("\u{13A3}\u{13B3}\u{13A9}", false, 0x6f39680a),
+        ("\u{13A3}\u{13B3}\u{13A9}", true, 0x6f39680a),
+        ("\u{65E5}\u{672C}\u{8A9E}", false, 0x049df40a),
+        ("\u{65E5}\u{672C}\u{8A9E}", true, 0x049df40a),
+        ("\u{1F600}", false, 0xbead7005),
+        ("\u{1F600}", true, 0xbead7005),
+        ("\u{10400}", false, 0x92215405),
+        ("\u{10400}", true, 0x17fce005),
+        ("\u{10428}", false, 0x17fce005),
+        ("\u{10428}", true, 0x17fce005),
+        ("\u{00C5}", false, 0x99edd003),
+        ("\u{00C5}", true, 0x987bb403),
+        ("\u{01C5}", false, 0xe0af5403),
+        ("\u{01C5}", true, 0x6a8bb003),
+        ("\u{00DF}", false, 0xf923c403),
+        ("\u{00DF}", true, 0x8079ac03),
     ];
     for &(name, fold, want) in VECTORS {
         assert_eq!(
@@ -2052,4 +2122,340 @@ fn apfs_hashed_open_writable_create_passes_fsck_apfs() {
         any_ran,
         "fsck_apfs (hashed) was never executed (no usable device nodes found in {devs:?})"
     );
+}
+
+/// A volume flagged only `APFS_INCOMPAT_CASE_INSENSITIVE` (0x1) — what
+/// `hdiutil`/Disk Utility produce by default — stores hashed drec keys
+/// even though `NORMALIZATION_INSENSITIVE` is clear. Every write-side
+/// path (create, rename, unlink, and the "already exists" check) must
+/// decode and emit hashed keys on it, and lookups must fold case the
+/// way the kernel does.
+#[test]
+fn apfs_case_insensitive_only_volume_is_hashed_and_mutable() {
+    let img = NamedTempFile::new().unwrap();
+    synthesize_volume_with_incompat(img.path(), 0x0000_0001);
+
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        fs.create_file_at(&mut dev, "/Alpha.txt", b"alpha\n", 0o644, 0)
+            .unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        fs.create_file_at(&mut dev, "/beta.txt", b"beta\n", 0o644, 0)
+            .unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        fs.create_dir_at(&mut dev, "/Dir", 0o755, 0).unwrap();
+        // Case-insensitive: "ALPHA.TXT" *is* "Alpha.txt".
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        let err = fs
+            .create_file_at(&mut dev, "/ALPHA.TXT", b"dup\n", 0o644, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already exists"), "{err}");
+        // rename + unlink go through find_drec / remove_drec on hashed keys.
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        fs.rename(&mut dev, "/beta.txt", "/Dir/gamma.txt").unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        fs.remove_path(&mut dev, "/alpha.TXT").unwrap();
+        dev.sync().unwrap();
+    }
+
+    let mut dev = FileBackend::open(img.path()).unwrap();
+    let fs = Apfs::open(&mut dev).unwrap();
+    let mut root: Vec<String> = fs
+        .list_path(&mut dev, "/")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    root.sort();
+    assert_eq!(root, vec!["Dir".to_string()], "root after rename + unlink");
+    let sub: Vec<String> = fs
+        .list_path(&mut dev, "/Dir")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(sub, vec!["gamma.txt".to_string()]);
+    let mut body = String::new();
+    std::io::Read::read_to_string(
+        &mut fs.open_file_reader(&mut dev, "/dir/GAMMA.txt").unwrap(),
+        &mut body,
+    )
+    .unwrap();
+    assert_eq!(body, "beta\n", "case-folded path lookup");
+}
+
+/// Names + 22-bit hashes read straight out of drec keys that macOS
+/// wrote (`hdiutil create -fs APFS -srcfolder`, a case-insensitive
+/// volume). These pin the writer's hash to Apple's: un-inverted CRC-32C
+/// over UTF-32 of the NFD + case-folded name.
+const APPLE_DREC_HASHES: &[(&str, u32)] = &[
+    ("foo", 0x2a5d5d),
+    ("lost+found", 0x30edff),
+    ("caf\u{00E9}", 0x2868e1),
+    ("stra\u{00DF}e", 0x146c83),
+    ("\u{FB01}le", 0x0e7c61),
+    ("\u{0130}stanbul", 0x0f6afc),
+    ("\u{65E5}\u{672C}\u{8A9E}", 0x01277d),
+    ("\u{1F600}", 0x2fab5c),
+    ("\u{00C5}", 0x261eed),
+    ("\u{01C5}", 0x1aa2ec),
+    ("\u{00DF}", 0x201e6b),
+    ("MixedCase.TXT", 0x2d00e9),
+    (
+        "\u{03A3}\u{03AF}\u{03C3}\u{03C5}\u{03C6}\u{03BF}\u{03C2}",
+        0x2acaf7,
+    ),
+    ("sub", 0x230e33),
+    ("link-to-foo", 0x23640a),
+];
+
+#[test]
+fn apfs_drec_hash_matches_apple_written_keys() {
+    use fstool::fs::apfs::write::apfs_drec_name_len_and_hash;
+    for &(name, want) in APPLE_DREC_HASHES {
+        let packed = apfs_drec_name_len_and_hash(name, true);
+        assert_eq!(
+            packed >> 10,
+            want,
+            "hash for {name:?} differs from what macOS stored"
+        );
+        assert_eq!(
+            packed & 0x3FF,
+            name.len() as u32 + 1,
+            "name_len for {name:?}"
+        );
+    }
+}
+
+/// End-to-end against a volume macOS populated itself: `hdiutil create
+/// -srcfolder` writes a case-insensitive (incompat 0x1) volume with
+/// hashed drec keys and `com.apple.fs.symlink` symlinks. fstool must
+/// list the tree, find entries by (case-folded) name, read file bodies
+/// and resolve the symlink target.
+#[test]
+fn apfs_reads_hdiutil_srcfolder_image() {
+    if !cfg!(target_os = "macos") || which("hdiutil").is_none() || !hdiutil_usable() {
+        eprintln!("skipping: APFS validation requires macOS (hdiutil)");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    let names: Vec<&str> = APPLE_DREC_HASHES
+        .iter()
+        .map(|(n, _)| *n)
+        .filter(|n| *n != "sub" && *n != "link-to-foo")
+        .collect();
+    for n in &names {
+        std::fs::write(src.join(n), format!("body of {n}\n")).unwrap();
+    }
+    std::os::unix::fs::symlink("../foo", src.join("sub").join("link-to-foo")).unwrap();
+    let img = dir.path().join("srcfolder.dmg");
+    let out = Command::new("hdiutil")
+        .args([
+            "create", "-fs", "APFS", "-layout", "NONE", "-format", "UDRW",
+        ])
+        .args(["-volname", "SRCVOL", "-srcfolder"])
+        .arg(&src)
+        .arg(&img)
+        .output()
+        .unwrap();
+    if !out.status.success() || !img.exists() {
+        eprintln!(
+            "skipping: hdiutil create -srcfolder failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+
+    let mut dev = FileBackend::open(&img).unwrap();
+    let fs = Apfs::open(&mut dev).unwrap();
+    let listed: std::collections::BTreeSet<String> = fs
+        .list_path(&mut dev, "/")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    for n in &names {
+        assert!(listed.contains(*n), "{n:?} missing from {listed:?}");
+    }
+    assert!(listed.contains("sub"));
+    // Lookups by exact and by case-folded name, on a hashed volume.
+    for path in [
+        "/foo",
+        "/FOO",
+        "/MixedCase.TXT",
+        "/mixedcase.txt",
+        "/stra\u{00DF}e",
+    ] {
+        let mut body = String::new();
+        std::io::Read::read_to_string(&mut fs.open_file_reader(&mut dev, path).unwrap(), &mut body)
+            .unwrap();
+        assert!(body.starts_with("body of "), "{path}: {body:?}");
+    }
+    let sub: Vec<String> = fs
+        .list_path(&mut dev, "/sub")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(sub, vec!["link-to-foo".to_string()]);
+    assert_eq!(
+        fs.read_symlink(&mut dev, "/sub/link-to-foo").unwrap(),
+        "../foo",
+        "failed to resolve a symlink macOS wrote"
+    );
+}
+
+/// Two separate write sessions must not hand out the same blocks.
+/// `read_spaceman_high_water` reports the format-time mark forever
+/// (a checkpoint leaves the previous spaceman alone), so before the
+/// fix the bump allocator restarted at the same address on every
+/// reopen and session two's extents landed on top of session one's.
+#[test]
+fn apfs_second_write_session_does_not_clobber_the_first() {
+    let img = NamedTempFile::new().unwrap();
+    {
+        let mut dev = FileBackend::create(img.path(), 4096 * 4096).unwrap();
+        ApfsWriter::new(&mut dev, 4096, 4096, "TWOSESS")
+            .unwrap()
+            .finish()
+            .unwrap();
+        dev.sync().unwrap();
+    }
+    let a = vec![b'A'; 5000];
+    let b = vec![b'B'; 5000];
+    for (name, body) in [("/a.txt", &a), ("/b.txt", &b)] {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        fs.create_file_at(&mut dev, name, body, 0o644, 0).unwrap();
+        dev.sync().unwrap();
+    }
+    let mut dev = FileBackend::open(img.path()).unwrap();
+    let fs = Apfs::open(&mut dev).unwrap();
+    for (name, want) in [("/a.txt", &a), ("/b.txt", &b)] {
+        let mut got = Vec::new();
+        std::io::Read::read_to_end(&mut fs.open_file_reader(&mut dev, name).unwrap(), &mut got)
+            .unwrap();
+        assert_eq!(&got, want, "{name} was clobbered by the other session");
+    }
+}
+
+/// A checkpoint must patch the live APSB/NXSB, not rebuild them from a
+/// fixed template. Before the fix a single `create_file_at` zeroed
+/// `apfs_features`, `apfs_incompatible_features`,
+/// `apfs_extentref_tree_oid`, `apfs_snap_meta_tree_oid` and
+/// `apfs_role`, so a volume our writer touched once stopped being the
+/// volume it was — most visibly, a hashed-drec volume silently became
+/// a plain-drec one and every directory entry on it became unreadable.
+#[test]
+fn apfs_checkpoint_preserves_volume_superblock_state() {
+    use std::os::unix::fs::FileExt;
+    let img = NamedTempFile::new().unwrap();
+    // incompat = CASE_INSENSITIVE | NORMALIZATION_INSENSITIVE.
+    synthesize_volume_with_incompat(img.path(), 0x0000_0009);
+
+    // Stamp a role and an extentref oid the writer has no idea about.
+    let find_apsb = |path: &std::path::Path| -> (std::fs::File, u64) {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let mut magic = [0u8; 4];
+        for paddr in 0..4096u64 {
+            f.read_exact_at(&mut magic, paddr * 4096 + 32).unwrap();
+            if &magic == b"APSB" {
+                return (f, paddr);
+            }
+        }
+        panic!("no APSB");
+    };
+    {
+        let (f, paddr) = find_apsb(img.path());
+        f.write_at(&0xDEADBEEFu64.to_le_bytes(), paddr * 4096 + 144)
+            .unwrap(); // extentref_tree_oid
+        f.write_at(&0x40u16.to_le_bytes(), paddr * 4096 + 964)
+            .unwrap(); // role
+        f.sync_all().unwrap();
+    }
+
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        fs.create_file_at(&mut dev, "/x.txt", b"x\n", 0o644, 0)
+            .unwrap();
+        dev.sync().unwrap();
+    }
+
+    let (f, paddr) = find_apsb(img.path());
+    let mut apsb = vec![0u8; 4096];
+    f.read_exact_at(&mut apsb, paddr * 4096).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(apsb[56..64].try_into().unwrap()),
+        0x0000_0009,
+        "apfs_incompatible_features must survive the checkpoint"
+    );
+    assert_eq!(
+        u64::from_le_bytes(apsb[144..152].try_into().unwrap()),
+        0xDEAD_BEEF,
+        "apfs_extentref_tree_oid must survive the checkpoint"
+    );
+    assert_eq!(
+        u16::from_le_bytes(apsb[964..966].try_into().unwrap()),
+        0x40,
+        "apfs_role must survive the checkpoint"
+    );
+
+    // And the volume still reads back as a hashed-drec volume.
+    let mut dev = FileBackend::open(img.path()).unwrap();
+    let fs = Apfs::open(&mut dev).unwrap();
+    let names: Vec<String> = fs
+        .list_path(&mut dev, "/")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(names, vec!["x.txt".to_string()]);
+}
+
+/// The checkpoint writer rebuilds the container omap with exactly one
+/// volume entry, so a multi-volume container must be refused for
+/// writing rather than silently losing its other volumes.
+#[test]
+fn apfs_open_writable_refuses_multi_volume_container() {
+    use std::os::unix::fs::FileExt;
+    let img = NamedTempFile::new().unwrap();
+    {
+        let mut dev = FileBackend::create(img.path(), 4096 * 4096).unwrap();
+        ApfsWriter::new(&mut dev, 4096, 4096, "MULTI")
+            .unwrap()
+            .finish()
+            .unwrap();
+        dev.sync().unwrap();
+    }
+    // Plant a second populated nx_fs_oid[] slot in every NXSB copy.
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(img.path())
+        .unwrap();
+    let mut magic = [0u8; 4];
+    for paddr in 0..32u64 {
+        f.read_exact_at(&mut magic, paddr * 4096 + 32).unwrap();
+        if &magic == b"NXSB" {
+            // fs_oid[1] at 184 + 8.
+            f.write_at(&2048u64.to_le_bytes(), paddr * 4096 + 192)
+                .unwrap();
+        }
+    }
+    f.sync_all().unwrap();
+
+    let mut dev = FileBackend::open(img.path()).unwrap();
+    // Read-only access is unaffected.
+    Apfs::open(&mut dev).unwrap();
+    let err = Apfs::open_writable(&mut dev).unwrap_err().to_string();
+    assert!(err.contains("2-volume container"), "{err}");
 }

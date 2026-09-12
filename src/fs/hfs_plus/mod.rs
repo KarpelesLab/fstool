@@ -47,6 +47,7 @@
 
 pub mod attributes;
 pub mod btree;
+pub(crate) mod case_fold;
 pub mod catalog;
 pub mod decmpfs;
 pub mod extents;
@@ -132,10 +133,10 @@ impl HfsPlus {
         journal::replay(dev, &vh)?;
         // Re-read the volume header in case replay restored it.
         let vh = read_volume_header(dev)?;
-        let case_sensitive = vh.is_hfsx();
+        let hfsx = vh.is_hfsx();
 
         let cat_fork = ForkReader::from_inline(&vh.catalog_file, vh.block_size, "catalog")?;
-        let catalog = Catalog::open(dev, cat_fork, case_sensitive)?;
+        let catalog = Catalog::open(dev, cat_fork, hfsx)?;
 
         // Open the extents-overflow file if its fork has any blocks.
         // It can be empty on a fresh volume.
@@ -151,7 +152,7 @@ impl HfsPlus {
         // is the table HFSCompression reads `com.apple.decmpfs` from;
         // images produced by our writer have an empty attributes fork
         // and so skip this path entirely.
-        let attributes = open_attributes(dev, &vh, case_sensitive)?;
+        let attributes = open_attributes(dev, &vh, hfsx)?;
 
         // The root folder's thread record is keyed by (ROOT_FOLDER_ID, "");
         // its name field is the volume name.
@@ -181,14 +182,14 @@ impl HfsPlus {
     /// when done to persist the catalog, bitmap, and volume header.
     pub fn format(dev: &mut dyn BlockDevice, opts: &writer::FormatOpts) -> Result<Self> {
         let (vh, w) = writer::format(dev, opts)?;
-        let case_sensitive = vh.is_hfsx();
+        let hfsx = vh.is_hfsx();
         let mut w = w;
         let mut vh_mut = vh.clone();
         writer::flush(&mut w, &mut vh_mut, dev)?;
         w.flushed = false;
 
         let cat_fork = ForkReader::from_inline(&vh_mut.catalog_file, vh_mut.block_size, "catalog")?;
-        let catalog = Catalog::open(dev, cat_fork, case_sensitive)?;
+        let catalog = Catalog::open(dev, cat_fork, hfsx)?;
         let overflow = if vh_mut.extents_file.total_blocks > 0 {
             let ext_fork = ForkReader::from_inline(
                 &vh_mut.extents_file,
@@ -199,7 +200,7 @@ impl HfsPlus {
         } else {
             None
         };
-        let attributes = open_attributes(dev, &vh_mut, case_sensitive)?;
+        let attributes = open_attributes(dev, &vh_mut, hfsx)?;
         let volume_name = w.volume_name.clone();
         Ok(Self {
             volume_header: vh_mut,
@@ -528,13 +529,13 @@ impl HfsPlus {
             return Ok(());
         };
         writer::flush(w, &mut self.volume_header, dev)?;
-        let case_sensitive = self.volume_header.is_hfsx();
+        let hfsx = self.volume_header.is_hfsx();
         let cat_fork = ForkReader::from_inline(
             &self.volume_header.catalog_file,
             self.volume_header.block_size,
             "catalog",
         )?;
-        self.catalog = Catalog::open(dev, cat_fork, case_sensitive)?;
+        self.catalog = Catalog::open(dev, cat_fork, hfsx)?;
         w.flushed = false;
         Ok(())
     }
@@ -1128,16 +1129,29 @@ impl HfsPlus {
         })
     }
 
-    /// Enumerate the direct children of folder `cnid` by scanning
-    /// every leaf node of the catalog from the first leaf onwards
-    /// and collecting entries whose key.parentID matches.
+    /// Enumerate the direct children of folder `cnid`.
+    ///
+    /// Catalog keys sort by `parentID` first, so every child of `cnid`
+    /// is contiguous in the leaf chain. Descend the B-tree to the leaf
+    /// that would hold `(cnid, "")` and walk forward from there,
+    /// stopping at the first key with a larger parent — walking from
+    /// the *first* leaf instead makes every listing cost the whole
+    /// catalog.
     fn list_cnid(&self, dev: &mut dyn BlockDevice, cnid: u32) -> Result<Vec<crate::fs::DirEntry>> {
         use crate::fs::{DirEntry as FsDirEntry, EntryKind};
 
         let mut out = Vec::new();
         let node_size = u32::from(self.catalog.header.node_size);
         let total_nodes = self.catalog.header.total_nodes;
-        let mut node_idx = self.catalog.header.first_leaf_node;
+        let start_key = CatalogKey {
+            parent_id: cnid,
+            name: crate::fs::hfs_plus::catalog::UniStr::default(),
+            encoded_len: 0,
+        };
+        let mut node_idx = match self.catalog.leaf_for_key(dev, &start_key)? {
+            Some(n) => n,
+            None => return Ok(out),
+        };
         // Bound the leaf-chain walk by the catalog node count: a malicious
         // `fLink` cycle would otherwise loop forever.
         let mut steps_left = total_nodes as usize;
@@ -2114,6 +2128,103 @@ mod tests {
     /// at its path with byte-exact contents, and the original file must
     /// still be intact. Locks down the open-as-writable path used by
     /// `fstool add` on an already-flushed HFS+ image.
+    /// The reserved head of an HFS+ volume is bytes 0..1024 plus the
+    /// 512-byte volume header at 1024..1536 — one allocation block at
+    /// 4 KiB but two at 1 KiB and three at 512 bytes. Laying the
+    /// special files out from block 1 regardless put the allocation
+    /// bitmap straight on top of the volume header on any volume with
+    /// a sub-2-KiB block size. The tail is the mirror case: the
+    /// alternate volume header's last 1 KiB spans two 512-byte blocks.
+    #[test]
+    fn small_block_sizes_do_not_clobber_the_volume_headers() {
+        for bs in [512u32, 1024, 2048, 4096] {
+            let mut dev = crate::block::MemoryBackend::new(8 * 1024 * 1024);
+            let opts = writer::FormatOpts {
+                block_size: bs,
+                volume_name: format!("BS{bs}"),
+                ..writer::FormatOpts::default()
+            };
+            let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+            let body = b"payload\n".repeat(100);
+            hfs.create_file(
+                &mut dev,
+                "/f.txt",
+                &mut std::io::Cursor::new(body.clone()),
+                body.len() as u64,
+                0o644,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+            hfs.flush(&mut dev).unwrap();
+
+            let hfs = HfsPlus::open(&mut dev)
+                .unwrap_or_else(|e| panic!("block_size {bs}: reopen failed: {e}"));
+            assert_eq!(hfs.volume_name, format!("BS{bs}"), "block_size {bs}");
+            let mut got = Vec::new();
+            std::io::Read::read_to_end(
+                &mut hfs.open_file_reader(&mut dev, "/f.txt").unwrap(),
+                &mut got,
+            )
+            .unwrap();
+            assert_eq!(got, body, "block_size {bs}");
+        }
+    }
+
+    /// Listings descend the catalog B-tree to the leaf holding
+    /// `(cnid, "")` instead of walking from the first leaf. The
+    /// entries of a directory whose CNID sorts late must still come
+    /// back complete — including the boundary cases of a child that is
+    /// the very first record of a leaf and one that is the very last.
+    #[test]
+    fn list_descends_to_the_right_leaf() {
+        let mut dev = crate::block::MemoryBackend::new(16 * 1024 * 1024);
+        let opts = writer::FormatOpts {
+            catalog_nodes: 64,
+            ..writer::FormatOpts::default()
+        };
+        let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+        // Several sibling directories so the catalog spans many leaves
+        // and the interesting parent is nowhere near the first one.
+        for d in 0..8 {
+            hfs.create_dir(&mut dev, &format!("/d{d}"), 0o755, 0, 0, 0)
+                .unwrap();
+            for i in 0..40 {
+                hfs.create_file(
+                    &mut dev,
+                    &format!("/d{d}/f{i:03}.txt"),
+                    &mut std::io::Cursor::new(b"x".to_vec()),
+                    1,
+                    0o644,
+                    0,
+                    0,
+                    0,
+                )
+                .unwrap();
+            }
+        }
+        hfs.flush(&mut dev).unwrap();
+
+        let hfs = HfsPlus::open(&mut dev).unwrap();
+        assert!(
+            hfs.catalog.header.tree_depth >= 2,
+            "test needs a multi-level catalog"
+        );
+        for d in 0..8 {
+            let names: Vec<String> = hfs
+                .list_path(&mut dev, &format!("/d{d}"))
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect();
+            assert_eq!(names.len(), 40, "/d{d} listing is short: {names:?}");
+            assert!(names.contains(&"f000.txt".to_string()));
+            assert!(names.contains(&"f039.txt".to_string()));
+        }
+        assert_eq!(hfs.list_path(&mut dev, "/").unwrap().len(), 8);
+    }
+
     #[test]
     fn reopen_writable_round_trip_add_file() {
         let mut dev = crate::block::MemoryBackend::new(8 * 1024 * 1024);
@@ -2517,11 +2628,8 @@ mod tests {
         // concerned. We rely on JournalLog::load tolerating a missing
         // checksum recompute because replay only reads start/end.
         let rewound_start: u64 = u64::from(super::journal::JHDR_SIZE);
-        // Patch the header in-place.
-        let mut hdr = [0u8; 24];
-        dev.read_at(jbuf_off, &mut hdr).unwrap();
-        hdr[8..16].copy_from_slice(&rewound_start.to_be_bytes());
-        dev.write_at(jbuf_off, &hdr).unwrap();
+        // Patch the header in-place (keeping its checksum valid).
+        super::journal::rewind_start_for_test(&mut dev, jbuf_off, rewound_start).unwrap();
 
         // Reopen and open the file for writing. The replay should fire
         // and re-apply the transaction. We then close without writing
@@ -2647,11 +2755,8 @@ mod tests {
         // 3. Zero the user-data block on disk, and rewind start so
         //    the journal looks dirty again.
         dev.write_at(dev_off_block0, &[0u8; 4096]).unwrap();
-        let mut hdr = [0u8; 24];
-        dev.read_at(jbuf_off, &mut hdr).unwrap();
         let rewound: u64 = u64::from(super::journal::JHDR_SIZE);
-        hdr[8..16].copy_from_slice(&rewound.to_be_bytes());
-        dev.write_at(jbuf_off, &hdr).unwrap();
+        super::journal::rewind_start_for_test(&mut dev, jbuf_off, rewound).unwrap();
         let _ = sealed_end;
 
         // 4. Reopen — replay should restore the 0xBB pattern.
@@ -3011,11 +3116,8 @@ mod tests {
         let zeros_bm = vec![0u8; bm_len as usize];
         dev.write_at(bm_off, &zeros_bm).unwrap();
         // Rewind start.
-        let mut hdr = [0u8; 24];
-        dev.read_at(jbuf_off, &mut hdr).unwrap();
         let rewound: u64 = u64::from(journal::JHDR_SIZE);
-        hdr[8..16].copy_from_slice(&rewound.to_be_bytes());
-        dev.write_at(jbuf_off, &hdr).unwrap();
+        journal::rewind_start_for_test(&mut dev, jbuf_off, rewound).unwrap();
 
         // Without replay, the catalog is unreadable. With replay, the
         // bytes come back and the catalog opens normally.

@@ -129,53 +129,112 @@ impl UniStr {
     }
 }
 
-/// Case-insensitive folding for a single Basic-Multilingual-Plane code
-/// unit, per HFS+ "H+" case-folding rules (TN1150 §"Case-Insensitive
-/// String Comparison Algorithm"). Returns the folded code unit; the
-/// special value `0xFFFF` is the in-tree "sort-as-maximum" marker the
-/// catalog comparator uses for code units the spec treats as
-/// non-sortable (NUL and other ignorables that appear only in
-/// synthesised internal names such as `\0\0\0\0HFS+ Private Data`).
+/// Case-fold a single UTF-16 code unit the way Apple's
+/// `FastUnicodeCompare` does (TN1150, "Case-Insensitive String
+/// Comparison Algorithm"), using the kernel's own tables in
+/// [`super::case_fold`].
 ///
-/// We carry the upper / lower case mappings that actually occur in
-/// path components used by ASCII + Latin-1 callers, plus the explicit
-/// NUL→`0xFFFF` mapping that makes fsck.hfsplus happy when it walks
-/// the catalog: Apple's tool empirically expects NUL-prefixed names
-/// to sort *after* every printable sibling under the same parent, so
-/// the `HFS+ Private Data` directory lands at the end of the root's
-/// children rather than the start. (Routing NUL through verbatim
-/// compare or a TN1150-style "skip ignorable" both produce orderings
-/// fsck rejects with "b-tree key … is out of order".)
-fn fold_case(c: u16) -> u16 {
-    match c {
-        0x0000 => 0xFFFF,
-        0x41..=0x5A => c + 0x20,
-        // Latin-1 uppercase A-O with diacritics and OE-equivalent
-        0xC0..=0xD6 => c + 0x20,
-        // Latin-1 uppercase O-Y with diacritics
-        0xD8..=0xDE => c + 0x20,
-        _ => c,
-    }
+/// Returns `None` when the code unit is *ignorable*: Apple's table
+/// folds those to zero and the comparator skips them outright, so they
+/// must not contribute to the ordering. `Some(0xFFFF)` is what U+0000
+/// folds to — a NUL is comparable and sorts after everything, which is
+/// what puts `\0\0\0\0HFS+ Private Data` last among the root's
+/// children (an ordering `fsck_hfs` insists on).
+fn fold_case(c: u16) -> Option<u16> {
+    let folded = if c < 0x0100 {
+        super::case_fold::LATIN_CASE_FOLD[c as usize]
+    } else {
+        // The first 256 entries index (in u16 units) the 256-entry
+        // subtable for that high byte, or are zero when nothing in the
+        // block folds and nothing in it is ignorable.
+        let page = super::case_fold::LOWER_CASE_TABLE[(c >> 8) as usize];
+        if page == 0 {
+            c
+        } else {
+            let idx = page as usize + (c & 0x00FF) as usize;
+            match super::case_fold::LOWER_CASE_TABLE.get(idx) {
+                Some(&v) => v,
+                None => c,
+            }
+        }
+    };
+    if folded == 0 { None } else { Some(folded) }
 }
 
-/// Lexicographic compare of two HFSUniStr255 values. With
-/// `case_sensitive == false` (plain HFS+) each code unit is mapped
-/// through the case-folding table before comparison; `case_sensitive
-/// == true` (HFSX binary mode) keeps the verbatim u16 values.
+/// Compare of two HFSUniStr255 values in catalog-key order.
+///
+/// With `case_sensitive == false` (plain HFS+) this is Apple's
+/// `FastUnicodeCompare`: each code unit goes through the TN1150 fold
+/// table, ignorable code units are skipped on both sides, and the
+/// comparison ends at the first differing folded unit — a string that
+/// runs out first compares less because its "next character" is the
+/// zero sentinel. Folding only ASCII and Latin-1 (what we used to do)
+/// leaves every Greek, Cyrillic, Armenian, fullwidth… name unfolded,
+/// and `fsck_hfs` then reports "keys out of order" for a tree we
+/// rebuilt.
+///
+/// With `case_sensitive == true` (HFSX with `keyCompareType` 0xBC)
+/// this is Apple's `UnicodeBinaryCompare`: verbatim code units, length
+/// as the tiebreak.
 pub fn compare_unistr(a: &UniStr, b: &UniStr, case_sensitive: bool) -> Ordering {
-    let n = a.code_units.len().min(b.code_units.len());
-    for i in 0..n {
-        let (ai, bi) = if case_sensitive {
-            (a.code_units[i], b.code_units[i])
-        } else {
-            (fold_case(a.code_units[i]), fold_case(b.code_units[i]))
-        };
-        match ai.cmp(&bi) {
-            Ordering::Equal => continue,
+    if case_sensitive {
+        let n = a.code_units.len().min(b.code_units.len());
+        for i in 0..n {
+            match a.code_units[i].cmp(&b.code_units[i]) {
+                Ordering::Equal => continue,
+                o => return o,
+            }
+        }
+        return a.code_units.len().cmp(&b.code_units.len());
+    }
+    let mut ia = a.code_units.iter();
+    let mut ib = b.code_units.iter();
+    loop {
+        // Zero doubles as "end of string" and "ignorable", exactly as
+        // in FastUnicodeCompare.
+        let ca = ia
+            .by_ref()
+            .filter_map(|&c| fold_case(c))
+            .next()
+            .unwrap_or(0);
+        let cb = ib
+            .by_ref()
+            .filter_map(|&c| fold_case(c))
+            .next()
+            .unwrap_or(0);
+        match ca.cmp(&cb) {
+            Ordering::Equal => {
+                if ca == 0 {
+                    return Ordering::Equal;
+                }
+            }
             o => return o,
         }
     }
-    a.code_units.len().cmp(&b.code_units.len())
+}
+
+/// `keyCompareType` for a binary (case-sensitive) B-tree —
+/// `kHFSBinaryCompare`. The case-folding value is 0xCF.
+pub const KEY_COMPARE_BINARY: u8 = 0xBC;
+
+/// The code-unit sequence a name is *ordered* by, so a sorted
+/// container can key on it directly and get exactly the ordering
+/// [`compare_unistr`] would produce.
+///
+/// Case-insensitive volumes fold each unit and drop the ignorables;
+/// case-sensitive (HFSX, `keyCompareType` 0xBC) volumes order by the
+/// verbatim units. In both cases plain lexicographic `Vec<u16>`
+/// ordering — element-wise, shorter-prefix-first — matches Apple's
+/// comparator.
+pub fn sort_units(name: &UniStr, case_sensitive: bool) -> Vec<u16> {
+    if case_sensitive {
+        name.code_units.clone()
+    } else {
+        name.code_units
+            .iter()
+            .filter_map(|&c| fold_case(c))
+            .collect()
+    }
 }
 
 /// A decoded catalog key.
@@ -463,7 +522,13 @@ pub struct Catalog {
 
 impl Catalog {
     /// Open the catalog by reading its B-tree header node (node 0).
-    pub fn open(dev: &mut dyn BlockDevice, fork: ForkReader, case_sensitive: bool) -> Result<Self> {
+    ///
+    /// `hfsx` says whether the volume's signature is `HX`. Case
+    /// sensitivity is *not* implied by that signature: an HFSX volume
+    /// can be either, and the authority is the catalog B-tree header's
+    /// `keyCompareType` (0xBC = binary/case-sensitive, 0xCF = case
+    /// folding). Plain HFS+ always folds.
+    pub fn open(dev: &mut dyn BlockDevice, fork: ForkReader, hfsx: bool) -> Result<Self> {
         // Read just enough of node 0 to discover the real node size.
         // The header record always begins at byte 14 of node 0, immediately
         // after the BTNodeDescriptor.
@@ -478,6 +543,7 @@ impl Catalog {
         }
         let hdr_buf = &bootstrap[NODE_DESCRIPTOR_SIZE..NODE_DESCRIPTOR_SIZE + HEADER_REC_SIZE];
         let header = BTreeHeader::decode(hdr_buf)?;
+        let case_sensitive = hfsx && header.key_compare_type == KEY_COMPARE_BINARY;
         Ok(Self {
             fork,
             header,
@@ -487,6 +553,77 @@ impl Catalog {
 
     /// Look up the record with exactly the given key. Returns the
     /// decoded record body, or `None` if no exact match exists.
+    /// Index of the leaf node that would hold `wanted`, i.e. the first
+    /// leaf whose key range reaches it. Used to start a directory
+    /// listing at the right place instead of walking the leaf chain
+    /// from the very first leaf — on a big catalog that difference is
+    /// the whole tree versus a handful of nodes.
+    ///
+    /// Returns `None` for an empty tree.
+    pub fn leaf_for_key(
+        &self,
+        dev: &mut dyn BlockDevice,
+        wanted: &CatalogKey,
+    ) -> Result<Option<u32>> {
+        let node_size = u32::from(self.header.node_size);
+        let mut node_idx = self.header.root_node;
+        if node_idx == 0 {
+            return Ok(None);
+        }
+        // Same descent guard as `lookup`: a malicious index record can
+        // point at itself or past the end of the tree.
+        let max_descent = self.header.tree_depth.max(1) as usize + 1;
+        for _ in 0..max_descent {
+            if node_idx >= self.header.total_nodes {
+                return Err(crate::Error::InvalidImage(format!(
+                    "hfs+: catalog child node {node_idx} >= total_nodes {}",
+                    self.header.total_nodes
+                )));
+            }
+            let node = read_node(dev, &self.fork, node_idx, node_size)?;
+            let desc = NodeDescriptor::decode(&node)?;
+            if desc.kind == KIND_LEAF {
+                return Ok(Some(node_idx));
+            }
+            if desc.kind != KIND_INDEX {
+                return Err(crate::Error::InvalidImage(format!(
+                    "hfs+: unexpected B-tree node kind {} in catalog traversal",
+                    desc.kind
+                )));
+            }
+            let offs = record_offsets(&node, desc.num_records)?;
+            let mut child: Option<u32> = None;
+            for i in 0..desc.num_records as usize {
+                let rec = record_bytes(&node, &offs, i);
+                let key = CatalogKey::decode(rec)?;
+                let pointer_off = align2(key.encoded_len);
+                if pointer_off + 4 > rec.len() {
+                    return Err(crate::Error::InvalidImage(
+                        "hfs+: index record missing child pointer".into(),
+                    ));
+                }
+                let next =
+                    u32::from_be_bytes(rec[pointer_off..pointer_off + 4].try_into().unwrap());
+                match key.compare(wanted, self.case_sensitive) {
+                    Ordering::Less | Ordering::Equal => child = Some(next),
+                    // `wanted` sorts before every key in this node, so
+                    // it belongs in the leftmost subtree.
+                    Ordering::Greater => {
+                        child.get_or_insert(next);
+                        break;
+                    }
+                }
+            }
+            node_idx = match child {
+                Some(c) => c,
+                None => return Ok(None),
+            };
+        }
+        Err(crate::Error::InvalidImage(
+            "hfs+: catalog B-tree descent exceeded tree depth (cycle?)".into(),
+        ))
+    }
+
     pub fn lookup(
         &self,
         dev: &mut dyn BlockDevice,

@@ -88,6 +88,7 @@ const OFF_HASHTABLE: usize = 0x018;
 const OFF_BYTE_SIZE: usize = 0x144; // file header
 const OFF_DAYS: usize = 0x1a4; // last-modified date triplet (dir/file)
 const OFF_NAME_LEN: usize = 0x1b0;
+const OFF_REAL_ENTRY: usize = 0x1d4; // hard link: header block of the target
 const OFF_NEXT_SAME_HASH: usize = 0x1f0;
 const OFF_EXTENSION: usize = 0x1f8; // file header / ext: next extension block
 const OFF_SEC_TYPE: usize = 0x1fc;
@@ -432,6 +433,42 @@ impl Affs {
                     _ => EntryKind::Unknown,
                 };
                 let name = read_name(&hb);
+                // Dates belong to the entry itself, so read them off
+                // the link's own header before it may be swapped for
+                // the target's below.
+                let mtime = amiga_date_to_unix(
+                    be_i32(&hb, OFF_DAYS),
+                    be_i32(&hb, OFF_DAYS + 4),
+                    be_i32(&hb, OFF_DAYS + 8),
+                );
+                // An AFFS hard link (ST_LINKFILE / ST_LINKDIR) is a
+                // header with no content of its own: its byteSize is
+                // zero, its data-block table and hash table are empty,
+                // and `realEntry` (0x1d4) names the header that holds
+                // everything. Read the target's header so the link
+                // reports the target's size and, for a linked
+                // directory, lists the target's children — otherwise
+                // every hard link looks like an empty file or folder.
+                let mut data_block = entry;
+                if matches!(sec_type, ST_LINKFILE | ST_LINKDIR) {
+                    let real = be_u32(&hb, OFF_REAL_ENTRY);
+                    if real != 0 && real != entry && (real as u64) < total_blocks as u64 {
+                        let mut target = vec![0u8; BSIZE];
+                        dev.read_at(real as u64 * BSIZE as u64, &mut target)?;
+                        // Only follow a link that actually points at a
+                        // matching real object; a broken or hostile
+                        // `realEntry` leaves the link as-is.
+                        let target_type = be_i32(&target, OFF_SEC_TYPE);
+                        let ok = match sec_type {
+                            ST_LINKFILE => target_type == ST_FILE,
+                            _ => target_type == ST_USERDIR || target_type == ST_ROOT,
+                        };
+                        if ok {
+                            data_block = real;
+                            hb = target;
+                        }
+                    }
+                }
                 let size = if kind == EntryKind::Regular {
                     be_u32(&hb, OFF_BYTE_SIZE) as u64
                 } else {
@@ -442,22 +479,28 @@ impl Affs {
                 } else {
                     None
                 };
-                let mtime = amiga_date_to_unix(
-                    be_i32(&hb, OFF_DAYS),
-                    be_i32(&hb, OFF_DAYS + 4),
-                    be_i32(&hb, OFF_DAYS + 8),
-                );
                 if !name.is_empty() && kind != EntryKind::Unknown {
                     out.push(Node {
                         name,
-                        block: entry,
+                        // For a hard link this is the *target's* header,
+                        // so reads and directory walks go through the
+                        // object that actually holds the content.
+                        block: data_block,
                         kind,
                         size,
                         link_target,
                         mtime,
                     });
                 }
-                entry = be_u32(&hb, OFF_NEXT_SAME_HASH);
+                // `hb` may now hold the *target's* header; the chain
+                // pointer belongs to the link, so re-read it from the
+                // block we actually walked.
+                let mut chain = vec![0u8; 4];
+                dev.read_at(
+                    entry as u64 * BSIZE as u64 + OFF_NEXT_SAME_HASH as u64,
+                    &mut chain,
+                )?;
+                entry = u32::from_be_bytes([chain[0], chain[1], chain[2], chain[3]]);
             }
         }
         Ok(out)

@@ -20,7 +20,16 @@ use super::{
 };
 
 /// Bits of allocation state per bitmap block: `(BSIZE/4 - 1)` words × 32.
-const BM_BITS_PER_BLOCK: u32 = (BSIZE as u32 / 4 - 1) * 32;
+pub(super) const BM_BITS_PER_BLOCK: u32 = (BSIZE as u32 / 4 - 1) * 32;
+
+/// Bitmap-page pointers stored inline in the root block (`bmPages`, at
+/// offset 0x13c). Anything beyond this lives in the bitmap-extension
+/// chain hanging off `bmExt` at 0x1a0.
+const ROOT_BM_PAGES: usize = 25;
+
+/// Bitmap-page pointers per bitmap-extension block: every word except
+/// the last, which points at the next extension block.
+const BM_EXT_PAGES: usize = BSIZE / 4 - 1;
 
 /// Options for formatting a fresh AFFS volume.
 #[derive(Clone, Debug)]
@@ -351,7 +360,18 @@ impl AffsWriter {
         used[1] = true;
         used[root_block as usize] = true;
         let bm_blocks: Vec<u32> = (0..bm_count).map(|i| root_block + 1 + i).collect();
-        for &b in &bm_blocks {
+        // Only 25 page pointers fit in the root; the rest hang off the
+        // `bmExt` chain at root offset 0x1a0. Without those extension
+        // blocks every volume past ~49.6 MiB ships a bitmap that only
+        // describes its first 101 600 blocks, and the kernel treats the
+        // undescribed tail as unusable.
+        let ext_count = bm_count
+            .saturating_sub(ROOT_BM_PAGES as u32)
+            .div_ceil(BM_EXT_PAGES as u32);
+        let bm_ext_blocks: Vec<u32> = (0..ext_count)
+            .map(|i| root_block + 1 + bm_count + i)
+            .collect();
+        for &b in bm_blocks.iter().chain(bm_ext_blocks.iter()) {
             if b as usize >= used.len() {
                 return Err(Error::InvalidArgument(
                     "affs: volume too small for bitmap".into(),
@@ -429,7 +449,7 @@ impl AffsWriter {
         // Root block.
         {
             let table = dir_hashtable.get(&0).cloned().unwrap_or([0; HT_SIZE]);
-            let buf = self.build_root(root_block, &table, &bm_blocks);
+            let buf = self.build_root(root_block, &table, &bm_blocks, &bm_ext_blocks);
             dev.write_at(root_block as u64 * BSIZE as u64, &buf)?;
         }
         for &id in &ids {
@@ -461,8 +481,10 @@ impl AffsWriter {
             }
         }
 
-        // Bitmap blocks.
+        // Bitmap blocks + the extension chain that indexes the pages
+        // the root block has no room for.
         self.write_bitmap(dev, &bm_blocks, &used)?;
+        self.write_bitmap_ext(dev, &bm_blocks, &bm_ext_blocks)?;
 
         // Boot block (non-bootable: "DOS"+flag, root pointer left 0 so the
         // reader/kernel derive it from geometry).
@@ -475,7 +497,13 @@ impl AffsWriter {
         Ok(())
     }
 
-    fn build_root(&self, self_block: u32, table: &[u32; HT_SIZE], bm_blocks: &[u32]) -> Vec<u8> {
+    fn build_root(
+        &self,
+        self_block: u32,
+        table: &[u32; HT_SIZE],
+        bm_blocks: &[u32],
+        bm_ext_blocks: &[u32],
+    ) -> Vec<u8> {
         let mut b = vec![0u8; BSIZE];
         put_u32(&mut b, 0x00, T_HEADER as u32);
         put_u32(&mut b, 0x0c, HT_SIZE as u32); // hashTableSize (root only)
@@ -483,9 +511,11 @@ impl AffsWriter {
             put_u32(&mut b, 0x18 + i * 4, slot);
         }
         put_i32(&mut b, 0x138, -1); // bmFlag = valid
-        for (i, &bm) in bm_blocks.iter().take(25).enumerate() {
+        for (i, &bm) in bm_blocks.iter().take(ROOT_BM_PAGES).enumerate() {
             put_u32(&mut b, 0x13c + i * 4, bm);
         }
+        // bmExt: head of the bitmap-extension chain (0 when all pages fit).
+        put_u32(&mut b, 0x1a0, bm_ext_blocks.first().copied().unwrap_or(0));
         // root-dir, volume, and creation date triplets all set to create_date.
         let (d, m, t) = unix_to_amiga(self.create_date);
         for off in [0x1a4usize, 0x1d8, 0x1e4] {
@@ -626,6 +656,33 @@ impl AffsWriter {
             }
             fix_checksum(&mut blk, 0x00);
             dev.write_at(bm as u64 * BSIZE as u64, &blk)?;
+        }
+        Ok(())
+    }
+
+    /// Write the bitmap-extension chain: each block holds
+    /// `BM_EXT_PAGES` bitmap-page pointers followed by the next
+    /// extension block (0 to terminate). Extension blocks carry no
+    /// checksum — the whole block is pointers.
+    fn write_bitmap_ext(
+        &self,
+        dev: &mut dyn BlockDevice,
+        bm_blocks: &[u32],
+        bm_ext_blocks: &[u32],
+    ) -> Result<()> {
+        if bm_ext_blocks.is_empty() {
+            return Ok(());
+        }
+        let spilled = &bm_blocks[ROOT_BM_PAGES.min(bm_blocks.len())..];
+        for (i, &ext) in bm_ext_blocks.iter().enumerate() {
+            let mut blk = vec![0u8; BSIZE];
+            let start = i * BM_EXT_PAGES;
+            for (w, &page) in spilled.iter().skip(start).take(BM_EXT_PAGES).enumerate() {
+                put_u32(&mut blk, w * 4, page);
+            }
+            let next = bm_ext_blocks.get(i + 1).copied().unwrap_or(0);
+            put_u32(&mut blk, BM_EXT_PAGES * 4, next);
+            dev.write_at(ext as u64 * BSIZE as u64, &blk)?;
         }
         Ok(())
     }

@@ -292,6 +292,17 @@ impl Hfs {
             if ntype != 0xFF {
                 break; // not a leaf node — chain ended
             }
+            // The record-offset table grows backwards from the end of
+            // the node: entry `i` sits at `NODE_SIZE - 2*(i+1)` and the
+            // record ends where entry `i+1` starts, so `nrecs + 1`
+            // entries must fit between the 14-byte node descriptor and
+            // the end of the node. `ndNRecs` is an unvalidated on-disk
+            // u16: at 256 records the subtraction below reaches offset
+            // 0 and `lo - 2` underflows (a panic in debug, an
+            // out-of-bounds read in release). Clamp to what the node
+            // can actually describe.
+            let max_recs = (NODE_SIZE - 14) / 2 - 1;
+            let nrecs = nrecs.min(max_recs);
             for i in 0..nrecs {
                 let lo = NODE_SIZE - 2 * (i + 1);
                 let o = be16(node, lo) as usize;
@@ -951,6 +962,32 @@ impl Filesystem for Hfs {
 mod tests {
     use super::*;
     use crate::block::MemoryBackend;
+
+    /// `ndNRecs` is an on-disk u16 with no relation to what a 512-byte
+    /// node can hold. At 256 records the offset-table walk reaches
+    /// offset 0 and the `lo - 2` lookup underflows — a panic in debug,
+    /// an out-of-bounds read in release. A corrupt node must be
+    /// clamped, not fatal.
+    #[test]
+    fn walk_leaves_survives_absurd_ndnrecs() {
+        // Two nodes: a header whose bthFNode points at node 1, and a
+        // leaf claiming u16::MAX records.
+        let mut buf = vec![0u8; NODE_SIZE * 2];
+        buf[24..28].copy_from_slice(&1u32.to_be_bytes()); // bthFNode
+        buf[36..40].copy_from_slice(&2u32.to_be_bytes()); // bthNNodes
+        let leaf = NODE_SIZE;
+        buf[leaf + 8] = 0xFF; // ndType = leaf
+        buf[leaf + 10..leaf + 12].copy_from_slice(&u16::MAX.to_be_bytes()); // ndNRecs
+        // No usable offset table — every record is rejected, and the
+        // walk must simply end.
+        let mut seen = 0usize;
+        Hfs::walk_leaves(&buf, |_k, _d| {
+            seen += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, 0);
+    }
 
     const HELLO: &[u8] = b"Hello from classic HFS!\n";
     const DEEP: &[u8] = b"Deep file in sub.\n";

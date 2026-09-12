@@ -41,7 +41,8 @@ use super::catalog::{
     ROOT_PARENT_ID, UniStr, compare_unistr,
 };
 use super::extents::{
-    EXTENT_KEY_PAYLOAD_LEN, EXTENT_RECORD_SIZE, ExtentKey, FORK_DATA, decode_extent_record,
+    EXTENT_KEY_PAYLOAD_LEN, EXTENT_RECORD_SIZE, ExtentKey, FORK_DATA, FORK_RESOURCE,
+    decode_extent_record,
 };
 use super::volume_header::{
     ExtentDescriptor, FORK_DATA_SIZE, FORK_EXTENT_COUNT, ForkData, SIG_HFS_PLUS,
@@ -204,12 +205,86 @@ impl PartialOrd for OwnedKey {
     }
 }
 
+/// A stable total order for keys, used where a deterministic sort is
+/// wanted without reference to a particular volume. It is **not** the
+/// catalog's on-disk order — that depends on the volume's
+/// `keyCompareType` and lives in [`CatalogMap`], which is what the
+/// record map is keyed by.
 impl Ord for OwnedKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match self.parent_id.cmp(&other.parent_id) {
-            std::cmp::Ordering::Equal => compare_unistr(&self.name, &other.name, false),
+            std::cmp::Ordering::Equal => self.name.code_units.cmp(&other.name.code_units),
             o => o,
         }
+    }
+}
+
+/// Catalog records held in on-disk B-tree key order.
+///
+/// The order depends on the volume: plain HFS+ folds case per TN1150,
+/// while HFSX with `keyCompareType` 0xBC compares code units
+/// verbatim. That flag can't live on [`OwnedKey`] without threading it
+/// through every construction site, and it can't be hardcoded either —
+/// a case-insensitive `Ord` on a case-sensitive volume makes
+/// "README" and "readme" the *same* map entry, so the second one
+/// silently replaces the first and the file disappears. So the map
+/// owns the flag and derives each entry's sort key from it.
+pub(crate) struct CatalogMap {
+    case_sensitive: bool,
+    map: BTreeMap<(u32, Vec<u16>), (OwnedKey, Vec<u8>)>,
+}
+
+impl CatalogMap {
+    pub(crate) fn new(case_sensitive: bool) -> Self {
+        Self {
+            case_sensitive,
+            map: BTreeMap::new(),
+        }
+    }
+
+    fn sort_key(&self, key: &OwnedKey) -> (u32, Vec<u16>) {
+        (
+            key.parent_id,
+            super::catalog::sort_units(&key.name, self.case_sensitive),
+        )
+    }
+
+    pub(crate) fn insert(&mut self, key: OwnedKey, body: Vec<u8>) -> Option<Vec<u8>> {
+        let sk = self.sort_key(&key);
+        self.map.insert(sk, (key, body)).map(|(_, b)| b)
+    }
+
+    pub(crate) fn get(&self, key: &OwnedKey) -> Option<&Vec<u8>> {
+        self.map.get(&self.sort_key(key)).map(|(_, b)| b)
+    }
+
+    pub(crate) fn get_mut(&mut self, key: &OwnedKey) -> Option<&mut Vec<u8>> {
+        let sk = self.sort_key(key);
+        self.map.get_mut(&sk).map(|(_, b)| b)
+    }
+
+    pub(crate) fn contains_key(&self, key: &OwnedKey) -> bool {
+        self.map.contains_key(&self.sort_key(key))
+    }
+
+    pub(crate) fn remove(&mut self, key: &OwnedKey) -> Option<Vec<u8>> {
+        let sk = self.sort_key(key);
+        self.map.remove(&sk).map(|(_, b)| b)
+    }
+
+    /// Entries in B-tree key order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&OwnedKey, &Vec<u8>)> {
+        self.map.values().map(|(k, b)| (k, b))
+    }
+
+    /// Mutable entries in B-tree key order. The key is read-only —
+    /// changing a name would invalidate the sort key it's filed under.
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (&OwnedKey, &mut Vec<u8>)> {
+        self.map.values_mut().map(|(k, b)| (&*k, b))
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &Vec<u8>> {
+        self.map.values().map(|(_, b)| b)
     }
 }
 
@@ -238,7 +313,17 @@ pub struct Writer {
     /// Catalog records, keyed in HFS+ catalog-order. Values are the
     /// encoded record bytes (without the leading key — we re-encode the
     /// key from the BTreeMap key on flush).
-    pub(crate) catalog: BTreeMap<OwnedKey, Vec<u8>>,
+    pub(crate) catalog: CatalogMap,
+    /// Volume key ordering: `false` = plain HFS+ case folding
+    /// (`keyCompareType` 0xCF), `true` = HFSX binary compare (0xBC).
+    /// Read off the volume at `open_writable`; `format` only produces
+    /// plain HFS+.
+    pub(crate) case_sensitive: bool,
+    /// Volume signature is `HX` (HFSX). Independent of
+    /// `case_sensitive` — an HFSX volume may still fold case — and it
+    /// is HFSX, not case sensitivity, that makes
+    /// `kHFSHasFolderCountMask` mandatory on folder records.
+    pub(crate) hfsx: bool,
 
     /// Extents-overflow records keyed by `(fork_type, file_id, start_block)`.
     /// Each value is a fixed-size group of up to eight `(start, count)`
@@ -1206,8 +1291,15 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
     }
     let total_blocks = total_blocks_u64 as u32;
 
-    // ---- layout: place special files starting at block 1.
-    let mut cursor: u32 = 1;
+    // ---- layout: place special files after the volume header.
+    //
+    // The reserved area is bytes 0..1024 plus the 512-byte volume
+    // header at 1024..1536 — one allocation block at the usual 4 KiB,
+    // but three at 512 bytes and two at 1 KiB. Starting at block 1
+    // unconditionally puts the allocation bitmap straight on top of the
+    // volume header on any volume with a block size below 2 KiB.
+    let head_reserved = 1536u64.div_ceil(u64::from(bs)) as u32;
+    let mut cursor: u32 = head_reserved;
 
     // Allocation bitmap: one bit per allocation block, rounded up to a
     // whole number of blocks.
@@ -1295,13 +1387,14 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
         let by = (b / 8) as usize;
         bitmap[by] |= 1u8 << (7 - (b & 7));
     }
-    // Mark the very last block as used too: we reserve it for the
-    // alternate volume header.
+    // Mark the tail blocks used too: the alternate volume header sits
+    // in the volume's last 1 KiB, which is one block at 4 KiB but two
+    // at 512 bytes.
+    let tail_reserved = 1024u64.div_ceil(u64::from(bs)) as u32;
     let last_block = total_blocks - 1;
-    let by = (last_block / 8) as usize;
-    let mask = 1u8 << (7 - (last_block & 7));
-    if bitmap[by] & mask == 0 {
-        bitmap[by] |= mask;
+    for b in total_blocks.saturating_sub(tail_reserved)..total_blocks {
+        let by = (b / 8) as usize;
+        bitmap[by] |= 1u8 << (7 - (b & 7));
     }
 
     // Zero only the metadata regions, not the whole device. The special
@@ -1319,10 +1412,9 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
 
     let mut free_blocks = total_blocks - cursor;
     if total_blocks > 0 {
-        // Account for alternate volume header (block last_block).
-        if last_block >= cursor {
-            free_blocks = free_blocks.saturating_sub(1);
-        }
+        // Account for the alternate volume header's tail blocks.
+        let tail_start = total_blocks.saturating_sub(tail_reserved).max(cursor);
+        free_blocks = free_blocks.saturating_sub(total_blocks - tail_start);
     }
 
     let volume_name_unistr = UniStr::from_str_lossy(&opts.volume_name);
@@ -1337,7 +1429,9 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
         bitmap,
         next_alloc: cursor,
         free_blocks,
-        catalog: BTreeMap::new(),
+        catalog: CatalogMap::new(false),
+        case_sensitive: false,
+        hfsx: false,
         overflow_extents: BTreeMap::new(),
         allocation_file,
         extents_file,
@@ -2070,7 +2164,7 @@ pub(crate) fn promote_to_hardlink(
 ) -> Result<u32> {
     // Forbid self-link: a hard link to itself would corrupt the catalog.
     if src_parent == dst_parent
-        && compare_unistr(src_name, dst_name, false) == std::cmp::Ordering::Equal
+        && compare_unistr(src_name, dst_name, writer.case_sensitive) == std::cmp::Ordering::Equal
     {
         return Err(crate::Error::InvalidArgument(
             "hfs+ writer: source and destination hard-link paths are the same".into(),
@@ -2331,32 +2425,43 @@ pub(crate) fn remove_entry(writer: &mut Writer, parent_id: u32, name: &UniStr) -
         }
         REC_FILE => {
             let cnid = u32::from_be_bytes(body[8..12].try_into().unwrap());
-            // Decode data fork to find blocks to free.
-            // dataFork starts at offset 88, 80 bytes.
-            let mut buf = [0u8; FORK_DATA_SIZE];
-            buf.copy_from_slice(&body[88..88 + FORK_DATA_SIZE]);
-            let fork = ForkData::decode(&buf);
-            for ext in &fork.extents {
-                if ext.block_count == 0 {
+            // Free both forks. An HFSPlusCatalogFile carries dataFork at
+            // offset 88 and rsrcFork immediately after it at 168, each an
+            // 80-byte HFSPlusForkData; forgetting the resource fork leaks
+            // its blocks (and its extents-overflow records) for the life
+            // of the volume.
+            let mut to_free: Vec<(u32, u32)> = Vec::new();
+            for fork_off in [88usize, 88 + FORK_DATA_SIZE] {
+                if body.len() < fork_off + FORK_DATA_SIZE {
                     continue;
                 }
-                writer.free(ext.start_block, ext.block_count);
+                let mut buf = [0u8; FORK_DATA_SIZE];
+                buf.copy_from_slice(&body[fork_off..fork_off + FORK_DATA_SIZE]);
+                for ext in &ForkData::decode(&buf).extents {
+                    if ext.block_count != 0 {
+                        to_free.push((ext.start_block, ext.block_count));
+                    }
+                }
+            }
+            for (start, count) in to_free {
+                writer.free(start, count);
             }
             // Drain any spilled extents-overflow records for this file
-            // and free the blocks they describe. Records keyed by
-            // (FORK_DATA, cnid, _) belong to this file.
-            let overflow_keys: Vec<(u8, u32, u32)> = writer
-                .overflow_extents
-                .range((FORK_DATA, cnid, 0)..=(FORK_DATA, cnid, u32::MAX))
-                .map(|(k, _)| *k)
-                .collect();
-            for key in overflow_keys {
-                if let Some(group) = writer.overflow_extents.remove(&key) {
-                    for ext in &group {
-                        if ext.block_count == 0 {
-                            continue;
+            // and free the blocks they describe — for both fork types.
+            for fork_type in [FORK_DATA, FORK_RESOURCE] {
+                let overflow_keys: Vec<(u8, u32, u32)> = writer
+                    .overflow_extents
+                    .range((fork_type, cnid, 0)..=(fork_type, cnid, u32::MAX))
+                    .map(|(k, _)| *k)
+                    .collect();
+                for key in overflow_keys {
+                    if let Some(group) = writer.overflow_extents.remove(&key) {
+                        for ext in &group {
+                            if ext.block_count == 0 {
+                                continue;
+                            }
+                            writer.free(ext.start_block, ext.block_count);
                         }
-                        writer.free(ext.start_block, ext.block_count);
                     }
                 }
             }
@@ -2438,6 +2543,33 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
     //    build once and — if the tree overflows the reserved fork — grow
     //    the fork (appending a fresh extent from free space) and rebuild,
     //    so the header records the correct total / free node counts.
+    // HFSX mandates `kHFSHasFolderCountMask` plus a live `folderCount`
+    // on every folder record (`fsck_hfs`: "HasFolderCount flag needs to
+    // be set"). Recompute both from the record set here instead of
+    // threading them through every mutation — the catalog is already
+    // fully in memory at this point.
+    if writer.hfsx {
+        const HAS_FOLDER_COUNT: u16 = 0x0010;
+        let mut subfolders: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for (key, body) in writer.catalog.iter() {
+            if body.len() >= 2 && i16::from_be_bytes([body[0], body[1]]) == REC_FOLDER {
+                *subfolders.entry(key.parent_id).or_default() += 1;
+            }
+        }
+        for (_, body) in writer.catalog.iter_mut() {
+            if body.len() < 88 || i16::from_be_bytes([body[0], body[1]]) != REC_FOLDER {
+                continue;
+            }
+            let flags = u16::from_be_bytes([body[2], body[3]]) | HAS_FOLDER_COUNT;
+            body[2..4].copy_from_slice(&flags.to_be_bytes());
+            let folder_id = u32::from_be_bytes(body[8..12].try_into().unwrap());
+            let count = subfolders.get(&folder_id).copied().unwrap_or(0);
+            // HFSPlusCatalogFolder.folderCount sits at +84, in what
+            // plain HFS+ leaves as `reserved`.
+            body[84..88].copy_from_slice(&count.to_be_bytes());
+        }
+    }
+
     let cat_records = |w: &Writer| -> Vec<PackedRecord> {
         w.catalog
             .iter()
@@ -2460,6 +2592,18 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
         grow_catalog_fork(writer, built.nodes.len() as u32)?;
         cat_total_nodes = cat_capacity(writer)?;
         built = build_btree(cat_records(writer), writer.node_size, cat_total_nodes)?;
+    }
+    // `header_node` writes the plain-HFS+ `keyCompareType` (0xCF,
+    // case folding). On HFSX the catalog is ordered binary and the
+    // header must say so (0xBC = kHFSBinaryCompare) or the kernel and
+    // fsck_hfs will read the tree with the wrong comparator.
+    if writer.case_sensitive
+        && let Some(header) = built.nodes.first_mut()
+    {
+        let off = NODE_DESCRIPTOR_SIZE + 37;
+        if header.len() > off {
+            header[off] = super::catalog::KEY_COMPARE_BINARY;
+        }
     }
     write_btree_to_fork(
         &mut sink,
@@ -2513,20 +2657,44 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
     )?;
 
     // 3. Allocation bitmap.
-    let bm_off =
-        u64::from(writer.allocation_file.extents[0].start_block) * u64::from(writer.block_size);
-    sink.write_at(bm_off, &writer.bitmap)?;
+    //
     // TN1150: when the bitmap has more bits than allocation blocks (the last
     // byte is partial), the bits beyond `total_blocks` must read as **zero** on
     // disk. The in-memory bitmap keeps those padding bits set to 1 so the
-    // allocator never hands them out; clear them in the last on-disk byte so
+    // allocator never hands them out; clear them in the copy we write so
     // `fsck.hfsplus` doesn't flag "Volume Bit Map needs minor repair".
+    let mut on_disk_bitmap = writer.bitmap.clone();
     if !writer.total_blocks.is_multiple_of(8) {
         let last = (writer.total_blocks / 8) as usize;
-        if last < writer.bitmap.len() {
+        if last < on_disk_bitmap.len() {
             let valid = writer.total_blocks % 8;
-            let corrected = writer.bitmap[last] & ((!0u8) << (8 - valid));
-            sink.write_at(bm_off + last as u64, &[corrected])?;
+            on_disk_bitmap[last] &= (!0u8) << (8 - valid);
+        }
+    }
+    // Write it back across the allocation file's extents. A fragmented
+    // allocation file (possible on a volume we didn't format) would
+    // otherwise get its tail written straight over whatever follows the
+    // first extent.
+    {
+        let mut written = 0usize;
+        for ext in writer.allocation_file.extents.iter() {
+            if written >= on_disk_bitmap.len() {
+                break;
+            }
+            if ext.block_count == 0 {
+                continue;
+            }
+            let span = (u64::from(ext.block_count) * u64::from(writer.block_size)) as usize;
+            let take = span.min(on_disk_bitmap.len() - written);
+            let off = u64::from(ext.start_block) * u64::from(writer.block_size);
+            sink.write_at(off, &on_disk_bitmap[written..written + take])?;
+            written += take;
+        }
+        if written < on_disk_bitmap.len() {
+            return Err(crate::Error::Unsupported(format!(
+                "hfs+ writer: allocation file's inline extents cover {written} of                  {} bitmap bytes (extents-overflow allocation file is not supported)",
+                on_disk_bitmap.len()
+            )));
         }
     }
     // Pad the rest of the allocation-file blocks with zero already done
@@ -2551,7 +2719,7 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
         let info_off = u64::from(writer.journal_info_block) * bs;
         let info = encode_journal_info_block(jbuf_offset, jbuf_size);
         sink.write_at(info_off, &info)?;
-        let hdr = encode_journal_header(jbuf_size);
+        let hdr = super::journal::fresh_journal_header(jbuf_size);
         sink.write_at(jbuf_offset, &hdr)?;
         // Mark the journaled attribute in the volume header.
         vh.attributes |= VOL_ATTR_JOURNALED;
@@ -2656,62 +2824,6 @@ fn encode_journal_info_block(buf_offset: u64, buf_size: u64) -> [u8; 512] {
     b
 }
 
-/// Encode the journal header that lives at the start of the journal
-/// buffer. With `start == end == jhdr_size` and no transactions queued,
-/// the kernel concludes there is nothing to replay.
-///
-/// TN1150 / Apple `journal.h`:
-///
-/// ```text
-/// 0    4   magic       0x4a4e4c78 "JNLx"
-/// 4    4   endian      0x12345678
-/// 8    8   start       (= jhdr_size, no transactions)
-/// 16   8   end         (= start)
-/// 24   8   size        journal buffer size in bytes
-/// 32   4   blhdr_size  block-list-header size (== sector size, 512)
-/// 36   4   checksum    CRC over the header w/ this field 0
-/// 40   4   jhdr_size   size of this header (== 512)
-/// ```
-fn encode_journal_header(buf_size: u64) -> [u8; 512] {
-    let mut b = [0u8; 512];
-    let jhdr_size: u32 = 512;
-    b[0..4].copy_from_slice(&JOURNAL_HEADER_MAGIC.to_be_bytes());
-    b[4..8].copy_from_slice(&JOURNAL_HEADER_ENDIAN.to_be_bytes());
-    b[8..16].copy_from_slice(&u64::from(jhdr_size).to_be_bytes());
-    b[16..24].copy_from_slice(&u64::from(jhdr_size).to_be_bytes());
-    b[24..32].copy_from_slice(&buf_size.to_be_bytes());
-    b[32..36].copy_from_slice(&jhdr_size.to_be_bytes()); // blhdr_size (use jhdr_size)
-    // Checksum over the header with the checksum field zeroed.
-    b[36..40].copy_from_slice(&0u32.to_be_bytes());
-    b[40..44].copy_from_slice(&jhdr_size.to_be_bytes());
-    let csum = journal_header_checksum(&b);
-    b[36..40].copy_from_slice(&csum.to_be_bytes());
-    b
-}
-
-/// CRC-32 over the journal header bytes with the checksum field
-/// zeroed. We use Apple's variant (CRC-32 with reflected polynomial
-/// 0xEDB88320, initial 0xFFFFFFFF, finalise without XOR) — that's
-/// the same algorithm zlib calls "CRC32" minus the final XOR.
-fn journal_header_checksum(buf: &[u8]) -> u32 {
-    // Compute over the entire 512-byte header. Apple's journal code
-    // only covers the journal-header struct (jhdr_size bytes), which is
-    // exactly the 512-byte sector we built.
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &byte in buf {
-        let mut c = (crc ^ u32::from(byte)) & 0xff;
-        for _ in 0..8 {
-            c = if c & 1 != 0 {
-                (c >> 1) ^ 0xEDB8_8320
-            } else {
-                c >> 1
-            };
-        }
-        crc = (crc >> 8) ^ c;
-    }
-    crc
-}
-
 /// Write a sequence of pre-encoded B-tree nodes into the fork's first
 /// extent through the supplied [`super::journal::FlushSink`]. On a
 /// `Direct` sink the writes hit `dev` immediately; on a `Buffered` sink
@@ -2804,15 +2916,23 @@ pub fn open_writable(
     }
 
     // ---- 1. Load the allocation bitmap.
+    //
+    // Read it through the allocation file's whole extent list, not just
+    // its first extent: a volume formatted elsewhere (or grown) can
+    // have a fragmented allocation file, and reading straight off the
+    // first extent would splice unrelated blocks into the bitmap and
+    // then, on flush, write the bitmap over them. `from_inline` also
+    // refuses an allocation file that spills into the
+    // extents-overflow tree, which the flush path could not write back.
     let bitmap_bytes = (total_blocks as u64).div_ceil(8) as usize;
     let mut bitmap = vec![0u8; bitmap_bytes];
-    if let Some(first) = vh.allocation_file.extents.first()
-        && first.block_count > 0
-    {
-        let off = u64::from(first.start_block) * u64::from(block_size);
-        // The on-disk bitmap may span more bytes than the live size
-        // (rounded up to a whole block); only read what we need.
-        dev.read_at(off, &mut bitmap)?;
+    if vh.allocation_file.extents.iter().any(|e| e.block_count > 0) {
+        let bm_fork = ForkReader::from_inline(
+            &vh.allocation_file,
+            block_size,
+            "allocation bitmap (writable open)",
+        )?;
+        bm_fork.read(dev, 0, &mut bitmap)?;
     }
     let free_blocks = count_free_bits(&bitmap, total_blocks);
 
@@ -2823,7 +2943,15 @@ pub fn open_writable(
     let node_size = u32::from(cat_header.node_size);
     let cat_total_nodes = cat_header.total_nodes;
 
-    let mut catalog: BTreeMap<OwnedKey, Vec<u8>> = BTreeMap::new();
+    // HFS+ ('H+') always folds case. HFSX ('HX') may do either, and
+    // the authority is the catalog B-tree header's `keyCompareType`
+    // (0xBC = binary/case-sensitive, 0xCF = case folding) — not the
+    // signature, since a case-insensitive HFSX volume exists. Getting
+    // this wrong on a case-sensitive volume makes "README" and
+    // "readme" collide in the in-memory catalog, so the second one
+    // replaces the first and a file vanishes on flush.
+    let case_sensitive = vh.is_hfsx() && cat_header.key_compare_type == 0xBC;
+    let mut catalog = CatalogMap::new(case_sensitive);
     let mut node_idx = cat_header.first_leaf_node;
     // HFS-1: bound the leaf-chain walk by the node count and reject any
     // out-of-range `f_link`, mirroring the read-side guard in
@@ -2962,6 +3090,8 @@ pub fn open_writable(
         next_alloc: total_blocks,
         free_blocks,
         catalog,
+        case_sensitive,
+        hfsx: vh.is_hfsx(),
         overflow_extents,
         allocation_file: vh.allocation_file,
         extents_file: vh.extents_file,
@@ -3463,6 +3593,81 @@ mod tests {
         remove_entry(&mut writer, ROOT_FOLDER_ID, &name).unwrap();
         assert!(writer.overflow_extents.is_empty());
         assert_eq!(writer.free_blocks, before_free);
+
+        flush(&mut writer, &mut vh, &mut dev).unwrap();
+    }
+
+    /// `remove` used to free only the data fork, so a file with a
+    /// resource fork leaked the resource fork's inline extents *and*
+    /// its extents-overflow records for the life of the volume. Our
+    /// own writer never creates resource forks, but `open_writable`
+    /// adopts catalog records from volumes that do.
+    #[test]
+    fn remove_frees_the_resource_fork_too() {
+        let mut dev = MemoryBackend::new(16 * 1024 * 1024);
+        let opts = FormatOpts::default();
+        let (mut vh, mut writer) = format(&mut dev, &opts).unwrap();
+
+        let before_free = writer.free_blocks;
+        let bs = writer.block_size as usize;
+        let payload = vec![0xAB; bs * 2];
+        let cnid = writer.next_cnid;
+        writer.next_cnid += 1;
+        let mut src = std::io::Cursor::new(&payload);
+        let fork =
+            stream_data_to_blocks(&mut writer, &mut dev, &mut src, payload.len() as u64, cnid)
+                .unwrap();
+        let name = UniStr::from_str_lossy("with-rsrc.bin");
+        insert_file(
+            &mut writer,
+            ROOT_FOLDER_ID,
+            &name,
+            cnid,
+            0o644 | crate::fs::hfs_plus::catalog::mode::S_IFREG,
+            0,
+            0,
+            0,
+            *b"\0\0\0\0",
+            *b"\0\0\0\0",
+            &fork,
+            0,
+        )
+        .unwrap();
+
+        // Give the record a resource fork: three inline blocks plus a
+        // two-block extents-overflow group, the way an adopted record
+        // from a Mac-written volume would look.
+        let rsrc_inline = writer.allocate(3).unwrap();
+        let rsrc_spill = writer.allocate(2).unwrap();
+        let key = OwnedKey {
+            parent_id: ROOT_FOLDER_ID,
+            name: name.clone(),
+        };
+        let body = writer.catalog.get_mut(&key).unwrap();
+        let roff = 88 + FORK_DATA_SIZE;
+        let rsrc_bytes = (3 * bs) as u64;
+        body[roff..roff + 8].copy_from_slice(&rsrc_bytes.to_be_bytes()); // logicalSize
+        body[roff + 12..roff + 16].copy_from_slice(&3u32.to_be_bytes()); // totalBlocks
+        body[roff + 16..roff + 20].copy_from_slice(&rsrc_inline.to_be_bytes());
+        body[roff + 20..roff + 24].copy_from_slice(&3u32.to_be_bytes());
+        writer.overflow_extents.insert((FORK_RESOURCE, cnid, 3), {
+            let mut group = [ExtentDescriptor::default(); 8];
+            group[0] = ExtentDescriptor {
+                start_block: rsrc_spill,
+                block_count: 2,
+            };
+            group
+        });
+
+        remove_entry(&mut writer, ROOT_FOLDER_ID, &name).unwrap();
+        assert!(
+            writer.overflow_extents.is_empty(),
+            "resource-fork overflow records must be dropped"
+        );
+        assert_eq!(
+            writer.free_blocks, before_free,
+            "both forks' blocks must come back"
+        );
 
         flush(&mut writer, &mut vh, &mut dev).unwrap();
     }
