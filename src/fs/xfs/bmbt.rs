@@ -43,6 +43,11 @@ use crate::block::BlockDevice;
 /// Bytes per extent record on disk.
 pub const BMBT_REC_SIZE: usize = 16;
 
+/// Largest block count a single `xfs_bmbt_rec` can express — the
+/// on-disk field is 21 bits (`MAXEXTLEN` / `XFS_MAX_BMBT_EXTLEN` in
+/// `fs/xfs/libxfs/xfs_format.h`).
+pub const MAX_EXTENT_BLOCKS: u32 = (1 << 21) - 1;
+
 /// Bytes per key in a bmbt B-tree node.
 pub const BMBT_KEY_SIZE: usize = 8;
 
@@ -108,17 +113,40 @@ impl Extent {
     /// Encode this record as the on-disk packed 128-bit form. Used by
     /// the writer to lay extent lists into the inode literal area and
     /// into bmbt leaf blocks; also used by the round-trip unit test.
-    pub fn encode(&self) -> [u8; BMBT_REC_SIZE] {
+    ///
+    /// Every field is narrower than its in-memory type: the logical
+    /// offset is 54 bits, the start block 52, and the block count only
+    /// [`MAX_EXTENT_BLOCKS`] (21 bits). A value that does not fit is an
+    /// error — masking it would write a record describing a different
+    /// range than the caller allocated.
+    pub fn encode(&self) -> Result<[u8; BMBT_REC_SIZE]> {
+        if self.blockcount == 0 || self.blockcount > MAX_EXTENT_BLOCKS {
+            return Err(crate::Error::InvalidArgument(format!(
+                "xfs: extent blockcount {} outside 1..={MAX_EXTENT_BLOCKS} \
+                 (the bmbt record field is 21 bits)",
+                self.blockcount
+            )));
+        }
+        if self.offset >= 1 << 54 {
+            return Err(crate::Error::InvalidArgument(format!(
+                "xfs: extent logical offset {} does not fit in 54 bits",
+                self.offset
+            )));
+        }
+        if self.startblock >= 1 << 52 {
+            return Err(crate::Error::InvalidArgument(format!(
+                "xfs: extent startblock {} does not fit in 52 bits",
+                self.startblock
+            )));
+        }
         let unwritten = if self.unwritten { 1u64 } else { 0 };
-        let hi = (unwritten << 63)
-            | ((self.offset & ((1 << 54) - 1)) << 9)
-            | ((self.startblock >> 43) & ((1 << 9) - 1));
-        let lo = ((self.startblock & ((1 << 43) - 1)) << 21)
-            | (self.blockcount as u64 & ((1 << 21) - 1));
+        let hi =
+            (unwritten << 63) | (self.offset << 9) | ((self.startblock >> 43) & ((1 << 9) - 1));
+        let lo = ((self.startblock & ((1 << 43) - 1)) << 21) | (self.blockcount as u64);
         let mut out = [0u8; 16];
         out[0..8].copy_from_slice(&hi.to_be_bytes());
         out[8..16].copy_from_slice(&lo.to_be_bytes());
-        out
+        Ok(out)
     }
 }
 
@@ -463,7 +491,7 @@ mod tests {
             },
         ];
         for c in cases {
-            let bytes = c.encode();
+            let bytes = c.encode().unwrap();
             let back = Extent::decode(&bytes).unwrap();
             assert_eq!(back, c);
         }
@@ -536,8 +564,8 @@ mod tests {
             blockcount: 8,
             unwritten: false,
         };
-        leaf0[72..72 + 16].copy_from_slice(&e0.encode());
-        leaf0[72 + 16..72 + 32].copy_from_slice(&e1.encode());
+        leaf0[72..72 + 16].copy_from_slice(&e0.encode().unwrap());
+        leaf0[72 + 16..72 + 32].copy_from_slice(&e1.encode().unwrap());
         // Write at FSB 10.
         dev.write_at(fsb_to_byte(agblklog, blocksize, agblocks, 10), &leaf0)
             .unwrap();
@@ -558,8 +586,8 @@ mod tests {
             blockcount: 1,
             unwritten: false,
         };
-        leaf1[72..72 + 16].copy_from_slice(&e2.encode());
-        leaf1[72 + 16..72 + 32].copy_from_slice(&e3.encode());
+        leaf1[72..72 + 16].copy_from_slice(&e2.encode().unwrap());
+        leaf1[72 + 16..72 + 32].copy_from_slice(&e3.encode().unwrap());
         dev.write_at(fsb_to_byte(agblklog, blocksize, agblocks, 11), &leaf1)
             .unwrap();
 
@@ -669,8 +697,8 @@ mod tests {
             blockcount: 8,
             unwritten: false,
         };
-        leaf0[72..72 + 16].copy_from_slice(&e0.encode());
-        leaf0[72 + 16..72 + 32].copy_from_slice(&e1.encode());
+        leaf0[72..72 + 16].copy_from_slice(&e0.encode().unwrap());
+        leaf0[72 + 16..72 + 32].copy_from_slice(&e1.encode().unwrap());
         dev.write_at(fsb_to_byte(agblklog, blocksize, agblocks, 10), &leaf0)
             .unwrap();
 
@@ -689,8 +717,8 @@ mod tests {
             blockcount: 1,
             unwritten: false,
         };
-        leaf1[72..72 + 16].copy_from_slice(&e2.encode());
-        leaf1[72 + 16..72 + 32].copy_from_slice(&e3.encode());
+        leaf1[72..72 + 16].copy_from_slice(&e2.encode().unwrap());
+        leaf1[72 + 16..72 + 32].copy_from_slice(&e3.encode().unwrap());
         dev.write_at(fsb_to_byte(agblklog, blocksize, agblocks, 11), &leaf1)
             .unwrap();
 
@@ -730,7 +758,7 @@ mod tests {
             blockcount: 3,
             unwritten: false,
         };
-        root[4..20].copy_from_slice(&e.encode());
+        root[4..20].copy_from_slice(&e.encode().unwrap());
         let got = read_btree_dir_extents(&mut dev, &layout, &root).unwrap();
         assert_eq!(got, vec![e]);
     }
@@ -792,7 +820,7 @@ mod tests {
             leaf[0..4].copy_from_slice(&XFS_BMAP_CRC_MAGIC.to_be_bytes());
             leaf[4..6].copy_from_slice(&0u16.to_be_bytes()); // level=0
             leaf[6..8].copy_from_slice(&1u16.to_be_bytes()); // numrecs=1
-            leaf[hdr..hdr + 16].copy_from_slice(&e.encode());
+            leaf[hdr..hdr + 16].copy_from_slice(&e.encode().unwrap());
             dev.write_at(fsb_to_byte(agblklog, blocksize, agblocks, *fsb), &leaf)
                 .unwrap();
         }

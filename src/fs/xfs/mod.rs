@@ -1281,7 +1281,7 @@ mod tests {
             blockcount: 1,
             unwritten: false,
         };
-        leaf[72..72 + 16].copy_from_slice(&extent.encode());
+        leaf[72..72 + 16].copy_from_slice(&extent.encode().unwrap());
         let leaf_byte = xfs.fsb_to_byte(leaf_fsb);
         dev.write_at(leaf_byte, &leaf).unwrap();
 
@@ -1431,7 +1431,7 @@ mod tests {
                     blockcount: 1,
                     unwritten: false,
                 };
-                leaf[hdr + j * 16..hdr + (j + 1) * 16].copy_from_slice(&e.encode());
+                leaf[hdr + j * 16..hdr + (j + 1) * 16].copy_from_slice(&e.encode().unwrap());
             }
             dev.write_at(xfs.fsb_to_byte(*leaf_fsb), &leaf).unwrap();
         }

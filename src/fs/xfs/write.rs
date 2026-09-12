@@ -1174,7 +1174,7 @@ impl Xfs {
     ) -> Result<()> {
         let mut lit = Vec::with_capacity(extents.len() * 16);
         for ext in extents {
-            lit.extend_from_slice(&ext.encode());
+            lit.extend_from_slice(&ext.encode()?);
         }
         // A directory can carry xattrs too; the rebuild must not drop
         // them. Lift the attribute fork off the inode we just read and
@@ -1353,7 +1353,7 @@ impl Xfs {
                 blockcount: nblocks,
                 unwritten: false,
             };
-            ext.encode().to_vec()
+            ext.encode()?.to_vec()
         } else {
             Vec::new()
         };
@@ -1412,7 +1412,7 @@ impl Xfs {
             blockcount: 1,
             unwritten: false,
         };
-        self.write_inode(dev, ino, builder, &ext.encode())?;
+        self.write_inode(dev, ino, builder, &ext.encode()?)?;
         self.append_dir_entry(dev, parent_ino, name, ino, XFS_DIR3_FT_DIR)?;
         Ok(ino)
     }
@@ -1514,7 +1514,7 @@ impl Xfs {
                 blockcount: 1,
                 unwritten: false,
             };
-            self.write_inode(dev, ino, builder, &ext.encode())?;
+            self.write_inode(dev, ino, builder, &ext.encode()?)?;
         } else {
             return Err(crate::Error::Unsupported(format!(
                 "xfs: symlink target {} bytes > one-block remote limit ({max_remote})",
@@ -1693,7 +1693,7 @@ impl Xfs {
         };
         let (atime, mtime, ctime) = (parent_core.atime, parent_core.mtime, parent_core.ctime);
         let mut lit = Vec::with_capacity(16);
-        lit.extend_from_slice(&parent_self_extent.encode());
+        lit.extend_from_slice(&parent_self_extent.encode()?);
         // Keep the parent's attribute fork across the rewrite.
         let attr = self.attr_fork_copy(&parent_buf, &parent_core)?;
         let lit_size = (XFS_INODESIZE as usize) - 176;
@@ -2022,7 +2022,7 @@ impl Xfs {
             blockcount: 1,
             unwritten: false,
         };
-        let payload = ext.encode().to_vec();
+        let payload = ext.encode()?.to_vec();
         // 16 bytes = 2 8-byte words.
         Ok((2u8, 2usize, payload, Some(leaf_fsb)))
     }
@@ -2590,7 +2590,7 @@ impl Xfs {
         //    same physical FSBs the source points at.
         let mut lit: Vec<u8> = Vec::with_capacity(extents.len() * 16);
         for e in &extents {
-            lit.extend_from_slice(&e.encode());
+            lit.extend_from_slice(&e.encode()?);
         }
 
         // 8) Write dst inode + add the entry to dst's parent directory.

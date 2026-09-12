@@ -430,3 +430,63 @@ fn bmdr_root_rejects_more_records_than_the_fork_can_hold() {
         Err(crate::Error::InvalidImage(_))
     ));
 }
+
+// ---------------------------------------------------------------------
+// Finding 28 — `Extent::encode` must not truncate to the 21-bit field.
+// ---------------------------------------------------------------------
+
+#[test]
+fn extent_encode_rejects_out_of_range_fields() {
+    use super::bmbt::{Extent, MAX_EXTENT_BLOCKS};
+
+    assert_eq!(MAX_EXTENT_BLOCKS, (1 << 21) - 1);
+    let ok = Extent {
+        offset: 0,
+        startblock: 1,
+        blockcount: MAX_EXTENT_BLOCKS,
+        unwritten: false,
+    };
+    assert_eq!(Extent::decode(&ok.encode().unwrap()).unwrap(), ok);
+
+    // One block past the field width used to wrap around to 0 — which
+    // `decode` then rejected as blockcount=0, or worse, silently described
+    // a different range than was allocated.
+    let too_many = Extent {
+        blockcount: MAX_EXTENT_BLOCKS + 1,
+        ..ok
+    };
+    assert!(matches!(
+        too_many.encode(),
+        Err(crate::Error::InvalidArgument(_))
+    ));
+    let wrapped = Extent {
+        blockcount: MAX_EXTENT_BLOCKS + 2,
+        ..ok
+    };
+    assert!(wrapped.encode().is_err());
+
+    assert!(
+        Extent {
+            offset: 1 << 54,
+            ..ok
+        }
+        .encode()
+        .is_err()
+    );
+    assert!(
+        Extent {
+            startblock: 1 << 52,
+            ..ok
+        }
+        .encode()
+        .is_err()
+    );
+    assert!(
+        Extent {
+            blockcount: 0,
+            ..ok
+        }
+        .encode()
+        .is_err()
+    );
+}

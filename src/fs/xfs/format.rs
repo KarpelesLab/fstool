@@ -477,7 +477,7 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Xfs> {
         blockcount: 1,
         unwritten: false,
     };
-    root_inode[176..176 + 16].copy_from_slice(&ext.encode());
+    root_inode[176..176 + 16].copy_from_slice(&ext.encode()?);
     stamp_v3_inode_crc(&mut root_inode);
     let root_byte = chunk_byte; // slot 0
     dev.write_at(root_byte, &root_inode)?;

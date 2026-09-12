@@ -490,7 +490,7 @@ impl<'a> XfsFileHandle<'a> {
         // Encode the extent list.
         let mut lit: Vec<u8> = Vec::with_capacity(self.extents.len() * 16);
         for ext in &self.extents {
-            lit.extend_from_slice(&ext.encode());
+            lit.extend_from_slice(&ext.encode()?);
         }
         // Build the inode buffer.
         let nblocks = self.nblocks();
