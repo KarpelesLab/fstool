@@ -449,6 +449,9 @@ where
         num_files,
         num_directories,
         num_symlinks,
+        apsb_template,
+        nxsb_template,
+        volume_index,
     ) = match &fs.state {
         ApfsState::Write(w) => (
             fs.block_size,
@@ -463,6 +466,9 @@ where
             w.num_files,
             w.num_directories,
             w.num_symlinks,
+            w.apsb_template.clone(),
+            w.nxsb_template.clone(),
+            w.volume_index,
         ),
         _ => {
             return Err(crate::Error::Unsupported(
@@ -514,6 +520,9 @@ where
             new_num_files,
             new_num_directories,
             new_num_symlinks,
+            apsb_template,
+            nxsb_template,
+            volume_index,
         )?;
         for (k, v) in records {
             w.push_raw_record(k, v);

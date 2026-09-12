@@ -426,28 +426,31 @@ impl RangeScan {
                 return Ok(None);
             }
             let leaf_idx = self.stack.len() - 1;
-            // Pull values out without holding a borrow on the stack
-            // across the `entry_at` call.
-            let (leaf_bytes, cursor) = {
-                let (lb, c) = &self.stack[leaf_idx];
-                (lb.clone(), *c)
-            };
-            let node = BTreeNode::decode(&leaf_bytes)?;
-            if !node.is_leaf() {
-                return Err(crate::Error::InvalidImage(
-                    "apfs: range scan: top of stack is not a leaf".into(),
-                ));
-            }
-            if cursor < node.nkeys {
-                let (kb, vb) = node.entry_at(cursor, self.fixed_klen, 0)?;
-                let key = FsKey::decode(kb)?;
-                if key.oid != self.stop_oid || key.kind != self.stop_kind {
-                    return Ok(None);
+            // Borrow the leaf in place (no per-record clone of the 4 KiB
+            // block); the owned key/value copies are made before the
+            // cursor bump so the borrow ends first.
+            let yielded = {
+                let (leaf_bytes, cursor) = &self.stack[leaf_idx];
+                let node = BTreeNode::decode(leaf_bytes)?;
+                if !node.is_leaf() {
+                    return Err(crate::Error::InvalidImage(
+                        "apfs: range scan: top of stack is not a leaf".into(),
+                    ));
                 }
-                let kb_owned = kb.to_vec();
-                let vb_owned = vb.to_vec();
+                if *cursor < node.nkeys {
+                    let (kb, vb) = node.entry_at(*cursor, self.fixed_klen, 0)?;
+                    let key = FsKey::decode(kb)?;
+                    if key.oid != self.stop_oid || key.kind != self.stop_kind {
+                        return Ok(None);
+                    }
+                    Some((kb.to_vec(), vb.to_vec()))
+                } else {
+                    None
+                }
+            };
+            if let Some(pair) = yielded {
                 self.stack[leaf_idx].1 += 1;
-                return Ok(Some((kb_owned, vb_owned)));
+                return Ok(Some(pair));
             }
             // Leaf exhausted — pop and walk back up.
             self.stack.pop();

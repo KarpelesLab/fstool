@@ -264,6 +264,18 @@ pub struct ApfsWriter<'a> {
     /// True when the label NXSB at block 0 should be refreshed (only on
     /// format).
     write_label_nxsb: bool,
+    /// Live APSB bytes to patch instead of building one from a fixed
+    /// template. `None` on the format path (there is nothing to carry
+    /// forward yet); `Some` on every checkpoint, so the volume's
+    /// feature flags, `apfs_incompatible_features`, extentref /
+    /// snapshot-metadata tree oids, role and encryption state survive
+    /// the rewrite. See [`ApfsWriter::build_apsb`].
+    apsb_template: Option<Vec<u8>>,
+    /// Live NXSB bytes, carried the same way. See
+    /// [`ApfsWriter::build_nxsb`].
+    nxsb_template: Option<Vec<u8>>,
+    /// Which `nx_fs_oid[]` slot the volume being rewritten occupies.
+    volume_index: usize,
 }
 
 // ───────────────────────── shared record builders ─────────────────────────
@@ -341,9 +353,13 @@ pub(crate) fn build_drec_record(
 
 /// Pack a drec's name length and 22-bit hash into the `u32 LE` that
 /// lives in `j_drec_hashed_key_t.name_len_and_hash`. The hash is
-/// CRC32C over the NFD-decomposed (and optionally case-folded) name
-/// encoded as UTF-32 LE; low 10 bits of the result are the raw name
-/// length **including** the trailing NUL.
+/// CRC-32C over the NFD-decomposed (and optionally case-folded) name
+/// encoded as UTF-32 LE, seeded with `0xFFFFFFFF` and **not** inverted
+/// at the end (what the kernel and the Linux apfs driver compute —
+/// the finalised CRC-32C is its bitwise complement, so this is
+/// `!crc32c(..)`); low 10 bits of the result are the raw name length
+/// **including** the trailing NUL. Verified against drecs written by
+/// macOS (`hdiutil create -srcfolder`).
 ///
 /// Best-effort match for Apple's kernel hash: ASCII and common BMP
 /// names match byte-for-byte. Uncommon combining sequences and
@@ -366,7 +382,9 @@ pub fn apfs_drec_name_len_and_hash(name: &str, case_fold: bool) -> u32 {
         normalize::nfd(name.chars()).map(|c| c as u32).collect()
     };
     let bytes: Vec<u8> = chars.iter().flat_map(|c| c.to_le_bytes()).collect();
-    let crc = crate::crc::crc32c(&bytes);
+    // `crc32c` is the finalised flavour (seed !0, final XOR !0); APFS
+    // stores the un-finalised register, i.e. its complement.
+    let crc = !crate::crc::crc32c(&bytes);
     let name_len = (name.len() + 1) as u32; // include trailing NUL
     ((crc & 0x003F_FFFF) << 10) | (name_len & 0x0000_03FF)
 }
@@ -568,6 +586,9 @@ impl<'a> ApfsWriter<'a> {
             xid: WRITE_XID,
             nxsb_paddr: NXSB_LIVE_PADDR,
             write_label_nxsb: true,
+            apsb_template: None,
+            nxsb_template: None,
+            volume_index: 0,
         };
         // Seed the root inode record (oid = 2). Times stay at 0
         // (epoch 1970) at format — callers refine via set_times /
@@ -604,6 +625,9 @@ impl<'a> ApfsWriter<'a> {
         num_files: u64,
         num_directories: u64,
         num_symlinks: u64,
+        apsb_template: Vec<u8>,
+        nxsb_template: Vec<u8>,
+        volume_index: usize,
     ) -> Result<Self> {
         if !(512..=65_536).contains(&block_size) || !block_size.is_power_of_two() {
             return Err(crate::Error::InvalidArgument(format!(
@@ -648,6 +672,9 @@ impl<'a> ApfsWriter<'a> {
             xid,
             nxsb_paddr,
             write_label_nxsb: false,
+            apsb_template: Some(apsb_template),
+            nxsb_template: Some(nxsb_template),
+            volume_index,
         })
     }
 
@@ -1288,6 +1315,16 @@ impl<'a> ApfsWriter<'a> {
     }
 
     /// Build the APSB block at offset `apsb_paddr`.
+    ///
+    /// On a checkpoint (`apsb_template` is `Some`) the live volume
+    /// superblock is used as the base and only the fields this
+    /// checkpoint actually changes are patched. Building from a fixed
+    /// template instead would zero `apfs_features`,
+    /// `apfs_incompatible_features` (which decides whether drec keys
+    /// are hashed — so the very next open would misparse every
+    /// directory entry), `apfs_extentref_tree_oid`,
+    /// `apfs_snap_meta_tree_oid`, `apfs_role` and the encryption
+    /// state.
     fn build_apsb(
         &self,
         bs: usize,
@@ -1295,45 +1332,45 @@ impl<'a> ApfsWriter<'a> {
         vol_omap_paddr: u64,
         fsroot_vid: u64,
     ) -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; bs];
+        let mut buf = match &self.apsb_template {
+            Some(t) if t.len() == bs => t.clone(),
+            _ => {
+                let mut fresh = vec![0u8; bs];
+                fresh[32..36].copy_from_slice(&APFS_MAGIC.to_le_bytes());
+                fresh[36..40].copy_from_slice(&0u32.to_le_bytes()); // fs_index
+                // features / ro_compat / incompat: 0 (plain drec
+                // layout, no sealed/encryption).
+                fresh[116..120].copy_from_slice(&(OBJECT_TYPE_BTREE).to_le_bytes());
+                fresh[120..124].copy_from_slice(&(OBJECT_TYPE_BTREE).to_le_bytes());
+                fresh[124..128].copy_from_slice(&(OBJECT_TYPE_BTREE).to_le_bytes());
+                fresh[144..152].copy_from_slice(&0u64.to_le_bytes()); // extentref_tree_oid
+                fresh[152..160].copy_from_slice(&0u64.to_le_bytes()); // snap_meta_tree_oid
+                fresh[160..168].copy_from_slice(&0u64.to_le_bytes()); // revert_to_xid
+                fresh[168..176].copy_from_slice(&0u64.to_le_bytes()); // revert_to_sblock_oid
+                const APFS_FS_UNENCRYPTED: u64 = 0x0000_0001;
+                fresh[264..272].copy_from_slice(&APFS_FS_UNENCRYPTED.to_le_bytes());
+                fresh
+            }
+        };
         // obj_phys
-        buf[8..16].copy_from_slice(&apsb_paddr.to_le_bytes()); // oid (we'll override below)
+        buf[8..16].copy_from_slice(&apsb_paddr.to_le_bytes()); // oid
         buf[16..24].copy_from_slice(&self.xid.to_le_bytes());
         // o_type = OBJECT_TYPE_FS | OBJ_VIRTUAL (default 0).
         buf[24..28].copy_from_slice(&OBJECT_TYPE_FS.to_le_bytes());
+        buf[28..32].copy_from_slice(&0u32.to_le_bytes()); // o_subtype
 
-        buf[32..36].copy_from_slice(&APFS_MAGIC.to_le_bytes());
-        buf[36..40].copy_from_slice(&0u32.to_le_bytes()); // fs_index
-        // features / ro_compat / incompat: 0 (plain drec layout, no
-        // sealed/encryption).
-        // apfs_root_tree_type at offset 116
-        buf[116..120].copy_from_slice(&(OBJECT_TYPE_BTREE).to_le_bytes());
-        buf[120..124].copy_from_slice(&(OBJECT_TYPE_BTREE).to_le_bytes());
-        buf[124..128].copy_from_slice(&(OBJECT_TYPE_BTREE).to_le_bytes());
         buf[128..136].copy_from_slice(&vol_omap_paddr.to_le_bytes()); // omap_oid
         buf[136..144].copy_from_slice(&fsroot_vid.to_le_bytes()); // root_tree_oid
-        buf[144..152].copy_from_slice(&0u64.to_le_bytes()); // extentref_tree_oid
-        buf[152..160].copy_from_slice(&0u64.to_le_bytes()); // snap_meta_tree_oid (none)
-        buf[160..168].copy_from_slice(&0u64.to_le_bytes()); // revert_to_xid
-        buf[168..176].copy_from_slice(&0u64.to_le_bytes()); // revert_to_sblock_oid
         buf[176..184].copy_from_slice(&self.next_oid.to_le_bytes()); // next_obj_id
         buf[184..192].copy_from_slice(&self.num_files.to_le_bytes());
         buf[192..200].copy_from_slice(&self.num_directories.to_le_bytes());
         buf[200..208].copy_from_slice(&self.num_symlinks.to_le_bytes());
-        // num_other_fsobjects: 0
-        // num_snapshots: 0
-        // total_blocks_alloced / freed: 0
         buf[240..256].copy_from_slice(&self.volume_uuid);
-        // last_mod_time, fs_flags
-        const APFS_FS_UNENCRYPTED: u64 = 0x0000_0001;
-        buf[264..272].copy_from_slice(&APFS_FS_UNENCRYPTED.to_le_bytes());
-        // formatted_by / modified_by: zero
         // volname at offset 704 (256 bytes)
         let name_bytes = self.volume_name.as_bytes();
         let n = name_bytes.len().min(255);
+        buf[704..704 + 256].fill(0);
         buf[704..704 + n].copy_from_slice(&name_bytes[..n]);
-        buf[704 + n] = 0;
-        // next_doc_id at 960, role at 964 — zero.
 
         // Final checksum.
         sign_block(&mut buf);
@@ -1350,7 +1387,10 @@ impl<'a> ApfsWriter<'a> {
         reaper_vid: u64,
         volume_vid: u64,
     ) -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; bs];
+        let mut buf = match &self.nxsb_template {
+            Some(t) if t.len() == bs => t.clone(),
+            _ => vec![0u8; bs],
+        };
         // obj_phys
         buf[8..16].copy_from_slice(&paddr.to_le_bytes()); // oid (physical = block)
         buf[16..24].copy_from_slice(&self.xid.to_le_bytes());
@@ -1359,7 +1399,8 @@ impl<'a> ApfsWriter<'a> {
         buf[32..36].copy_from_slice(&NX_MAGIC.to_le_bytes());
         buf[36..40].copy_from_slice(&self.block_size.to_le_bytes());
         buf[40..48].copy_from_slice(&self.total_blocks.to_le_bytes());
-        // features / ro_compat / incompat: 0 (we ship a vanilla container)
+        // features / ro_compat / incompat come from the template on a
+        // checkpoint (zero on format — we ship a vanilla container).
         buf[72..88].copy_from_slice(&self.container_uuid);
         buf[88..96].copy_from_slice(&(self.next_oid + 1024).to_le_bytes()); // next_oid
         buf[96..104].copy_from_slice(&(self.xid + 1).to_le_bytes()); // next_xid
@@ -1387,9 +1428,13 @@ impl<'a> ApfsWriter<'a> {
         buf[168..176].copy_from_slice(&reaper_vid.to_le_bytes()); // reaper_oid
         buf[176..180].copy_from_slice(&0u32.to_le_bytes()); // test_type
         buf[180..184].copy_from_slice(&(NX_MAX_FILE_SYSTEMS as u32).to_le_bytes());
-        // fs_oid[0] = volume_vid
-        buf[184..192].copy_from_slice(&volume_vid.to_le_bytes());
-        // rest of fs_oid[] = 0
+        // fs_oid[volume_index] = volume_vid. `open_writable` refuses
+        // multi-volume containers, so the remaining slots are already
+        // zero (format) or already correct (checkpoint template).
+        let fs_oid_off = 184 + self.volume_index * 8;
+        if fs_oid_off + 8 <= bs {
+            buf[fs_oid_off..fs_oid_off + 8].copy_from_slice(&volume_vid.to_le_bytes());
+        }
 
         // Silence unused-variable warning when the writer ends up not
         // needing to walk the bump pointer afterwards.
