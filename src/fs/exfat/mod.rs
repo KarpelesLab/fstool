@@ -657,30 +657,53 @@ impl Exfat {
     // directory-entry mutation, file/dir create + remove, and flush.
     // ===================================================================
 
+    /// The allocation-bitmap bit for `cluster`: `Some(true)` allocated,
+    /// `Some(false)` free, `None` when the bitmap does not cover it (no
+    /// bitmap was found, or a truncated one).
+    fn bitmap_bit(&self, cluster: u32) -> Option<bool> {
+        if cluster < 2 {
+            return None;
+        }
+        let bit = (cluster - 2) as usize;
+        let byte = *self.bitmap.get(bit / 8)?;
+        Some(byte & (1u8 << (bit % 8)) != 0)
+    }
+
+    /// `true` when `cluster` may be handed out by the allocator.
+    ///
+    /// On exFAT the allocation bitmap is the sole authority: a file marked
+    /// NoFatChain owns its clusters with FAT entries left at zero, so a
+    /// FAT-only scan would hand its data out again. The FAT check stays as
+    /// a belt-and-braces guard against a stale bitmap — a cluster is free
+    /// only when *both* agree.
+    fn cluster_is_free(&self, cluster: u32) -> bool {
+        self.bitmap_bit(cluster) == Some(false) && self.fat.raw(cluster) == Some(fat::FREE)
+    }
+
     /// Allocate one free cluster, mark it used in the FAT (as a one-cluster
     /// EOC chain) and in the allocation bitmap. Returns the cluster number.
+    ///
+    /// Refuses when the volume has no readable allocation bitmap: without
+    /// it there is no way to tell a free cluster from one owned by a
+    /// NoFatChain file.
     fn alloc_cluster(&mut self) -> Result<u32> {
-        let max = (self.boot.cluster_count + 2) as usize;
-        let start = self.next_free_hint.max(2) as usize;
-        for cluster in start..max {
-            if self.fat.raw(cluster as u32) == Some(fat::FREE) {
-                self.fat.set_raw(cluster as u32, fat::EOC);
-                self.fat_dirty = true;
-                set_bitmap_bit(&mut self.bitmap, cluster as u32, true);
-                self.bitmap_dirty = true;
-                self.next_free_hint = (cluster as u32).saturating_add(1);
-                return Ok(cluster as u32);
-            }
+        if self.bitmap_first_cluster < 2 || self.bitmap.is_empty() {
+            return Err(crate::Error::InvalidImage(
+                "exfat: volume has no allocation bitmap; refusing to allocate clusters".into(),
+            ));
         }
-        // Wrap and retry from cluster 2.
-        for cluster in 2..start {
-            if self.fat.raw(cluster as u32) == Some(fat::FREE) {
-                self.fat.set_raw(cluster as u32, fat::EOC);
+        let max = self.boot.cluster_count + 2;
+        let start = self.next_free_hint.clamp(2, max);
+        // Scan from the hint to the end, then wrap to cluster 2.
+        let candidates = (start..max).chain(2..start);
+        for cluster in candidates {
+            if self.cluster_is_free(cluster) {
+                self.fat.set_raw(cluster, fat::EOC);
                 self.fat_dirty = true;
-                set_bitmap_bit(&mut self.bitmap, cluster as u32, true);
+                set_bitmap_bit(&mut self.bitmap, cluster, true);
                 self.bitmap_dirty = true;
-                self.next_free_hint = (cluster as u32).saturating_add(1);
-                return Ok(cluster as u32);
+                self.next_free_hint = cluster.saturating_add(1);
+                return Ok(cluster);
             }
         }
         Err(crate::Error::InvalidArgument(
@@ -2051,6 +2074,88 @@ mod tests {
             out.extend_from_slice(&set);
         }
         out
+    }
+
+    /// Byte offset of cluster `c` in the synthetic image (heap at sector 128).
+    fn test_cluster_off(c: u32) -> u64 {
+        128 * BPS as u64 + (c as u64 - 2) * BPC as u64
+    }
+
+    /// First two clusters after the metadata in the synthetic image that a
+    /// NoFatChain file occupies.
+    const CL_NOFAT: u32 = 8;
+
+    /// The synthetic image plus a two-cluster file `nofat.bin` stored as a
+    /// contiguous NoFatChain run at clusters 8..=9: its FAT entries stay
+    /// zero (exactly as the spec allows) and only the allocation bitmap
+    /// records the clusters as used. The bitmap bits for the six
+    /// metadata / data clusters of the base image are set too. Returns
+    /// the image and the file's payload.
+    fn image_with_nofat_file() -> (MemoryBackend, Vec<u8>) {
+        let mut dev = build_test_image();
+        // Bitmap byte 0 covers clusters 2..=9: all of them are in use.
+        dev.write_at(test_cluster_off(CL_BITMAP), &[0xFF]).unwrap();
+        let payload: Vec<u8> = (0..2 * BPC).map(|i| (i % 253) as u8).collect();
+        dev.write_at(test_cluster_off(CL_NOFAT), &payload).unwrap();
+        let mut set = build_dir_entries(&[("nofat.bin", false, CL_NOFAT, payload.len() as u64)]);
+        set[ENTRY_SIZE + 1] = dir::SECFLAG_ALLOC_POSSIBLE | dir::SECFLAG_NO_FAT_CHAIN;
+        let csum = dir::set_checksum(&set);
+        set[2..4].copy_from_slice(&csum.to_le_bytes());
+        // Root holds 3 metadata slots + two 3-slot sets; append after them.
+        dev.write_at(test_cluster_off(CL_ROOT) + 9 * ENTRY_SIZE as u64, &set)
+            .unwrap();
+        (dev, payload)
+    }
+
+    #[test]
+    fn alloc_skips_clusters_owned_by_nofatchain_files() {
+        let (mut dev, payload) = image_with_nofat_file();
+        let mut fs = Exfat::open(&mut dev).unwrap();
+        // Sanity: the FAT says clusters 8 and 9 are free, the bitmap says
+        // they are not.
+        assert_eq!(fs.fat.raw(CL_NOFAT), Some(fat::FREE));
+        assert_eq!(fs.bitmap_bit(CL_NOFAT), Some(true));
+
+        let fresh: Vec<u8> = vec![0xEE; 2 * BPC as usize];
+        let mut reader: &[u8] = &fresh;
+        let first = fs
+            .create_file(&mut dev, "/new.bin", &mut reader, fresh.len() as u64, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+        assert!(
+            first >= CL_NOFAT + 2,
+            "new file must not land on the NoFatChain run (got cluster {first})"
+        );
+
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        use crate::io::Read;
+        let mut got = Vec::new();
+        fs2.open_file_reader(&mut dev, "/nofat.bin")
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
+        assert_eq!(got, payload, "NoFatChain file data was overwritten");
+        let mut got2 = Vec::new();
+        fs2.open_file_reader(&mut dev, "/new.bin")
+            .unwrap()
+            .read_to_end(&mut got2)
+            .unwrap();
+        assert_eq!(got2, fresh);
+    }
+
+    #[test]
+    fn alloc_refuses_without_allocation_bitmap() {
+        let mut dev = build_test_image();
+        // Mark the AllocationBitmap slot (second root slot) as not in use.
+        dev.write_at(test_cluster_off(CL_ROOT) + ENTRY_SIZE as u64, &[0x01])
+            .unwrap();
+        let mut fs = Exfat::open(&mut dev).unwrap();
+        assert!(fs.bitmap.is_empty());
+        let mut reader: &[u8] = b"x";
+        match fs.create_file(&mut dev, "/x.txt", &mut reader, 1, 0) {
+            Err(crate::Error::InvalidImage(_)) => {}
+            other => panic!("expected InvalidImage, got {other:?}"),
+        }
     }
 
     #[test]
