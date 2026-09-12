@@ -65,7 +65,15 @@ pub(super) fn add_file_bytes(
     }
 
     let compressed = crate::compression::compress(crate::compression::Algo::Zlib, &plain)?;
-    let len = compressed.len() as u32;
+    // Incompressible input grows a little under zlib, so the compressed
+    // length (and its aligned size) must be range-checked separately from
+    // the plain length — a silent `as u32` here would corrupt the table.
+    let len = u32::try_from(compressed.len())
+        .ok()
+        .filter(|l| l.div_ceil(DATA_ALIGN).checked_mul(DATA_ALIGN).is_some())
+        .ok_or_else(|| {
+            crate::Error::Unsupported("grf: compressed file body larger than 4 GiB".into())
+        })?;
     let len_aligned = len.div_ceil(DATA_ALIGN) * DATA_ALIGN;
 
     // Position relative to end-of-header; data_end is absolute.
