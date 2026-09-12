@@ -25,6 +25,10 @@ const converting = ref(false)
 
 const partitionIndex = ref(null)
 const rootEntries = ref([])
+// Bumped on every open so the whole tree remounts. TreeNode resolves its
+// path and kind once in setup() and caches its children, so a node reused
+// across two partitions would keep showing the previous one's listing.
+const treeEpoch = ref(0)
 
 // Expose worker + helpers to descendant tree nodes.
 provide('fstool', fstool)
@@ -47,6 +51,9 @@ const badges = computed(() => {
 const partitions = computed(() => report.value?.partition_table?.partitions ?? [])
 
 async function handleFile(f) {
+  // A second file dropped mid-probe would race the first: the earlier
+  // open would run against the later file's bytes.
+  if (status.value) return
   error.value = ''
   convertNote.msg = ''
   file.name = f.name || 'image'
@@ -82,6 +89,7 @@ async function openImage(part) {
     if (!targets.value.length) targets.value = await fstool.targets()
     if (!selectedTarget.value) selectedTarget.value = targets.value[0]?.id ?? ''
     rootEntries.value = sortEntries(await fstool.list('/'))
+    treeEpoch.value++
     phase.value = 'opened'
   } catch (e) {
     error.value = String(e.message || e)
@@ -135,6 +143,13 @@ function editLoaded() {
 function leaveBuilder() {
   mode.value = 'inspect'
   adopt.value = false
+  // Taking the file into the builder dropped the worker's inspect image,
+  // so anything still on screen could only answer "no image open".
+  if (phase.value === 'opened') {
+    phase.value = 'loaded'
+    rootEntries.value = []
+    fsKind.value = ''
+  }
 }
 
 // Drag & drop / file input --------------------------------------------------
@@ -144,6 +159,8 @@ function onPick() {
 }
 function onInputChange(e) {
   const f = e.target.files[0]
+  // Clear it so choosing the same file again still fires `change`.
+  e.target.value = ''
   if (f) handleFile(f)
 }
 function onDrop(e) {
@@ -266,7 +283,7 @@ function onDrop(e) {
             <span>Contents</span>
             <span class="pill">{{ fsKind }}</span>
           </div>
-          <div class="tree" role="tree">
+          <div :key="treeEpoch" class="tree" role="tree">
             <TreeNode
               v-for="entry in rootEntries"
               :key="entry.name"

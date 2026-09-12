@@ -15,6 +15,20 @@ export class Fstool {
       this.pending.delete(id)
       ok ? p.resolve(result) : p.reject(new Error(error))
     }
+    // Without these, a worker that dies — or never finishes importing the
+    // wasm — leaves every request pending forever and the UI sits on a
+    // spinner with no error.
+    const failAll = (msg) => {
+      const waiting = [...this.pending.values()]
+      this.pending.clear()
+      for (const p of waiting) p.reject(new Error(msg))
+    }
+    this.worker.onerror = (ev) => {
+      ev.preventDefault?.()
+      failAll(ev.message || 'the fstool worker failed to start')
+    }
+    this.worker.onmessageerror = () =>
+      failAll('a worker reply could not be decoded')
   }
 
   #call(cmd, args, transfer = []) {

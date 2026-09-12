@@ -17,6 +17,25 @@ let rawBytes = null // the uploaded file, kept for (re-)open
 let img = null // the currently-open Image handle (inspect mode)
 let ws = null // the currently-open Workspace (create/edit mode)
 
+// wasm-bindgen hands ownership of these back to JS and only reclaims them
+// through a FinalizationRegistry, which JS GC never runs on wasm
+// allocation pressure — and wasm memory never shrinks. Each handle holds a
+// whole copy of the image, so drop the old one explicitly before taking a
+// new one or a few partition switches exhaust the address space.
+function dropImage() {
+  if (img) {
+    img.free()
+    img = null
+  }
+}
+
+function dropWorkspace() {
+  if (ws) {
+    ws.free()
+    ws = null
+  }
+}
+
 // Every workspace command reports the new layout back, so the UI never has
 // to remember to ask — one round trip per action instead of two.
 function wsInfo() {
@@ -28,8 +47,21 @@ function requireWorkspace() {
   return ws
 }
 
+// A wasm trap (an allocation abort on a huge image, say) leaves the
+// instance permanently unusable: every later call throws the same way.
+// Latch it so the UI is told to reload instead of retrying into a corpse.
+let crashed = false
+
 self.onmessage = (e) => {
   const { id, cmd, args } = e.data
+  if (crashed) {
+    self.postMessage({
+      id,
+      ok: false,
+      error: 'the fstool wasm module crashed — reload the page to continue',
+    })
+    return
+  }
   try {
     let result
     let transfer = []
@@ -37,7 +69,7 @@ self.onmessage = (e) => {
     switch (cmd) {
       case 'load':
         rawBytes = new Uint8Array(args.buffer)
-        img = null
+        dropImage()
         result = JSON.parse(probe(rawBytes))
         break
       case 'targets':
@@ -45,6 +77,7 @@ self.onmessage = (e) => {
         break
       case 'open':
         if (!rawBytes) throw new Error('no file loaded')
+        dropImage()
         img = args && args.part
           ? Image.openPartition(rawBytes, args.part)
           : new Image(rawBytes)
@@ -62,6 +95,7 @@ self.onmessage = (e) => {
         break
       }
       case 'symlink':
+        if (!img) throw new Error('no image open')
         result = img.readSymlink(args.path)
         break
       case 'convert': {
@@ -78,19 +112,22 @@ self.onmessage = (e) => {
         result = JSON.parse(creatable_filesystems())
         break
       case 'newFilesystem':
-        img = null
+        dropImage()
+        dropWorkspace()
         ws = Workspace.newFilesystem(args.fsType, args.size, args.options || '')
         result = wsInfo()
         break
       case 'newDisk':
-        img = null
+        dropImage()
+        dropWorkspace()
         ws = Workspace.newDisk(args.size, args.table)
         result = wsInfo()
         break
       case 'editLoaded':
         // Take the file already handed over by `load` into edit mode.
         if (!rawBytes) throw new Error('no file loaded')
-        img = null
+        dropImage()
+        dropWorkspace()
         ws = Workspace.fromBytes(rawBytes)
         result = wsInfo()
         break
@@ -149,7 +186,7 @@ self.onmessage = (e) => {
         break
       }
       case 'wsClose':
-        ws = null
+        dropWorkspace()
         result = { ok: true }
         break
 
@@ -159,6 +196,20 @@ self.onmessage = (e) => {
 
     self.postMessage({ id, ok: true, result }, transfer)
   } catch (err) {
+    if (err instanceof WebAssembly.RuntimeError) {
+      crashed = true
+      rawBytes = null
+      img = null
+      ws = null
+      self.postMessage({
+        id,
+        ok: false,
+        error:
+          'the fstool wasm module crashed (out of memory?) — reload the page ' +
+          'to continue',
+      })
+      return
+    }
     self.postMessage({ id, ok: false, error: String((err && err.message) || err) })
   }
 }

@@ -29,9 +29,12 @@ async function toggle() {
   if (!isDir) return
   open.value = !open.value
   if (open.value && !loaded.value) {
-    loaded.value = true
+    // Mark loaded only on success, and clear any earlier error, so a
+    // transient failure can be retried by collapsing and re-expanding.
+    loadError.value = ''
     try {
       children.value = sortEntries(await fstool.list(full))
+      loaded.value = true
     } catch (e) {
       loadError.value = String(e.message || e)
     }

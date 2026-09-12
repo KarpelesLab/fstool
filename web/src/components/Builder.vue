@@ -5,7 +5,7 @@
 // All state that matters lives in the Rust `Workspace` behind the worker —
 // this component only mirrors it. Every mutating call resolves with a fresh
 // `info()`, so there is one source of truth and no separate refresh step.
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
 import { humanSize, parseSize, download, sortEntries, joinPath } from '../fstool.js'
 
 const props = defineProps({
@@ -66,6 +66,12 @@ onMounted(async () => {
   } catch (e) {
     error.value = String(e.message || e)
   }
+})
+
+// The workspace owns a whole copy of the image in wasm memory; hand it
+// back when this pane goes away rather than holding it for the session.
+onBeforeUnmount(() => {
+  props.fstool.wsClose().catch(() => {})
 })
 
 // Run a workspace call that resolves with a fresh WorkspaceInfo.
@@ -130,10 +136,20 @@ async function createDisk() {
 }
 
 async function addPartition() {
+  // 0 means "all remaining space" on the Rust side, so never arrive there
+  // from a size box that simply failed to parse.
+  let size = 0
+  if (!part.rest) {
+    size = parseSize(part.size)
+    if (size == null) {
+      error.value = `cannot parse size "${part.size}" — try e.g. 64MiB`
+      return
+    }
+  }
   cwd.value = '/'
   await run('Adding partition…', () =>
     props.fstool.addPartition({
-      size: part.rest ? 0 : sizeOr(part.size, 0),
+      size,
       kind: part.kind,
       name: part.name,
       fsType: part.fsType,
@@ -184,7 +200,11 @@ async function onFilesPicked(e) {
     }
   }
   busy.value = ''
+  // `run` clears `error` first, so carry any add failure across the
+  // refresh — otherwise the file just silently fails to appear.
+  const failure = error.value
   await run('Refreshing…', () => props.fstool.wsInfo())
+  if (failure) error.value = failure
 }
 
 async function newFolder() {
@@ -243,7 +263,12 @@ async function downloadImage() {
 }
 
 async function startOver() {
-  await props.fstool.wsClose()
+  // Nothing open is fine; this is an unguarded click handler.
+  try {
+    await props.fstool.wsClose()
+  } catch {
+    /* no workspace to close */
+  }
   info.value = null
   entries.value = []
   cwd.value = '/'
