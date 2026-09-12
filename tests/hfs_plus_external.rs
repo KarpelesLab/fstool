@@ -943,3 +943,174 @@ fn writer_journaled_reopen_multi_transaction_flush() {
         eprintln!("skipping fsck oracle: not installed");
     }
 }
+
+/// Turn an fstool-formatted HFS+ image into a case-sensitive HFSX one:
+/// flip the volume signature/version in both the primary and alternate
+/// volume headers and set the catalog B-tree header's `keyCompareType`
+/// to `kHFSBinaryCompare` (0xBC). A freshly formatted catalog holds a
+/// single record, so its ordering is valid under either comparator.
+fn make_case_sensitive_hfsx(path: &std::path::Path) {
+    use std::os::unix::fs::FileExt;
+    let (cat_off, alt_vh_off) = {
+        let mut dev = FileBackend::open(path).unwrap();
+        let vh = fstool::fs::hfs_plus::volume_header::read_volume_header(&mut dev).unwrap();
+        let node_desc_size = 14u64;
+        let cat_start = u64::from(vh.catalog_file.extents[0].start_block);
+        (
+            cat_start * u64::from(vh.block_size) + node_desc_size + 37,
+            dev.total_size() - 1024,
+        )
+    };
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    for vh_off in [1024u64, alt_vh_off] {
+        f.write_at(b"HX", vh_off).unwrap();
+        f.write_at(&5u16.to_be_bytes(), vh_off + 2).unwrap();
+    }
+    f.write_at(&[0xBC], cat_off).unwrap();
+    f.sync_all().unwrap();
+}
+
+/// On a case-sensitive HFSX volume "README" and "readme" are two
+/// different files. The writer's in-memory catalog used to order keys
+/// case-insensitively no matter what the volume said, so the second
+/// name landed on the first one's map entry and silently replaced it —
+/// one of the two files simply disappeared at flush. The rebuilt tree
+/// must also advertise `keyCompareType` 0xBC so the kernel and
+/// `fsck_hfs` read it with the comparator it was built with.
+#[test]
+fn hfsx_case_sensitive_writer_keeps_case_variant_names() {
+    let tmp = NamedTempFile::new().unwrap();
+    let opts = FormatOpts {
+        volume_name: "CaseVol".into(),
+        ..FormatOpts::default()
+    };
+    {
+        let (mut dev, _hfs) = fresh_image(&tmp, &opts);
+        dev.sync().unwrap();
+    }
+    make_case_sensitive_hfsx(tmp.path());
+
+    {
+        let mut dev = FileBackend::open(tmp.path()).unwrap();
+        let mut hfs = HfsPlus::open(&mut dev).unwrap();
+        for (name, body) in [("/README", &b"upper\n"[..]), ("/readme", &b"lower\n"[..])] {
+            let mut src = Cursor::new(body.to_vec());
+            hfs.create_file(&mut dev, name, &mut src, body.len() as u64, 0o644, 0, 0, 0)
+                .unwrap();
+        }
+        hfs.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+
+    let mut dev = FileBackend::open(tmp.path()).unwrap();
+    let hfs = HfsPlus::open(&mut dev).unwrap();
+    let mut names: Vec<String> = hfs
+        .list_path(&mut dev, "/")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["README".to_string(), "readme".to_string()],
+        "both case variants must survive on a case-sensitive volume"
+    );
+    for (path, want) in [("/README", "upper\n"), ("/readme", "lower\n")] {
+        let mut got = String::new();
+        hfs.open_file_reader(&mut dev, path)
+            .unwrap()
+            .read_to_string(&mut got)
+            .unwrap();
+        assert_eq!(got, want, "{path} has the other file's contents");
+    }
+    // The rebuilt catalog header must still say "binary compare".
+    {
+        let vh = fstool::fs::hfs_plus::volume_header::read_volume_header(&mut dev).unwrap();
+        let off =
+            u64::from(vh.catalog_file.extents[0].start_block) * u64::from(vh.block_size) + 14 + 37;
+        let mut byte = [0u8; 1];
+        dev.read_at(off, &mut byte).unwrap();
+        assert_eq!(byte[0], 0xBC, "keyCompareType must stay kHFSBinaryCompare");
+    }
+    drop(dev);
+
+    if let Some((fsck, label)) = find_fsck_hfs() {
+        assert_fsck_clean(&fsck, label, tmp.path());
+    } else {
+        eprintln!("skipping fsck oracle: not installed");
+    }
+}
+
+/// TN1150 case folding covers the whole BMP, not just ASCII and
+/// Latin-1. With only the old ASCII/Latin-1 fold, Cyrillic and Greek
+/// names sorted by raw code unit while `fsck_hfs` (and the kernel)
+/// folded them, so a rebuilt catalog came back as "keys out of order".
+#[test]
+fn writer_folds_non_latin_names_the_way_fsck_does() {
+    let tmp = NamedTempFile::new().unwrap();
+    let opts = FormatOpts {
+        volume_name: "FoldVol".into(),
+        ..FormatOpts::default()
+    };
+    let (mut dev, mut hfs) = fresh_image(&tmp, &opts);
+    // Pairs that only a full-BMP fold table orders consistently:
+    // Ё/ё (U+0401/U+0451), Ω/ω (U+03A9/U+03C9), Ä (NFD) and a
+    // fullwidth Latin capital.
+    let names = [
+        "\u{0401}\u{043B}\u{043A}\u{0430}.txt",
+        "\u{0451}\u{0436}.txt",
+        "\u{03A9}mega.txt",
+        "\u{03C9}x.txt",
+        "A\u{0308}pfel.txt",
+        "\u{FF21}ll.txt",
+        "zzz.txt",
+    ];
+    for name in names {
+        let body = format!("body of {name}\n");
+        let mut src = Cursor::new(body.clone().into_bytes());
+        hfs.create_file(
+            &mut dev,
+            &format!("/{name}"),
+            &mut src,
+            body.len() as u64,
+            0o644,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+    }
+    hfs.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    let mut dev = FileBackend::open(tmp.path()).unwrap();
+    let hfs = HfsPlus::open(&mut dev).unwrap();
+    let listed: std::collections::BTreeSet<String> = hfs
+        .list_path(&mut dev, "/")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    for name in names {
+        assert!(listed.contains(name), "{name:?} missing from {listed:?}");
+        let mut got = String::new();
+        hfs.open_file_reader(&mut dev, &format!("/{name}"))
+            .unwrap()
+            .read_to_string(&mut got)
+            .unwrap();
+        assert_eq!(got, format!("body of {name}\n"));
+    }
+    drop(dev);
+
+    if let Some((fsck, label)) = find_fsck_hfs() {
+        assert_fsck_clean(&fsck, label, tmp.path());
+    } else {
+        eprintln!("skipping fsck oracle: not installed");
+    }
+}

@@ -205,12 +205,86 @@ impl PartialOrd for OwnedKey {
     }
 }
 
+/// A stable total order for keys, used where a deterministic sort is
+/// wanted without reference to a particular volume. It is **not** the
+/// catalog's on-disk order — that depends on the volume's
+/// `keyCompareType` and lives in [`CatalogMap`], which is what the
+/// record map is keyed by.
 impl Ord for OwnedKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match self.parent_id.cmp(&other.parent_id) {
-            std::cmp::Ordering::Equal => compare_unistr(&self.name, &other.name, false),
+            std::cmp::Ordering::Equal => self.name.code_units.cmp(&other.name.code_units),
             o => o,
         }
+    }
+}
+
+/// Catalog records held in on-disk B-tree key order.
+///
+/// The order depends on the volume: plain HFS+ folds case per TN1150,
+/// while HFSX with `keyCompareType` 0xBC compares code units
+/// verbatim. That flag can't live on [`OwnedKey`] without threading it
+/// through every construction site, and it can't be hardcoded either —
+/// a case-insensitive `Ord` on a case-sensitive volume makes
+/// "README" and "readme" the *same* map entry, so the second one
+/// silently replaces the first and the file disappears. So the map
+/// owns the flag and derives each entry's sort key from it.
+pub(crate) struct CatalogMap {
+    case_sensitive: bool,
+    map: BTreeMap<(u32, Vec<u16>), (OwnedKey, Vec<u8>)>,
+}
+
+impl CatalogMap {
+    pub(crate) fn new(case_sensitive: bool) -> Self {
+        Self {
+            case_sensitive,
+            map: BTreeMap::new(),
+        }
+    }
+
+    fn sort_key(&self, key: &OwnedKey) -> (u32, Vec<u16>) {
+        (
+            key.parent_id,
+            super::catalog::sort_units(&key.name, self.case_sensitive),
+        )
+    }
+
+    pub(crate) fn insert(&mut self, key: OwnedKey, body: Vec<u8>) -> Option<Vec<u8>> {
+        let sk = self.sort_key(&key);
+        self.map.insert(sk, (key, body)).map(|(_, b)| b)
+    }
+
+    pub(crate) fn get(&self, key: &OwnedKey) -> Option<&Vec<u8>> {
+        self.map.get(&self.sort_key(key)).map(|(_, b)| b)
+    }
+
+    pub(crate) fn get_mut(&mut self, key: &OwnedKey) -> Option<&mut Vec<u8>> {
+        let sk = self.sort_key(key);
+        self.map.get_mut(&sk).map(|(_, b)| b)
+    }
+
+    pub(crate) fn contains_key(&self, key: &OwnedKey) -> bool {
+        self.map.contains_key(&self.sort_key(key))
+    }
+
+    pub(crate) fn remove(&mut self, key: &OwnedKey) -> Option<Vec<u8>> {
+        let sk = self.sort_key(key);
+        self.map.remove(&sk).map(|(_, b)| b)
+    }
+
+    /// Entries in B-tree key order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&OwnedKey, &Vec<u8>)> {
+        self.map.values().map(|(k, b)| (k, b))
+    }
+
+    /// Mutable entries in B-tree key order. The key is read-only —
+    /// changing a name would invalidate the sort key it's filed under.
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (&OwnedKey, &mut Vec<u8>)> {
+        self.map.values_mut().map(|(k, b)| (&*k, b))
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &Vec<u8>> {
+        self.map.values().map(|(_, b)| b)
     }
 }
 
@@ -239,7 +313,17 @@ pub struct Writer {
     /// Catalog records, keyed in HFS+ catalog-order. Values are the
     /// encoded record bytes (without the leading key — we re-encode the
     /// key from the BTreeMap key on flush).
-    pub(crate) catalog: BTreeMap<OwnedKey, Vec<u8>>,
+    pub(crate) catalog: CatalogMap,
+    /// Volume key ordering: `false` = plain HFS+ case folding
+    /// (`keyCompareType` 0xCF), `true` = HFSX binary compare (0xBC).
+    /// Read off the volume at `open_writable`; `format` only produces
+    /// plain HFS+.
+    pub(crate) case_sensitive: bool,
+    /// Volume signature is `HX` (HFSX). Independent of
+    /// `case_sensitive` — an HFSX volume may still fold case — and it
+    /// is HFSX, not case sensitivity, that makes
+    /// `kHFSHasFolderCountMask` mandatory on folder records.
+    pub(crate) hfsx: bool,
 
     /// Extents-overflow records keyed by `(fork_type, file_id, start_block)`.
     /// Each value is a fixed-size group of up to eight `(start, count)`
@@ -1338,7 +1422,9 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
         bitmap,
         next_alloc: cursor,
         free_blocks,
-        catalog: BTreeMap::new(),
+        catalog: CatalogMap::new(false),
+        case_sensitive: false,
+        hfsx: false,
         overflow_extents: BTreeMap::new(),
         allocation_file,
         extents_file,
@@ -2071,7 +2157,7 @@ pub(crate) fn promote_to_hardlink(
 ) -> Result<u32> {
     // Forbid self-link: a hard link to itself would corrupt the catalog.
     if src_parent == dst_parent
-        && compare_unistr(src_name, dst_name, false) == std::cmp::Ordering::Equal
+        && compare_unistr(src_name, dst_name, writer.case_sensitive) == std::cmp::Ordering::Equal
     {
         return Err(crate::Error::InvalidArgument(
             "hfs+ writer: source and destination hard-link paths are the same".into(),
@@ -2450,6 +2536,33 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
     //    build once and — if the tree overflows the reserved fork — grow
     //    the fork (appending a fresh extent from free space) and rebuild,
     //    so the header records the correct total / free node counts.
+    // HFSX mandates `kHFSHasFolderCountMask` plus a live `folderCount`
+    // on every folder record (`fsck_hfs`: "HasFolderCount flag needs to
+    // be set"). Recompute both from the record set here instead of
+    // threading them through every mutation — the catalog is already
+    // fully in memory at this point.
+    if writer.hfsx {
+        const HAS_FOLDER_COUNT: u16 = 0x0010;
+        let mut subfolders: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for (key, body) in writer.catalog.iter() {
+            if body.len() >= 2 && i16::from_be_bytes([body[0], body[1]]) == REC_FOLDER {
+                *subfolders.entry(key.parent_id).or_default() += 1;
+            }
+        }
+        for (_, body) in writer.catalog.iter_mut() {
+            if body.len() < 88 || i16::from_be_bytes([body[0], body[1]]) != REC_FOLDER {
+                continue;
+            }
+            let flags = u16::from_be_bytes([body[2], body[3]]) | HAS_FOLDER_COUNT;
+            body[2..4].copy_from_slice(&flags.to_be_bytes());
+            let folder_id = u32::from_be_bytes(body[8..12].try_into().unwrap());
+            let count = subfolders.get(&folder_id).copied().unwrap_or(0);
+            // HFSPlusCatalogFolder.folderCount sits at +84, in what
+            // plain HFS+ leaves as `reserved`.
+            body[84..88].copy_from_slice(&count.to_be_bytes());
+        }
+    }
+
     let cat_records = |w: &Writer| -> Vec<PackedRecord> {
         w.catalog
             .iter()
@@ -2472,6 +2585,18 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
         grow_catalog_fork(writer, built.nodes.len() as u32)?;
         cat_total_nodes = cat_capacity(writer)?;
         built = build_btree(cat_records(writer), writer.node_size, cat_total_nodes)?;
+    }
+    // `header_node` writes the plain-HFS+ `keyCompareType` (0xCF,
+    // case folding). On HFSX the catalog is ordered binary and the
+    // header must say so (0xBC = kHFSBinaryCompare) or the kernel and
+    // fsck_hfs will read the tree with the wrong comparator.
+    if writer.case_sensitive
+        && let Some(header) = built.nodes.first_mut()
+    {
+        let off = NODE_DESCRIPTOR_SIZE + 37;
+        if header.len() > off {
+            header[off] = super::catalog::KEY_COMPARE_BINARY;
+        }
     }
     write_btree_to_fork(
         &mut sink,
@@ -2779,7 +2904,15 @@ pub fn open_writable(
     let node_size = u32::from(cat_header.node_size);
     let cat_total_nodes = cat_header.total_nodes;
 
-    let mut catalog: BTreeMap<OwnedKey, Vec<u8>> = BTreeMap::new();
+    // HFS+ ('H+') always folds case. HFSX ('HX') may do either, and
+    // the authority is the catalog B-tree header's `keyCompareType`
+    // (0xBC = binary/case-sensitive, 0xCF = case folding) — not the
+    // signature, since a case-insensitive HFSX volume exists. Getting
+    // this wrong on a case-sensitive volume makes "README" and
+    // "readme" collide in the in-memory catalog, so the second one
+    // replaces the first and a file vanishes on flush.
+    let case_sensitive = vh.is_hfsx() && cat_header.key_compare_type == 0xBC;
+    let mut catalog = CatalogMap::new(case_sensitive);
     let mut node_idx = cat_header.first_leaf_node;
     // HFS-1: bound the leaf-chain walk by the node count and reject any
     // out-of-range `f_link`, mirroring the read-side guard in
@@ -2918,6 +3051,8 @@ pub fn open_writable(
         next_alloc: total_blocks,
         free_blocks,
         catalog,
+        case_sensitive,
+        hfsx: vh.is_hfsx(),
         overflow_extents,
         allocation_file: vh.allocation_file,
         extents_file: vh.extents_file,

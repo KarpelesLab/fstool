@@ -47,6 +47,7 @@
 
 pub mod attributes;
 pub mod btree;
+pub(crate) mod case_fold;
 pub mod catalog;
 pub mod decmpfs;
 pub mod extents;
@@ -132,10 +133,10 @@ impl HfsPlus {
         journal::replay(dev, &vh)?;
         // Re-read the volume header in case replay restored it.
         let vh = read_volume_header(dev)?;
-        let case_sensitive = vh.is_hfsx();
+        let hfsx = vh.is_hfsx();
 
         let cat_fork = ForkReader::from_inline(&vh.catalog_file, vh.block_size, "catalog")?;
-        let catalog = Catalog::open(dev, cat_fork, case_sensitive)?;
+        let catalog = Catalog::open(dev, cat_fork, hfsx)?;
 
         // Open the extents-overflow file if its fork has any blocks.
         // It can be empty on a fresh volume.
@@ -151,7 +152,7 @@ impl HfsPlus {
         // is the table HFSCompression reads `com.apple.decmpfs` from;
         // images produced by our writer have an empty attributes fork
         // and so skip this path entirely.
-        let attributes = open_attributes(dev, &vh, case_sensitive)?;
+        let attributes = open_attributes(dev, &vh, hfsx)?;
 
         // The root folder's thread record is keyed by (ROOT_FOLDER_ID, "");
         // its name field is the volume name.
@@ -181,14 +182,14 @@ impl HfsPlus {
     /// when done to persist the catalog, bitmap, and volume header.
     pub fn format(dev: &mut dyn BlockDevice, opts: &writer::FormatOpts) -> Result<Self> {
         let (vh, w) = writer::format(dev, opts)?;
-        let case_sensitive = vh.is_hfsx();
+        let hfsx = vh.is_hfsx();
         let mut w = w;
         let mut vh_mut = vh.clone();
         writer::flush(&mut w, &mut vh_mut, dev)?;
         w.flushed = false;
 
         let cat_fork = ForkReader::from_inline(&vh_mut.catalog_file, vh_mut.block_size, "catalog")?;
-        let catalog = Catalog::open(dev, cat_fork, case_sensitive)?;
+        let catalog = Catalog::open(dev, cat_fork, hfsx)?;
         let overflow = if vh_mut.extents_file.total_blocks > 0 {
             let ext_fork = ForkReader::from_inline(
                 &vh_mut.extents_file,
@@ -199,7 +200,7 @@ impl HfsPlus {
         } else {
             None
         };
-        let attributes = open_attributes(dev, &vh_mut, case_sensitive)?;
+        let attributes = open_attributes(dev, &vh_mut, hfsx)?;
         let volume_name = w.volume_name.clone();
         Ok(Self {
             volume_header: vh_mut,
@@ -528,13 +529,13 @@ impl HfsPlus {
             return Ok(());
         };
         writer::flush(w, &mut self.volume_header, dev)?;
-        let case_sensitive = self.volume_header.is_hfsx();
+        let hfsx = self.volume_header.is_hfsx();
         let cat_fork = ForkReader::from_inline(
             &self.volume_header.catalog_file,
             self.volume_header.block_size,
             "catalog",
         )?;
-        self.catalog = Catalog::open(dev, cat_fork, case_sensitive)?;
+        self.catalog = Catalog::open(dev, cat_fork, hfsx)?;
         w.flushed = false;
         Ok(())
     }
