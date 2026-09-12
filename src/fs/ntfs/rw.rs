@@ -765,6 +765,18 @@ pub(super) fn commit_txn(
             chunk_start = chunk_end;
         }
 
+        // Truncate the chain: a transaction always restarts at page 0, so
+        // a shorter one would otherwise leave the previous transaction's
+        // trailing pages in place for `walk_records` to replay. Zeroing
+        // the slot just past what we wrote ends the chain outright (the
+        // LSN check in `walk_records` is the backstop for the wrapped
+        // case, where this slot is a page we just wrote).
+        let page_size = super::logfile::LOG_PAGE_SIZE as u64;
+        let tail_delta = page_idx * page_size;
+        if tail_delta < rcrd_region_size {
+            dev.zero_range(rcrd_region_start + tail_delta, page_size)?;
+        }
+
         // Stamp restart pages: dirty, current_lsn = last_lsn.
         let dirty_page = super::logfile::build_restart_page(last_lsn, log_size, false);
         dev.write_at(logfile_offset, &dirty_page)?;
