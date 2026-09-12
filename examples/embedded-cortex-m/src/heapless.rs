@@ -18,7 +18,7 @@
 
 use core::ptr;
 
-use fstool::noalloc::fat::{FatKind, SectorDriver, Volume};
+use fstool::fs::fat::{FatKind, SectorDriver, Volume};
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {

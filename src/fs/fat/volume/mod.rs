@@ -33,7 +33,7 @@
 //! Operations on a handle therefore take the volume back:
 //!
 //! ```
-//! # use fstool::noalloc::fat::{Error, SectorDriver, Volume};
+//! # use fstool::fs::fat::{Error, SectorDriver, Volume};
 //! # struct RamCard([u8; 0]);
 //! # impl SectorDriver for RamCard {
 //! #     type Error = core::convert::Infallible;
@@ -233,30 +233,123 @@ pub enum FatKind {
 }
 
 impl FatKind {
-    /// `"FAT12"` / `"FAT16"` / `"FAT32"`.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            FatKind::Fat12 => "FAT12",
-            FatKind::Fat16 => "FAT16",
-            FatKind::Fat32 => "FAT32",
-        }
-    }
-
     /// End-of-chain threshold: an entry at or above this ends the chain.
     fn eoc_floor(&self) -> u32 {
-        match self {
-            FatKind::Fat12 => 0x0FF8,
-            FatKind::Fat16 => 0xFFF8,
-            FatKind::Fat32 => 0x0FFF_FFF8,
-        }
+        self.eoc_min()
     }
 
     /// Value written to terminate a chain.
     fn eoc_mark(&self) -> u32 {
+        self.eoc()
+    }
+
+    /// Entry width in bits.
+    pub fn bits(self) -> u32 {
         match self {
-            FatKind::Fat12 => 0x0FFF,
-            FatKind::Fat16 => 0xFFFF,
+            FatKind::Fat12 => 12,
+            FatKind::Fat16 => 16,
+            FatKind::Fat32 => 32,
+        }
+    }
+
+    /// The meaningful bits of one entry — 28 for FAT32, the full width
+    /// otherwise.
+    pub fn entry_mask(self) -> u32 {
+        match self {
+            FatKind::Fat12 => 0x0000_0FFF,
+            FatKind::Fat16 => 0x0000_FFFF,
             FatKind::Fat32 => 0x0FFF_FFFF,
+        }
+    }
+
+    /// The end-of-chain value this writer stores (all meaningful bits set).
+    pub fn eoc(self) -> u32 {
+        self.entry_mask()
+    }
+
+    /// Minimum value that counts as an end-of-chain marker.
+    pub fn eoc_min(self) -> u32 {
+        self.entry_mask() & !0x7
+    }
+
+    /// Whether `value` marks the end of a cluster chain.
+    pub fn is_eoc(self, value: u32) -> bool {
+        value >= self.eoc_min()
+    }
+
+    /// The "bad cluster" marker (one below the end-of-chain range).
+    pub fn bad_cluster(self) -> u32 {
+        self.eoc_min() - 1
+    }
+
+    /// Smallest data-cluster count that makes a volume this flavour.
+    pub fn min_clusters(self) -> u32 {
+        match self {
+            FatKind::Fat12 => 1,
+            FatKind::Fat16 => 4085,
+            FatKind::Fat32 => 65525,
+        }
+    }
+
+    /// Largest data-cluster count this flavour can address. The cap is one
+    /// below the first reserved/bad-cluster value.
+    pub fn max_clusters(self) -> u32 {
+        match self {
+            FatKind::Fat12 => 4084,
+            FatKind::Fat16 => 65524,
+            FatKind::Fat32 => 0x0FFF_FFF4,
+        }
+    }
+
+    /// Classify a volume by its data-cluster count, per the FAT
+    /// specification's one true rule.
+    pub fn from_cluster_count(clusters: u32) -> FatKind {
+        if clusters < FatKind::Fat16.min_clusters() {
+            FatKind::Fat12
+        } else if clusters < FatKind::Fat32.min_clusters() {
+            FatKind::Fat16
+        } else {
+            FatKind::Fat32
+        }
+    }
+
+    /// Bytes needed on disk to hold `entries` entries (before rounding up
+    /// to a whole number of sectors).
+    pub fn fat_bytes(self, entries: u64) -> u64 {
+        match self {
+            // Two entries per three bytes; an odd count still needs the
+            // whole trailing pair's second byte.
+            FatKind::Fat12 => (entries * 3).div_ceil(2),
+            FatKind::Fat16 => entries * 2,
+            FatKind::Fat32 => entries * 4,
+        }
+    }
+
+    /// How many whole entries fit in `bytes` bytes of on-disk FAT.
+    pub fn entries_in(self, bytes: usize) -> usize {
+        match self {
+            FatKind::Fat12 => bytes * 2 / 3,
+            FatKind::Fat16 => bytes / 2,
+            FatKind::Fat32 => bytes / 4,
+        }
+    }
+
+    /// The 8-byte `fs_type` string conventionally stored in the BPB. It is
+    /// informational only — never used to identify a volume.
+    pub fn fs_type_label(self) -> &'static [u8; 8] {
+        match self {
+            FatKind::Fat12 => b"FAT12   ",
+            FatKind::Fat16 => b"FAT16   ",
+            FatKind::Fat32 => b"FAT32   ",
+        }
+    }
+
+    /// Lower-case name used in CLI arguments and diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FatKind::Fat12 => "fat12",
+            FatKind::Fat16 => "fat16",
+            FatKind::Fat32 => "fat32",
         }
     }
 }
@@ -447,6 +540,11 @@ pub struct Volume<D: SectorDriver, const SECTOR: usize = 512> {
     free_count: Option<u32>,
     /// Where to start looking for a free cluster.
     next_free: u32,
+    /// The allocation table, held in memory when there is a heap to hold
+    /// it in. Pure optimisation: the same calls give the same answers
+    /// without it, just one device transfer per lookup instead of none.
+    #[cfg(feature = "alloc")]
+    fat_cache: FatCache,
     /// Whether `free_count` / `next_free` have moved since mount.
     fsinfo_dirty: bool,
     /// What to stamp on entries this volume creates or modifies.
@@ -523,6 +621,8 @@ impl<D: SectorDriver, const SECTOR: usize> Volume<D, SECTOR> {
             cache_lba: None,
             cache_dirty: false,
             free_count: None,
+            #[cfg(feature = "alloc")]
+            fat_cache: FatCache::default(),
             next_free: 2,
             fsinfo_dirty: false,
             now: Timestamp::EPOCH,
@@ -630,6 +730,23 @@ impl<D: SectorDriver, const SECTOR: usize> Volume<D, SECTOR> {
     /// The timestamp currently being stamped.
     pub fn time(&self) -> Timestamp {
         self.now
+    }
+
+    /// Bytes of allocation table currently held in memory.
+    ///
+    /// Always `0` in a build without `alloc`, where every lookup reads a
+    /// sector from the device. With a heap the table is kept as it is
+    /// touched, which is the whole of the difference the feature makes to
+    /// this driver: no call changes, no result changes, fewer transfers.
+    pub fn fat_cache_bytes(&self) -> usize {
+        #[cfg(feature = "alloc")]
+        {
+            self.fat_cache.bytes_held()
+        }
+        #[cfg(not(feature = "alloc"))]
+        {
+            0
+        }
     }
 
     /// The root directory.
@@ -752,7 +869,34 @@ impl<D: SectorDriver, const SECTOR: usize> Volume<D, SECTOR> {
         let bps = self.bps() as u64;
         let sector = self.fat_start(self.geom.active_fat) + (off / bps) as u32;
         let at = (off % bps) as usize;
+        #[cfg(feature = "alloc")]
+        {
+            let rel = (off / bps) as u32;
+            if let Some(byte) = self.cached_fat_byte(rel, at)? {
+                return Ok(byte);
+            }
+        }
         Ok(self.sector(sector)?[at])
+    }
+
+    /// One byte of the active FAT from the in-memory copy, filling it from
+    /// the device on first touch. `None` when this build has no heap.
+    #[cfg(feature = "alloc")]
+    fn cached_fat_byte(&mut self, rel: u32, at: usize) -> Result<Option<u8>, Error<D::Error>> {
+        let bps = self.bps();
+        if rel >= self.geom.fat_sectors {
+            return Ok(None);
+        }
+        if !self.fat_cache.holds(rel) {
+            // Read it through the sector cache so a pending write to this
+            // very sector is seen, then keep the copy.
+            let sector = self.fat_start(self.geom.active_fat) + rel;
+            let mut tmp = [0u8; SECTOR];
+            tmp[..bps].copy_from_slice(self.sector(sector)?);
+            self.fat_cache
+                .store(rel, &tmp[..bps], self.geom.fat_sectors);
+        }
+        Ok(self.fat_cache.byte(rel, at, bps))
     }
 
     /// Read `cluster`'s FAT entry, normalised to its defined bits.
@@ -846,6 +990,17 @@ impl<D: SectorDriver, const SECTOR: usize> Volume<D, SECTOR> {
                 let at = (at_off % bps) as usize;
                 let buf = self.sector_mut(sector)?;
                 buf[at] = (buf[at] & keep) | set;
+            }
+        }
+        // Keep the in-memory copy in step rather than dropping it: an
+        // allocation walk writes and re-reads the same entries constantly.
+        #[cfg(feature = "alloc")]
+        {
+            let bps = self.bps();
+            for &(at_off, keep, set) in &edits[..n] {
+                let rel = (at_off / bps as u64) as u32;
+                let at = (at_off % bps as u64) as usize;
+                self.fat_cache.patch(rel, at, keep, set, bps);
             }
         }
         Ok(())
@@ -1019,6 +1174,71 @@ impl<D: SectorDriver, const SECTOR: usize> Volume<D, SECTOR> {
         }
         self.fsinfo_dirty = false;
         Ok(())
+    }
+}
+
+/// The active FAT, held in memory a sector at a time.
+///
+/// Only ever a cache of what is on the device: every write goes to the
+/// device through the sector cache first and is mirrored here, so dropping
+/// this wholesale would cost speed and nothing else.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Default)]
+struct FatCache {
+    /// The FAT's sectors, laid out end to end; empty until first use.
+    bytes: alloc::vec::Vec<u8>,
+    /// Which of them have been read in.
+    present: alloc::vec::Vec<bool>,
+}
+
+#[cfg(feature = "alloc")]
+impl FatCache {
+    fn holds(&self, rel: u32) -> bool {
+        self.present.get(rel as usize).copied().unwrap_or(false)
+    }
+
+    /// Take a copy of one FAT sector, allocating the table on first use.
+    ///
+    /// A FAT is 4 MiB for a 32 GB card, which is why this fills lazily:
+    /// a volume that only ever reads one file touches a handful of
+    /// sectors, and pays for a handful.
+    fn store(&mut self, rel: u32, sector: &[u8], fat_sectors: u32) {
+        if self.bytes.is_empty() {
+            let total = fat_sectors as usize * sector.len();
+            // A card whose FAT will not fit stays uncached rather than
+            // failing: correctness never depends on this.
+            if total == 0 || self.bytes.try_reserve_exact(total).is_err() {
+                return;
+            }
+            self.bytes.resize(total, 0);
+            self.present.resize(fat_sectors as usize, false);
+        }
+        let at = rel as usize * sector.len();
+        if at + sector.len() <= self.bytes.len() {
+            self.bytes[at..at + sector.len()].copy_from_slice(sector);
+            self.present[rel as usize] = true;
+        }
+    }
+
+    fn byte(&self, rel: u32, at: usize, bps: usize) -> Option<u8> {
+        if !self.holds(rel) {
+            return None;
+        }
+        self.bytes.get(rel as usize * bps + at).copied()
+    }
+
+    /// Apply the same edit the device just took.
+    fn patch(&mut self, rel: u32, at: usize, keep: u8, set: u8, bps: usize) {
+        if !self.holds(rel) {
+            return;
+        }
+        if let Some(b) = self.bytes.get_mut(rel as usize * bps + at) {
+            *b = (*b & keep) | set;
+        }
+    }
+
+    fn bytes_held(&self) -> usize {
+        self.bytes.len()
     }
 }
 

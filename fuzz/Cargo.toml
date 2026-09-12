@@ -35,8 +35,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "noalloc_fat"
-path = "fuzz_targets/noalloc_fat.rs"
+name = "fat_volume"
+path = "fuzz_targets/fat_volume.rs"
 test = false
 doc = false
 bench = false

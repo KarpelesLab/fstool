@@ -1150,3 +1150,46 @@ fn dropping_a_volume_flushes_its_cache() {
         "the cached sector was discarded on drop"
     );
 }
+
+/// `alloc` is a performance feature for this driver and nothing more: the
+/// allocation table is kept in memory, so walking a long chain stops
+/// re-reading FAT sectors. The API, and every answer it gives, is the
+/// same either way.
+#[test]
+fn the_in_memory_fat_only_changes_how_much_is_read() {
+    let mut vol = mount(fat16());
+    let cb = vol.cluster_bytes() as usize;
+    let body: Vec<u8> = (0..cb * 40).map(|i| (i % 251) as u8).collect();
+    let mut f = vol.create_file("/chain.bin").unwrap();
+    f.write_all(&mut vol, &body).unwrap();
+    f.flush(&mut vol).unwrap();
+    let mut vol = remount(vol);
+
+    // Walk the whole chain backwards, which re-reads FAT entries the most.
+    let mut f = vol.open_file("/chain.bin").unwrap();
+    let mut one = [0u8; 1];
+    vol.driver_mut().reads = 0;
+    for i in (0..40).rev() {
+        f.seek(&mut vol, (i * cb) as u32).unwrap();
+        f.read_exact(&mut vol, &mut one).unwrap();
+        assert_eq!(one[0], body[i * cb], "cluster {i}");
+    }
+    let reads = vol.driver().reads;
+
+    if cfg!(feature = "alloc") {
+        // The FAT is resident, so the reads left are the data sectors.
+        assert!(
+            vol.fat_cache_bytes() > 0,
+            "the table should be held in memory"
+        );
+        assert!(
+            reads <= 45,
+            "{reads} sector reads for 40 backward seeks — the table is not being cached"
+        );
+    } else {
+        // Without a heap every lookup goes to the card, which is the
+        // trade the configuration makes.
+        assert_eq!(vol.fat_cache_bytes(), 0);
+        assert!(reads >= 40);
+    }
+}

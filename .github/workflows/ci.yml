@@ -171,7 +171,7 @@ jobs:
             --target thumbv7em-none-eabihf -- -D warnings
           cargo test --lib --no-default-features --features fat,exfat,littlefs
           # And the floor below that: `fat` on its own, with no allocator
-          # at all — the configuration `noalloc::fat` is built for.
+          # at all — the configuration `fs::fat` is built for.
           cargo rustc --lib --crate-type rlib --no-default-features --features fat \
             --target thumbv7em-none-eabihf -- -D warnings
           cargo clippy --lib --no-default-features --features fat \

@@ -1,5 +1,5 @@
 //! Build a small valid FAT volume, splatter the fuzzer's bytes into it,
-//! then mount and walk it with the allocator-free driver.
+//! then mount and walk it with the allocation-free driver.
 //!
 //! Everything must terminate with entries or an `Err` — never a panic,
 //! never a read past the medium, and never an endless walk. That last one
@@ -11,8 +11,7 @@
 
 use fstool::block::{BlockDevice, MemoryBackend};
 use fstool::fs::Filesystem;
-use fstool::fs::fat::{Fat32, FatFormatOpts, FatKind};
-use fstool::noalloc::fat::{SectorDriver, Volume};
+use fstool::fs::fat::{Fat32, FatFormatOpts, FatKind, SectorDriver, Volume};
 use libfuzzer_sys::fuzz_target;
 
 /// The volume under test, in RAM.

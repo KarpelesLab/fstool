@@ -763,37 +763,40 @@ of the core run in the `no_std` configuration too
 
 ### No allocator at all
 
-The core above still wants a heap, because the hosted API hands back
-`Vec`s and `String`s and its FAT driver keeps the whole allocation table
-resident. Underneath it is a floor with no heap at all: `alloc` is itself
-a (default) feature, and turning it off removes the layers that need one.
-What is left today is `fstool::noalloc::fat`, a second, independent
-FAT12/16/32 driver:
+The core above still wants a heap, because the hosted `Filesystem` API
+hands back `Vec`s and `String`s. Underneath it is a floor with no heap at
+all: `alloc` is itself a (default) feature, and turning it off removes the
+layers that need one. What is left today is the FAT driver, at the same
+path it always had:
 
 ```toml
 [dependencies]
 fstool = { version = "0.4", default-features = false, features = ["fat"] }
 ```
 
-That is the *same* `fat` feature a hosted build uses — FAT needs no
-allocator, so it does not ask for one, and `alloc` only ever adds the
-hosted driver beside this one. (Every other backend still requires
-`alloc` today and says so in its feature.) With `alloc` off nothing that
-can allocate is compiled, so the crate links on a target with no
-`#[global_allocator]` — a guarantee CI checks by linking exactly such a
-binary on every push. Every buffer is a fixed array
+That is the *same* `fat` feature a hosted build uses, and
+`fstool::fs::fat` is the same module — FAT needs no allocator, so it does
+not ask for one. `alloc` is purely additive here: it brings the hosted
+[`Fat32`] (the `Filesystem` implementation that `inspect`, `repack`, the
+spec engine and the CLI dispatch through) and it makes the driver below
+*faster* by keeping the allocation table in memory instead of reading a
+sector per lookup. Not one call or type changes shape. (Every other
+backend still requires `alloc` today and says so in its feature.) With
+`alloc` off nothing that can allocate is compiled, so the crate links on
+a target with no `#[global_allocator]` — a guarantee CI checks by linking
+exactly such a binary on every push. Every buffer is a fixed array
 or comes from the caller; the FAT is read a sector at a time from the
 device, so mounting a 32 GB card costs one sector of RAM rather than the
 four megabytes its table would occupy. It reads *and writes*: create,
 remove, append, extend, truncate, subdirectories, long names, and volumes
 inside MBR partitions.
 
-It carries its own `SectorDriver` trait (the hosted `SectorIo` returns a
-`crate::Error`, which owns a `String`) and its own error type, generic
-over your driver's:
+The driver carries its own `SectorDriver` trait (the hosted `SectorIo`
+returns a `crate::Error`, which owns a `String`) and its own error type,
+generic over your driver's:
 
 ```rust
-use fstool::noalloc::fat::{SectorDriver, Volume};
+use fstool::fs::fat::{SectorDriver, Volume};
 
 struct SdCard { /* your driver */ }
 
@@ -805,7 +808,7 @@ impl SectorDriver for SdCard {
     fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), MyDriverError> { todo!() }
 }
 
-fn log_boot(card: SdCard) -> Result<(), fstool::noalloc::fat::Error<MyDriverError>> {
+fn log_boot(card: SdCard) -> Result<(), fstool::fs::fat::Error<MyDriverError>> {
     // Mounts the whole card, or its first FAT partition if it has an MBR.
     let mut vol = Volume::<_, 512>::mount_auto(card)?;
 
@@ -822,9 +825,12 @@ fn log_boot(card: SdCard) -> Result<(), fstool::noalloc::fat::Error<MyDriverErro
 ```
 
 The same program on a Cortex-M4F links to **~19 KB of flash** and needs
-well under 1 KiB of RAM for the volume, whatever the size of the card.
-Both drivers can be compiled together (the default build has both), and
-`examples/embedded-cortex-m` builds the same demo against each.
+well under 1 KiB of RAM for the volume, whatever the size of the card —
+one sector of scratch, plus the handles you hold. Give it `alloc` and the
+identical program keeps the allocation table resident instead
+(`Volume::fat_cache_bytes` reports how much), trading RAM for transfers
+without a line of it changing. `examples/embedded-cortex-m` builds the
+same demo against each half.
 
 ## Compression
 

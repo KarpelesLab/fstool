@@ -7,8 +7,8 @@ and links for a real microcontroller target, and to measure what it costs.
 
 | binary | feature | fstool features | driver | heap |
 |--------|---------|-----------------|--------|------|
-| `fstool-embedded-cortex-m` | `alloc-demo` (default) | `fat`, `alloc` | `fstool::fs::fat` | 64 KiB bump allocator |
-| `fstool-embedded-heapless` | `heapless` | `fat` | `fstool::noalloc::fat` | **none** |
+| `fstool-embedded-cortex-m` | `alloc-demo` (default) | `fat`, `alloc` | `fs::fat::Fat32` | 64 KiB bump allocator |
+| `fstool-embedded-heapless` | `heapless` | `fat` | `fs::fat::Volume` | **none** |
 
 The second one is the interesting one: it defines no `#[global_allocator]`
 and never links the `alloc` crate, so if anything reachable behind the
@@ -38,7 +38,7 @@ format + create + list + read, `core::fmt`, and a 64 KiB bump allocator:
 
 (The heapless driver is compiled into this build too — `fat` enables both
 — but nothing references it, so LTO drops every byte: the binary carries
-no `noalloc` symbols at all.)
+no symbols from the allocation-free driver at all.)
 
 `.bss` is the 64 KiB allocator arena plus a few words; the driver itself
 keeps the allocation table and one cluster resident.

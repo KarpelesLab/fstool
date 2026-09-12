@@ -16,10 +16,10 @@
 //! spec, [`inspect`] opens and walks an existing one, [`repack`] converts
 //! between formats, and [`memconv`] / [`memedit`] do both in memory.
 //!
-//! Beside that stack sits [`noalloc`], for targets with no heap: drivers
-//! that allocate nothing and depend on none of the layers above. Today
-//! that is [`noalloc::fat`], a second FAT12/16/32 implementation that
-//! reads and writes a card through one sector of scratch RAM.
+//! `alloc` is a feature of that stack rather than a floor beneath it.
+//! [`fs::fat`] works with or without a heap through the same API, and
+//! turning `alloc` on adds the hosted [`fs::Filesystem`] surface and an
+//! in-memory allocation table — never a different shape to call.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -30,7 +30,7 @@
 //
 // With the `alloc` feature off, none of that is compiled and the crate
 // links on a target with no global allocator; what remains is
-// [`noalloc`]. Host unit tests always have `alloc` available, so test
+// [`fs::fat`]'s driver. Host unit tests always have `alloc` available, so test
 // code can still build fixtures with a `Vec` while the code under test
 // cannot.
 #[cfg(any(feature = "alloc", test))]
@@ -91,7 +91,7 @@ pub mod crc;
 pub mod error;
 #[cfg(feature = "alloc")]
 pub mod format_opts;
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "alloc", feature = "fat"))]
 pub mod fs;
 #[cfg(feature = "fuse")]
 pub mod fuse_adapter;
@@ -145,11 +145,6 @@ macro_rules! fstool_log {
         }
     }};
 }
-
-/// Allocator-free backends: everything here works with no heap at all,
-/// on a target with no global allocator. See [`noalloc::fat`].
-#[cfg(feature = "fat")]
-pub mod noalloc;
 
 #[cfg(feature = "alloc")]
 pub use error::{Error, Result};

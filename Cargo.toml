@@ -108,7 +108,7 @@ std = ["alloc", "uuid/std", "uuid/v4"]
 #                features = ["fat"] }
 #
 # and reads and writes an SD card through the `SectorDriver` you
-# implement over your card driver. See `noalloc::fat`.
+# implement over your card driver. See `fs::fat`.
 alloc = []
 
 # Everything the library reads and writes, with no command-line surface.
@@ -150,15 +150,15 @@ filesystems = [
 # FAT12 / FAT16 / FAT32, in both configurations — the one backend that
 # needs neither `std` nor `alloc`.
 #
-# On its own it compiles `noalloc::fat`, the allocation-free driver: a
+# On its own it compiles the allocation-free driver in `fs::fat`: a
 # `SectorDriver` you implement, one sector of scratch RAM, and the
 # allocation table read from the card rather than held in memory. Reads
 # and writes, long names, subdirectories, MBR partitions.
 #
-# With `alloc` (so, in any default or `std` build) it *also* compiles
-# `fs::fat`, the hosted driver, which speaks the crate's `Filesystem`
-# trait, formats volumes and builds images. The two share no code and
-# can be used together.
+# `alloc` (so, any default or `std` build) only adds to that module: the
+# hosted `Fat32`, which speaks the crate's `Filesystem` trait and formats
+# volumes, and an in-memory allocation table that makes the driver above
+# faster through exactly the same API.
 fat = []
 # exFAT. Shares the allocation-table code with the hosted `fat` driver,
 # so unlike `fat` it needs a heap.
