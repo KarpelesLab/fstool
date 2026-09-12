@@ -343,10 +343,12 @@ impl Exfat {
                 name: entry.name,
                 inode: entry.first_cluster,
                 kind,
+                // DataLength is the file's size; bytes past ValidDataLength
+                // read as zero (see `open_file_reader`).
                 size: if entry.is_directory {
                     0
                 } else {
-                    entry.valid_data_length
+                    entry.data_length
                 },
             });
         }
@@ -368,16 +370,18 @@ impl Exfat {
         let cluster_bytes = self.boot.bytes_per_cluster() as u64;
         let chain =
             self.build_data_chain(entry.first_cluster, entry.no_fat_chain(), entry.data_length)?;
-        // ValidDataLength is what the file system reports as the logical
-        // file size; bytes beyond it but within DataLength are nominally
-        // zero. Cap reads to ValidDataLength.
-        let remaining = entry.valid_data_length;
+        // DataLength is the file's size. ValidDataLength marks how much of
+        // it has been written; the bytes between the two are defined to
+        // read as zero whatever the clusters hold (a pre-allocation left
+        // by another implementation typically contains stale data).
         Ok(ExfatFileReader {
             dev,
             chain,
             cluster_heap_offset: self.boot.cluster_heap_byte_offset(),
             cluster_bytes,
-            remaining,
+            remaining: entry.data_length,
+            valid: entry.valid_data_length.min(entry.data_length),
+            pos: 0,
             cluster_idx: 0,
             cluster_off: 0,
         })
@@ -1886,25 +1890,39 @@ pub struct ExfatFileReader<'a> {
     chain: Vec<u32>,
     cluster_heap_offset: u64,
     cluster_bytes: u64,
-    /// Bytes of the file still to be returned (capped to ValidDataLength).
+    /// Bytes of the file still to be returned (down from DataLength).
     remaining: u64,
+    /// ValidDataLength: bytes at or past this offset read as zero.
+    valid: u64,
+    /// Current byte offset within the file.
+    pos: u64,
     cluster_idx: usize,
     cluster_off: u64,
 }
 
 impl<'a> crate::io::Read for ExfatFileReader<'a> {
     fn read(&mut self, buf: &mut [u8]) -> crate::io::Result<usize> {
-        if self.remaining == 0 || self.cluster_idx >= self.chain.len() {
+        if self.remaining == 0 || buf.is_empty() || self.cluster_idx >= self.chain.len() {
             return Ok(0);
         }
         let avail_in_cluster = self.cluster_bytes - self.cluster_off;
-        let want = (buf.len() as u64).min(avail_in_cluster).min(self.remaining) as usize;
-        let cluster = self.chain[self.cluster_idx];
-        let cluster_start = self.cluster_heap_offset + (cluster as u64 - 2) * self.cluster_bytes;
-        let off = cluster_start + self.cluster_off;
-        self.dev
-            .read_at(off, &mut buf[..want])
-            .map_err(crate::io::Error::other)?;
+        let mut want = (buf.len() as u64).min(avail_in_cluster).min(self.remaining);
+        if self.pos < self.valid {
+            // Stop at ValidDataLength so the next call zero-fills from
+            // there.
+            want = want.min(self.valid - self.pos);
+            let cluster = self.chain[self.cluster_idx];
+            let cluster_start =
+                self.cluster_heap_offset + (cluster as u64 - 2) * self.cluster_bytes;
+            let off = cluster_start + self.cluster_off;
+            self.dev
+                .read_at(off, &mut buf[..want as usize])
+                .map_err(crate::io::Error::other)?;
+        } else {
+            buf[..want as usize].fill(0);
+        }
+        let want = want as usize;
+        self.pos += want as u64;
         self.cluster_off += want as u64;
         self.remaining -= want as u64;
         if self.cluster_off == self.cluster_bytes {
@@ -2262,6 +2280,91 @@ mod tests {
             Err(crate::Error::InvalidImage(_)) => {}
             other => panic!("expected InvalidImage, got {other:?}"),
         }
+    }
+
+    /// The synthetic image with `hello.txt` re-described as ValidDataLength
+    /// 5 / DataLength 14: only "Hello" counts as written, the rest of the
+    /// cluster (", exFAT!\n") is stale pre-allocation that must read as
+    /// zero.
+    fn image_with_vdl_gap() -> MemoryBackend {
+        let mut dev = build_test_image();
+        // Root: label, bitmap, upcase, then hello.txt's 3-slot set at 96.
+        let set_off = test_cluster_off(CL_ROOT) + 3 * ENTRY_SIZE as u64;
+        let mut set = vec![0u8; 3 * ENTRY_SIZE];
+        dev.read_at(set_off, &mut set).unwrap();
+        assert_eq!(set[0], dir::ENTRY_FILE);
+        set[ENTRY_SIZE + 8..ENTRY_SIZE + 16].copy_from_slice(&5u64.to_le_bytes());
+        let csum = dir::set_checksum(&set);
+        set[2..4].copy_from_slice(&csum.to_le_bytes());
+        dev.write_at(set_off, &set).unwrap();
+        dev
+    }
+
+    #[test]
+    fn reads_report_data_length_and_zero_fill_past_valid_data_length() {
+        use crate::io::{Read, Seek, SeekFrom};
+        let mut dev = image_with_vdl_gap();
+        let mut fs = Exfat::open(&mut dev).unwrap();
+        let expect = {
+            let mut v = b"Hello".to_vec();
+            v.resize(14, 0);
+            v
+        };
+        let listed = fs.list_path(&mut dev, "/").unwrap();
+        let hello = listed.iter().find(|e| e.name == "hello.txt").unwrap();
+        assert_eq!(hello.size, 14);
+        assert_eq!(read_file_contents(&mut fs, &mut dev, "/hello.txt"), expect);
+
+        let attrs =
+            Filesystem::getattr(&mut fs, &mut dev, crate::path::Path::new("/hello.txt")).unwrap();
+        assert_eq!(attrs.size, 14);
+
+        let mut h = fs
+            .open_file_ro(&mut dev, crate::path::Path::new("/hello.txt"))
+            .unwrap();
+        assert_eq!(h.len(), 14);
+        h.seek(SeekFrom::Start(3)).unwrap();
+        let mut four = [0xAAu8; 4];
+        h.read_exact(&mut four).unwrap();
+        assert_eq!(&four, b"lo\0\0");
+    }
+
+    #[test]
+    fn rw_handle_zeroes_the_valid_data_length_gap_before_writing() {
+        use crate::io::{Read, Seek, SeekFrom, Write};
+        let mut dev = image_with_vdl_gap();
+        let mut fs = Exfat::open(&mut dev).unwrap();
+        {
+            let mut h = fs
+                .open_file_rw(
+                    &mut dev,
+                    crate::path::Path::new("/hello.txt"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(h.len(), 14);
+            h.seek(SeekFrom::Start(12)).unwrap();
+            h.write_all(b"XY").unwrap();
+            h.seek(SeekFrom::Start(0)).unwrap();
+            let mut all = Vec::new();
+            h.read_to_end(&mut all).unwrap();
+            let mut expect = b"Hello".to_vec();
+            expect.resize(12, 0);
+            expect.extend_from_slice(b"XY");
+            assert_eq!(all, expect);
+            h.sync().unwrap();
+        }
+        // The stale bytes really were zeroed on disk, and the entry now
+        // has ValidDataLength == DataLength.
+        let mut on_disk = [0u8; 14];
+        dev.read_at(test_cluster_off(CL_HELLO), &mut on_disk)
+            .unwrap();
+        assert_eq!(&on_disk[5..12], &[0u8; 7]);
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        let (set, _) = fs2.resolve_entry(&mut dev, "/hello.txt").unwrap();
+        assert_eq!(set.data_length, 14);
+        assert_eq!(set.valid_data_length, 14);
     }
 
     #[test]

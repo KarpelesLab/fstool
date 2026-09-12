@@ -53,8 +53,13 @@ pub struct ExfatFileHandle<'a> {
     pub(super) chain: Vec<u32>,
     /// Whether the on-disk stream extension marks the file as NoFatChain.
     pub(super) no_fat_chain: bool,
-    /// Logical length (ValidDataLength).
+    /// File size (DataLength).
     pub(super) len: u64,
+    /// ValidDataLength: how much of `len` holds written data. Bytes in
+    /// `valid_len..len` read as zero whatever the clusters contain; every
+    /// mutation first zeroes that range on disk and closes the gap (see
+    /// [`materialise_valid_gap`](Self::materialise_valid_gap)).
+    pub(super) valid_len: u64,
     /// Current read/write cursor.
     pub(super) pos: u64,
     /// True when `entry_bytes` differs from what's on disk.
@@ -93,7 +98,8 @@ impl<'a> ExfatFileHandle<'a> {
         self.entry_bytes[stream_off + 1] = flags;
 
         // ValidDataLength (8 bytes at offset 8).
-        self.entry_bytes[stream_off + 8..stream_off + 16].copy_from_slice(&self.len.to_le_bytes());
+        self.entry_bytes[stream_off + 8..stream_off + 16]
+            .copy_from_slice(&self.valid_len.to_le_bytes());
         // FirstCluster (4 bytes at offset 20).
         let first_cluster = if self.chain.is_empty() {
             0
@@ -103,7 +109,8 @@ impl<'a> ExfatFileHandle<'a> {
         self.entry_bytes[stream_off + 20..stream_off + 24]
             .copy_from_slice(&first_cluster.to_le_bytes());
         // DataLength (8 bytes at offset 24). exFAT requires
-        // DataLength >= ValidDataLength; we keep them equal here.
+        // DataLength >= ValidDataLength; after any mutation they are equal.
+        debug_assert!(self.valid_len <= self.len);
         self.entry_bytes[stream_off + 24..stream_off + 32].copy_from_slice(&self.len.to_le_bytes());
 
         // Recompute SetChecksum over the whole set (skipping primary[2..4]).
@@ -275,9 +282,10 @@ impl<'a> ExfatFileHandle<'a> {
     }
 
     /// Read `buf.len()` bytes (or fewer at EOF) starting at the current
-    /// position. Helper for `Read::read`.
+    /// position. Helper for `Read::read`. Bytes at or past
+    /// ValidDataLength read as zero without touching the disk.
     fn read_internal(&mut self, buf: &mut [u8]) -> crate::io::Result<usize> {
-        if self.pos >= self.len {
+        if self.pos >= self.len || buf.is_empty() {
             return Ok(0);
         }
         let cb = self.cluster_size();
@@ -287,15 +295,34 @@ impl<'a> ExfatFileHandle<'a> {
         if cluster_idx >= self.chain.len() {
             return Ok(0);
         }
-        let cluster = self.chain[cluster_idx];
         let in_cluster = cb - cluster_off;
-        let want = (buf.len() as u64).min(in_cluster).min(avail) as usize;
-        let disk_off = self.cluster_disk_offset(cluster) + cluster_off;
-        self.dev
-            .read_at(disk_off, &mut buf[..want])
-            .map_err(crate::io::Error::other)?;
-        self.pos += want as u64;
-        Ok(want)
+        let mut want = (buf.len() as u64).min(in_cluster).min(avail);
+        if self.pos < self.valid_len {
+            want = want.min(self.valid_len - self.pos);
+            let cluster = self.chain[cluster_idx];
+            let disk_off = self.cluster_disk_offset(cluster) + cluster_off;
+            self.dev
+                .read_at(disk_off, &mut buf[..want as usize])
+                .map_err(crate::io::Error::other)?;
+        } else {
+            buf[..want as usize].fill(0);
+        }
+        self.pos += want;
+        Ok(want as usize)
+    }
+
+    /// Before the first mutation, make the on-disk bytes in
+    /// `valid_len..min(len, upto)` really zero and advance
+    /// ValidDataLength over them, so a later write or truncation cannot
+    /// expose the stale data those clusters held. Every mutation ends
+    /// with `valid_len == len`.
+    fn materialise_valid_gap(&mut self, upto: u64) -> Result<()> {
+        let upto = upto.min(self.len);
+        if self.valid_len < upto {
+            self.zero_range(self.valid_len, upto)?;
+            self.valid_len = upto;
+        }
+        Ok(())
     }
 
     /// Write `buf` at the current position, growing the file as needed.
@@ -305,6 +332,9 @@ impl<'a> ExfatFileHandle<'a> {
         if buf.is_empty() {
             return Ok(0);
         }
+        // Phase 0: close any ValidDataLength gap so the bytes we leave
+        // untouched below stay zero on disk.
+        self.materialise_valid_gap(self.len)?;
         // Phase 1: if `pos > len`, the range [len, pos) becomes a sparse
         // gap. Allocate clusters covering it and zero those bytes.
         if self.pos > self.len {
@@ -313,6 +343,7 @@ impl<'a> ExfatFileHandle<'a> {
             let gap_hi = self.pos;
             self.zero_range(gap_lo, gap_hi)?;
             self.len = self.pos;
+            self.valid_len = self.pos;
             self.refresh_entry_bytes();
         }
 
@@ -340,6 +371,7 @@ impl<'a> ExfatFileHandle<'a> {
         if self.pos > self.len {
             self.len = self.pos;
         }
+        self.valid_len = self.len;
         self.refresh_entry_bytes();
         Ok(written)
     }
@@ -389,22 +421,27 @@ impl<'a> FileHandle for ExfatFileHandle<'a> {
 
     fn set_len(&mut self, new_len: u64) -> Result<()> {
         let cb = self.cluster_size();
+        if new_len == self.len {
+            return Ok(());
+        }
+        // Zero whatever part of the ValidDataLength gap survives the
+        // resize; the rest is either freed or was never written.
+        self.materialise_valid_gap(new_len)?;
         if new_len < self.len {
             let keep_clusters = new_len.div_ceil(cb) as usize;
             self.shrink_chain(keep_clusters)?;
             self.len = new_len;
             // If pos is past new end, leave it — the next read will
             // return 0; the next write will reopen the sparse-fill path.
-        } else if new_len > self.len {
+        } else {
             self.ensure_capacity(new_len)?;
             // Zero the freshly-exposed bytes (everything from old `len`
             // up to `new_len`).
             let old_len = self.len;
             self.zero_range(old_len, new_len)?;
             self.len = new_len;
-        } else {
-            return Ok(());
         }
+        self.valid_len = self.len;
         self.refresh_entry_bytes();
         Ok(())
     }
@@ -618,7 +655,8 @@ impl Exfat {
             )?;
         }
         let no_fat_chain = set.no_fat_chain();
-        let len = set.valid_data_length;
+        let len = set.data_length;
+        let valid_len = set.valid_data_length.min(len);
         Ok(ExfatFileHandle {
             fs: self,
             dev,
@@ -629,6 +667,7 @@ impl Exfat {
             chain,
             no_fat_chain,
             len,
+            valid_len,
             pos: 0,
             entry_dirty: false,
         })
