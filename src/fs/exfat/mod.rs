@@ -768,6 +768,36 @@ impl Exfat {
         Ok(())
     }
 
+    /// Free the contiguous run of `n` clusters starting at `first_cluster`
+    /// — the allocation of a NoFatChain file, whose FAT entries carry no
+    /// chain to walk. Clears the bitmap bits and resets any FAT entries in
+    /// the run.
+    fn free_contiguous(&mut self, first_cluster: u32, n: u64) -> Result<()> {
+        if first_cluster < 2 || n == 0 {
+            return Ok(());
+        }
+        let max = u64::from(self.boot.cluster_count) + 2;
+        let end = u64::from(first_cluster)
+            .checked_add(n)
+            .ok_or_else(|| crate::Error::InvalidImage("exfat: cluster overflow".into()))?;
+        if end > max {
+            return Err(crate::Error::InvalidImage(format!(
+                "exfat: contiguous run {first_cluster}..{end} exceeds ClusterCount {}",
+                self.boot.cluster_count
+            )));
+        }
+        for c in first_cluster..end as u32 {
+            self.fat.set_raw(c, fat::FREE);
+            set_bitmap_bit(&mut self.bitmap, c, false);
+        }
+        if self.next_free_hint > first_cluster {
+            self.next_free_hint = first_cluster;
+        }
+        self.fat_dirty = true;
+        self.bitmap_dirty = true;
+        Ok(())
+    }
+
     /// Walk the FAT chain of a directory and collect every cluster.
     fn dir_chain(&self, first_cluster: u32) -> Result<Vec<u32>> {
         self.fat.chain(first_cluster, self.boot.cluster_count)
@@ -1286,9 +1316,17 @@ impl Exfat {
         // Clear the in-use bits on each slot of the entry set.
         let _ = self.dir_pos_to_disk_offset(parent_cluster, pos)?; // sanity
         self.clear_entry_set(dev, parent_cluster, pos, total)?;
-        // Free the data cluster chain (only if first_cluster > 0).
+        // Free the data clusters (only if first_cluster > 0). A NoFatChain
+        // entry owns `ceil(DataLength / cluster)` contiguous clusters and
+        // its FAT entries are zero — walking the FAT would free only the
+        // first cluster and leak the rest.
         if set.first_cluster >= 2 {
-            self.free_chain(set.first_cluster)?;
+            if set.no_fat_chain() {
+                let cb = u64::from(self.boot.bytes_per_cluster());
+                self.free_contiguous(set.first_cluster, set.data_length.div_ceil(cb))?;
+            } else {
+                self.free_chain(set.first_cluster)?;
+            }
         }
         Ok(())
     }
@@ -2144,6 +2182,26 @@ mod tests {
             .read_to_end(&mut got2)
             .unwrap();
         assert_eq!(got2, fresh);
+    }
+
+    #[test]
+    fn remove_frees_every_cluster_of_a_nofatchain_file() {
+        let (mut dev, _payload) = image_with_nofat_file();
+        let mut fs = Exfat::open(&mut dev).unwrap();
+        assert_eq!(fs.bitmap_bit(CL_NOFAT), Some(true));
+        assert_eq!(fs.bitmap_bit(CL_NOFAT + 1), Some(true));
+        fs.remove(&mut dev, "/nofat.bin").unwrap();
+        assert_eq!(fs.bitmap_bit(CL_NOFAT), Some(false));
+        assert_eq!(
+            fs.bitmap_bit(CL_NOFAT + 1),
+            Some(false),
+            "second cluster of the contiguous run leaked"
+        );
+        fs.flush(&mut dev).unwrap();
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        assert_eq!(fs2.bitmap_bit(CL_NOFAT), Some(false));
+        assert_eq!(fs2.bitmap_bit(CL_NOFAT + 1), Some(false));
+        assert!(fs2.open_file_reader(&mut dev, "/nofat.bin").is_err());
     }
 
     #[test]
