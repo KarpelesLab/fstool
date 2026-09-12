@@ -118,6 +118,19 @@ impl MergeModel {
         Ok(model)
     }
 
+    /// The layers in model order, with any nested [`Source::Layered`]
+    /// expanded in place — the same numbering `build` assigns, so the
+    /// per-layer tar walk in [`Self::walk_into_sink`] lines up with the
+    /// `layer` index stored on each tar body.
+    fn flatten_layers<'a>(layers: &'a [Source], out: &mut Vec<&'a Source>) {
+        for layer in layers {
+            match layer {
+                Source::Layered(nested) => Self::flatten_layers(nested, out),
+                other => out.push(other),
+            }
+        }
+    }
+
     /// Drop `path` and every descendant. Used by tombstone application.
     fn remove_subtree(&mut self, path: &Path) {
         let prefix = path.to_path_buf();
@@ -324,9 +337,13 @@ impl MergeModel {
         #[cfg(not(feature = "tar"))]
         let _ = layers;
         #[cfg(feature = "tar")]
-        for (idx, layer) in layers.iter().enumerate() {
-            if let Source::TarArchive { path, codec } = layer {
-                stream_tar_layer_winners(self, idx, path, *codec, sink, to_meta, &to_xattrs)?;
+        {
+            let mut flat = Vec::new();
+            Self::flatten_layers(layers, &mut flat);
+            for (idx, layer) in flat.into_iter().enumerate() {
+                if let Source::TarArchive { path, codec } = layer {
+                    stream_tar_layer_winners(self, idx, path, *codec, sink, to_meta, &to_xattrs)?;
+                }
             }
         }
 
@@ -497,10 +514,12 @@ fn apply_layer(layer: &Source, model: &mut MergeModel, layer_idx: &mut usize) ->
 fn apply_host_dir(root: &Path, model: &mut MergeModel) -> Result<()> {
     // Track inodes seen with nlink > 1: the first occurrence emits a real
     // file (BodyRef::Host); subsequent ones become hardlinks pointing back
-    // to the first path. Scoped per host-dir layer (inodes only collide
-    // within one filesystem).
+    // to the first path. Scoped per host-dir layer and keyed on
+    // (device, inode), since inode numbers only identify a file within
+    // one filesystem and a tree can span a mount.
     #[cfg(unix)]
-    let mut link_map: std::collections::HashMap<u64, PathBuf> = std::collections::HashMap::new();
+    let mut link_map: std::collections::HashMap<(u64, u64), PathBuf> =
+        std::collections::HashMap::new();
     let mut stack: Vec<(PathBuf, PathBuf)> = vec![(root.to_path_buf(), PathBuf::from("/"))];
     while let Some((host, fs)) = stack.pop() {
         for entry in std::fs::read_dir(&host)? {
@@ -560,11 +579,11 @@ fn apply_host_dir(root: &Path, model: &mut MergeModel) -> Result<()> {
                     if meta.len() == 0 {
                         BodyRef::Empty
                     } else if meta.nlink() > 1 {
-                        let ino = meta.ino();
-                        match link_map.get(&ino) {
+                        let key = (meta.dev(), meta.ino());
+                        match link_map.get(&key) {
                             Some(first) => BodyRef::HardLink(first.clone()),
                             None => {
-                                link_map.insert(ino, dest.clone());
+                                link_map.insert(key, dest.clone());
                                 BodyRef::Host(entry.path())
                             }
                         }

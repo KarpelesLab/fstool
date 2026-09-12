@@ -1291,14 +1291,13 @@ impl AnyFs {
         at_path: &str,
         src: &crate::repack::Source,
     ) -> Result<()> {
-        let _ = at_path; // generic populate walks from the source root;
-        // a future enhancement can rebase entries under `at_path` for
-        // add_dir_tree's "drop the tree here" semantics.
+        let base = at_path.trim_end_matches('/').to_string();
+        if base.is_empty() {
+            return self
+                .as_filesystem_dyn(|fs| crate::repack::populate_fs_from_source_dyn(dev, fs, src));
+        }
         self.as_filesystem_dyn(|fs| {
-            // SAFETY: populate_fs_from_source is generic over F:
-            // Filesystem; we can't call it directly on a trait object,
-            // so we open a private helper that takes &mut dyn.
-            crate::repack::populate_fs_from_source_dyn(dev, fs, src)
+            crate::repack::populate_fs_from_source_dyn_at(dev, fs, &base, src)
         })
     }
 
@@ -1595,6 +1594,13 @@ pub fn detect_partition_table(dev: &mut dyn BlockDevice) -> Result<Option<Detect
     dev.read_at(0, &mut s0)?;
     let is_fat32 = s0[510] == 0x55 && s0[511] == 0xAA && &s0[82..87] == b"FAT32";
     if is_fat32 {
+        return Ok(None);
+    }
+    // FAT12 / FAT16 too: a DOS-formatted floppy or small volume carries
+    // boot code and message strings right through the 0x1BE..0x1FE range
+    // that the MBR heuristic below reads as partition entries.
+    #[cfg(feature = "fat")]
+    if crate::fs::fat::boot::probe(&s0).is_some() {
         return Ok(None);
     }
     let has_55aa = s0[510] == 0x55 && s0[511] == 0xAA;

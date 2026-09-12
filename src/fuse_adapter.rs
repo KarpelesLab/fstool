@@ -615,10 +615,26 @@ impl FuseFilesystem for FstoolFs {
         let new = Self::child_path(&newparent_path, newname);
         match self.fs.rename(self.dev.as_mut(), &old, &new) {
             Ok(()) => {
-                // Keep the same FUSE inode pointing at the new path.
-                if let Some(id) = self.path_to_ino.remove(&old) {
-                    self.ino_to_path.insert(id, new.clone());
-                    self.path_to_ino.insert(new, id);
+                // Keep the same FUSE inodes pointing at the new paths —
+                // the renamed entry and, for a directory, everything
+                // under it (an open handle on a descendant must keep
+                // resolving, and a stale key must not be handed to a
+                // later create at the old path).
+                let moved: Vec<(PathBuf, u64)> = self
+                    .path_to_ino
+                    .iter()
+                    .filter(|(p, _)| *p == &old || p.starts_with(&old))
+                    .map(|(p, id)| (p.clone(), *id))
+                    .collect();
+                for (p, id) in moved {
+                    self.path_to_ino.remove(&p);
+                    let rebased = match p.strip_prefix(&old) {
+                        Ok(rest) if rest.as_os_str().is_empty() => new.clone(),
+                        Ok(rest) => new.join(rest),
+                        Err(_) => continue,
+                    };
+                    self.ino_to_path.insert(id, rebased.clone());
+                    self.path_to_ino.insert(rebased, id);
                 }
                 reply.ok();
             }
@@ -678,11 +694,19 @@ impl FuseFilesystem for FstoolFs {
         if handle.seek(SeekFrom::Start(offset as u64)).is_err() {
             return reply.error(libc::EIO);
         }
+        // libfuse treats a short reply as EOF, and a backend reader may
+        // legitimately return one block per call — loop until the request
+        // is satisfied or the file really ends.
         let mut buf = vec![0u8; size as usize];
-        let n = match handle.read(&mut buf) {
-            Ok(n) => n,
-            Err(_) => return reply.error(libc::EIO),
-        };
+        let mut n = 0usize;
+        while n < buf.len() {
+            match handle.read(&mut buf[n..]) {
+                Ok(0) => break,
+                Ok(k) => n += k,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return reply.error(libc::EIO),
+            }
+        }
         buf.truncate(n);
         reply.data(&buf);
     }

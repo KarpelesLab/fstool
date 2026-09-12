@@ -2621,10 +2621,11 @@ fn tar_output_codec(path: &std::path::Path) -> Option<fstool::compression::Algo>
 /// `None` for plain `.tar` (the regular BlockDevice path handles it
 /// fine) and for non-tar files.
 fn tar_input_codec(path: &str) -> Option<fstool::compression::Algo> {
-    // Strip any `:N` partition selector — tar archives don't have
-    // partitions, but the parsing helper allows the form.
-    let p = std::path::Path::new(path.split(':').next().unwrap_or(path));
-    tar_output_codec(p)
+    // Strip a `:N` partition selector — tar archives don't have
+    // partitions, but the parsing helper allows the form. Only a purely
+    // numeric tail counts, so a `:` inside the path (a drive letter, an
+    // ISO-8601 timestamp in a directory name) keeps its extension.
+    tar_output_codec(std::path::Path::new(safety::strip_partition_selector(path)))
 }
 
 /// Open `src` as a freshly-decoded `Read` positioned at the

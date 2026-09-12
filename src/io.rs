@@ -395,7 +395,9 @@ mod nostd {
     impl<T: AsRef<[u8]>> Read for Cursor<T> {
         fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
             let data = self.inner.as_ref();
-            let start = (self.pos as usize).min(data.len());
+            // Clamp before narrowing: on a 32-bit target a position past
+            // 2^32 must read as EOF, not wrap to a low offset.
+            let start = self.pos.min(data.len() as u64) as usize;
             let n = (data.len() - start).min(buf.len());
             buf[..n].copy_from_slice(&data[start..start + n]);
             self.pos += n as u64;
@@ -426,9 +428,19 @@ mod nostd {
         }
     }
 
+    /// The `usize` write position for a growable cursor, refusing one
+    /// that does not fit the address space (or would overflow with
+    /// `len` more bytes) instead of truncating it on a 32-bit target.
+    fn cursor_write_pos(pos: u64, len: usize) -> Result<usize> {
+        usize::try_from(pos)
+            .ok()
+            .filter(|p| p.checked_add(len).is_some())
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "cursor position overflow"))
+    }
+
     impl Write for Cursor<Vec<u8>> {
         fn write(&mut self, buf: &[u8]) -> Result<usize> {
-            let pos = self.pos as usize;
+            let pos = cursor_write_pos(self.pos, buf.len())?;
             let end = pos + buf.len();
             if self.inner.len() < end {
                 self.inner.resize(end, 0);
@@ -444,7 +456,7 @@ mod nostd {
 
     impl Write for Cursor<&mut Vec<u8>> {
         fn write(&mut self, buf: &[u8]) -> Result<usize> {
-            let pos = self.pos as usize;
+            let pos = cursor_write_pos(self.pos, buf.len())?;
             let end = pos + buf.len();
             if self.inner.len() < end {
                 self.inner.resize(end, 0);
@@ -460,7 +472,7 @@ mod nostd {
 
     impl Write for Cursor<&mut [u8]> {
         fn write(&mut self, buf: &[u8]) -> Result<usize> {
-            let pos = (self.pos as usize).min(self.inner.len());
+            let pos = self.pos.min(self.inner.len() as u64) as usize;
             let n = (self.inner.len() - pos).min(buf.len());
             self.inner[pos..pos + n].copy_from_slice(&buf[..n]);
             self.pos += n as u64;

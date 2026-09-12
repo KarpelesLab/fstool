@@ -365,6 +365,12 @@ mod nostd {
                     break;
                 }
             }
+            // Only trim the separator after a consumed component; with an
+            // empty prefix the path (root included) comes back unchanged,
+            // matching std.
+            if n == 0 {
+                return Ok(self);
+            }
             Ok(Path::new(rest.trim_start_matches('/')))
         }
 

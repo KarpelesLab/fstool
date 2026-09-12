@@ -620,3 +620,165 @@ fn ext_hardlinks_materialise_into_tar() {
         assert_eq!(body.stdout, b"shared\n", "hardlink {name} content wrong");
     }
 }
+
+/// A sequential archive that names a path twice — `dir/file` before
+/// `dir/` (find -depth | cpio, bsdtar with explicit arguments) and a
+/// member appended over an earlier one — must land as one entry each:
+/// the explicit directory's metadata applied to the synthesised parent,
+/// the last file body winning. The ext writer appends dirents blindly,
+/// so this is the walker's job.
+#[cfg(all(feature = "tar", feature = "ext"))]
+#[test]
+fn duplicate_stream_entries_collapse_into_ext4() {
+    use fstool::block::MemoryBackend;
+    use fstool::fs::Filesystem;
+    use fstool::fs::ext::{Ext, FormatOpts, FsKind};
+    use fstool::fs::tar::{TarEntryMeta, TarStreamWriter};
+    use std::path::Path;
+
+    let work = tempfile::tempdir().unwrap();
+    let tar_path = work.path().join("dup.tar");
+    {
+        let f = std::fs::File::create(&tar_path).unwrap();
+        let mut w = TarStreamWriter::new(std::io::BufWriter::new(f));
+        let meta = |mode: u16| TarEntryMeta {
+            mode,
+            uid: 7,
+            gid: 8,
+            mtime: 1_700_000_000,
+            ..TarEntryMeta::default()
+        };
+        let body = b"first\n";
+        w.add_file(
+            "dir/file",
+            &mut &body[..],
+            body.len() as u64,
+            meta(0o644),
+            &[],
+        )
+        .unwrap();
+        w.add_dir("dir/", meta(0o700), &[]).unwrap();
+        let body = b"second, longer\n";
+        w.add_file(
+            "dir/file",
+            &mut &body[..],
+            body.len() as u64,
+            meta(0o600),
+            &[],
+        )
+        .unwrap();
+        w.finish().unwrap();
+    }
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        blocks_count: 8192,
+        inodes_count: 64,
+        journal_blocks: 1024,
+        ..FormatOpts::default()
+    };
+    let mut dev = MemoryBackend::new(opts.blocks_count as u64 * opts.block_size as u64);
+    let mut fs = Ext::format_with(&mut dev, &opts).unwrap();
+    let src = fstool::repack::Source::TarArchive {
+        path: tar_path,
+        codec: None,
+    };
+    fstool::repack::populate_fs_from_source_dyn(&mut dev, &mut fs, &src).unwrap();
+    fs.flush(&mut dev).unwrap();
+
+    let root: Vec<String> = fs
+        .list(&mut dev, Path::new("/"))
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .filter(|n| n == "dir")
+        .collect();
+    assert_eq!(root, ["dir"], "root must carry exactly one `dir` entry");
+    let sub: Vec<String> = fs
+        .list(&mut dev, Path::new("/dir"))
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .filter(|n| n == "file")
+        .collect();
+    assert_eq!(sub, ["file"], "dir must carry exactly one `file` entry");
+
+    let dir_attrs = fs.getattr(&mut dev, Path::new("/dir")).unwrap();
+    assert_eq!(
+        dir_attrs.mode & 0o7777,
+        0o700,
+        "explicit dir metadata applied"
+    );
+    assert_eq!((dir_attrs.uid, dir_attrs.gid), (7, 8));
+
+    let file_attrs = fs.getattr(&mut dev, Path::new("/dir/file")).unwrap();
+    assert_eq!(file_attrs.mode & 0o7777, 0o600, "last member wins");
+    let mut body = Vec::new();
+    fs.open_file_ro(&mut dev, Path::new("/dir/file"))
+        .unwrap()
+        .read_to_end(&mut body)
+        .unwrap();
+    assert_eq!(body, b"second, longer\n");
+}
+
+/// `add_dir_tree` (`fstool add IMG HOST DEST`, the shell's `put`) drops
+/// the host tree *under* DEST, not at the image root.
+#[cfg(feature = "ext")]
+#[test]
+fn add_dir_tree_lands_under_destination() {
+    use fstool::block::MemoryBackend;
+    use fstool::fs::ext::{Ext, FormatOpts, FsKind};
+    use fstool::inspect::AnyFs;
+
+    let work = tempfile::tempdir().unwrap();
+    let host = work.path().join("www");
+    std::fs::create_dir_all(host.join("assets")).unwrap();
+    std::fs::write(host.join("index.html"), b"<h1>hi</h1>").unwrap();
+    std::fs::write(host.join("assets/a.css"), b"body{}").unwrap();
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        blocks_count: 8192,
+        inodes_count: 64,
+        journal_blocks: 1024,
+        ..FormatOpts::default()
+    };
+    let mut dev = MemoryBackend::new(opts.blocks_count as u64 * opts.block_size as u64);
+    {
+        let mut fs = Ext::format_with(&mut dev, &opts).unwrap();
+        fstool::fs::Filesystem::create_dir(
+            &mut fs,
+            &mut dev,
+            std::path::Path::new("/srv"),
+            fstool::fs::FileMeta::default(),
+        )
+        .unwrap();
+        fstool::fs::Filesystem::flush(&mut fs, &mut dev).unwrap();
+    }
+    let mut any = AnyFs::open(&mut dev).unwrap();
+    any.add_dir_tree(&mut dev, "/srv/www", &host).unwrap();
+    any.flush(&mut dev).unwrap();
+
+    let names = |any: &mut AnyFs, dev: &mut MemoryBackend, p: &str| -> Vec<String> {
+        let mut v: Vec<String> = any
+            .list(dev, p)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .filter(|n| n != "." && n != "..")
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(names(&mut any, &mut dev, "/"), ["lost+found", "srv"]);
+    assert_eq!(names(&mut any, &mut dev, "/srv"), ["www"]);
+    assert_eq!(
+        names(&mut any, &mut dev, "/srv/www"),
+        ["assets", "index.html"]
+    );
+    assert_eq!(names(&mut any, &mut dev, "/srv/www/assets"), ["a.css"]);
+    let mut body = Vec::new();
+    any.copy_file_to(&mut dev, "/srv/www/assets/a.css", &mut body)
+        .unwrap();
+    assert_eq!(body, b"body{}");
+}

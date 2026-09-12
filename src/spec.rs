@@ -1057,7 +1057,13 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
                 let block_size = fs.block_size.unwrap_or(1024);
                 // Fill the partition: blocks_count = partition_bytes / fs_block_size,
                 // rounded DOWN to a multiple of 8 (the byte-aligned-group invariant).
-                let blocks = ((part_bytes / block_size as u64) / 8 * 8) as u32;
+                let blocks =
+                    u32::try_from((part_bytes / block_size as u64) / 8 * 8).map_err(|_| {
+                        crate::Error::InvalidArgument(format!(
+                            "partition of {part_bytes} bytes exceeds the ext block count at \
+                             block_size {block_size}"
+                        ))
+                    })?;
                 let opts = ext_format_opts(fs, kind, block_size, Some(blocks))?;
                 format_ext_into(&mut slice, fs, &opts)?;
             }

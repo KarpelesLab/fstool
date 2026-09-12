@@ -197,8 +197,9 @@ fn partition_fs_kind(dev: &mut MemoryBackend, start: u64, size: u64) -> Option<S
     if end > buf.len() as u64 || size == 0 {
         return None;
     }
-    let slice = buf[start as usize..end as usize].to_vec();
-    let mut sub = MemoryBackend::from_bytes(slice);
+    // A slice view: copying a multi-GB partition just to sniff its
+    // superblock would transiently double the wasm heap.
+    let mut sub = crate::block::sliced::SlicedBackend::new(dev, start, size).ok()?;
     AnyFs::open(&mut sub)
         .ok()
         .map(|fs| fs.kind_string().to_string())

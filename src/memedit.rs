@@ -892,11 +892,14 @@ impl Workspace {
     /// Best-effort probe of what filesystem partition `index` carries.
     fn probe_partition(&mut self, index: usize) -> Option<String> {
         let (start, len) = self.partition_range(index).ok()?;
-        let slice = self.disk.get(start as usize..(start + len) as usize)?;
-        let mut dev = MemoryBackend::from_bytes(slice.to_vec());
-        crate::inspect::detect_fs(&mut dev)
+        // Lend the disk to a device and slice it in place — sniffing a
+        // superblock must not copy the whole partition.
+        let mut disk = MemoryBackend::from_bytes(std::mem::take(&mut self.disk));
+        let kind = crate::block::sliced::SlicedBackend::new(&mut disk, start, len)
             .ok()
-            .map(|k| format!("{k:?}").to_ascii_lowercase())
+            .and_then(|mut dev| crate::inspect::detect_fs(&mut dev).ok());
+        self.disk = disk.into_bytes();
+        kind.map(|k| format!("{k:?}").to_ascii_lowercase())
     }
 
     // -- opening / syncing ----------------------------------------------

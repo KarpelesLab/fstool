@@ -457,7 +457,9 @@ impl Source {
         // Layered: `a+b+c` (bottom=a, top=c). The single `+` separator
         // never collides with real paths in practice — `+` is rare in
         // filenames and `path:partition` syntax uses `:` not `+`.
-        if spec.contains('+') {
+        // A path that actually exists is never a layer list, however
+        // many `+` it carries (`libstdc++-dev.tar.gz`).
+        if spec.contains('+') && std::fs::metadata(spec).is_err() {
             let parts: Vec<_> = spec
                 .split('+')
                 .filter(|p| !p.is_empty())
@@ -487,7 +489,7 @@ impl Source {
         {
             return Ok(Self::HostDir(bare_path.to_path_buf()));
         }
-        if let Some(codec) = tar_input_codec(spec) {
+        if let Some(codec) = tar_output_codec(bare_path) {
             return Ok(Self::TarArchive {
                 path: bare_path.to_path_buf(),
                 codec: Some(codec),
@@ -639,6 +641,21 @@ pub trait RepackSink {
             "repack: sink can't materialise a hard-link copy".into(),
         ))
     }
+    /// Re-apply metadata to a directory this sink has already created —
+    /// an archive that lists `dir/` after `dir/file` (or after a synthetic
+    /// parent) must end up with one directory carrying the explicit
+    /// entry's mode / owner / times, not two. Sinks that count or size
+    /// entries ignore it; an FS sink updates in place; a tar sink re-emits
+    /// (extractors apply the last entry).
+    fn update_dir(&mut self, _path: &str, _meta: RepackMeta, _xattrs: &[XattrPair]) -> Result<()> {
+        Ok(())
+    }
+    /// Drop an entry that is about to be re-created under the same path
+    /// (a duplicate member in a sequential archive: the last one wins).
+    /// Missing entries are not an error. Default: nothing to remove.
+    fn remove_existing(&mut self, _path: &str) -> Result<()> {
+        Ok(())
+    }
     /// Finalise the destination (flush / write the archive trailer).
     fn finish(&mut self) -> Result<()>;
 }
@@ -718,6 +735,40 @@ impl RepackSink for FsSink<'_> {
         self.dst
             .create_dir(self.dev, Path::new(path), meta.to_file_meta())?;
         self.apply_xattrs(path, xattrs)
+    }
+
+    fn update_dir(&mut self, path: &str, meta: RepackMeta, xattrs: &[XattrPair]) -> Result<()> {
+        let attrs = crate::fs::SetAttrs {
+            mode: Some(meta.mode),
+            uid: Some(meta.uid),
+            gid: Some(meta.gid),
+            atime: Some(meta.atime),
+            mtime: Some(meta.mtime),
+            ctime: Some(meta.ctime),
+        };
+        match self.dst.set_attrs(self.dev, Path::new(path), attrs) {
+            // A metadata-poor destination keeps whatever it stored at
+            // creation; the directory itself is already there.
+            Ok(()) | Err(crate::Error::Unsupported(_)) => {}
+            Err(e) if self.lossy => {
+                eprintln!("repack: dropping metadata update on {path:?}: {e}");
+            }
+            Err(e) => return Err(e),
+        }
+        self.apply_xattrs(path, xattrs)
+    }
+
+    fn remove_existing(&mut self, path: &str) -> Result<()> {
+        match self.dst.remove(self.dev, Path::new(path)) {
+            Ok(()) => Ok(()),
+            // Backends report a missing entry as `Io(NotFound)` or an
+            // `InvalidArgument("no such entry")`; a lossy sink may also
+            // have dropped the earlier member entirely.
+            Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(crate::Error::InvalidArgument(_)) => Ok(()),
+            Err(_) if self.lossy => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     fn put_file(
@@ -861,6 +912,12 @@ impl RepackSink for TarStreamSink {
     fn put_dir(&mut self, path: &str, meta: RepackMeta, xattrs: &[XattrPair]) -> Result<()> {
         self.writer
             .add_dir(tar_name(path), meta.to_tar_meta(), &xattrs_to_tar(xattrs))
+    }
+
+    fn update_dir(&mut self, path: &str, meta: RepackMeta, xattrs: &[XattrPair]) -> Result<()> {
+        // A later tar member for the same path overrides the earlier one
+        // at extraction time, so re-emitting is the update.
+        self.put_dir(path, meta, xattrs)
     }
 
     fn put_file(
@@ -1229,7 +1286,7 @@ pub fn open_tar_stream(path: &Path, codec: Option<Algo>) -> Result<Box<dyn Read>
 /// true metadata (it won't be in `created` yet).
 fn ensure_parents(
     path: &str,
-    created: &mut std::collections::HashSet<String>,
+    created: &mut std::collections::HashMap<String, bool>,
     sink: &mut dyn RepackSink,
 ) -> Result<()> {
     let trimmed = path.trim_matches('/');
@@ -1242,8 +1299,14 @@ fn ensure_parents(
     for seg in &parts[..parts.len() - 1] {
         cur.push('/');
         cur.push_str(seg);
-        if created.insert(cur.clone()) {
-            sink.put_dir(&cur, RepackMeta::dir_default(), &[])?;
+        match created.insert(cur.clone(), true) {
+            Some(true) => {}
+            Some(false) => {
+                // A file where the archive now wants a directory.
+                sink.remove_existing(&cur)?;
+                sink.put_dir(&cur, RepackMeta::dir_default(), &[])?;
+            }
+            None => sink.put_dir(&cur, RepackMeta::dir_default(), &[])?,
         }
     }
     Ok(())
@@ -1323,8 +1386,13 @@ fn collapse_path(p: &str) -> String {
 /// [`RepackSink::materialise_copy`]. Does **not** call `sink.finish()` — the
 /// caller does that after any final bookkeeping (matching `walk_anyfs`).
 pub fn walk_stream(stream: &mut dyn ArchiveStream, sink: &mut dyn RepackSink) -> Result<()> {
-    let mut created: std::collections::HashSet<String> =
-        std::collections::HashSet::from(["/".to_string()]);
+    // Every path emitted so far, with whether it is a directory. A
+    // sequential archive can name a path twice — `dir/` after `dir/file`
+    // (find -depth | cpio, bsdtar with explicit arguments), an appended
+    // member replacing an earlier one — and a destination that appends
+    // dirents blindly would otherwise carry duplicates.
+    let mut created: std::collections::HashMap<String, bool> =
+        std::collections::HashMap::from([("/".to_string(), true)]);
     let mut entries_seen: u64 = 0;
 
     while let Some(e) = stream.next_entry()? {
@@ -1338,51 +1406,74 @@ pub fn walk_stream(stream: &mut dyn ArchiveStream, sink: &mut dyn RepackSink) ->
         ensure_parents(&path, &mut created, sink)?;
 
         match e.kind {
-            StreamKind::Dir => {
-                sink.put_dir(&path, e.meta, &e.xattrs)?;
-                created.insert(path);
-            }
-            StreamKind::Regular => {
-                let mut body = StreamBody(&mut *stream);
-                sink.put_file(&path, &mut body, e.size, e.meta, &e.xattrs)?;
-                note_bytes(e.size);
-            }
-            StreamKind::Symlink => {
-                let target = e.link_target.as_deref().unwrap_or("");
-                sink.put_symlink(&path, target, e.meta, &e.xattrs)?;
-            }
-            StreamKind::HardLink => {
-                // The reader resolved the target to an archive-absolute path;
-                // collapse again as defense-in-depth.
-                let raw = e.link_target.as_deref().unwrap_or("");
-                let target = collapse_path(raw);
-                if !sink.put_hardlink(&path, &target, e.meta, &e.xattrs)? {
-                    sink.materialise_copy(&path, &target, e.meta, &e.xattrs)?;
+            StreamKind::Dir => match created.insert(path.clone(), true) {
+                Some(true) => sink.update_dir(&path, e.meta, &e.xattrs)?,
+                Some(false) => {
+                    sink.remove_existing(&path)?;
+                    sink.put_dir(&path, e.meta, &e.xattrs)?;
                 }
+                None => sink.put_dir(&path, e.meta, &e.xattrs)?,
+            },
+            _ if created.insert(path.clone(), false).is_some() => {
+                // Last member wins, as extractors do.
+                sink.remove_existing(&path)?;
+                emit_stream_entry(stream, sink, &path, &e)?;
             }
-            StreamKind::Char => {
-                sink.put_device(
-                    &path,
-                    DeviceKind::Char,
-                    e.device_major,
-                    e.device_minor,
-                    e.meta,
-                    &e.xattrs,
-                )?;
+            _ => emit_stream_entry(stream, sink, &path, &e)?,
+        }
+    }
+    Ok(())
+}
+
+/// Emit one non-directory stream entry into `sink`.
+fn emit_stream_entry(
+    stream: &mut dyn ArchiveStream,
+    sink: &mut dyn RepackSink,
+    path: &str,
+    e: &StreamEntryMeta,
+) -> Result<()> {
+    match e.kind {
+        StreamKind::Dir => unreachable!("directories are handled by walk_stream"),
+        StreamKind::Regular => {
+            let mut body = StreamBody(&mut *stream);
+            sink.put_file(path, &mut body, e.size, e.meta, &e.xattrs)?;
+            note_bytes(e.size);
+        }
+        StreamKind::Symlink => {
+            let target = e.link_target.as_deref().unwrap_or("");
+            sink.put_symlink(path, target, e.meta, &e.xattrs)?;
+        }
+        StreamKind::HardLink => {
+            // The reader resolved the target to an archive-absolute path;
+            // collapse again as defense-in-depth.
+            let raw = e.link_target.as_deref().unwrap_or("");
+            let target = collapse_path(raw);
+            if !sink.put_hardlink(path, &target, e.meta, &e.xattrs)? {
+                sink.materialise_copy(path, &target, e.meta, &e.xattrs)?;
             }
-            StreamKind::Block => {
-                sink.put_device(
-                    &path,
-                    DeviceKind::Block,
-                    e.device_major,
-                    e.device_minor,
-                    e.meta,
-                    &e.xattrs,
-                )?;
-            }
-            StreamKind::Fifo => {
-                sink.put_device(&path, DeviceKind::Fifo, 0, 0, e.meta, &e.xattrs)?;
-            }
+        }
+        StreamKind::Char => {
+            sink.put_device(
+                path,
+                DeviceKind::Char,
+                e.device_major,
+                e.device_minor,
+                e.meta,
+                &e.xattrs,
+            )?;
+        }
+        StreamKind::Block => {
+            sink.put_device(
+                path,
+                DeviceKind::Block,
+                e.device_major,
+                e.device_minor,
+                e.meta,
+                &e.xattrs,
+            )?;
+        }
+        StreamKind::Fifo => {
+            sink.put_device(path, DeviceKind::Fifo, 0, 0, e.meta, &e.xattrs)?;
         }
     }
     Ok(())
@@ -1404,8 +1495,12 @@ pub fn walk_tar_stream(reader: &mut dyn Read, sink: &mut dyn RepackSink) -> Resu
 /// metadata (mode/uid/gid/times), symlinks, and — on Unix — device
 /// nodes and hard links.
 fn walk_host_dir(root: &Path, sink: &mut dyn RepackSink) -> Result<()> {
+    // Keyed on (device, inode): inode numbers are only unique within one
+    // filesystem, and a source tree can span a bind mount or a separate
+    // `/boot`.
     #[cfg(unix)]
-    let mut link_map: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    let mut link_map: std::collections::HashMap<(u64, u64), String> =
+        std::collections::HashMap::new();
     let mut stack: Vec<(PathBuf, String)> = vec![(root.to_path_buf(), "/".to_string())];
     while let Some((dir, fs_dir)) = stack.pop() {
         for entry in std::fs::read_dir(&dir)? {
@@ -1434,13 +1529,13 @@ fn walk_host_dir(root: &Path, sink: &mut dyn RepackSink) -> Result<()> {
                 {
                     use std::os::unix::fs::MetadataExt;
                     if meta.nlink() > 1 {
-                        let ino = meta.ino();
-                        if let Some(first) = link_map.get(&ino) {
+                        let key = (meta.dev(), meta.ino());
+                        if let Some(first) = link_map.get(&key) {
                             if sink.put_hardlink(&dest, first, rmeta, &[])? {
                                 continue;
                             }
                         } else {
-                            link_map.insert(ino, dest.clone());
+                            link_map.insert(key, dest.clone());
                         }
                     }
                 }
@@ -1599,6 +1694,108 @@ pub fn populate_fs_from_source_dyn(
     // errors). Entries the destination *can* store are still created.
     let mut sink = FsSink::new(dst, dst_dev).lossy();
     walk_source_into_sink(source, &mut sink)
+}
+
+/// [`populate_fs_from_source_dyn`] with every entry rebased under `base`
+/// (an absolute path inside the destination, no trailing slash, already
+/// created by the caller). Backs `add_dir_tree`'s "drop the tree here".
+pub fn populate_fs_from_source_dyn_at(
+    dst_dev: &mut dyn crate::block::BlockDevice,
+    dst: &mut dyn crate::fs::Filesystem,
+    base: &str,
+    source: &Source,
+) -> Result<()> {
+    let mut fs_sink = FsSink::new(dst, dst_dev).lossy();
+    let mut sink = RebasedSink {
+        inner: &mut fs_sink,
+        base: base.trim_end_matches('/').to_string(),
+    };
+    walk_source_into_sink(source, &mut sink)
+}
+
+/// A sink adapter that prefixes every path (targets of hard links
+/// included — they are destination-absolute) with `base`.
+struct RebasedSink<'a> {
+    inner: &'a mut dyn RepackSink,
+    base: String,
+}
+
+impl RebasedSink<'_> {
+    fn at(&self, path: &str) -> String {
+        let rel = path.trim_start_matches('/');
+        if rel.is_empty() {
+            self.base.clone()
+        } else {
+            format!("{}/{rel}", self.base)
+        }
+    }
+}
+
+impl RepackSink for RebasedSink<'_> {
+    fn put_dir(&mut self, path: &str, meta: RepackMeta, xattrs: &[XattrPair]) -> Result<()> {
+        self.inner.put_dir(&self.at(path), meta, xattrs)
+    }
+    fn put_file(
+        &mut self,
+        path: &str,
+        body: &mut dyn Read,
+        len: u64,
+        meta: RepackMeta,
+        xattrs: &[XattrPair],
+    ) -> Result<()> {
+        self.inner.put_file(&self.at(path), body, len, meta, xattrs)
+    }
+    fn put_symlink(
+        &mut self,
+        path: &str,
+        target: &str,
+        meta: RepackMeta,
+        xattrs: &[XattrPair],
+    ) -> Result<()> {
+        // The target is the link's own text, not a destination path.
+        self.inner.put_symlink(&self.at(path), target, meta, xattrs)
+    }
+    fn put_device(
+        &mut self,
+        path: &str,
+        kind: DeviceKind,
+        major: u32,
+        minor: u32,
+        meta: RepackMeta,
+        xattrs: &[XattrPair],
+    ) -> Result<()> {
+        self.inner
+            .put_device(&self.at(path), kind, major, minor, meta, xattrs)
+    }
+    fn put_hardlink(
+        &mut self,
+        path: &str,
+        target: &str,
+        meta: RepackMeta,
+        xattrs: &[XattrPair],
+    ) -> Result<bool> {
+        self.inner
+            .put_hardlink(&self.at(path), &self.at(target), meta, xattrs)
+    }
+    fn materialise_copy(
+        &mut self,
+        path: &str,
+        target: &str,
+        meta: RepackMeta,
+        xattrs: &[XattrPair],
+    ) -> Result<()> {
+        self.inner
+            .materialise_copy(&self.at(path), &self.at(target), meta, xattrs)
+    }
+    fn update_dir(&mut self, path: &str, meta: RepackMeta, xattrs: &[XattrPair]) -> Result<()> {
+        self.inner.update_dir(&self.at(path), meta, xattrs)
+    }
+    fn remove_existing(&mut self, path: &str) -> Result<()> {
+        self.inner.remove_existing(&self.at(path))
+    }
+    fn finish(&mut self) -> Result<()> {
+        self.inner.finish()
+    }
 }
 
 /// Convert host `Metadata` into a public [`crate::fs::FileMeta`], preserving
@@ -1851,17 +2048,6 @@ pub(crate) fn tar_output_codec(path: &std::path::Path) -> Option<crate::compress
         return None;
     }
     crate::compression::Algo::from_extension(path)
-}
-
-/// `Some(algo)` when `path` points at a compressed tar archive that
-/// should be stream-walked rather than decompressed-to-tempfile.
-/// `None` for plain `.tar` (the regular BlockDevice path handles it
-/// fine) and for non-tar files.
-pub(crate) fn tar_input_codec(path: &str) -> Option<crate::compression::Algo> {
-    // Strip any `:N` partition selector — tar archives don't have
-    // partitions, but the parsing helper allows the form.
-    let p = std::path::Path::new(path.split(':').next().unwrap_or(path));
-    tar_output_codec(p)
 }
 
 /// Single-pass walk that builds a [`TarStreamIndex`] for a compressed

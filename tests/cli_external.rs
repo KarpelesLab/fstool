@@ -801,7 +801,11 @@ fn cli_convert_and_repack_refuse_same_file() {
         assert!(!r.status.success(), "{cmd} onto itself must fail");
         let err = String::from_utf8_lossy(&r.stderr);
         assert!(err.contains("same file"), "{cmd}: unexpected stderr: {err}");
-        assert_eq!(std::fs::read(&img).unwrap(), before, "{cmd} clobbered the image");
+        assert_eq!(
+            std::fs::read(&img).unwrap(),
+            before,
+            "{cmd} clobbered the image"
+        );
     }
     // Same guard when the source carries a partition selector.
     let mut spec = img.as_os_str().to_owned();
