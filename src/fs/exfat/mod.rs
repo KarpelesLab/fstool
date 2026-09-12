@@ -23,6 +23,7 @@
 //! AllocationBitmap (0x81), UpcaseTable (0x82), and VolumeLabel (0x83).
 
 use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -99,6 +100,15 @@ pub struct Exfat {
     /// Staged instead of rewriting the parent's cluster chain on every
     /// child; serialized once on eviction or at flush.
     dir_batch: DirBatch<u32, PendingEntry>,
+    /// Parent directory of every directory this session has walked
+    /// through or created (child first cluster → parent first cluster).
+    /// Lets a grown directory's entry set be found without a tree search.
+    dir_parents: BTreeMap<u32, u32>,
+    /// Directories whose cluster chain grew (first cluster → new byte
+    /// length) and whose DataLength / ValidDataLength in the parent's
+    /// entry set still says otherwise. Applied once every batch is on
+    /// disk, in [`Exfat::flush_dir_batches`].
+    dir_len_patches: BTreeMap<u32, u64>,
 }
 
 impl Exfat {
@@ -174,6 +184,8 @@ impl Exfat {
             fat_dirty: false,
             bitmap_dirty: false,
             dir_batch: DirBatch::new(DEFAULT_CAPACITY),
+            dir_parents: BTreeMap::new(),
+            dir_len_patches: BTreeMap::new(),
         };
         let root_bytes = tmp.read_chain_bytes(
             dev,
@@ -292,6 +304,8 @@ impl Exfat {
             fat_dirty: false,
             bitmap_dirty: false,
             dir_batch: DirBatch::new(DEFAULT_CAPACITY),
+            dir_parents: BTreeMap::new(),
+            dir_len_patches: BTreeMap::new(),
         })
     }
 
@@ -817,7 +831,7 @@ impl Exfat {
     /// terminal component, plus the terminal component name. Errors on
     /// the root path.
     fn split_path_for_create<'p>(
-        &self,
+        &mut self,
         dev: &mut dyn BlockDevice,
         path: &'p str,
     ) -> Result<(u32, &'p str)> {
@@ -849,9 +863,18 @@ impl Exfat {
                     "exfat: {part:?} is not a directory"
                 )));
             }
+            self.note_parent(first_cluster, cluster);
             cluster = first_cluster;
         }
         Ok((cluster, last))
+    }
+
+    /// Remember that directory `child` lives in directory `parent`, so a
+    /// later growth of `child` can patch its entry set without a search.
+    pub(super) fn note_parent(&mut self, child: u32, parent: u32) {
+        if child >= 2 && child != self.boot.first_cluster_of_root_directory {
+            self.dir_parents.insert(child, parent);
+        }
     }
 
     /// Stage a child entry for `dir_cluster` instead of rewriting the
@@ -871,12 +894,108 @@ impl Exfat {
     }
 
     /// Serialize every pending directory batch (at flush, or before a
-    /// read path that consumes on-disk directory entries).
+    /// read path that consumes on-disk directory entries), then bring the
+    /// DataLength of every directory that grew up to date in its parent.
     fn flush_dir_batches(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         for (dir_cluster, entries) in self.dir_batch.drain_all() {
             self.serialize_one_dir(dev, dir_cluster, entries)?;
         }
+        self.apply_dir_len_patches(dev)
+    }
+
+    /// Rewrite the StreamExtension of every directory recorded in
+    /// `dir_len_patches` so its DataLength / ValidDataLength equal the
+    /// chain's byte length. Runs once all batches are on disk, so the
+    /// parent's entry set can be found and patched in place.
+    fn apply_dir_len_patches(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        let patches = core::mem::take(&mut self.dir_len_patches);
+        for (dir, len) in patches {
+            let parent = match self.dir_parents.get(&dir) {
+                Some(&p) => Some(p),
+                None => self.find_parent_of_dir(dev, dir)?,
+            };
+            // No entry anywhere refers to it (an orphan): nothing to patch.
+            let Some(parent) = parent else { continue };
+            self.dir_parents.insert(dir, parent);
+            self.patch_dir_entry_length(dev, parent, dir, len)?;
+        }
         Ok(())
+    }
+
+    /// Set DataLength and ValidDataLength to `len` in the entry set under
+    /// `parent` that describes directory `dir`, recomputing the
+    /// SetChecksum. Returns `false` when `parent` holds no such entry.
+    fn patch_dir_entry_length(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        parent: u32,
+        dir: u32,
+        len: u64,
+    ) -> Result<bool> {
+        let bytes = self.read_dir_bytes(dev, parent)?;
+        let mut i = 0;
+        while i + ENTRY_SIZE <= bytes.len() {
+            let slot: &[u8; ENTRY_SIZE] = (&bytes[i..i + ENTRY_SIZE]).try_into().unwrap();
+            match dir::classify_slot(slot) {
+                RawSlot::EndOfDirectory => break,
+                RawSlot::File {
+                    secondary_count, ..
+                } => {
+                    let total = (1 + secondary_count as usize) * ENTRY_SIZE;
+                    if i + total > bytes.len() {
+                        break;
+                    }
+                    let set = dir::parse_file_set(&bytes[i..i + total])?;
+                    if set.is_directory && set.first_cluster == dir {
+                        let mut set_bytes = bytes[i..i + total].to_vec();
+                        let stream = ENTRY_SIZE;
+                        set_bytes[stream + 8..stream + 16].copy_from_slice(&len.to_le_bytes());
+                        set_bytes[stream + 24..stream + 32].copy_from_slice(&len.to_le_bytes());
+                        let csum = dir::set_checksum(&set_bytes);
+                        set_bytes[2..4].copy_from_slice(&csum.to_le_bytes());
+                        // Primary and stream slots changed; each 32-byte
+                        // slot lies within one cluster, but the two may
+                        // sit in different clusters, so map them separately.
+                        for k in 0..2 {
+                            let pos = (i + k * ENTRY_SIZE) as u64;
+                            let off = self.dir_pos_to_disk_offset(parent, pos)?;
+                            dev.write_at(off, &set_bytes[k * ENTRY_SIZE..(k + 1) * ENTRY_SIZE])?;
+                        }
+                        return Ok(true);
+                    }
+                    i += total;
+                }
+                _ => i += ENTRY_SIZE,
+            }
+        }
+        Ok(false)
+    }
+
+    /// Depth-first search from the root for the directory whose entry set
+    /// points at `target`. Fallback for a directory reached through a
+    /// cluster number the session never resolved by path.
+    fn find_parent_of_dir(&self, dev: &mut dyn BlockDevice, target: u32) -> Result<Option<u32>> {
+        let root = self.boot.first_cluster_of_root_directory;
+        let mut stack = vec![root];
+        let mut visited: BTreeSet<u32> = BTreeSet::new();
+        while let Some(cur) = stack.pop() {
+            if !visited.insert(cur) {
+                continue;
+            }
+            let bytes = self.read_dir_bytes(dev, cur)?;
+            for e in iter_file_sets(&bytes)? {
+                if !e.is_directory || e.first_cluster < 2 {
+                    continue;
+                }
+                if e.first_cluster == target {
+                    return Ok(Some(cur));
+                }
+                if !visited.contains(&e.first_cluster) {
+                    stack.push(e.first_cluster);
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Resolve a child of `dir_cluster` by name from the pending batch
@@ -952,6 +1071,13 @@ impl Exfat {
                 last = nc;
             }
             buf.resize(chain.len() * cb, 0);
+            // The directory's own entry set (in its parent) records the
+            // chain's byte length; it is patched once every batch is on
+            // disk. The root has no entry set.
+            if first_cluster != self.boot.first_cluster_of_root_directory {
+                self.dir_len_patches
+                    .insert(first_cluster, chain.len() as u64 * cb as u64);
+            }
         }
         buf[end_pos..end_pos + need].copy_from_slice(&combined);
         // Write back only the clusters the new entries touched.
@@ -1252,6 +1378,7 @@ impl Exfat {
             timestamp,
             self.name_hash_for(name),
         );
+        self.note_parent(new_cluster, dir_cluster);
         self.stage_dir_entry(
             dev,
             dir_cluster,
@@ -2637,6 +2764,67 @@ mod tests {
             read_file_contents(&mut fs2, &mut dev, "/data.bin"),
             b"0123456789"
         );
+    }
+
+    /// A directory's entry set records the byte length of its cluster
+    /// chain. Growing the chain (many children) used to leave the
+    /// parent's DataLength at the original one cluster.
+    #[test]
+    fn growing_a_directory_updates_its_data_length_in_the_parent() {
+        let (mut dev, mut fs) = fresh_volume("DIRLEN");
+        let cb = fs.cluster_size() as u64;
+        fs.create_dir(&mut dev, "/d", 0).unwrap();
+        // 200 three-slot sets: 600 slots, five 128-slot clusters.
+        for i in 0..200 {
+            fs.create_file(
+                &mut dev,
+                &format!("/d/f{i:03}"),
+                &mut crate::io::empty(),
+                0,
+                0,
+            )
+            .unwrap();
+        }
+        fs.flush(&mut dev).unwrap();
+
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        let (set, _) = fs2.resolve_entry(&mut dev, "/d").unwrap();
+        let chain = fs2.dir_chain(set.first_cluster).unwrap();
+        assert!(chain.len() >= 5, "{}", chain.len());
+        assert_eq!(set.data_length, chain.len() as u64 * cb);
+        assert_eq!(set.valid_data_length, set.data_length);
+        assert_eq!(fs2.list_path(&mut dev, "/d").unwrap().len(), 200);
+
+        // A nested directory grown through the cluster-addressed API on a
+        // fresh instance that never resolved its parent: found by search.
+        let mut fs3 = Exfat::open(&mut dev).unwrap();
+        fs3.create_dir(&mut dev, "/d/e", 0).unwrap();
+        fs3.flush(&mut dev).unwrap();
+        let mut fs4 = Exfat::open(&mut dev).unwrap();
+        let (e_set, _) = fs4.resolve_entry(&mut dev, "/d/e").unwrap();
+        assert!(fs4.dir_parents.is_empty());
+        for i in 0..100 {
+            fs4.create_file_in(
+                &mut dev,
+                e_set.first_cluster,
+                &format!("g{i}"),
+                &mut crate::io::empty(),
+                0,
+                0,
+            )
+            .unwrap();
+        }
+        fs4.flush(&mut dev).unwrap();
+        let fs5 = Exfat::open(&mut dev).unwrap();
+        let (e_set, _) = fs5.resolve_entry(&mut dev, "/d/e").unwrap();
+        let chain = fs5.dir_chain(e_set.first_cluster).unwrap();
+        assert!(chain.len() >= 3, "{}", chain.len());
+        assert_eq!(e_set.data_length, chain.len() as u64 * cb);
+        assert_eq!(fs5.list_path(&mut dev, "/d/e").unwrap().len(), 100);
+        // /d itself did not grow again (200 sets left slack) — still right.
+        let (d_set, _) = fs5.resolve_entry(&mut dev, "/d").unwrap();
+        let d_chain = fs5.dir_chain(d_set.first_cluster).unwrap();
+        assert_eq!(d_set.data_length, d_chain.len() as u64 * cb);
     }
 
     #[test]

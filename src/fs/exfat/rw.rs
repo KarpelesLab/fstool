@@ -507,6 +507,7 @@ impl Exfat {
                     "exfat: {part:?} is not a directory"
                 )));
             }
+            self.note_parent(next.first_cluster, parent_cluster);
             parent_cluster = next.first_cluster;
         }
 
