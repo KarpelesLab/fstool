@@ -1218,3 +1218,49 @@ fn reusing_a_freed_inode_replaces_its_staged_tombstone() {
     let re = Ext::open(&mut dev).unwrap();
     assert_eq!(read_path(&re, &mut dev, "/f.txt"), b"second-and-longer");
 }
+
+// ─────────── finding 15: flushing over an unreplayed journal ───────────
+
+/// `commit_journal_and_checkpoint` always lays its transaction down at
+/// `s_first` and then stamps the journal clean. On an image whose log
+/// still holds committed-but-uncheckpointed transactions (`s_start !=
+/// 0`) that destroys the records *and* abandons the half-applied
+/// metadata they were going to repair. Refuse instead; the caller is
+/// expected to run `replay_pending_journal` first, which is what the
+/// CLI, the repack path and `open_file_rw` all do.
+#[test]
+fn flush_refuses_to_clobber_an_unreplayed_journal() {
+    let opts = FormatOpts {
+        kind: FsKind::Ext3,
+        journal_blocks: 1024,
+        ..ext4_opts()
+    };
+    let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    add_file(&mut ext, &mut dev, INO_ROOT_DIR, b"a", b"aaaa");
+    ext.flush(&mut dev).unwrap();
+
+    // Mark the journal dirty (`s_start = s_first`, both big-endian in
+    // the JBD2 superblock) and drop a sentinel into the first log slot.
+    let re = Ext::open(&mut dev).unwrap();
+    let bs = re.layout.block_size as u64;
+    let jinode = re.read_inode(&mut dev, re.sb.journal_inum).unwrap();
+    let jsb_phys = re.file_block(&mut dev, &jinode, 0).unwrap() as u64;
+    let mut jsb = vec![0u8; bs as usize];
+    dev.read_at(jsb_phys * bs, &mut jsb).unwrap();
+    let first = u32::from_be_bytes(jsb[20..24].try_into().unwrap());
+    jsb[28..32].copy_from_slice(&first.to_be_bytes());
+    dev.write_at(jsb_phys * bs, &jsb).unwrap();
+    let log_phys = re.file_block(&mut dev, &jinode, first).unwrap() as u64;
+    let sentinel = vec![0xD7u8; bs as usize];
+    dev.write_at(log_phys * bs, &sentinel).unwrap();
+
+    let mut re = Ext::open(&mut dev).unwrap();
+    add_file(&mut re, &mut dev, INO_ROOT_DIR, b"b", b"bbbb");
+    let err = re.flush(&mut dev).unwrap_err();
+    assert!(matches!(err, crate::Error::InvalidImage(_)), "{err:?}");
+
+    let mut back = vec![0u8; bs as usize];
+    dev.read_at(log_phys * bs, &mut back).unwrap();
+    assert_eq!(back, sentinel, "the unreplayed log must be left intact");
+}

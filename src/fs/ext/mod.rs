@@ -2547,6 +2547,22 @@ impl Ext {
                 jsb.blocksize
             )));
         }
+        // `s_start != 0` means the log holds committed transactions that
+        // have not been checkpointed to their home blocks — the image
+        // crashed, or was detached mid-commit. We lay our transaction
+        // down at `s_first` and then stamp the journal clean, which
+        // destroys those records *and* leaves the half-applied metadata
+        // they were going to repair. Nothing here can merge the two, so
+        // refuse: `Ext::replay_pending_journal` (what the CLI and the
+        // repack path call, and what `open_file_rw` does for itself)
+        // recovers the log first and resets `s_start`.
+        if jsb.start != 0 {
+            return Err(crate::Error::InvalidImage(format!(
+                "ext: journal has unreplayed transactions (s_start = {}); \
+                 call Ext::replay_pending_journal before flushing",
+                jsb.start
+            )));
+        }
 
         // A single transaction can never exceed the journal ring. When the
         // metadata set is larger than the journal can hold — the bulk
