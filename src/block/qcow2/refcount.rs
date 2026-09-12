@@ -241,60 +241,73 @@ impl Refcount {
                 }
             }
         }
-        // Pass 2: grow the file. Pick the cluster right past current EOF.
-        let new_cluster = *file_len / self.cluster_size;
+        // Pass 2: grow the file. Start at the first cluster wholly past the
+        // current EOF: when the file length is not cluster-aligned (a
+        // compressed image whose last payload ends mid-cluster, say) the
+        // cluster straddling EOF is in use and must not be handed out.
+        let mut new_cluster = file_len.div_ceil(self.cluster_size);
         let entries_per_block = self.entries_per_block();
-        let block_idx = (new_cluster / entries_per_block) as usize;
-        if block_idx >= table_len {
-            return Err(crate::Error::Unsupported(
-                "qcow2: refcount table is full (image would exceed 16 PiB at default cluster size)"
-                    .into(),
-            ));
-        }
-        let block_off = self.table[block_idx];
-        if block_off == 0 {
-            // Need to allocate a new refcount block. It lives at the
-            // next cluster past EOF (`new_cluster`), tracks itself, and
-            // also tracks the data cluster we're handing out
-            // (`new_cluster + 1`).
-            let rcb_cluster = new_cluster;
-            let data_cluster = new_cluster + 1;
-            let next_block_idx = (data_cluster / entries_per_block) as usize;
-            if next_block_idx != block_idx {
-                // The data cluster falls into the next refcount block —
-                // an unlikely edge at 2 GiB boundaries that we don't
-                // handle in v1.
+        loop {
+            let block_idx = (new_cluster / entries_per_block) as usize;
+            if block_idx >= table_len {
                 return Err(crate::Error::Unsupported(
-                    "qcow2: allocation across refcount-block boundary not implemented".into(),
+                    "qcow2: refcount table is full (image would exceed 16 PiB at default \
+                     cluster size)"
+                        .into(),
                 ));
             }
-            let rcb_off = rcb_cluster * self.cluster_size;
-            let data_off = data_cluster * self.cluster_size;
-            let mut entries = vec![0u16; entries_per_block as usize];
-            entries[(rcb_cluster % entries_per_block) as usize] = 1;
-            entries[(data_cluster % entries_per_block) as usize] = 1;
-            self.block_cache.insert(
-                rcb_off,
-                RefcountBlock {
-                    entries,
-                    dirty: true,
-                },
-            );
-            self.table[block_idx] = rcb_off;
-            self.table_dirty = true;
-            *file_len = data_off + self.cluster_size;
-            self.next_free_hint = data_cluster + 1;
-            return Ok(data_cluster);
+            let block_off = self.table[block_idx];
+            if block_off == 0 {
+                // Need to allocate a new refcount block. It lives at the
+                // next cluster past EOF (`new_cluster`), tracks itself, and
+                // also tracks the data cluster we're handing out
+                // (`new_cluster + 1`).
+                let rcb_cluster = new_cluster;
+                let data_cluster = new_cluster + 1;
+                let next_block_idx = (data_cluster / entries_per_block) as usize;
+                if next_block_idx != block_idx {
+                    // The data cluster falls into the next refcount block —
+                    // an unlikely edge at 2 GiB boundaries that we don't
+                    // handle in v1.
+                    return Err(crate::Error::Unsupported(
+                        "qcow2: allocation across refcount-block boundary not implemented".into(),
+                    ));
+                }
+                let rcb_off = rcb_cluster * self.cluster_size;
+                let data_off = data_cluster * self.cluster_size;
+                let mut entries = vec![0u16; entries_per_block as usize];
+                entries[(rcb_cluster % entries_per_block) as usize] = 1;
+                entries[(data_cluster % entries_per_block) as usize] = 1;
+                self.block_cache.insert(
+                    rcb_off,
+                    RefcountBlock {
+                        entries,
+                        dirty: true,
+                    },
+                );
+                self.table[block_idx] = rcb_off;
+                self.table_dirty = true;
+                *file_len = data_off + self.cluster_size;
+                self.next_free_hint = data_cluster + 1;
+                return Ok(data_cluster);
+            }
+            // Existing refcount block: the cluster past EOF should be free,
+            // but an image may legitimately reference clusters beyond its
+            // current length (a truncated preallocation, say). Never hand
+            // out a cluster something already points at — move past it.
+            let _block = self.load_block(file, block_off)?;
+            let block = self.block_cache.get_mut(&block_off).unwrap();
+            let idx = (new_cluster % entries_per_block) as usize;
+            if block.entries[idx] != 0 {
+                new_cluster += 1;
+                continue;
+            }
+            block.entries[idx] = 1;
+            block.dirty = true;
+            *file_len = (new_cluster + 1) * self.cluster_size;
+            self.next_free_hint = new_cluster + 1;
+            return Ok(new_cluster);
         }
-        // Existing refcount block; just bump the new cluster's entry.
-        let _block = self.load_block(file, block_off)?;
-        let block = self.block_cache.get_mut(&block_off).unwrap();
-        let idx = (new_cluster % entries_per_block) as usize;
-        block.entries[idx] = 1;
-        block.dirty = true;
-        *file_len = (new_cluster + 1) * self.cluster_size;
-        self.next_free_hint = new_cluster + 1;
-        Ok(new_cluster)
     }
 
     /// Decrement the refcount of every host cluster overlapping the byte
@@ -396,6 +409,32 @@ mod tests {
         assert_eq!(c, 4);
         let block = r.block_cache.get(&1024).unwrap();
         assert_eq!(block.entries[4], 1);
+    }
+
+    /// With every tracked cluster in use and a file length that is not
+    /// cluster-aligned, the allocator must not hand out the cluster that
+    /// straddles EOF — it is (partially) present and referenced — but the
+    /// first one wholly past it, allocating a refcount block for it.
+    #[test]
+    fn grow_skips_the_cluster_straddling_eof() {
+        let mut r = Refcount::new_fresh(512, 512, 1024, &[0, 1, 2, 3]).unwrap();
+        // cluster_size 512 → one refcount block covers 256 clusters; mark
+        // them all used so the scan in pass 1 finds nothing.
+        r.block_cache.get_mut(&1024).unwrap().entries.fill(1);
+        // The file ends 100 bytes into cluster 255.
+        let mut file_len = 255 * 512 + 100;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cur = Cursor::new(&mut buf);
+        let c = r.alloc_cluster(&mut cur, &mut file_len).unwrap();
+        // Cluster 256 becomes the refcount block tracking the new range,
+        // 257 is the data cluster; 255 stays untouched.
+        assert_eq!(c, 257);
+        assert_eq!(r.table[1], 256 * 512);
+        assert_eq!(file_len, 258 * 512);
+        let block = r.block_cache.get(&(256 * 512)).unwrap();
+        assert_eq!(block.entries[0], 1);
+        assert_eq!(block.entries[1], 1);
+        assert_eq!(block.entries[2], 0);
     }
 
     /// A layout reaching past the single seeded refcount block must be a
