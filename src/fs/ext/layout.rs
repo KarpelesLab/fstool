@@ -503,11 +503,38 @@ pub fn from_superblock(sb: &super::superblock::Superblock) -> crate::Result<Layo
             sb.inodes_count, max_inodes
         )));
     }
+    // `s_first_ino` seeds the inode allocator and the reserved-inode
+    // bitmap prefix; the kernel requires `11 <= first_ino <= inodes_count`
+    // (`ext4_fill_super`). A zero value used to underflow `first_ino - 1`.
+    if sb.first_ino < super::constants::FIRST_INO_DYNAMIC || sb.first_ino > sb.inodes_count {
+        return Err(crate::Error::InvalidImage(format!(
+            "ext: bad s_first_ino {} (inodes_count {})",
+            sb.first_ino, sb.inodes_count
+        )));
+    }
+    // `s_inode_size` sizes every inode-table read; the kernel accepts only
+    // a power of two in `128..=block_size`.
+    let inode_size = sb.inode_size;
+    if inode_size < super::constants::INODE_SIZE_GOOD_OLD
+        || inode_size as u32 > block_size
+        || !inode_size.is_power_of_two()
+    {
+        return Err(crate::Error::InvalidImage(format!(
+            "ext: bad s_inode_size {inode_size} (block size {block_size})"
+        )));
+    }
 
     let inode_table_blocks =
         (sb.inodes_per_group as u64 * sb.inode_size as u64).div_ceil(block_size as u64) as u32;
     let desc_size = sb.group_desc_size();
     let gdt_blocks = (num_groups as u64 * desc_size as u64).div_ceil(block_size as u64) as u32;
+    // Reserved GDT blocks (`resize_inode`) sit right after the live GDT in
+    // every group that carries a superblock backup; they are metadata,
+    // not data. Saturate: the field is untrusted and only bounds
+    // `data_start`, which the allocator clamps to the group anyway.
+    let sb_gdt_blocks_total: u32 = 1u32
+        .saturating_add(gdt_blocks)
+        .saturating_add(sb.reserved_gdt_blocks as u32);
 
     // `sparse_super2` (compat 0x200) takes precedence over `sparse_super`:
     // it pins backups to the two listed groups regardless. Otherwise fall
@@ -536,24 +563,29 @@ pub fn from_superblock(sb: &super::superblock::Superblock) -> crate::Result<Layo
 
     let mut groups: Vec<GroupLayout> = Vec::with_capacity(num_groups as usize);
     for g in 0..num_groups {
-        let start = sb.first_data_block + g * sb.blocks_per_group;
-        let nominal_end = start + sb.blocks_per_group - 1;
-        let end = nominal_end.min(sb.blocks_count - 1);
+        // Group bounds in u64: `first_data_block + g * blocks_per_group`
+        // and `+ blocks_per_group - 1` overflow u32 when `blocks_count`
+        // sits near `u32::MAX`. `g < num_groups` guarantees the start is
+        // inside the volume; only the nominal end needs clamping.
+        let start64 = sb.first_data_block as u64 + g as u64 * sb.blocks_per_group as u64;
+        let end64 = (start64 + sb.blocks_per_group as u64 - 1).min(sb.blocks_count as u64 - 1);
+        let start = start64 as u32;
+        let end = end64 as u32;
         // Whether this group is expected to carry a SB+GDT backup. The
         // on-disk descriptor pointers (read by `Ext::open` and patched into
         // `layout.groups`) remain the source of truth for actual block
         // locations; `has_superblock` only controls where we *write* SB+GDT
         // backups on flush.
         let has_sb = sparse_super_mode.group_has_backup(g);
-        let sb_gdt_blocks: u32 = if has_sb { 1 + gdt_blocks } else { 0 };
-        let local_meta_start = start + sb_gdt_blocks;
+        let sb_gdt_blocks: u32 = if has_sb { sb_gdt_blocks_total } else { 0 };
+        let local_meta_start = start.saturating_add(sb_gdt_blocks);
 
         let (block_bitmap, inode_bitmap, inode_table, data_start, meta_blocks);
         if log_groups_per_flex == 0 {
             block_bitmap = local_meta_start;
-            inode_bitmap = local_meta_start + 1;
-            inode_table = local_meta_start + 2;
-            data_start = inode_table + inode_table_blocks;
+            inode_bitmap = local_meta_start.saturating_add(1);
+            inode_table = local_meta_start.saturating_add(2);
+            data_start = inode_table.saturating_add(inode_table_blocks);
             meta_blocks = data_start - start;
         } else {
             let flex_first = (g / flex_size) * flex_size;
@@ -564,15 +596,17 @@ pub fn from_superblock(sb: &super::superblock::Superblock) -> crate::Result<Layo
                 let prev = &groups[flex_first as usize];
                 (prev.start_block, prev.has_superblock)
             };
-            let packed_base = first_start + if first_has_sb { 1 + gdt_blocks } else { 0 };
+            let packed_base =
+                first_start.saturating_add(if first_has_sb { sb_gdt_blocks_total } else { 0 });
             let bbm_base = packed_base;
-            let ibm_base = bbm_base + flex_size;
-            let table_base = ibm_base + flex_size;
-            block_bitmap = bbm_base + pos_in_flex;
-            inode_bitmap = ibm_base + pos_in_flex;
-            inode_table = table_base + pos_in_flex * inode_table_blocks;
+            let ibm_base = bbm_base.saturating_add(flex_size);
+            let table_base = ibm_base.saturating_add(flex_size);
+            block_bitmap = bbm_base.saturating_add(pos_in_flex);
+            inode_bitmap = ibm_base.saturating_add(pos_in_flex);
+            inode_table = table_base.saturating_add(pos_in_flex.saturating_mul(inode_table_blocks));
             if pos_in_flex == 0 {
-                let packed_end = table_base + flex_size * inode_table_blocks;
+                let packed_end =
+                    table_base.saturating_add(flex_size.saturating_mul(inode_table_blocks));
                 data_start = packed_end;
                 meta_blocks = data_start - start;
             } else {
@@ -903,6 +937,68 @@ mod tests {
             from_superblock(&sb),
             Err(crate::Error::InvalidImage(_))
         ));
+    }
+
+    #[test]
+    fn rejects_bad_first_ino() {
+        let mut sb = valid_sb();
+        sb.first_ino = 0; // used to underflow `first_ino - 1` in open()
+        assert!(matches!(
+            from_superblock(&sb),
+            Err(crate::Error::InvalidImage(_))
+        ));
+        sb.first_ino = sb.inodes_count + 1;
+        assert!(matches!(
+            from_superblock(&sb),
+            Err(crate::Error::InvalidImage(_))
+        ));
+        sb.first_ino = 11;
+        assert!(from_superblock(&sb).is_ok());
+    }
+
+    #[test]
+    fn rejects_bad_inode_size() {
+        let mut sb = valid_sb();
+        for bad in [0u16, 64, 100, 192, 2048] {
+            sb.inode_size = bad; // 2048 > 1 KiB block size
+            assert!(
+                matches!(from_superblock(&sb), Err(crate::Error::InvalidImage(_))),
+                "inode_size {bad} must be rejected"
+            );
+        }
+        sb.inode_size = 256;
+        assert!(from_superblock(&sb).is_ok());
+    }
+
+    #[test]
+    fn group_bounds_do_not_overflow_near_u32_max() {
+        // 4 KiB blocks, blocks_count = u32::MAX: the last group's nominal
+        // end (`start + blocks_per_group - 1`) exceeds u32::MAX.
+        let mut sb = valid_sb();
+        sb.log_block_size = 2;
+        sb.first_data_block = 0;
+        sb.blocks_count = u32::MAX;
+        sb.blocks_per_group = 32768;
+        sb.inodes_per_group = 8;
+        sb.inodes_count = 8 * u32::MAX.div_ceil(32768);
+        let layout = from_superblock(&sb).expect("must not overflow");
+        let last = layout.groups.last().unwrap();
+        assert_eq!(last.end_block, u32::MAX - 1);
+        assert!(last.start_block <= last.end_block);
+    }
+
+    #[test]
+    fn reserved_gdt_blocks_push_data_start() {
+        let mut sb = valid_sb();
+        let base = from_superblock(&sb).unwrap();
+        sb.reserved_gdt_blocks = 7;
+        let with = from_superblock(&sb).unwrap();
+        assert_eq!(
+            with.groups[0].data_start,
+            base.groups[0].data_start + 7,
+            "reserved GDT blocks are metadata that precede the bitmaps"
+        );
+        assert_eq!(with.groups[0].block_bitmap, base.groups[0].block_bitmap + 7);
     }
 
     #[test]
