@@ -377,6 +377,84 @@ fn writer_image_passes_unsquashfs_round_trip() {
     );
 }
 
+/// More than 512 fragment blocks: the fragment table must span several
+/// metablocks with one L1 pointer each. With a 4 KiB block size, files of
+/// 4095 bytes each take a fragment block of their own, so 600 files force
+/// two fragment-table metablocks. `unsquashfs` must list and extract every
+/// one of them.
+#[test]
+fn writer_image_with_many_fragments_extracts() {
+    if !tool_present("unsquashfs", "-version") {
+        eprintln!("skipping: unsquashfs not installed");
+        return;
+    }
+    const N: usize = 600;
+    let tail = 4095usize;
+    let body = |i: usize| -> Vec<u8> { vec![(i % 251) as u8; tail] };
+
+    let workdir = tempfile::tempdir().unwrap();
+    let img = workdir.path().join("frags.sqfs");
+    build_image(&img, Compression::Unknown(0), |dev, sq| {
+        for i in 0..N {
+            sq.create_file(
+                dev,
+                &format!("/f{i:04}"),
+                FileSource::Reader {
+                    reader: Box::new(std::io::Cursor::new(body(i))) as Box<dyn ReadSeek + Send>,
+                    len: tail as u64,
+                },
+                EntryMeta {
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        }
+    });
+
+    let out = Command::new("unsquashfs")
+        .arg("-l")
+        .arg(&img)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "unsquashfs -l failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let listing = String::from_utf8_lossy(&out.stdout);
+    for i in [0usize, 511, 512, N - 1] {
+        let want = format!("squashfs-root/f{i:04}");
+        assert!(listing.contains(&want), "unsquashfs -l missed {want}");
+    }
+
+    let extract = workdir.path().join("extract");
+    let out = Command::new("unsquashfs")
+        .arg("-no-xattrs")
+        .arg("-d")
+        .arg(&extract)
+        .arg(&img)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "unsquashfs -d failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    for i in [0usize, 1, 511, 512, 513, N - 1] {
+        assert_eq!(
+            fs::read(extract.join(format!("f{i:04}"))).unwrap(),
+            body(i),
+            "f{i:04} extracted wrong"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 2) mksquashfs → fstool reader.
 // ---------------------------------------------------------------------------

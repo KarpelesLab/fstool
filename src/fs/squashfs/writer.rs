@@ -1101,6 +1101,15 @@ impl WriteState {
                         dir_table_raw.extend_from_slice(&signed.to_le_bytes());
                         dir_table_raw.extend_from_slice(&kind.to_le_bytes());
                         let name_bytes = name.as_bytes();
+                        // SQUASHFS_NAME_LEN: a directory entry name is at
+                        // most 256 bytes; the kernel and unsquashfs reject
+                        // longer ones, so refuse to emit them.
+                        if name_bytes.is_empty() || name_bytes.len() > 256 {
+                            return Err(crate::Error::InvalidArgument(format!(
+                                "squashfs: entry name {name:?} is {} bytes; limit is 256",
+                                name_bytes.len()
+                            )));
+                        }
                         // Stored as len-1.
                         let name_size = (name_bytes.len() - 1) as u16;
                         dir_table_raw.extend_from_slice(&name_size.to_le_bytes());
@@ -1116,7 +1125,10 @@ impl WriteState {
                 chunk_raw_to_metablocks(&dir_table_raw, self.compression)?;
             dir_disk_payload = payload;
             let dir_raw_to_pos = |raw_off: usize| -> (u32, u16) {
-                let entry = dir_block_rel_map[raw_off / 8192];
+                // An image whose every directory is empty has no directory
+                // table at all (the map is empty); its listings point at
+                // block 0, offset 0, which is what mksquashfs writes too.
+                let entry = dir_block_rel_map.get(raw_off / 8192).copied().unwrap_or(0);
                 (entry, (raw_off % 8192) as u16)
             };
 
@@ -1222,23 +1234,36 @@ impl WriteState {
         let fragment_table_start = if fragment_count == 0 {
             u64::MAX
         } else {
-            // Build a metablock of fragment entries (16 bytes each).
+            // Fragment entries are 16 bytes each, packed 512 to an 8 KiB
+            // metablock; the L1 array holds one u64 per metablock (that is
+            // how readers, including ours, locate entry `idx`: metablock
+            // `idx / 512`, slot `idx % 512`).
             let mut frag_raw = Vec::with_capacity(fragment_entries.len() * 16);
             for (start, size_word) in &fragment_entries {
                 frag_raw.extend_from_slice(&start.to_le_bytes());
                 frag_raw.extend_from_slice(&size_word.to_le_bytes());
                 frag_raw.extend_from_slice(&0u32.to_le_bytes()); // unused
             }
-            let mb = encode_metablock(&frag_raw, self.compression)?;
-            let mb_disk_offset = next_disk_offset;
-            ensure_size(dev, next_disk_offset + mb.len() as u64)?;
-            dev.write_at(mb_disk_offset, &mb)?;
-            next_disk_offset += mb.len() as u64;
-            // L1 array: a single u64 pointing at our metablock.
+            let mut mb_offsets_abs: Vec<u64> = Vec::new();
+            let mut pos = 0usize;
+            while pos < frag_raw.len() {
+                let end = (pos + 8192).min(frag_raw.len());
+                let mb = encode_metablock(&frag_raw[pos..end], self.compression)?;
+                let mb_off = next_disk_offset;
+                ensure_size(dev, next_disk_offset + mb.len() as u64)?;
+                dev.write_at(mb_off, &mb)?;
+                next_disk_offset += mb.len() as u64;
+                mb_offsets_abs.push(mb_off);
+                pos = end;
+            }
             let l1_offset = next_disk_offset;
-            ensure_size(dev, next_disk_offset + 8)?;
-            dev.write_at(l1_offset, &mb_disk_offset.to_le_bytes())?;
-            next_disk_offset += 8;
+            let mut l1 = Vec::with_capacity(mb_offsets_abs.len() * 8);
+            for o in &mb_offsets_abs {
+                l1.extend_from_slice(&o.to_le_bytes());
+            }
+            ensure_size(dev, next_disk_offset + l1.len() as u64)?;
+            dev.write_at(l1_offset, &l1)?;
+            next_disk_offset += l1.len() as u64;
             l1_offset
         };
 
@@ -1972,5 +1997,88 @@ mod tests {
         assert_eq!(buf, b"hello");
         let tgt = s.read_symlink(&mut dev, "/lnk").unwrap();
         assert_eq!(tgt, "etc/hello.txt");
+    }
+
+    /// An image with nothing but the root directory has an empty directory
+    /// table; flushing it used to index an empty metablock map and panic.
+    #[test]
+    fn flush_root_only_image() {
+        let mut dev = MemoryBackend::new(256 * 1024);
+        let mut state = WriteState::new(DEFAULT_BLOCK_SIZE, Compression::Unknown(0));
+        let sb = state.flush(&mut dev).unwrap();
+        assert_eq!(sb.inode_count, 1);
+        let s = super::super::Squashfs::open(&mut dev).unwrap();
+        assert!(s.list_path(&mut dev, "/").unwrap().is_empty());
+
+        // Same for a tree made only of empty directories.
+        let mut dev = MemoryBackend::new(256 * 1024);
+        let mut state = WriteState::new(DEFAULT_BLOCK_SIZE, Compression::Unknown(0));
+        state
+            .create_dir("/a", EntryMeta::default(), Vec::new())
+            .unwrap();
+        state.flush(&mut dev).unwrap();
+        let s = super::super::Squashfs::open(&mut dev).unwrap();
+        assert_eq!(s.list_path(&mut dev, "/").unwrap().len(), 1);
+        assert!(s.list_path(&mut dev, "/a").unwrap().is_empty());
+    }
+
+    /// The fragment table spans several metablocks once there are more than
+    /// 512 fragment blocks; the writer used to cram every entry into one
+    /// metablock (and assert on >8 KiB). Files just under the block size each
+    /// occupy their own fragment block, so 600 of them need 600 entries.
+    #[test]
+    fn more_than_512_fragments_round_trip() {
+        const N: usize = 600;
+        let block_size = 4096u32;
+        let tail = block_size as usize - 1;
+        let mut dev = MemoryBackend::new(8 * 1024 * 1024);
+        let mut state = WriteState::new(block_size, Compression::Unknown(0));
+        let body = |i: usize| -> Vec<u8> { vec![(i % 251) as u8; tail] };
+        for i in 0..N {
+            state
+                .create_file(
+                    &mut dev,
+                    &format!("/f{i:04}"),
+                    FileSource::Reader {
+                        reader: Box::new(std::io::Cursor::new(body(i))),
+                        len: tail as u64,
+                    },
+                    EntryMeta::default(),
+                    Vec::new(),
+                )
+                .unwrap();
+        }
+        let sb = state.flush(&mut dev).unwrap();
+        assert!(
+            sb.fragment_count > 512,
+            "expected >512 fragment blocks, got {}",
+            sb.fragment_count
+        );
+        let s = super::super::Squashfs::open(&mut dev).unwrap();
+        assert_eq!(s.list_path(&mut dev, "/").unwrap().len(), N);
+        // Spot-check files from the first, second and last fragment
+        // metablock, including the boundary entries 511/512.
+        for i in [0usize, 1, 511, 512, 513, N - 1] {
+            let mut r = s.open_file_reader(&mut dev, &format!("/f{i:04}")).unwrap();
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut r, &mut buf).unwrap();
+            assert_eq!(buf, body(i), "file f{i:04} read back wrong");
+        }
+    }
+
+    /// Directory entry names are capped at 256 bytes on disk (the name_size
+    /// field is stored as `len - 1` and the kernel enforces SQUASHFS_NAME_LEN).
+    #[test]
+    fn long_entry_name_is_rejected() {
+        let mut dev = MemoryBackend::new(256 * 1024);
+        let mut state = WriteState::new(DEFAULT_BLOCK_SIZE, Compression::Unknown(0));
+        let long = "n".repeat(257);
+        state
+            .create_dir(&format!("/{long}"), EntryMeta::default(), Vec::new())
+            .unwrap();
+        assert!(matches!(
+            state.flush(&mut dev),
+            Err(crate::Error::InvalidArgument(_))
+        ));
     }
 }

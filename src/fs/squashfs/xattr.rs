@@ -24,7 +24,7 @@
 use crate::Result;
 use crate::block::BlockDevice;
 use crate::fs::squashfs::Compression;
-use crate::fs::squashfs::metablock::{encode_metablock, read_metablock};
+use crate::fs::squashfs::metablock::{MetadataReader, encode_metablock, read_metablock};
 
 /// Recognised key prefixes in the SquashFS xattr table.
 pub const XATTR_TYPE_USER: u16 = 0;
@@ -155,12 +155,27 @@ impl XattrReader {
         // `entry.count` is a raw u32 from disk; don't trust it for the
         // initial capacity (the loop reads each record from disk anyway, so
         // a wrong count just stops the loop early or errors on a short read).
-        let mut out = Vec::new();
+        // Every record is at least 8 bytes (u16 type + u16 name_size + u32
+        // value_size), so a count that could not fit in the set's declared
+        // uncompressed size is bogus — reject it rather than looping (and
+        // allocating) billions of times.
+        if (entry.count as u64) * 8 > entry._size as u64 {
+            return Err(crate::Error::InvalidImage(format!(
+                "squashfs: xattr set {idx} declares {} records in {} bytes",
+                entry.count, entry._size
+            )));
+        }
+        let mut out = Vec::with_capacity(entry.count as usize);
         let mut mb_rel = meta_block_rel;
         let mut offset = in_block_offset;
+        // One reader for the whole walk: consecutive records almost always
+        // share a metablock, so this decompresses each block once instead of
+        // once per record. A second reader serves out-of-line values so a
+        // detour to another block doesn't evict the record cursor's block.
+        let mut mr = MetadataReader::new(self.kv_start, compression);
+        let mut ool = MetadataReader::new(self.kv_start, compression);
         for _ in 0..entry.count {
-            let (kv, nb, no) =
-                read_kv_record(dev, self.kv_start, mb_rel, offset, entry._size, compression)?;
+            let (kv, nb, no) = read_kv_record(dev, &mut mr, &mut ool, mb_rel, offset, entry._size)?;
             mb_rel = nb;
             offset = no;
             out.push(kv);
@@ -170,22 +185,21 @@ impl XattrReader {
 }
 
 /// Read a single key/value record starting at `(mb_rel, offset)` within
-/// the K/V metablock stream anchored at `kv_start`. Returns the parsed
-/// record plus the new cursor.
+/// the K/V metablock stream `mr` walks (anchored at `kv_start`). Returns
+/// the parsed record plus the new cursor. `ool` is a second cursor over the
+/// same stream used to chase out-of-line value references.
 fn read_kv_record(
     dev: &mut dyn BlockDevice,
-    kv_start: u64,
+    mr: &mut MetadataReader,
+    ool: &mut MetadataReader,
     mut mb_rel: u64,
     mut offset: usize,
     entry_size: u32,
-    compression: Compression,
 ) -> Result<(Xattr, u64, usize)> {
-    use crate::fs::squashfs::metablock::MetadataReader;
     // A single record's name/value can never be larger than the whole xattr
     // set's declared uncompressed size. Use it as an upper bound so a bogus
     // u16/u32 length field can't drive an oversized read/allocation.
     let max_field = entry_size as usize;
-    let mut mr = MetadataReader::new(kv_start, compression);
     // Key header: u16 type, u16 name_size.
     let (head, nb, no) = mr.read(dev, mb_rel, offset, 4)?;
     mb_rel = nb;
@@ -209,9 +223,16 @@ fn read_kv_record(
     mb_rel = nb;
     offset = no;
     let v_size = u32::from_le_bytes(vh[0..4].try_into().unwrap()) as usize;
-    // Out-of-line values store an 8-byte reference rather than the value
-    // itself, so only bound inline values against the entry size.
-    if raw_type & XATTR_FLAG_OOL == 0 && v_size > max_field {
+    let is_ool = raw_type & XATTR_FLAG_OOL != 0;
+    // Out-of-line values store exactly an 8-byte reference in place of the
+    // value; anything else is malformed. Inline values are bounded by the
+    // set's declared size like the name.
+    if is_ool && v_size != 8 {
+        return Err(crate::Error::InvalidImage(format!(
+            "squashfs: out-of-line xattr reference has size {v_size}, expected 8"
+        )));
+    }
+    if !is_ool && v_size > max_field {
         return Err(crate::Error::InvalidImage(format!(
             "squashfs: xattr value size {v_size} exceeds entry size {max_field}"
         )));
@@ -220,19 +241,18 @@ fn read_kv_record(
     mb_rel = nb;
     offset = no;
     // Out-of-line values: v_bytes is a u64 reference. Follow it.
-    if raw_type & XATTR_FLAG_OOL != 0 && v_size == 8 {
+    if is_ool {
         let oref = u64::from_le_bytes(v_bytes.as_slice().try_into().unwrap());
         let ref_block = oref >> 16;
         let ref_offset = (oref & 0xFFFF) as usize;
-        let mut mr2 = MetadataReader::new(kv_start, compression);
-        let (vh2, nb2, no2) = mr2.read(dev, ref_block, ref_offset, 4)?;
+        let (vh2, nb2, no2) = ool.read(dev, ref_block, ref_offset, 4)?;
         let real_size = u32::from_le_bytes(vh2[0..4].try_into().unwrap()) as usize;
         if real_size > max_field {
             return Err(crate::Error::InvalidImage(format!(
                 "squashfs: out-of-line xattr value size {real_size} exceeds entry size {max_field}"
             )));
         }
-        let (real_bytes, _, _) = mr2.read(dev, nb2, no2, real_size)?;
+        let (real_bytes, _, _) = ool.read(dev, nb2, no2, real_size)?;
         v_bytes = real_bytes;
     }
     Ok((
@@ -444,5 +464,76 @@ mod tests {
             .unwrap();
         let empty = r.fetch(&mut dev, 0, Compression::Unknown(0)).unwrap();
         assert_eq!(empty.len(), 0);
+    }
+
+    /// Lay out a hand-built xattr table: one K/V metablock holding `kv`
+    /// followed by one lookup metablock with a single entry describing it,
+    /// then the 16-byte header. Returns the device and the header offset.
+    fn crafted_table(kv: &[u8], count: u32, size: u32) -> (MemoryBackend, u64) {
+        let comp = Compression::Unknown(0);
+        let mut img = Vec::new();
+        let kv_start = 0u64;
+        img.extend_from_slice(&encode_metablock(kv, comp).unwrap());
+        let lookup_at = img.len() as u64;
+        let mut entry = Vec::new();
+        entry.extend_from_slice(&0u64.to_le_bytes()); // xattr_ref: block 0, off 0
+        entry.extend_from_slice(&count.to_le_bytes());
+        entry.extend_from_slice(&size.to_le_bytes());
+        img.extend_from_slice(&encode_metablock(&entry, comp).unwrap());
+        let header_at = img.len() as u64;
+        img.extend_from_slice(&kv_start.to_le_bytes());
+        img.extend_from_slice(&1u32.to_le_bytes());
+        img.extend_from_slice(&0u32.to_le_bytes());
+        img.extend_from_slice(&lookup_at.to_le_bytes());
+        let mut dev = MemoryBackend::new(img.len() as u64 + 64);
+        dev.write_at(0, &img).unwrap();
+        (dev, header_at)
+    }
+
+    /// An out-of-line record must carry exactly an 8-byte reference; a
+    /// bogus value size on it must not drive a multi-gigabyte read.
+    #[test]
+    fn out_of_line_value_size_must_be_eight() {
+        let mut kv = Vec::new();
+        kv.extend_from_slice(&(XATTR_TYPE_USER | XATTR_FLAG_OOL).to_le_bytes());
+        kv.extend_from_slice(&1u16.to_le_bytes());
+        kv.push(b'x');
+        kv.extend_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+        let (mut dev, hdr) = crafted_table(&kv, 1, 17);
+        let mut r = XattrReader::new();
+        r.ensure_loaded(&mut dev, hdr, Compression::Unknown(0))
+            .unwrap();
+        assert!(matches!(
+            r.fetch(&mut dev, 0, Compression::Unknown(0)),
+            Err(crate::Error::InvalidImage(_))
+        ));
+    }
+
+    /// A record count that cannot fit in the set's declared size is bogus.
+    #[test]
+    fn inflated_record_count_is_rejected() {
+        let mut kv = Vec::new();
+        kv.extend_from_slice(&XATTR_TYPE_USER.to_le_bytes());
+        kv.extend_from_slice(&1u16.to_le_bytes());
+        kv.push(b'x');
+        kv.extend_from_slice(&1u32.to_le_bytes());
+        kv.push(b'y');
+        let (mut dev, hdr) = crafted_table(&kv, u32::MAX, kv.len() as u32);
+        let mut r = XattrReader::new();
+        r.ensure_loaded(&mut dev, hdr, Compression::Unknown(0))
+            .unwrap();
+        assert!(matches!(
+            r.fetch(&mut dev, 0, Compression::Unknown(0)),
+            Err(crate::Error::InvalidImage(_))
+        ));
+        // The same record with an honest count still decodes.
+        let (mut dev, hdr) = crafted_table(&kv, 1, kv.len() as u32);
+        let mut r = XattrReader::new();
+        r.ensure_loaded(&mut dev, hdr, Compression::Unknown(0))
+            .unwrap();
+        let set = r.fetch(&mut dev, 0, Compression::Unknown(0)).unwrap();
+        assert_eq!(set.len(), 1);
+        assert_eq!(set[0].key, "user.x");
+        assert_eq!(set[0].value, b"y");
     }
 }
