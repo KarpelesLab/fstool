@@ -1135,6 +1135,9 @@ quit | exit         leave
             if streaming {
                 emit(h, output)?;
                 emitted += 1;
+                if limit.is_some_and(|n| emitted >= n) {
+                    return Ok(());
+                }
             } else {
                 hits.push(h);
             }

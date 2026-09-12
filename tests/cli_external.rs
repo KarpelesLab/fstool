@@ -771,6 +771,51 @@ fn cli_fat32_build_ls_cat_info_roundtrip() {
 
 /// `fstool convert` does a byte-for-byte raw ↔ qcow2 round-trip.
 #[cfg(all(feature = "ext", feature = "qcow2"))]
+#[cfg(feature = "ext")]
+#[test]
+fn cli_convert_and_repack_refuse_same_file() {
+    // `convert a a` / `repack a a` used to open the source, then create
+    // (truncate) the destination — zeroing the image under the reader.
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("hello"), b"same file\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.img");
+    let out = Command::new(FSTOOL)
+        .args(["create", "-t", "ext4"])
+        .arg(srcdir.path())
+        .arg("-o")
+        .arg(&img)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "create failed");
+    let before = std::fs::read(&img).unwrap();
+    assert!(before.iter().any(|&b| b != 0));
+
+    for cmd in ["convert", "repack"] {
+        let r = Command::new(FSTOOL)
+            .arg(cmd)
+            .arg(&img)
+            .arg(&img)
+            .output()
+            .unwrap();
+        assert!(!r.status.success(), "{cmd} onto itself must fail");
+        let err = String::from_utf8_lossy(&r.stderr);
+        assert!(err.contains("same file"), "{cmd}: unexpected stderr: {err}");
+        assert_eq!(std::fs::read(&img).unwrap(), before, "{cmd} clobbered the image");
+    }
+    // Same guard when the source carries a partition selector.
+    let mut spec = img.as_os_str().to_owned();
+    spec.push(":1");
+    let r = Command::new(FSTOOL)
+        .arg("repack")
+        .arg(&spec)
+        .arg(&img)
+        .output()
+        .unwrap();
+    assert!(!r.status.success());
+    assert_eq!(std::fs::read(&img).unwrap(), before);
+}
+
 #[test]
 fn cli_convert_raw_qcow2_roundtrip() {
     if !which("qemu-img") {

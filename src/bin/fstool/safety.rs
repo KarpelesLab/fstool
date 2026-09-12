@@ -67,6 +67,27 @@ pub fn sanitize_name(s: &str) -> String {
     out
 }
 
+/// True when both paths resolve to the same existing file. Used by the
+/// commands that open a source and then *create* (truncate) a destination:
+/// with the same path on both sides the create would zero the source
+/// underneath the reader.
+pub fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Strip a trailing `:N` partition selector from an image spec, but only
+/// when `N` is purely numeric so a Windows drive letter (`C:\foo.img`)
+/// survives.
+pub fn strip_partition_selector(spec: &str) -> &str {
+    match spec.rsplit_once(':') {
+        Some((head, tail)) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => head,
+        _ => spec,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

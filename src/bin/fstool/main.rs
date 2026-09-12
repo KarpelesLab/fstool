@@ -296,8 +296,10 @@ enum Command {
         /// (default: every type that takes a content-fit size).
         #[arg(long, value_name = "TYPE")]
         fs_type: Option<String>,
-        /// ext block size used for the ext size estimate.
-        #[arg(long, default_value_t = 4096)]
+        /// ext block size used for the ext size estimate. Matches the
+        /// `repack --block-size` default so the recommendation is what
+        /// `repack --shrink` will actually produce.
+        #[arg(long, default_value_t = 1024)]
         block_size: u32,
         /// Emit machine-readable JSON instead of text.
         #[arg(long)]
@@ -310,9 +312,13 @@ enum Command {
         /// Path to the TOML spec file.
         #[arg(value_name = "SPEC")]
         spec: PathBuf,
-        /// Output image file.
+        /// Output image file or block device.
         #[arg(short = 'o', long = "output", value_name = "IMAGE")]
         output: PathBuf,
+        /// Required when OUTPUT is a block device — refuses to format a
+        /// real device without an explicit opt-in.
+        #[arg(long)]
+        force: bool,
         /// Compress the qcow2 output. `--compress` = zlib level 6;
         /// also `--compress=zstd`, `--compress=9`, or `--compress=zstd:9`.
         #[cfg(feature = "qcow2")]
@@ -398,6 +404,10 @@ enum Command {
         /// be larger (grows the image with all-zero tail) but not smaller.
         #[arg(long, value_name = "SIZE")]
         size: Option<String>,
+        /// Required when DST is a block device — refuses to overwrite a
+        /// real device without an explicit opt-in.
+        #[arg(long)]
+        force: bool,
         /// qcow2 cluster size for the destination, when DST is a qcow2.
         #[cfg(feature = "qcow2")]
         #[arg(long, value_name = "SIZE", default_value = "64KiB")]
@@ -441,6 +451,10 @@ enum Command {
         /// ext block size (1024/2048/4096); ignored for FAT32 output.
         #[arg(long, default_value_t = 1024)]
         block_size: u32,
+        /// Required when the destination is a block device — refuses to
+        /// format a real device without an explicit opt-in.
+        #[arg(long)]
+        force: bool,
         /// qcow2 cluster size for the destination, when DST is a qcow2.
         #[cfg(feature = "qcow2")]
         #[arg(long, value_name = "SIZE", default_value = "64KiB")]
@@ -854,11 +868,17 @@ fn run(cli: Cli) -> fstool::Result<()> {
         Command::Build {
             spec,
             output,
+            force,
             #[cfg(feature = "qcow2")]
             compress,
         } => {
             #[cfg(feature = "qcow2")]
             let comp = parse_compress(compress.as_deref())?;
+            require_force_for_device(
+                &output,
+                fstool::block::file::is_block_device(&output),
+                force,
+            )?;
             build(&spec, &output)?;
             #[cfg(feature = "qcow2")]
             if let Some((ctype, level)) = comp {
@@ -903,6 +923,7 @@ fn run(cli: Cli) -> fstool::Result<()> {
             src,
             dst,
             size,
+            force,
             #[cfg(feature = "qcow2")]
             cluster_size,
             #[cfg(feature = "qcow2")]
@@ -919,6 +940,7 @@ fn run(cli: Cli) -> fstool::Result<()> {
                 &dst,
                 size.as_deref(),
                 password.as_deref(),
+                force,
                 &create_opts,
             )?;
             #[cfg(feature = "qcow2")]
@@ -933,6 +955,7 @@ fn run(cli: Cli) -> fstool::Result<()> {
             shrink,
             fs_type,
             block_size,
+            force,
             #[cfg(feature = "qcow2")]
             cluster_size,
             #[cfg(feature = "qcow2")]
@@ -959,6 +982,7 @@ fn run(cli: Cli) -> fstool::Result<()> {
                 fs_type_override: fs_type.as_deref(),
                 block_size,
                 password: password.as_deref(),
+                force,
                 create_opts: &create_opts,
             });
             fstool::repack::leave();
@@ -1292,8 +1316,15 @@ fn convert_cmd(
     dst: &std::path::Path,
     size_arg: Option<&str>,
     password: Option<&str>,
+    force: bool,
     create_opts: &fstool::block::CreateOpts,
 ) -> fstool::Result<()> {
+    if safety::same_file(src, dst) {
+        return Err(fstool::Error::InvalidArgument(
+            "convert: source and destination are the same file".into(),
+        ));
+    }
+    require_force_for_device(dst, fstool::block::file::is_block_device(dst), force)?;
     let mut src_dev = fstool::block::open_image_with_password(src, password)?;
     let src_size = src_dev.total_size();
     let dst_size = match size_arg {
@@ -1344,6 +1375,8 @@ struct RepackArgs<'a> {
     block_size: u32,
     /// Passphrase for encrypted *sources*.
     password: Option<&'a str>,
+    /// Allow a block-device destination.
+    force: bool,
     /// How to make the destination container: cluster size, and any
     /// encryption or backing file the caller asked for.
     create_opts: &'a fstool::block::CreateOpts,
@@ -1358,6 +1391,7 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
         fs_type_override,
         block_size,
         password,
+        force,
         create_opts,
     } = args;
     #[cfg(feature = "tar")]
@@ -1368,6 +1402,20 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
             "repack: at least one source is required".into(),
         ));
     }
+    // The destination is created (truncated) after the sources are
+    // opened; a source that is the destination would be zeroed under
+    // the walker. A `+`-joined layer spec is split the same way
+    // `Source::detect` splits it.
+    for src in srcs.iter().flat_map(|s| s.split('+')) {
+        let bare = std::path::Path::new(safety::strip_partition_selector(src));
+        if safety::same_file(bare, dst) {
+            return Err(fstool::Error::InvalidArgument(format!(
+                "repack: source {src} and destination {} are the same file",
+                dst.display()
+            )));
+        }
+    }
+    require_force_for_device(dst, fstool::block::file::is_block_device(dst), force)?;
 
     // Multi-source: fold the layers into an in-memory `MergeModel`
     // (metadata only — no file bodies in RAM) and drive the destination
@@ -1684,7 +1732,7 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
                 opts.prezeroed = true;
                 let plan_size = opts.blocks_count as u64 * opts.block_size as u64;
                 if dst_size > plan_size {
-                    let max = (dst_size / opts.block_size as u64) as u32;
+                    let max = u32::try_from(dst_size / opts.block_size as u64).unwrap_or(u32::MAX);
                     opts.blocks_count = (max / 8) * 8;
                     let by_density =
                         (opts.blocks_count as u64 * opts.block_size as u64 / 16_384) as u32;
@@ -2080,7 +2128,7 @@ fn repack_layered_to_dst(
             opts.prezeroed = true;
             let plan_size = opts.blocks_count as u64 * opts.block_size as u64;
             if dst_size > plan_size {
-                let max = (dst_size / opts.block_size as u64) as u32;
+                let max = u32::try_from(dst_size / opts.block_size as u64).unwrap_or(u32::MAX);
                 opts.blocks_count = (max / 8) * 8;
                 let by_density =
                     (opts.blocks_count as u64 * opts.block_size as u64 / 16_384) as u32;
@@ -2342,7 +2390,7 @@ fn repack_tar_stream_to_fs(
     if let Some(opts) = ext_opts.as_mut() {
         let plan_size = opts.blocks_count as u64 * opts.block_size as u64;
         if dst_size > plan_size {
-            let max = (dst_size / opts.block_size as u64) as u32;
+            let max = u32::try_from(dst_size / opts.block_size as u64).unwrap_or(u32::MAX);
             opts.blocks_count = (max / 8) * 8;
             let by_density = (opts.blocks_count as u64 * opts.block_size as u64 / 16_384) as u32;
             opts.inodes_count = opts.inodes_count.max(by_density);
@@ -3515,6 +3563,10 @@ fn create_ext(
     // device's capacity wins.
     let plan_size = format_opts.blocks_count as u64 * format_opts.block_size as u64;
     let want_size = match size_arg {
+        // On a block device the capacity wins (see the `--size` help);
+        // passing the request through would only make `create_image`
+        // reject a device smaller than it.
+        Some(_) if is_device => plan_size,
         Some(s) => fstool::spec::parse_size(s)?,
         None => plan_size,
     };
@@ -3776,12 +3828,7 @@ where
 /// files, and the provisioned sparse tail is only zeros.
 fn truncate_output_file(output: &std::path::Path, len: u64) -> fstool::Result<()> {
     use fstool::block::file::is_block_device;
-    if is_block_device(output)
-        || output
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("qcow2"))
-    {
+    if is_block_device(output) || fstool::block::is_qcow2_path(output) {
         return Ok(());
     }
     let f = std::fs::OpenOptions::new().write(true).open(output)?;

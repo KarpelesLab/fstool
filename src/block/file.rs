@@ -26,9 +26,27 @@ pub fn is_block_device(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileTypeExt;
-        std::fs::metadata(path)
-            .map(|m| m.file_type().is_block_device())
-            .unwrap_or(false)
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
+        let ft = meta.file_type();
+        if ft.is_block_device() {
+            return true;
+        }
+        // macOS exposes every disk twice: `/dev/diskN` (buffered, a block
+        // device) and `/dev/rdiskN` (raw, a *character* device). Both take
+        // the same DKIOC* size ioctls; without this a raw node reads as a
+        // 0-byte regular file.
+        #[cfg(target_os = "macos")]
+        if ft.is_char_device()
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("rdisk"))
+        {
+            return true;
+        }
+        false
     }
     #[cfg(not(unix))]
     {

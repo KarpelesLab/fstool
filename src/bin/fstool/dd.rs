@@ -412,14 +412,6 @@ fn human_dur(secs: u64) -> String {
     }
 }
 
-/// True when both paths resolve to the same existing file.
-fn same_file(a: &Path, b: &Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => false,
-    }
-}
-
 fn check_pow2(name: &str, v: usize) -> Result<()> {
     if v == 0 || !v.is_power_of_two() {
         return Err(Error::InvalidArgument(format!(
@@ -433,7 +425,7 @@ fn check_pow2(name: &str, v: usize) -> Result<()> {
 pub fn run(args: DdArgs) -> Result<()> {
     install_interrupt_handler();
 
-    if same_file(args.src, args.dst) {
+    if crate::safety::same_file(args.src, args.dst) {
         return Err(Error::InvalidArgument(
             "dd: source and destination are the same file".into(),
         ));
@@ -445,6 +437,12 @@ pub fn run(args: DdArgs) -> Result<()> {
     // Source opened raw and read-only — we never modify it.
     let src: Box<dyn BlockDevice> = Box::new(FileBackend::open_read_only(args.src)?);
     let total = src.total_size();
+    if total == 0 {
+        return Err(Error::InvalidArgument(format!(
+            "dd: {} reports a size of 0 bytes; nothing to copy",
+            args.src.display()
+        )));
+    }
     let min_block = match args.min_block_size {
         Some(s) => fstool::spec::parse_size(s)? as usize,
         None => src.block_size() as usize,
@@ -511,6 +509,14 @@ pub fn run(args: DdArgs) -> Result<()> {
             "dd: warning: {} unreadable; those regions were left untouched on the destination",
             human_bytes(stats.bad_bytes),
         );
+    }
+    // A partial copy must not look like a complete one to a script: the
+    // summary above already says how far it got, so fail the exit code.
+    if stats.interrupted {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "dd: copy interrupted before completion",
+        )));
     }
     Ok(())
 }
