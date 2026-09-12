@@ -121,7 +121,9 @@ impl MergeModel {
     /// The layers in model order, with any nested [`Source::Layered`]
     /// expanded in place — the same numbering `build` assigns, so the
     /// per-layer tar walk in [`Self::walk_into_sink`] lines up with the
-    /// `layer` index stored on each tar body.
+    /// `layer` index stored on each tar body. Only the tar walk needs
+    /// it; without that backend no tar layer can reach the model.
+    #[cfg(feature = "tar")]
     fn flatten_layers<'a>(layers: &'a [Source], out: &mut Vec<&'a Source>) {
         for layer in layers {
             match layer {
