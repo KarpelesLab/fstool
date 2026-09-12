@@ -579,6 +579,18 @@ fn open_writer<'a>(
     Ok(h)
 }
 
+/// Resize the file at `path`, the path-flavoured [`FileHandle::set_len`].
+pub(super) fn truncate(
+    fs: &mut LittleFs,
+    dev: &mut dyn BlockDevice,
+    path: &Path,
+    new_size: u64,
+) -> Result<()> {
+    let mut h = open_rw(fs, dev, path, OpenFlags::default(), None)?;
+    h.set_len(new_size)?;
+    h.sync()
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::LittleFsFormatOpts;
@@ -692,16 +704,4 @@ mod tests {
         expect.resize(16, 0);
         assert_eq!(read_back(&mut fs, &mut dev, "/small.bin"), expect);
     }
-}
-
-/// Resize the file at `path`, the path-flavoured [`FileHandle::set_len`].
-pub(super) fn truncate(
-    fs: &mut LittleFs,
-    dev: &mut dyn BlockDevice,
-    path: &Path,
-    new_size: u64,
-) -> Result<()> {
-    let mut h = open_rw(fs, dev, path, OpenFlags::default(), None)?;
-    h.set_len(new_size)?;
-    h.sync()
 }
