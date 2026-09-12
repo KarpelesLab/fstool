@@ -1172,6 +1172,18 @@ impl Ext {
     /// read-modify-write at flush. Newly created inodes go through
     /// [`Self::push_new_inode`] so their tail is initialised.
     fn push_inode(&mut self, ino: u32, inode: Inode) {
+        // Replace, never duplicate. `alloc_inode` reuses a slot as soon
+        // as it is freed, so the same inode number can be staged twice
+        // in one session: once as the zeroed tombstone `remove` leaves
+        // behind, then again as the new file. Appending a second entry
+        // left the tombstone in front of it, and the callers that scan
+        // `self.inodes` linearly (rather than through `inode_idx`)
+        // found the zeroed one — the new file read back as "not a
+        // regular file".
+        if let Some(&pos) = self.inode_idx.get(&ino) {
+            self.inodes[pos] = (ino, inode);
+            return;
+        }
         self.inode_idx.insert(ino, self.inodes.len());
         self.inodes.push((ino, inode));
     }
@@ -3674,37 +3686,197 @@ impl Ext {
     /// inode references. No-op for inodes with no allocated blocks (fast
     /// symlinks, device nodes).
     fn free_inode_blocks(&mut self, dev: &mut dyn BlockDevice, inode: &Inode) -> Result<()> {
-        if inode.blocks_512 == 0 {
+        // The external xattr block belongs to the inode too and was
+        // never released, leaking one block per removed file that
+        // carried xattrs.
+        if inode.file_acl != 0 {
+            self.free_block(inode.file_acl);
+        }
+        if !self.inode_has_block_map(inode) {
+            // inline_data keeps the file body in `i_block`; a fast
+            // symlink keeps the target there; device nodes, FIFOs and
+            // sockets keep `rdev` there. Walking any of those as block
+            // pointers frees blocks that belong to other files.
             return Ok(());
         }
-        let bs = self.layout.block_size;
-        let n_blocks = (inode.size as u64).div_ceil(bs as u64) as u32;
-        for n in 0..n_blocks {
-            let phys = self.file_block(dev, inode, n)?;
-            if phys != 0 {
-                self.free_block(phys);
+        if inode.flags & constants::EXT4_EXTENTS_FL != 0 {
+            self.free_extent_tree(dev, inode)
+        } else {
+            self.free_indirect_tree(dev, inode)
+        }
+    }
+
+    /// Whether `i_block` holds block pointers (or an extent tree) as
+    /// opposed to file data.
+    ///
+    /// `EXT4_INLINE_DATA_FL` puts the body there; a fast symlink puts
+    /// the target there; character/block devices, FIFOs and sockets put
+    /// `rdev` in the first words. Only regular files, directories and
+    /// slow symlinks have a real block map.
+    fn inode_has_block_map(&self, inode: &Inode) -> bool {
+        if inode.flags & constants::EXT4_INLINE_DATA_FL != 0 {
+            return false;
+        }
+        match inode.mode & constants::S_IFMT {
+            constants::S_IFREG | constants::S_IFDIR => true,
+            constants::S_IFLNK => !self.is_fast_symlink(inode),
+            _ => false,
+        }
+    }
+
+    /// The kernel's `ext4_inode_is_fast_symlink`: a symlink whose
+    /// target sits in `i_block`, identified by having no data blocks
+    /// charged beyond the one an external xattr block costs.
+    fn is_fast_symlink(&self, inode: &Inode) -> bool {
+        let ea_blocks_512 = if inode.file_acl != 0 {
+            self.layout.block_size / 512
+        } else {
+            0
+        };
+        inode.file_size() <= 60 && inode.blocks_512.saturating_sub(ea_blocks_512) == 0
+    }
+
+    /// Free every block reachable from an extent-mapped inode: the data
+    /// blocks of each leaf extent plus every on-disk index/leaf node of
+    /// the tree.
+    ///
+    /// The old code walked logical blocks `0..i_size/block_size` through
+    /// `file_block`, which (a) took `i_size` from the low 32 bits only,
+    /// so a file above 4 GiB kept most of its blocks allocated, (b)
+    /// leaked every tree block of a depth >= 1 inode — the comment
+    /// claiming extent inodes keep the whole tree inline is only true
+    /// at depth 0 — and (c) missed the blocks behind unwritten extents,
+    /// which `file_block` reports as holes.
+    fn free_extent_tree(&mut self, dev: &mut dyn BlockDevice, inode: &Inode) -> Result<()> {
+        let iblock = extent::iblock_to_bytes(&inode.block);
+        let header = extent::decode_header(&iblock[..12])?;
+        if header.depth == 0 {
+            let (_, runs) = extent::decode_depth0_iblock(&iblock)?;
+            self.free_extent_runs(&runs);
+            return Ok(());
+        }
+        let (_, indices) = extent::decode_idx_iblock(&iblock)?;
+        let child_depth = header.depth - 1;
+        let mut visited: Vec<u32> = Vec::new();
+        for idx in &indices {
+            self.free_extent_subtree(dev, idx.leaf as u32, child_depth, &mut visited)?;
+        }
+        Ok(())
+    }
+
+    /// Free the subtree rooted at on-disk node `blk`, then `blk`
+    /// itself. `visited` rejects cycles in a forged tree (and stops a
+    /// double free of an aliased node).
+    fn free_extent_subtree(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        blk: u32,
+        expected_depth: u16,
+        visited: &mut Vec<u32>,
+    ) -> Result<()> {
+        if visited.contains(&blk) {
+            return Err(crate::Error::InvalidImage(format!(
+                "ext4: extent tree cycle through physical block {blk}"
+            )));
+        }
+        visited.push(blk);
+        let bs = self.layout.block_size as usize;
+        let mut buf = vec![0u8; bs];
+        self.read_block(dev, blk, &mut buf)?;
+        let header = extent::decode_header(&buf[..12])?;
+        if header.depth != expected_depth {
+            return Err(crate::Error::InvalidImage(format!(
+                "ext4: extent node depth {} != expected {expected_depth}",
+                header.depth
+            )));
+        }
+        if header.depth == 0 {
+            let (_, runs) = extent::decode_leaf_block(&buf)?;
+            self.free_extent_runs(&runs);
+        } else {
+            let max_entries = (bs.saturating_sub(12) / 12) as u16;
+            if header.entries > max_entries {
+                return Err(crate::Error::InvalidImage(format!(
+                    "ext4: extent index claims {} entries, block holds at most {max_entries}",
+                    header.entries
+                )));
+            }
+            let child_depth = header.depth - 1;
+            for i in 0..header.entries as usize {
+                let off = 12 + i * 12;
+                let idx = extent::decode_idx(&buf[off..off + 12]);
+                self.free_extent_subtree(dev, idx.leaf as u32, child_depth, visited)?;
             }
         }
-        // Classic indirection metadata blocks (extent inodes keep their tree
-        // inline in i_block, so they have no external metadata blocks).
-        if inode.flags & constants::EXT4_EXTENTS_FL == 0 {
-            let ind = inode.block[constants::IDX_INDIRECT];
-            if ind != 0 {
-                self.free_block(ind);
-            }
-            let dind = inode.block[constants::IDX_DOUBLE_INDIRECT];
-            if dind != 0 {
-                let mut buf = vec![0u8; bs as usize];
-                self.read_block(dev, dind, &mut buf)?;
-                for i in 0..(bs as usize / 4) {
-                    let sub = u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
-                    if sub != 0 {
-                        self.free_block(sub);
-                    }
-                }
-                self.free_block(dind);
+        self.free_block(blk);
+        Ok(())
+    }
+
+    /// Free the data blocks of every leaf extent, unwritten ones
+    /// included — a preallocated range still owns its blocks.
+    fn free_extent_runs(&mut self, runs: &[extent::ExtentRun]) {
+        for r in runs {
+            for off in 0..r.actual_len() as u64 {
+                self.free_block((r.physical + off) as u32);
             }
         }
+    }
+
+    /// Free every block of a block-mapped (non-extent) inode by walking
+    /// the pointer tree itself — the kernel's `ext4_free_branches`
+    /// approach — rather than trusting `i_size`. Frees the indirection
+    /// blocks at all three levels; the triple-indirect branch used to
+    /// be skipped entirely.
+    fn free_indirect_tree(&mut self, dev: &mut dyn BlockDevice, inode: &Inode) -> Result<()> {
+        for b in &inode.block[..constants::N_DIRECT] {
+            if *b != 0 {
+                self.free_block(*b);
+            }
+        }
+        let mut visited: Vec<u32> = Vec::new();
+        for (slot, depth) in [
+            (constants::IDX_INDIRECT, 1u8),
+            (constants::IDX_DOUBLE_INDIRECT, 2),
+            (constants::IDX_TRIPLE_INDIRECT, 3),
+        ] {
+            let root = inode.block[slot];
+            if root != 0 {
+                self.free_indirect_branch(dev, root, depth, &mut visited)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Free the indirection block `blk` (at `depth` levels above the
+    /// data blocks) and everything it points at.
+    fn free_indirect_branch(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        blk: u32,
+        depth: u8,
+        visited: &mut Vec<u32>,
+    ) -> Result<()> {
+        if visited.contains(&blk) {
+            return Err(crate::Error::InvalidImage(format!(
+                "ext: indirect-block tree aliases metadata block {blk}"
+            )));
+        }
+        visited.push(blk);
+        let bs = self.layout.block_size as usize;
+        let mut buf = vec![0u8; bs];
+        self.read_block(dev, blk, &mut buf)?;
+        for i in 0..bs / 4 {
+            let p = u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+            if p == 0 {
+                continue;
+            }
+            if depth > 1 {
+                self.free_indirect_branch(dev, p, depth - 1, visited)?;
+            } else {
+                self.free_block(p);
+            }
+        }
+        self.free_block(blk);
         Ok(())
     }
 
@@ -4584,18 +4756,11 @@ impl Ext {
             )));
         }
         // Fast (inline) symlink: target is in the 60 bytes of block[].
-        // The kernel's test (`ext4_inode_is_fast_symlink`) is
-        // `i_blocks - ea_blocks == 0`, where `ea_blocks` is the one
-        // cluster charged for an external xattr block. A symlink that
-        // carries xattrs therefore still has its target in `i_block`
-        // even though `i_blocks` is non-zero; treating it as a slow
-        // symlink made us read the xattr block as the target.
-        let ea_blocks_512 = if inode.file_acl != 0 {
-            self.layout.block_size / 512
-        } else {
-            0
-        };
-        if size <= 60 && inode.blocks_512.saturating_sub(ea_blocks_512) == 0 {
+        // See [`Self::is_fast_symlink`] — a symlink that carries an
+        // external xattr block still keeps its target in `i_block`
+        // even though `i_blocks` is non-zero; requiring `i_blocks == 0`
+        // made us read the xattr block as the target.
+        if self.is_fast_symlink(&inode) {
             let mut bytes = [0u8; 60];
             for (i, &w) in inode.block.iter().enumerate() {
                 bytes[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());

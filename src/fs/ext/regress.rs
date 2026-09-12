@@ -1027,3 +1027,194 @@ fn routing_into_a_non_half_md4_index_is_refused() {
         .unwrap_err();
     assert!(matches!(err, crate::Error::Unsupported(_)), "{err:?}");
 }
+
+// ────────────── finding 7: free_inode_blocks completeness ──────────────
+
+/// Number of blocks marked in-use across every group bitmap.
+fn used_block_count(ext: &Ext) -> u32 {
+    let mut n = 0;
+    for (gi, g) in ext.layout.groups.iter().enumerate() {
+        let blocks = g.end_block - g.start_block + 1;
+        for bit in 0..blocks {
+            if super::group::test_bit(&ext.groups[gi].block_bitmap, bit) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Removing a file must give every block it owned back: the data
+/// blocks, the extent tree's index and leaf nodes, and the external
+/// xattr block. A depth >= 1 extent tree used to leak all of its tree
+/// blocks, and `file_acl` was never freed at all.
+#[test]
+fn removing_a_file_frees_its_tree_blocks_and_xattr_block() {
+    use crate::fs::{Filesystem, OpenFlags};
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+    let opts = FormatOpts {
+        block_size: 1024,
+        blocks_count: 32 * 1024,
+        ..ext4_opts()
+    };
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    ext.flush(&mut dev).unwrap();
+    let baseline = used_block_count(&ext);
+
+    let ino = add_file(&mut ext, &mut dev, INO_ROOT_DIR, b"deep", b"");
+    ext.set_xattrs(
+        &mut dev,
+        ino,
+        &[super::xattr::Xattr {
+            name: "user.k".into(),
+            value: vec![7; 64],
+        }],
+    )
+    .unwrap();
+    ext.flush(&mut dev).unwrap();
+    let with_file = used_block_count(&ext);
+
+    // Sparse single-block writes with a gap between them: the runs
+    // can't coalesce, so the leaf count spills the tree out of
+    // `i_block` into on-disk index and leaf nodes.
+    {
+        let mut h = ext
+            .open_file_rw(
+                &mut dev,
+                std::path::Path::new("/deep"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+        for i in 0..400u64 {
+            h.seek(SeekFrom::Start(i * 1024 * 8)).unwrap();
+            h.write_all(b"X").unwrap();
+        }
+        h.flush().unwrap();
+    }
+    ext.flush(&mut dev).unwrap();
+
+    let mut re = Ext::open(&mut dev).unwrap();
+    let inode = re.read_inode(&mut dev, ino).unwrap();
+    assert_ne!(inode.file_acl, 0, "test needs an external xattr block");
+    let iblock = super::extent::iblock_to_bytes(&inode.block);
+    assert!(
+        super::extent::decode_header(&iblock[..12]).unwrap().depth >= 1,
+        "test needs a depth >= 1 extent tree"
+    );
+    assert!(
+        used_block_count(&re) > with_file,
+        "the sparse writes must have allocated blocks"
+    );
+
+    re.remove_path(&mut dev, "/deep").unwrap();
+    re.flush(&mut dev).unwrap();
+    let after = Ext::open(&mut dev).unwrap();
+    assert_eq!(
+        used_block_count(&after),
+        baseline,
+        "removing the file must return every block it owned \
+         (data, extent-tree nodes and the xattr block)"
+    );
+}
+
+/// A fast symlink, an inline-data file and a device node all keep
+/// something other than block pointers in `i_block`. Removing them
+/// must not hand those words to `free_block` — that clears bitmap bits
+/// belonging to live files.
+#[test]
+fn removing_inodes_without_a_block_map_frees_nothing_foreign() {
+    use crate::fs::DeviceKind;
+    let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+    let opts = FormatOpts {
+        inode_size: 256,
+        inline_data: true,
+        ..ext4_opts()
+    };
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    // Live files whose blocks must survive.
+    let keep: Vec<(String, Vec<u8>)> = (0..8)
+        .map(|i| (format!("keep{i}"), vec![0xB0 + i as u8; 8192]))
+        .collect();
+    for (n, b) in &keep {
+        add_file(&mut ext, &mut dev, INO_ROOT_DIR, n.as_bytes(), b);
+    }
+
+    // A fast symlink carrying an xattr block: `i_block` holds the
+    // target text, and `i_blocks` is non-zero because of the xattr.
+    let link = ext
+        .add_symlink_to(
+            &mut dev,
+            INO_ROOT_DIR,
+            b"lnk",
+            b"keep0",
+            FileMeta::with_mode(0o777),
+        )
+        .unwrap();
+    ext.set_xattrs(
+        &mut dev,
+        link,
+        &[super::xattr::Xattr {
+            name: "user.k".into(),
+            value: vec![3; 32],
+        }],
+    )
+    .unwrap();
+    // An inline-data file: `i_block` holds the body.
+    add_file(&mut ext, &mut dev, INO_ROOT_DIR, b"tiny", b"inline body");
+    // A device node: `i_block[0..2]` holds rdev.
+    ext.add_device_to(
+        &mut dev,
+        INO_ROOT_DIR,
+        b"nod",
+        DeviceKind::Char,
+        0xFE,
+        0x2A,
+        FileMeta::with_mode(0o600),
+    )
+    .unwrap();
+    ext.flush(&mut dev).unwrap();
+
+    let mut re = Ext::open(&mut dev).unwrap();
+    let before = used_block_count(&re);
+    re.remove_path(&mut dev, "/lnk").unwrap();
+    re.remove_path(&mut dev, "/tiny").unwrap();
+    re.remove_path(&mut dev, "/nod").unwrap();
+    re.flush(&mut dev).unwrap();
+
+    let after = Ext::open(&mut dev).unwrap();
+    // Only the symlink's xattr block should have come back.
+    assert_eq!(used_block_count(&after), before - 1);
+    for (n, b) in &keep {
+        assert_eq!(&read_path(&after, &mut dev, &format!("/{n}")), b);
+    }
+}
+
+/// Creating a file, removing it and creating another in the same
+/// session reuses the freed inode number (that is the point of
+/// `alloc_inode`'s bitmap scan). The staged-inode list must then hold
+/// one entry for that number, not the zeroed tombstone `remove` left
+/// behind followed by the new inode — the linear scans over
+/// `self.inodes` find the first match, so the new file read back as
+/// "not a regular file".
+#[test]
+fn reusing_a_freed_inode_replaces_its_staged_tombstone() {
+    let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+    let mut ext = Ext::format_with(&mut dev, &ext4_opts()).unwrap();
+    let first = add_file(&mut ext, &mut dev, INO_ROOT_DIR, b"f.txt", b"first");
+    ext.remove_path(&mut dev, "/f.txt").unwrap();
+    let second = add_file(
+        &mut ext,
+        &mut dev,
+        INO_ROOT_DIR,
+        b"f.txt",
+        b"second-and-longer",
+    );
+    assert_eq!(first, second, "the freed inode should be reused");
+    assert_eq!(read_path(&ext, &mut dev, "/f.txt"), b"second-and-longer");
+    ext.flush(&mut dev).unwrap();
+    let re = Ext::open(&mut dev).unwrap();
+    assert_eq!(read_path(&re, &mut dev, "/f.txt"), b"second-and-longer");
+}

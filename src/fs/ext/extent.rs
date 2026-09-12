@@ -54,27 +54,6 @@ pub struct ExtentRun {
     pub physical: u64,
 }
 
-impl ExtentRun {
-    /// True when the record is an ext4 *unwritten* (a.k.a. uninitialized)
-    /// extent: `ee_len > 32768` is the kernel's encoding for
-    /// "preallocated but never written", and such a range reads back as
-    /// zeroes no matter what the physical blocks happen to hold
-    /// (`fs/ext4/ext4_extents.h::ext4_ext_is_unwritten`).
-    pub fn is_unwritten(&self) -> bool {
-        self.len > MAX_LEN_PER_EXTENT
-    }
-
-    /// Number of blocks the run actually covers, undoing the unwritten
-    /// bias (`ext4_ext_get_actual_len`).
-    pub fn actual_len(&self) -> u16 {
-        if self.len > MAX_LEN_PER_EXTENT {
-            self.len - MAX_LEN_PER_EXTENT
-        } else {
-            self.len
-        }
-    }
-}
-
 /// One internal-node entry in the extent tree. Points at a child node
 /// (another idx block at depth > 1, or a leaf block at depth == 1).
 #[derive(Debug, Clone, Copy)]
@@ -115,14 +94,13 @@ pub fn encode_header(entries: u16, max: u16, depth: u16) -> [u8; 12] {
 }
 
 /// Encode one 12-byte leaf-extent record.
-///
-/// `run.len` is the raw `ee_len`, so `1..=32768` is an initialized run
-/// and `32769..=65535` an *unwritten* one covering `ee_len - 32768`
-/// blocks. Both are re-encoded verbatim: an image made by `fallocate`
-/// carries unwritten extents, and re-packing its tree (which every
-/// write to the inode does) must not turn them into initialized data.
-/// This used to assert `len <= 32768` and so panicked on such images.
 pub fn encode_leaf(run: ExtentRun) -> [u8; 12] {
+    assert!(
+        run.len <= MAX_LEN_PER_EXTENT,
+        "extent length {} exceeds initialized cap {}",
+        run.len,
+        MAX_LEN_PER_EXTENT
+    );
     let mut out = [0u8; 12];
     out[0..4].copy_from_slice(&run.logical.to_le_bytes());
     out[4..6].copy_from_slice(&run.len.to_le_bytes());
