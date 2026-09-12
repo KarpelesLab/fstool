@@ -2259,3 +2259,180 @@ fn set_attrs_chmod_roundtrips_readonly_bit() {
     r.read_to_end(&mut buf).unwrap();
     assert_eq!(buf, b"hi\n");
 }
+
+/// Once `$MFT` is fragmented enough that its run list stops fitting in
+/// record 0, NTFS spills the later `$DATA` segments into extension
+/// records named by record 0's `$ATTRIBUTE_LIST`. Taking only the first
+/// `$DATA` attribute truncated `$MFT`, so every record past the first
+/// fragment read back as "past the end of $MFT".
+///
+/// This rewrites a formatted volume's record 0 into that shape — same
+/// clusters, but described as two `$DATA` segments, the second living in
+/// an extension record — and checks a record in the tail segment still
+/// resolves.
+#[test]
+fn mft_bootstrap_follows_attribute_list_on_record_zero() {
+    use super::attribute::{TYPE_ATTRIBUTE_LIST, TYPE_DATA};
+    let (mut dev, _ntfs) = fresh_volume(8 * 1024 * 1024);
+    let (base_off, rec_size, cluster_size) = {
+        let ro = Ntfs::open(&mut dev).unwrap();
+        let b = ro.boot_sector();
+        (
+            b.mft_lcn * b.cluster_size() as u64,
+            b.mft_record_size() as usize,
+            b.cluster_size() as u64,
+        )
+    };
+    // Decode record 0: keep every attribute except $DATA verbatim, and
+    // pull $DATA's single extent apart.
+    let mut rec0 = vec![0u8; rec_size];
+    dev.read_at(base_off, &mut rec0).unwrap();
+    mft::apply_fixup(&mut rec0, mft::NTFS_BLOCK_SIZE).unwrap();
+    let hdr = mft::RecordHeader::parse(&rec0).unwrap();
+    let mut keep: Vec<Vec<u8>> = Vec::new();
+    let mut data: Option<(u64, u64, u64, u64, u64)> = None; // lcn, len, alloc, real, init
+    for a in AttributeIter::new(&rec0, hdr.first_attribute_offset as usize) {
+        let a = a.unwrap();
+        if a.type_code == TYPE_DATA {
+            match a.kind {
+                AttributeKind::NonResident {
+                    ref runs,
+                    allocated_size,
+                    real_size,
+                    initialized_size,
+                    ..
+                } => {
+                    assert_eq!(runs.len(), 1, "a fresh $MFT is one extent");
+                    data = Some((
+                        runs[0].lcn.unwrap(),
+                        runs[0].length,
+                        allocated_size,
+                        real_size,
+                        initialized_size,
+                    ));
+                }
+                _ => panic!("$MFT $DATA must be non-resident"),
+            }
+            continue;
+        }
+        keep.push(rec0[a.offset..a.offset + a.length as usize].to_vec());
+    }
+    let (lcn, clusters, allocated, real, initialized) = data.expect("$MFT has $DATA");
+    let records_per_cluster = cluster_size / rec_size as u64;
+    // Split three clusters off the tail. The extension record and every
+    // system record stay inside the leading segment; the marker record
+    // below lands in the tail one.
+    assert!(clusters > 4, "test needs a multi-cluster $MFT");
+    let split = clusters - 3;
+    let tail_first_record = split * records_per_cluster;
+    let marker_rec = tail_first_record + 1;
+    let ext_rec = tail_first_record - 4; // free, inside the head segment
+
+    // A recognisable record in the tail segment.
+    let mut marker = vec![0u8; rec_size];
+    format::emit_record(
+        &mut marker,
+        rec_size,
+        marker_rec,
+        mft::RecordHeader::FLAG_IN_USE,
+        &[format::build_resident_attr(
+            TYPE_DATA,
+            &[],
+            b"tail-segment marker",
+            0,
+            0,
+        )],
+        mft::NTFS_BLOCK_SIZE,
+        1,
+    )
+    .unwrap();
+    dev.write_at(base_off + marker_rec * rec_size as u64, &marker)
+        .unwrap();
+
+    // $DATA segment 0 (VCN 0..split) stays in record 0; segment 1 goes to
+    // the extension record.
+    let seg0 = format::build_non_resident_attr(
+        TYPE_DATA,
+        &[],
+        &format::encode_run_list(&[(lcn, split)]),
+        0,
+        split - 1,
+        allocated,
+        real,
+        initialized,
+        0,
+        0,
+    );
+    let seg1 = format::build_non_resident_attr(
+        TYPE_DATA,
+        &[],
+        &format::encode_run_list(&[(lcn + split, clusters - split)]),
+        split,
+        clusters - 1,
+        allocated,
+        real,
+        initialized,
+        0,
+        0,
+    );
+    // $ATTRIBUTE_LIST: one 0x20-byte row per segment.
+    let mut alist = Vec::new();
+    for (vcn, rec) in [(0u64, 0u64), (split, ext_rec)] {
+        alist.extend_from_slice(&TYPE_DATA.to_le_bytes());
+        alist.extend_from_slice(&0x20u16.to_le_bytes());
+        alist.push(0); // name_len
+        alist.push(0x1A); // name_off
+        alist.extend_from_slice(&vcn.to_le_bytes());
+        alist.extend_from_slice(&(rec | (1u64 << 48)).to_le_bytes());
+        alist.extend_from_slice(&0u16.to_le_bytes()); // attribute_id
+        alist.extend_from_slice(&[0u8; 6]);
+    }
+    let alist_attr = format::build_resident_attr(TYPE_ATTRIBUTE_LIST, &[], &alist, 0, 0);
+
+    let mut attrs = keep;
+    attrs.push(alist_attr);
+    attrs.push(seg0);
+    let mut new0 = vec![0u8; rec_size];
+    format::emit_record(
+        &mut new0,
+        rec_size,
+        0,
+        mft::RecordHeader::FLAG_IN_USE,
+        &attrs,
+        mft::NTFS_BLOCK_SIZE,
+        1,
+    )
+    .unwrap();
+    dev.write_at(base_off, &new0).unwrap();
+
+    let mut ext = vec![0u8; rec_size];
+    format::emit_record(
+        &mut ext,
+        rec_size,
+        ext_rec,
+        mft::RecordHeader::FLAG_IN_USE,
+        &[seg1],
+        mft::NTFS_BLOCK_SIZE,
+        1,
+    )
+    .unwrap();
+    dev.write_at(base_off + ext_rec * rec_size as u64, &ext)
+        .unwrap();
+
+    // The reopened volume must stitch both segments together.
+    let mut ro = Ntfs::open(&mut dev).unwrap();
+    let mut got = vec![0u8; rec_size];
+    ro.read_mft_record(&mut dev, marker_rec, &mut got).unwrap();
+    let hdr = mft::RecordHeader::parse(&got).unwrap();
+    let mut found = false;
+    for a in AttributeIter::new(&got, hdr.first_attribute_offset as usize) {
+        let a = a.unwrap();
+        if let AttributeKind::Resident { value, .. } = a.kind {
+            assert_eq!(value, b"tail-segment marker");
+            found = true;
+        }
+    }
+    assert!(found, "marker record in the tail segment must be readable");
+    // The root directory (in the head segment) still lists normally.
+    assert!(ro.list_path(&mut dev, "/").is_ok());
+}

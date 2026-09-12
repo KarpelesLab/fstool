@@ -270,46 +270,10 @@ impl Ntfs {
             }
         }
 
-        // Bootstrap: read record 0 from the BPB-anchored MFT LCN. From
-        // record 0 we extract $MFT's $DATA run list and cache it.
+        // Bootstrap: read record 0 from the BPB-anchored MFT LCN and
+        // reconstruct $MFT's own $DATA run list from it.
         if self.mft_runs.is_empty() {
-            let base = self
-                .boot
-                .mft_lcn
-                .checked_mul(u64::from(self.boot.cluster_size()))
-                .ok_or_else(|| {
-                    crate::Error::InvalidImage("ntfs: $MFT LCN offset overflow".into())
-                })?;
-            // Record 0 is at the very start of the MFT — its index times
-            // record_size is zero, so the read offset is just `base`.
-            dev.read_at(base, out)?;
-            mft::apply_fixup(out, mft::NTFS_BLOCK_SIZE)?;
-            // Now decode record 0's attributes to find $DATA's run list.
-            let header = mft::RecordHeader::parse(out)?;
-            for attr_res in AttributeIter::new(out, header.first_attribute_offset as usize) {
-                let attr = attr_res?;
-                if attr.type_code == TYPE_DATA && attr.name.is_empty() {
-                    match attr.kind {
-                        AttributeKind::NonResident { runs, .. } => {
-                            self.mft_runs = runs;
-                        }
-                        AttributeKind::Resident { .. } => {
-                            return Err(crate::Error::InvalidImage(
-                                "ntfs: $MFT $DATA is resident — impossible".into(),
-                            ));
-                        }
-                    }
-                    break;
-                }
-            }
-            if self.mft_runs.is_empty() {
-                return Err(crate::Error::InvalidImage(
-                    "ntfs: could not locate $MFT $DATA run list in record 0".into(),
-                ));
-            }
-            if rec == 0 {
-                return Ok(()); // already loaded
-            }
+            self.bootstrap_mft_runs(dev)?;
         }
 
         // For all other records, map record `rec` through the MFT $DATA
@@ -362,6 +326,147 @@ impl Ntfs {
         Ok(())
     }
 
+    /// Collect every unnamed, non-resident `$DATA` segment of one MFT
+    /// record as `(starting_vcn, runs)`. A `$DATA` split across several
+    /// attribute instances (the `$ATTRIBUTE_LIST` case) contributes one
+    /// entry per instance.
+    fn data_segments(record: &[u8]) -> Result<Vec<(u64, Vec<Extent>)>> {
+        let header = mft::RecordHeader::parse(record)?;
+        let mut out = Vec::new();
+        for attr_res in AttributeIter::new(record, header.first_attribute_offset as usize) {
+            let attr = attr_res?;
+            if attr.type_code != TYPE_DATA || !attr.name.is_empty() {
+                continue;
+            }
+            match attr.kind {
+                AttributeKind::NonResident {
+                    starting_vcn, runs, ..
+                } => out.push((starting_vcn, runs)),
+                AttributeKind::Resident { .. } => {
+                    return Err(crate::Error::InvalidImage(
+                        "ntfs: $MFT $DATA is resident — impossible".into(),
+                    ));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reconstruct `$MFT`'s own `$DATA` run list and cache it in
+    /// `self.mft_runs`.
+    ///
+    /// Record 0 is read directly from the BPB-anchored `$MFT` LCN, since
+    /// mapping anything requires the very run list we are building. The
+    /// record may hold more than one `$DATA` instance, and once `$MFT` is
+    /// fragmented enough that its run list no longer fits one record,
+    /// NTFS spills the later segments into extension records and lists
+    /// them in record 0's `$ATTRIBUTE_LIST` (ntfs-3g
+    /// `ntfs_mft_load`/`ntfs_attrlist_need_expansion`, ntfs3
+    /// `ntfs_load_attr_list`). Taking only the first segment truncated
+    /// `$MFT` on any such volume, so every record past the first fragment
+    /// read back as "past the end of $MFT".
+    ///
+    /// The extension records themselves live inside `$MFT`, and the
+    /// segment starting at VCN 0 always covers them, so they are mapped
+    /// through the partial run list gathered from record 0.
+    fn bootstrap_mft_runs(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        let rec_size = self.boot.mft_record_size() as usize;
+        let base_off = self
+            .boot
+            .mft_lcn
+            .checked_mul(u64::from(self.boot.cluster_size()))
+            .ok_or_else(|| crate::Error::InvalidImage("ntfs: $MFT LCN offset overflow".into()))?;
+        let mut rec0 = vec![0u8; rec_size];
+        dev.read_at(base_off, &mut rec0)?;
+        mft::apply_fixup(&mut rec0, mft::NTFS_BLOCK_SIZE)?;
+
+        let mut segments = Self::data_segments(&rec0)?;
+        if segments.is_empty() {
+            return Err(crate::Error::InvalidImage(
+                "ntfs: could not locate $MFT $DATA run list in record 0".into(),
+            ));
+        }
+        // Publish what record 0 knows so the extension records — which
+        // sit inside $MFT itself — can be mapped.
+        self.mft_runs = Self::concat_segments(&mut segments);
+
+        if let Some(alist) = self.read_attribute_list(dev, &rec0)? {
+            let mut seen = std::collections::HashSet::from([0u64]);
+            for entry in attribute_list::decode(&alist)? {
+                if entry.type_code != TYPE_DATA || !entry.name.is_empty() {
+                    continue;
+                }
+                let ext_rec = entry.record_number();
+                if !seen.insert(ext_rec) {
+                    continue;
+                }
+                let mut buf = vec![0u8; rec_size];
+                self.read_mft_record(dev, ext_rec, &mut buf)?;
+                segments.extend(Self::data_segments(&buf)?);
+            }
+            self.mft_runs = Self::concat_segments(&mut segments);
+        }
+        Ok(())
+    }
+
+    /// Sort `(starting_vcn, runs)` segments by VCN, drop duplicates, and
+    /// splice their run lists into one.
+    fn concat_segments(segments: &mut [(u64, Vec<Extent>)]) -> Vec<Extent> {
+        segments.sort_by_key(|(vcn, _)| *vcn);
+        let mut out: Vec<Extent> = Vec::new();
+        let mut last_vcn: Option<u64> = None;
+        for (vcn, runs) in segments.iter() {
+            if last_vcn == Some(*vcn) {
+                continue;
+            }
+            last_vcn = Some(*vcn);
+            out.extend(runs.iter().cloned());
+        }
+        out
+    }
+
+    /// Decode `$ATTRIBUTE_LIST`'s value out of `record`, if it has one.
+    /// A non-resident list is read straight off the device through its
+    /// own run list (those clusters are ordinary volume clusters, not
+    /// `$MFT` ones, so this works during the `$MFT` bootstrap too).
+    fn read_attribute_list(
+        &self,
+        dev: &mut dyn BlockDevice,
+        record: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        let hdr = mft::RecordHeader::parse(record)?;
+        for attr_res in AttributeIter::new(record, hdr.first_attribute_offset as usize) {
+            let attr = attr_res?;
+            if attr.type_code != TYPE_ATTRIBUTE_LIST {
+                continue;
+            }
+            return match attr.kind {
+                AttributeKind::Resident { value, .. } => Ok(Some(value.to_vec())),
+                AttributeKind::NonResident {
+                    real_size, runs, ..
+                } => {
+                    let cap = checked_alloc_len(real_size, dev.total_size(), "$ATTRIBUTE_LIST")?;
+                    let cluster_size = self.boot.cluster_size() as u64;
+                    let mut reader = NonResidentReader {
+                        dev: &mut *dev,
+                        cluster_size,
+                        runs,
+                        real_size,
+                        initialized_size: real_size,
+                        pos: 0,
+                        cluster_buf: vec![0u8; cluster_size as usize],
+                        cached_vcn: u64::MAX,
+                        cached_cluster_filled: false,
+                    };
+                    let mut buf = Vec::with_capacity(cap);
+                    reader.read_to_end(&mut buf).map_err(crate::Error::from)?;
+                    Ok(Some(buf))
+                }
+            };
+        }
+        Ok(None)
+    }
+
     /// Read the base record `rec_no` plus, if it has an `$ATTRIBUTE_LIST`,
     /// every extension record named in that list. Returns a vector of
     /// `(record_number, record_bytes)` pairs ordered base-first.
@@ -377,44 +482,7 @@ impl Ntfs {
 
         // Look for $ATTRIBUTE_LIST in the base record.
         let base_bytes = records[0].1.clone();
-        let hdr = mft::RecordHeader::parse(&base_bytes)?;
-        let mut alist_bytes: Option<Vec<u8>> = None;
-        for attr_res in AttributeIter::new(&base_bytes, hdr.first_attribute_offset as usize) {
-            let attr = attr_res?;
-            if attr.type_code != TYPE_ATTRIBUTE_LIST {
-                continue;
-            }
-            match attr.kind {
-                AttributeKind::Resident { value, .. } => {
-                    alist_bytes = Some(value.to_vec());
-                }
-                AttributeKind::NonResident {
-                    real_size, runs, ..
-                } => {
-                    // Non-resident $ATTRIBUTE_LIST: stream it cluster by
-                    // cluster through a dedicated reader. This is uncommon
-                    // (the list rarely overflows a record) but legal.
-                    let cap = checked_alloc_len(real_size, dev.total_size(), "$ATTRIBUTE_LIST")?;
-                    let mut reader = NonResidentReader {
-                        dev: &mut *dev,
-                        cluster_size: self.boot.cluster_size() as u64,
-                        runs,
-                        real_size,
-                        initialized_size: real_size,
-                        pos: 0,
-                        cluster_buf: vec![0u8; self.boot.cluster_size() as usize],
-                        cached_vcn: u64::MAX,
-                        cached_cluster_filled: false,
-                    };
-                    let mut buf = Vec::with_capacity(cap);
-                    reader.read_to_end(&mut buf).map_err(crate::Error::from)?;
-                    alist_bytes = Some(buf);
-                }
-            }
-            break;
-        }
-
-        let Some(alist_bytes) = alist_bytes else {
+        let Some(alist_bytes) = self.read_attribute_list(dev, &base_bytes)? else {
             return Ok(records);
         };
         let entries = attribute_list::decode(&alist_bytes)?;
