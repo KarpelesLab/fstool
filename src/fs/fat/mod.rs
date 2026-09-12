@@ -24,10 +24,13 @@
 
 mod volume;
 
+// `Error` here is the driver's own — generic over your `SectorDriver`'s
+// failure, and allocating nothing. The hosted half returns the crate's
+// `Error` instead, and exports no type of that name, so there is no
+// ambiguity inside this module.
 pub use volume::{
-    Attributes, Dir, DirEntry, DirIter, Error as VolumeError, FatKind, File, Geometry,
-    MAX_FILE_LEN, MAX_SECTOR_SIZE, MIN_SECTOR_SIZE, MbrPartition, Metadata, SectorDriver,
-    Timestamp, Volume,
+    Attributes, Dir, DirEntry, DirIter, Error, FatKind, File, Geometry, MAX_FILE_LEN,
+    MAX_SECTOR_SIZE, MIN_SECTOR_SIZE, MbrPartition, Metadata, SectorDriver, Timestamp, Volume,
 };
 
 // ---------------------------------------------------------------------
