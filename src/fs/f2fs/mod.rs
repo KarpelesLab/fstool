@@ -1690,6 +1690,82 @@ mod tests {
         assert_eq!(ino.links, 2);
     }
 
+    /// Removing one name of a hard-linked file keeps the inode (and its
+    /// data) alive for the surviving name, and unlinking a plain file
+    /// must not touch the parent's link count — only `rmdir` does, for
+    /// the vanished ".." back-pointer (kernel `f2fs_rmdir`).
+    #[test]
+    fn remove_respects_link_counts() {
+        use crate::fs::Filesystem as _;
+        let mut dev = MemoryBackend::new(2 * 1024 * 1024);
+        let opts = super::FormatOpts {
+            log_blocks_per_seg: 2,
+            ..super::FormatOpts::default()
+        };
+        let mut fs = F2fs::format(&mut dev, &opts).unwrap();
+        let payload = b"two names, one inode";
+        fs.create_file(
+            &mut dev,
+            std::path::Path::new("/a.txt"),
+            crate::fs::FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(payload.to_vec())),
+                len: payload.len() as u64,
+            },
+            crate::fs::FileMeta::default(),
+        )
+        .unwrap();
+        fs.create_hardlink(
+            &mut dev,
+            std::path::Path::new("/a.txt"),
+            std::path::Path::new("/b.txt"),
+        )
+        .unwrap();
+        for d in ["/d", "/e"] {
+            fs.create_dir(
+                &mut dev,
+                std::path::Path::new(d),
+                crate::fs::FileMeta::default(),
+            )
+            .unwrap();
+        }
+        // Root links: 2 ("." + "..") + one per child directory = 4.
+        fs.remove(&mut dev, std::path::Path::new("/a.txt")).unwrap();
+        fs.remove(&mut dev, std::path::Path::new("/e")).unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        let mut ro = F2fs::open(&mut dev).unwrap();
+        let names: Vec<String> = ro
+            .list_path(&mut dev, "/")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(!names.contains(&"a.txt".to_string()));
+        assert!(!names.contains(&"e".to_string()));
+        assert!(names.contains(&"b.txt".to_string()));
+        // The surviving name still reads the payload back, and the inode
+        // is down to a single link.
+        let mut got = Vec::new();
+        {
+            let mut r = ro.open_file_reader(&mut dev, "/b.txt").unwrap();
+            r.read_to_end(&mut got).unwrap();
+        }
+        assert_eq!(got, payload);
+        assert_eq!(
+            ro.getattr(&mut dev, std::path::Path::new("/b.txt"))
+                .unwrap()
+                .nlink,
+            1
+        );
+        // 4 - 1 for the removed directory; unlinking a.txt changed nothing.
+        assert_eq!(
+            ro.getattr(&mut dev, std::path::Path::new("/"))
+                .unwrap()
+                .nlink,
+            3
+        );
+    }
+
     /// Hard-linking a directory is forbidden by POSIX; the writer must say
     /// so explicitly.
     #[test]

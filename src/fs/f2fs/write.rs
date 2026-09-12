@@ -1109,14 +1109,37 @@ impl Writer {
         if let Some(idx) = self.child_index.get_mut(&parent_nid) {
             idx.remove(&leaf);
         }
-        // Drop bookkeeping for the child (its on-disk blocks become
-        // "abandoned" but that's fine for a fresh-image writer; the
-        // checkpoint will simply omit the nid from NAT).
-        self.inodes.remove(&child);
-        self.children.remove(&child);
-        self.child_index.remove(&child);
-        // If the removed entry was a directory, the parent loses a link.
-        if let Some(parent) = self.inodes.get_mut(&parent_nid)
+        // Drop one link from the child. A hard-linked file keeps its
+        // inode (and its data blocks) alive for the remaining dentries;
+        // only the last link frees it. `i_links` on a fresh directory is
+        // 2 ("." plus the parent's entry), so a directory always hits
+        // zero here — we only reach this point once it is empty.
+        let child_is_dir = self
+            .inodes
+            .get(&child)
+            .is_some_and(|i| i.mode & super::constants::S_IFMT == S_IFDIR);
+        let survives = match self.inodes.get_mut(&child) {
+            Some(rec) if !child_is_dir && rec.links > 1 => {
+                rec.links -= 1;
+                true
+            }
+            _ => false,
+        };
+        if !survives {
+            // Last link: drop the bookkeeping. The on-disk blocks become
+            // "abandoned" but that's fine for a fresh-image writer; the
+            // checkpoint will simply omit the nid from NAT.
+            self.inodes.remove(&child);
+            self.children.remove(&child);
+            self.child_index.remove(&child);
+        }
+        // Only a removed *directory* takes a link off the parent (its
+        // ".." entry). Unlinking a file or symlink leaves the parent's
+        // link count alone — see f2fs_unlink()/f2fs_rmdir() in the
+        // kernel, which calls f2fs_i_links_write(dir, false) from
+        // f2fs_drop_nlink() only on the rmdir path.
+        if child_is_dir
+            && let Some(parent) = self.inodes.get_mut(&parent_nid)
             && parent.links > 1
         {
             parent.links -= 1;
