@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **breaking** *(fat)* the allocation-free driver moved from
+  `fstool::noalloc::fat` to `fstool::fs::fat`, where FAT already lived.
+  Rename the import and nothing else changes:
+  `use fstool::noalloc::fat::{SectorDriver, Volume}` becomes
+  `use fstool::fs::fat::{SectorDriver, Volume}`. The `fstool::noalloc`
+  module is gone.
+
+  One module now holds the whole backend and `alloc` only ever adds to
+  it: without a heap you get the driver, with one you additionally get
+  the hosted `Fat32` (the `Filesystem` implementation) and an in-memory
+  allocation table that makes the driver faster through the same API.
+  Nothing about a call or a type depends on the feature.
+
+### Added
+
+- *(fat)* `Volume` keeps the allocation table in memory when `alloc` is
+  on, filling lazily a sector at a time and mirroring its own writes, so
+  walking a cluster chain stops re-reading the table.
+  `Volume::fat_cache_bytes` reports how much is held (always 0 without a
+  heap). Pure optimisation: same calls, same answers, fewer transfers.
+
 ## [0.4.29](https://github.com/KarpelesLab/fstool/compare/v0.4.28...v0.4.29) - 2026-09-12
 
 ### Added
