@@ -294,6 +294,10 @@ pub struct Fat32 {
     /// harmless: they really do exist (on disk), so the answer is still
     /// correct.
     pending_names: BTreeMap<u32, BTreeSet<String>>,
+    /// Per-directory set of the 8.3 names of entries staged this session,
+    /// so a generated short name can be checked for uniqueness against
+    /// siblings that are not on disk yet (the on-disk ones are scanned).
+    pending_shorts: BTreeMap<u32, BTreeSet<[u8; 11]>>,
 }
 
 impl Fat32 {
@@ -497,6 +501,7 @@ impl Fat32 {
             next_free: if kind == FatKind::Fat32 { 3 } else { 2 },
             dir_batch: DirBatch::new(DEFAULT_CAPACITY),
             pending_names: BTreeMap::new(),
+            pending_shorts: BTreeMap::new(),
         };
         // Zero only the metadata, not the whole device: the reserved
         // sectors + every FAT copy + (on FAT12/16) the fixed root region —
@@ -1070,6 +1075,7 @@ impl Fat32 {
             next_free,
             dir_batch: DirBatch::new(DEFAULT_CAPACITY),
             pending_names: BTreeMap::new(),
+            pending_shorts: BTreeMap::new(),
         })
     }
 
@@ -1759,6 +1765,146 @@ mod tests {
             Err(crate::Error::InvalidImage(msg)) => assert!(msg.contains("cannot map"), "{msg}"),
             other => panic!("expected InvalidImage, got {other:?}"),
         }
+    }
+
+    /// Short name of the entry at `path`, via the on-disk lookup.
+    fn short_name_of(fs: &mut Fat32, dev: &mut dyn BlockDevice, path: &str) -> [u8; 11] {
+        fs.flush_dir_batches(dev).unwrap();
+        let (parent, leaf) = fs.resolve_parent(dev, path).unwrap();
+        fs.find_entry(dev, parent, &leaf)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{path} not found"))
+            .entry
+            .name_83
+    }
+
+    /// Every empty long-named file used to get the short name `FT000000`
+    /// (its first cluster, 0, was the sequence number), so only the first
+    /// one in a directory was reachable by short name and the LFN
+    /// checksums of the rest tied to a duplicate 8.3 entry.
+    #[test]
+    fn empty_long_named_files_get_distinct_short_names() {
+        use crate::io::Read as _;
+        let (mut dev, mut fs) = fresh_volume();
+        let names = ["readme-one.txt", "readme-two.txt", "readme-three.txt"];
+        for n in names {
+            fs.add_file_from_reader(&mut dev, &format!("/{n}"), &mut crate::io::empty(), 0, 0)
+                .unwrap();
+        }
+        // Shorts are unique while still staged...
+        let staged: BTreeSet<[u8; 11]> = fs.pending_shorts[&fs.boot.root_cluster].clone();
+        assert_eq!(staged.len(), 3, "{staged:?}");
+        fs.flush(&mut dev).unwrap();
+
+        // ...and on disk after re-open.
+        let mut fs2 = Fat32::open(&mut dev).unwrap();
+        let shorts: BTreeSet<[u8; 11]> = names
+            .iter()
+            .map(|n| short_name_of(&mut fs2, &mut dev, &format!("/{n}")))
+            .collect();
+        assert_eq!(shorts.len(), 3, "{shorts:?}");
+        assert!(!shorts.contains(b"FT000000   "), "{shorts:?}");
+
+        // Each long name still resolves to its own entry: write distinct
+        // bodies through the rw handle and read them back by long name.
+        for (i, n) in names.iter().enumerate() {
+            let mut h = fs2
+                .open_file_rw(
+                    &mut dev,
+                    Path::new(&format!("/{n}")),
+                    OpenFlags::default(),
+                    None,
+                )
+                .unwrap();
+            h.write_all(format!("body {i}").as_bytes()).unwrap();
+            h.sync().unwrap();
+        }
+        for (i, n) in names.iter().enumerate() {
+            let mut got = Vec::new();
+            fs2.read_file(&mut dev, Path::new(&format!("/{n}")))
+                .unwrap()
+                .read_to_end(&mut got)
+                .unwrap();
+            assert_eq!(got, format!("body {i}").into_bytes(), "{n}");
+        }
+    }
+
+    /// The probe steps past a short name that is already taken.
+    #[test]
+    fn generated_short_name_probes_past_collisions() {
+        let (_dev, fs) = fresh_volume();
+        let name = "some long name.bin";
+        let seed = dir::short_name_seed(name);
+        let mut taken = BTreeSet::new();
+        assert_eq!(
+            fs.unique_short_name(name, 0, &taken).unwrap().0,
+            dir::generate_83(name, seed)
+        );
+        taken.insert(dir::generate_83(name, seed));
+        taken.insert(dir::generate_83(name, seed.wrapping_add(1)));
+        assert_eq!(
+            fs.unique_short_name(name, 0, &taken).unwrap().0,
+            dir::generate_83(name, seed.wrapping_add(2))
+        );
+        // A non-empty file seeds from its cluster and probes the same way.
+        taken.insert(dir::generate_83(name, 77));
+        assert_eq!(
+            fs.unique_short_name(name, 77, &taken).unwrap().0,
+            dir::generate_83(name, 78)
+        );
+        // A plain 8.3 name is used as-is.
+        assert_eq!(
+            fs.unique_short_name("HELLO.TXT", 0, &taken).unwrap(),
+            (*b"HELLO   TXT", false)
+        );
+    }
+
+    /// A removed name must be creatable again in the same session — the
+    /// session-wide name index used to keep it forever.
+    #[test]
+    fn removed_name_can_be_recreated_in_the_same_session() {
+        use crate::io::Read as _;
+        let (mut dev, mut fs) = fresh_volume();
+        let body = |s: &str| FileSource::Reader {
+            reader: Box::new(crate::io::Cursor::new(s.as_bytes().to_vec())),
+            len: s.len() as u64,
+        };
+        fs.create_file(
+            &mut dev,
+            Path::new("/again.txt"),
+            body("first"),
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+        fs.remove(&mut dev, "/again.txt").unwrap();
+        fs.create_file(
+            &mut dev,
+            Path::new("/again.txt"),
+            body("second"),
+            FileMeta::default(),
+        )
+        .expect("re-create after remove");
+        // Without a flush in between, too.
+        fs.remove(&mut dev, "/again.txt").unwrap();
+        fs.create_file(
+            &mut dev,
+            Path::new("/again.txt"),
+            body("third"),
+            FileMeta::default(),
+        )
+        .expect("re-create after unflushed remove");
+        fs.flush(&mut dev).unwrap();
+
+        let mut fs2 = Fat32::open(&mut dev).unwrap();
+        let listed = fs2.list(&mut dev, Path::new("/")).unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        let mut got = Vec::new();
+        fs2.read_file(&mut dev, Path::new("/again.txt"))
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
+        assert_eq!(got, b"third");
     }
 
     /// A file of 4 GiB or more cannot be represented (the 8.3 entry has a

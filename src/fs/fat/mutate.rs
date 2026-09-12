@@ -10,6 +10,7 @@
 use crate::io::Read;
 #[cfg(feature = "std")]
 use crate::path::Path;
+use alloc::collections::BTreeSet;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -273,11 +274,11 @@ impl Fat32 {
             )));
         }
         let (parent_cluster, leaf) = self.resolve_parent(dev, dest_path)?;
-        if self.child_exists(dev, parent_cluster, &leaf)? {
+        let Some(taken) = self.scan_dir_for_create(dev, parent_cluster, &leaf)? else {
             return Err(crate::Error::InvalidArgument(format!(
                 "fat32: {dest_path:?} already exists"
             )));
-        }
+        };
         let cb = self.cluster_bytes();
         let chain = if size == 0 {
             Vec::new()
@@ -295,7 +296,8 @@ impl Fat32 {
             first,
             size as u32,
             mtime,
-        );
+            &taken,
+        )?;
         self.stage_dir_entry(
             dev,
             parent_cluster,
@@ -343,11 +345,11 @@ impl Fat32 {
         mtime: u32,
     ) -> Result<()> {
         let (parent_cluster, leaf) = self.resolve_parent(dev, dest_path)?;
-        if self.child_exists(dev, parent_cluster, &leaf)? {
+        let Some(taken) = self.scan_dir_for_create(dev, parent_cluster, &leaf)? else {
             return Err(crate::Error::InvalidArgument(format!(
                 "fat32: {dest_path:?} already exists"
             )));
-        }
+        };
         let chain = self.alloc_free_clusters(1)?;
         let child_cluster = chain[0];
         // Initialise the new directory with "." and ".." entries.
@@ -371,7 +373,8 @@ impl Fat32 {
             child_cluster,
             0,
             mtime,
-        );
+            &taken,
+        )?;
         self.stage_dir_entry(
             dev,
             parent_cluster,
@@ -395,11 +398,21 @@ impl Fat32 {
         entry: PendingEntry,
     ) -> Result<()> {
         // Record the leaf name (ASCII-lowercased) in the per-parent index
-        // so `child_exists` is O(1) instead of scanning the growing batch.
+        // so the duplicate check is O(1) instead of scanning the growing
+        // batch, and its 8.3 name (the last slot of the run) so later
+        // siblings can pick a short name that does not collide with it.
         self.pending_names
             .entry(parent_cluster)
             .or_default()
             .insert(entry.name.to_ascii_lowercase());
+        if let Some(slot) = entry.bytes.len().checked_sub(dir::ENTRY_SIZE) {
+            let mut short = [0u8; 11];
+            short.copy_from_slice(&entry.bytes[slot..slot + 11]);
+            self.pending_shorts
+                .entry(parent_cluster)
+                .or_default()
+                .insert(short);
+        }
         if let Some((victim, entries)) = self.dir_batch.stage(parent_cluster, entry) {
             self.serialize_one_dir(dev, victim, entries)?;
         }
@@ -444,23 +457,89 @@ impl Fat32 {
             .map(|e| (e.first_cluster, e.is_dir))
     }
 
-    /// `true` if `name` already exists under `dir_cluster` — on disk or
-    /// staged in the pending batch.
-    fn child_exists(
+    /// One directory scan in preparation for creating `name` under
+    /// `dir_cluster`: `Ok(None)` if the name already exists (on disk or
+    /// staged in the pending batch), otherwise the set of 8.3 names
+    /// already in use in that directory — on disk plus staged — so the
+    /// caller can pick a generated short name that does not collide.
+    fn scan_dir_for_create(
         &self,
         dev: &mut dyn BlockDevice,
         dir_cluster: u32,
         name: &str,
-    ) -> Result<bool> {
+    ) -> Result<Option<BTreeSet<[u8; 11]>>> {
         // O(1) check against the per-parent name index — covers both
         // currently-pending entries and any already serialised in this
-        // session (we never remove from `pending_names` on eviction).
+        // session (`pending_names` only shrinks on `remove`).
         if let Some(set) = self.pending_names.get(&dir_cluster)
             && set.contains(&name.to_ascii_lowercase())
         {
-            return Ok(true);
+            return Ok(None);
         }
-        Ok(self.find_entry(dev, dir_cluster, name)?.is_some())
+        let bytes = self.read_dir_bytes(dev, dir_cluster)?;
+        let mut taken: BTreeSet<[u8; 11]> = BTreeSet::new();
+        let mut lfn_run: Vec<dir::LfnFragment> = Vec::new();
+        for slot in bytes.as_chunks::<{ dir::ENTRY_SIZE }>().0 {
+            match dir::classify_slot(slot) {
+                dir::RawSlot::End => break,
+                dir::RawSlot::Deleted => lfn_run.clear(),
+                dir::RawSlot::Lfn(frag) => lfn_run.push(frag),
+                dir::RawSlot::ShortEntry(entry) => {
+                    if entry.attr & dir::ATTR_VOLUME_ID != 0
+                        && entry.attr & dir::ATTR_DIRECTORY == 0
+                    {
+                        lfn_run.clear();
+                        continue;
+                    }
+                    let matches_short = entry.short_name_string().eq_ignore_ascii_case(name);
+                    let matches_long = dir::assemble_lfn(&lfn_run, &entry.name_83)
+                        .is_some_and(|l| l.eq_ignore_ascii_case(name));
+                    lfn_run.clear();
+                    if matches_short || matches_long {
+                        return Ok(None);
+                    }
+                    taken.insert(entry.name_83);
+                }
+            }
+        }
+        if let Some(staged) = self.pending_shorts.get(&dir_cluster) {
+            taken.extend(staged.iter().copied());
+        }
+        Ok(Some(taken))
+    }
+
+    /// Pick the 8.3 name for `name`: the name itself when it already is a
+    /// valid upper-case 8.3 name, otherwise a generated `FTxxxxxx` name
+    /// that is unique among `taken` (the directory's existing short
+    /// names). The sequence starts at the entry's first cluster — unique
+    /// volume-wide — or, for an entry with no cluster (an empty file), at
+    /// a hash of the long name, and probes upward until it is free.
+    pub(super) fn unique_short_name(
+        &self,
+        name: &str,
+        first_cluster: u32,
+        taken: &BTreeSet<[u8; 11]>,
+    ) -> Result<([u8; 11], bool)> {
+        let upper = name.to_ascii_uppercase();
+        if dir::is_valid_83(&upper) {
+            return Ok((dir::pack_83(&upper), upper != name));
+        }
+        let seed = if first_cluster >= 2 {
+            first_cluster
+        } else {
+            dir::short_name_seed(name)
+        };
+        // The generated form carries 24 bits of sequence; a full sweep is
+        // the hard bound on the probe.
+        for k in 0..(1u32 << 24) {
+            let candidate = dir::generate_83(name, seed.wrapping_add(k));
+            if !taken.contains(&candidate) {
+                return Ok((candidate, true));
+            }
+        }
+        Err(crate::Error::InvalidArgument(format!(
+            "fat32: no free 8.3 name for {name:?} in its directory"
+        )))
     }
 
     /// Remove a file, or an empty directory, at `path`. Returns
@@ -508,6 +587,14 @@ impl Fat32 {
             self.free_chain(entry.first_cluster)?;
         }
         self.mark_entries_deleted(dev, &layout, &mut bytes, run_start, entry_pos)?;
+        // The name is gone from disk; forget it in the session indexes so
+        // it can be created again.
+        if let Some(set) = self.pending_names.get_mut(&parent_cluster) {
+            set.remove(&leaf.to_ascii_lowercase());
+        }
+        if let Some(set) = self.pending_shorts.get_mut(&parent_cluster) {
+            set.remove(&entry.name_83);
+        }
         Ok(())
     }
 
@@ -611,9 +698,10 @@ impl Fat32 {
     }
 
     /// Append a "long-name-aware" directory entry run (LFN fragments + 8.3
-    /// entry) for `name` into `entries`. Wraps the existing private helper
-    /// without the short-name uniqueness counter — modify-in-place callers
-    /// pick a fresh seq via the cluster number, which is itself unique.
+    /// entry) for `name` into `entries`. `taken` is the directory's set of
+    /// short names already in use (see
+    /// [`scan_dir_for_create`](Self::scan_dir_for_create)), which a
+    /// generated 8.3 name must not collide with.
     #[allow(clippy::too_many_arguments)]
     fn push_dir_entry(
         &self,
@@ -623,13 +711,9 @@ impl Fat32 {
         first_cluster: u32,
         file_size: u32,
         mtime: u32,
-    ) {
-        let upper = name.to_ascii_uppercase();
-        let (name_83, need_lfn) = if dir::is_valid_83(&upper) {
-            (dir::pack_83(&upper), upper != name)
-        } else {
-            (dir::generate_83(name, first_cluster), true)
-        };
+        taken: &BTreeSet<[u8; 11]>,
+    ) -> Result<()> {
+        let (name_83, need_lfn) = self.unique_short_name(name, first_cluster, taken)?;
         if need_lfn {
             let csum = dir::lfn_checksum(&name_83);
             for frag in dir::encode_lfn_run(name, csum) {
@@ -644,6 +728,7 @@ impl Fat32 {
             mtime,
         };
         entries.extend_from_slice(&entry.encode());
+        Ok(())
     }
 }
 
