@@ -165,6 +165,9 @@ pub struct Fat {
     /// alone doesn't determine it.
     byte_len: usize,
     entries: Vec<u32>,
+    /// True when an entry changed since the table was last written (or
+    /// since it was built — a fresh table has never been written).
+    dirty: bool,
 }
 
 impl Fat {
@@ -179,7 +182,19 @@ impl Fat {
             kind,
             byte_len,
             entries,
+            dirty: true,
         }
+    }
+
+    /// Whether an entry changed since [`Fat::mark_clean`] (or since a
+    /// fresh table was built).
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Record that the table has been written out as it is now.
+    pub fn mark_clean(&mut self) {
+        self.dirty = false;
     }
 
     /// The entry width this table was built for.
@@ -221,7 +236,11 @@ impl Fat {
     /// table's capacity is ignored rather than panicking.
     pub fn set(&mut self, cluster: u32, value: u32) {
         if let Some(slot) = self.entries.get_mut(cluster as usize) {
-            *slot = value & self.kind.entry_mask();
+            let value = value & self.kind.entry_mask();
+            if *slot != value {
+                *slot = value;
+                self.dirty = true;
+            }
         }
     }
 
@@ -299,6 +318,7 @@ impl Fat {
             kind,
             byte_len: bytes.len(),
             entries,
+            dirty: false,
         }
     }
 

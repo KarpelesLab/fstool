@@ -675,10 +675,19 @@ impl Fat32 {
     /// backup boot sector and both FSInfo sectors, neither of which
     /// FAT12/FAT16 has. Free-cluster accounting is derived from the current
     /// FAT, so this works for both fresh-format and modify-in-place flows.
+    ///
+    /// Everything written here is a function of the in-memory FAT (the
+    /// boot sector never changes after format; FSInfo is derived from the
+    /// FAT), so when no entry changed since the last flush the whole pass
+    /// is skipped — a handle `sync` or a read-only session costs no
+    /// metadata rewrite.
     pub fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         // Serialize pending directory batches first — they may allocate
         // clusters, which the FAT written below must reflect.
         self.flush_dir_batches(dev)?;
+        if !self.fat.is_dirty() {
+            return Ok(());
+        }
         let boot_bytes = self.boot.encode();
         dev.write_at(0, &boot_bytes)?;
 
@@ -719,6 +728,7 @@ impl Fat32 {
                 * SECTOR as u64;
             dev.write_at(off, &fat_bytes)?;
         }
+        self.fat.mark_clean();
         Ok(())
     }
 
@@ -1869,6 +1879,94 @@ mod tests {
             other => panic!("expected InvalidArgument, got {other:?}"),
         }
         assert!(fs.open_file_reader(&mut dev, "/a.txt/b").is_err());
+    }
+
+    /// A block device that counts positional writes, to show a flush with
+    /// nothing to persist touches nothing.
+    struct CountingDev {
+        inner: MemoryBackend,
+        writes: usize,
+    }
+
+    impl crate::io::Read for CountingDev {
+        fn read(&mut self, buf: &mut [u8]) -> crate::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl crate::io::Write for CountingDev {
+        fn write(&mut self, buf: &[u8]) -> crate::io::Result<usize> {
+            self.writes += 1;
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> crate::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl crate::io::Seek for CountingDev {
+        fn seek(&mut self, pos: SeekFrom) -> crate::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    impl BlockDevice for CountingDev {
+        fn block_size(&self) -> u32 {
+            self.inner.block_size()
+        }
+
+        fn total_size(&self) -> u64 {
+            self.inner.total_size()
+        }
+
+        fn sync(&mut self) -> Result<()> {
+            self.inner.sync()
+        }
+
+        fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
+            self.writes += 1;
+            self.inner.write_at(offset, buf)
+        }
+    }
+
+    /// `flush` rewrites the boot sectors, FSInfo and every FAT copy only
+    /// when an entry changed; a handle sync or a read-only session must
+    /// not rewrite the metadata.
+    #[test]
+    fn flush_is_a_no_op_when_the_fat_is_clean() {
+        let (mem, _fs) = fresh_volume();
+        let mut dev = CountingDev {
+            inner: mem,
+            writes: 0,
+        };
+        let mut fs = Fat32::open(&mut dev).unwrap();
+        assert!(!fs.fat().is_dirty());
+        fs.flush(&mut dev).unwrap();
+        assert_eq!(dev.writes, 0, "clean flush wrote to the device");
+
+        // A change is written once, then the table is clean again.
+        fs.add_file_from_reader(&mut dev, "/a.txt", &mut &b"abc"[..], 3, 0)
+            .unwrap();
+        assert!(fs.fat().is_dirty());
+        fs.flush(&mut dev).unwrap();
+        assert!(!fs.fat().is_dirty());
+        let after_first = dev.writes;
+        assert!(after_first > 0);
+        fs.flush(&mut dev).unwrap();
+        assert_eq!(dev.writes, after_first, "second flush rewrote metadata");
+
+        // A read-only handle's drop / sync leaves it untouched as well.
+        {
+            let mut h = fs.open_file_ro(&mut dev, Path::new("/a.txt")).unwrap();
+            let mut buf = [0u8; 3];
+            crate::io::Read::read_exact(&mut h, &mut buf).unwrap();
+            assert_eq!(&buf, b"abc");
+        }
+        assert_eq!(dev.writes, after_first);
+
+        let mut fs2 = Fat32::open(&mut dev).unwrap();
+        assert_eq!(read_all(&mut fs2, &mut dev, "/a.txt"), b"abc");
     }
 
     /// Short name of the entry at `path`, via the on-disk lookup.
