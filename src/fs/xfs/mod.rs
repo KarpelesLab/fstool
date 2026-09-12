@@ -87,6 +87,9 @@ impl Xfs {
         let mut buf = [0u8; 512];
         dev.read_at(0, &mut buf)?;
         let sb = Superblock::decode(&buf)?;
+        // "Incompat" means a reader without support for the bit cannot
+        // interpret the metadata; refuse rather than misread it.
+        sb.check_incompat()?;
         // Refuse exotic configurations that would silently break reads.
         if sb.rblocks != 0 {
             return Err(crate::Error::Unsupported(
@@ -189,7 +192,7 @@ impl Xfs {
         let off = self.ino_byte_offset(ino)?;
         let mut buf = vec![0u8; self.sb.inodesize as usize];
         dev.read_at(off, &mut buf)?;
-        let core = DinodeCore::decode(&buf)?;
+        let core = DinodeCore::decode_with(&buf, self.sb.has_nrext64())?;
         // For v3 inodes the di_ino field should match the address we used.
         if let Some(self_ino) = core.di_ino
             && self_ino != ino
@@ -725,6 +728,13 @@ pub fn probe(dev: &mut dyn BlockDevice) -> Result<bool> {
 
 /// Split a `/`-rooted path into non-empty components. Treats `/`, `""`,
 /// and `.` as "the root" (empty vec). Multiple slashes are collapsed.
+/// Squeeze a decoded inode timestamp into the 32-bit Unix-seconds field
+/// the generic `FileAttrs` exposes. BIGTIME inodes can hold dates
+/// outside that range; saturate instead of wrapping.
+fn clamp_secs_u32(sec: i64) -> u32 {
+    sec.clamp(0, u32::MAX as i64) as u32
+}
+
 fn split_path(path: &str) -> Vec<&str> {
     path.split('/')
         .filter(|p| !p.is_empty() && *p != ".")
@@ -936,9 +946,11 @@ impl crate::fs::Filesystem for Xfs {
             size: core.size,
             blocks: core.size.div_ceil(512),
             nlink: core.nlink,
-            atime: core.atime.sec,
-            mtime: core.mtime.sec,
-            ctime: core.ctime.sec,
+            // `FileAttrs` carries 32-bit Unix seconds; clamp rather
+            // than wrap for a pre-1970 or post-2106 bigtime stamp.
+            atime: clamp_secs_u32(core.atime.sec),
+            mtime: clamp_secs_u32(core.mtime.sec),
+            ctime: clamp_secs_u32(core.ctime.sec),
             rdev: self.dinode_rdev(&ino_buf, &core),
             inode: ino as u32,
         })

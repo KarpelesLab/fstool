@@ -87,7 +87,8 @@ pub const XFS_ATTR3_LEAF_CRC_OFF: usize = 12;
 // re-exported here under the names this module has always used.
 
 pub use super::xattr::{
-    XFS_ATTR_INCOMPLETE, XFS_ATTR_LOCAL, XFS_ATTR_NSP_ONDISK_MASK, XFS_ATTR_ROOT, XFS_ATTR_SECURE,
+    XFS_ATTR_INCOMPLETE, XFS_ATTR_LOCAL, XFS_ATTR_NSP_ONDISK_MASK, XFS_ATTR_PARENT, XFS_ATTR_ROOT,
+    XFS_ATTR_SECURE,
 };
 
 /// Map a userland xattr name (`"user.foo"`, `"trusted.bar"`,
@@ -305,8 +306,9 @@ pub fn decode_leaf(block: &[u8]) -> Result<std::collections::HashMap<String, Vec
         let e_off = entries_start + i * XFS_ATTR_LEAF_ENTRY_SIZE;
         let nameidx = u16::from_be_bytes(block[e_off + 4..e_off + 6].try_into().unwrap()) as usize;
         let flags = block[e_off + 6];
-        if flags & XFS_ATTR_INCOMPLETE != 0 {
-            // Mid-transaction entry; don't expose.
+        if flags & (XFS_ATTR_INCOMPLETE | XFS_ATTR_PARENT) != 0 {
+            // Mid-transaction entry, or a parent pointer (internal
+            // bookkeeping the kernel also hides from listxattr).
             continue;
         }
         if flags & XFS_ATTR_LOCAL == 0 {

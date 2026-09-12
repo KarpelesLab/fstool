@@ -153,15 +153,15 @@ impl EntryMeta {
     fn ts(&self) -> (XfsTimestamp, XfsTimestamp, XfsTimestamp) {
         (
             XfsTimestamp {
-                sec: self.atime,
+                sec: self.atime as i64,
                 nsec: 0,
             },
             XfsTimestamp {
-                sec: self.mtime,
+                sec: self.mtime as i64,
                 nsec: 0,
             },
             XfsTimestamp {
-                sec: self.ctime,
+                sec: self.ctime as i64,
                 nsec: 0,
             },
         )
@@ -884,6 +884,7 @@ impl Xfs {
             let rel = startino_ag + slot;
             let ino = ((ag as u64) << (inopblog + agblklog)) | (rel as u64);
             let builder = V3DinodeBuilder {
+                nrext64: self.sb.has_nrext64(),
                 inodesize: isize,
                 mode: 0, // free
                 format: 0,
@@ -1370,6 +1371,7 @@ impl Xfs {
             None => (0u8, 2u8, 0u16, &[][..]),
         };
         let builder = V3DinodeBuilder {
+            nrext64: self.sb.has_nrext64(),
             inodesize: XFS_INODESIZE as usize,
             mode: core.mode,
             format: 2, // EXTENTS
@@ -1502,6 +1504,7 @@ impl Xfs {
         let ino = self.alloc_inode(dev)?;
         let (atime, mtime, ctime) = meta.ts();
         let builder = V3DinodeBuilder {
+            nrext64: self.sb.has_nrext64(),
             inodesize: XFS_INODESIZE as usize,
             mode: S_IFREG | (meta.mode & 0o7777),
             format: 2, // EXTENTS
@@ -1555,6 +1558,7 @@ impl Xfs {
 
         let (atime, mtime, ctime) = meta.ts();
         let builder = V3DinodeBuilder {
+            nrext64: self.sb.has_nrext64(),
             inodesize: XFS_INODESIZE as usize,
             mode: S_IFDIR | (meta.mode & 0o7777),
             format: 2, // EXTENTS
@@ -1609,6 +1613,7 @@ impl Xfs {
         if target_bytes.len() <= lit_max {
             // Inline (local) symlink.
             let builder = V3DinodeBuilder {
+                nrext64: self.sb.has_nrext64(),
                 inodesize: XFS_INODESIZE as usize,
                 mode: S_IFLNK | 0o777,
                 format: 1, // LOCAL
@@ -1657,6 +1662,7 @@ impl Xfs {
             dev.write_at(blk_byte, &blkbuf)?;
 
             let builder = V3DinodeBuilder {
+                nrext64: self.sb.has_nrext64(),
                 inodesize: XFS_INODESIZE as usize,
                 mode: S_IFLNK | 0o777,
                 format: 2, // EXTENTS
@@ -1719,6 +1725,7 @@ impl Xfs {
         // FIFOs and sockets use XFS_DINODE_FMT_DEV too, with rdev 0.
         let lit = super::inode::encode_xfs_dev(major, minor).to_be_bytes();
         let builder = V3DinodeBuilder {
+            nrext64: self.sb.has_nrext64(),
             inodesize: XFS_INODESIZE as usize,
             mode: kind.s_ifmt() | (meta.mode & 0o7777),
             format: 0, // DEV
@@ -1879,6 +1886,7 @@ impl Xfs {
             None => (0u8, 2u8, 0u16, &[][..]),
         };
         let builder = V3DinodeBuilder {
+            nrext64: self.sb.has_nrext64(),
             inodesize: XFS_INODESIZE as usize,
             mode: parent_core.mode,
             format: 2, // EXTENTS
@@ -2113,6 +2121,7 @@ impl Xfs {
             - if prev_leaf_fsb.is_some() { 1 } else { 0 };
 
         let builder = V3DinodeBuilder {
+            nrext64: self.sb.has_nrext64(),
             inodesize: XFS_INODESIZE as usize,
             mode: core.mode,
             format: match core.format {
@@ -2774,6 +2783,7 @@ impl Xfs {
 
         // 6) Build dst inode core (mirror src's, except di_ino + REFLINK flag).
         let dst_builder = V3DinodeBuilder {
+            nrext64: self.sb.has_nrext64(),
             inodesize: XFS_INODESIZE as usize,
             mode: src_core.mode,
             format: 2, // EXTENTS

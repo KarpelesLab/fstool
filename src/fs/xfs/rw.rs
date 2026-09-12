@@ -497,6 +497,7 @@ impl<'a> XfsFileHandle<'a> {
         // Build the inode buffer.
         let nblocks = self.nblocks();
         let builder = V3DinodeBuilder {
+            nrext64: self.fs.sb.has_nrext64(),
             inodesize: XFS_INODESIZE as usize,
             mode: self.keep_mode,
             format: 2, // EXTENTS

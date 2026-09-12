@@ -59,6 +59,9 @@ pub const XFS_ATTR_LOCAL: u8 = 0x01;
 pub const XFS_ATTR_ROOT: u8 = 0x02;
 /// Attribute flag: name belongs to the security namespace.
 pub const XFS_ATTR_SECURE: u8 = 0x04;
+/// Attribute flag: entry is a parent pointer (the PARENT feature). The
+/// kernel keeps these out of `listxattr`; so do we.
+pub const XFS_ATTR_PARENT: u8 = 0x08;
 /// Attribute flag: entry is mid-create / mid-delete and must be ignored.
 pub const XFS_ATTR_INCOMPLETE: u8 = 0x80;
 
@@ -186,6 +189,7 @@ pub fn decode_shortform(buf: &[u8]) -> Result<HashMap<String, Vec<u8>>> {
         let namelen = buf[pos] as usize;
         let valuelen = buf[pos + 1] as usize;
         let flags = buf[pos + 2];
+        let hidden = flags & (XFS_ATTR_PARENT | XFS_ATTR_INCOMPLETE) != 0;
         let name_start = pos + 3;
         let name_end = name_start + namelen;
         let val_end = name_end + valuelen;
@@ -197,9 +201,13 @@ pub fn decode_shortform(buf: &[u8]) -> Result<HashMap<String, Vec<u8>>> {
         let suffix = std::str::from_utf8(&buf[name_start..name_end]).map_err(|_| {
             crate::Error::InvalidImage("xfs: non-UTF-8 shortform xattr name".into())
         })?;
-        let full_name = name_from_disk(suffix, flags);
-        let value = buf[name_end..val_end].to_vec();
-        out.insert(full_name, value);
+        // Parent pointers (and entries caught mid-transaction) are
+        // internal bookkeeping, not user-visible attributes.
+        if !hidden {
+            let full_name = name_from_disk(suffix, flags);
+            let value = buf[name_end..val_end].to_vec();
+            out.insert(full_name, value);
+        }
         pos = val_end;
     }
     Ok(out)

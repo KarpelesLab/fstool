@@ -69,6 +69,48 @@ pub const XFS_SB_VERSION_NUMBITS: u16 = 0x000f;
 pub const XFS_SB_VERSION_5: u16 = 5;
 pub const XFS_SB_VERSION_4: u16 = 4;
 
+// --- `sb_features_incompat` bits (fs/xfs/libxfs/xfs_format.h) --------
+
+/// Directory entries carry a file type byte.
+pub const XFS_SB_FEAT_INCOMPAT_FTYPE: u32 = 1 << 0;
+/// Sparse inode chunks (INOBT records grow a hole mask).
+pub const XFS_SB_FEAT_INCOMPAT_SPINODES: u32 = 1 << 1;
+/// Metadata blocks are stamped with `sb_meta_uuid`, not `sb_uuid`.
+pub const XFS_SB_FEAT_INCOMPAT_META_UUID: u32 = 1 << 2;
+/// Large timestamps: inodes with `XFS_DIFLAG2_BIGTIME` store a 64-bit
+/// nanosecond count instead of the legacy `{sec, nsec}` pair.
+pub const XFS_SB_FEAT_INCOMPAT_BIGTIME: u32 = 1 << 3;
+/// The volume is mid-repair / known damaged and must not be mounted.
+pub const XFS_SB_FEAT_INCOMPAT_NEEDSREPAIR: u32 = 1 << 4;
+/// 64-bit extent counters — changes the `xfs_dinode` field layout.
+pub const XFS_SB_FEAT_INCOMPAT_NREXT64: u32 = 1 << 5;
+/// The `exchange-range` operation is supported (no on-disk change).
+pub const XFS_SB_FEAT_INCOMPAT_EXCHRANGE: u32 = 1 << 6;
+/// Parent pointers — directories record their parents as attr-fork
+/// entries flagged `XFS_ATTR_PARENT`.
+pub const XFS_SB_FEAT_INCOMPAT_PARENT: u32 = 1 << 7;
+/// Metadata directory tree — relocates the realtime / quota metadata
+/// inodes and adds superblock fields we do not decode.
+pub const XFS_SB_FEAT_INCOMPAT_METADIR: u32 = 1 << 8;
+
+/// The `sb_features_incompat` bits this implementation understands.
+///
+/// Everything here either needs no special handling on the paths we
+/// implement (FTYPE, META_UUID, EXCHRANGE), is decoded explicitly
+/// (BIGTIME, NREXT64), only affects metadata we already refuse to
+/// rewrite (SPINODES — see `Xfs::resume_writes`), or is filtered out of
+/// the data we surface (PARENT, whose attr-fork entries are skipped).
+/// Any other bit — NEEDSREPAIR, METADIR, or something added after this
+/// code was written — makes [`Superblock::check_incompat`] refuse the
+/// volume rather than misread it.
+pub const XFS_SB_FEAT_INCOMPAT_KNOWN: u32 = XFS_SB_FEAT_INCOMPAT_FTYPE
+    | XFS_SB_FEAT_INCOMPAT_SPINODES
+    | XFS_SB_FEAT_INCOMPAT_META_UUID
+    | XFS_SB_FEAT_INCOMPAT_BIGTIME
+    | XFS_SB_FEAT_INCOMPAT_NREXT64
+    | XFS_SB_FEAT_INCOMPAT_EXCHRANGE
+    | XFS_SB_FEAT_INCOMPAT_PARENT;
+
 /// Minimum and maximum block size XFS allows (512 .. 65536). We accept the
 /// full range; the kernel pegs it to the host page size at mount, but for
 /// read-only inspection we don't care.
@@ -277,6 +319,49 @@ impl Superblock {
     /// True iff this is a v5 (CRC) superblock.
     pub fn is_v5(&self) -> bool {
         (self.versionnum & XFS_SB_VERSION_NUMBITS) == XFS_SB_VERSION_5
+    }
+
+    /// Refuse a volume carrying `sb_features_incompat` bits this code
+    /// does not understand. Incompat means exactly that: a reader
+    /// without support for the bit cannot interpret the metadata, so
+    /// pressing on would silently produce wrong answers.
+    ///
+    /// Only meaningful on v5; the field does not exist on v4.
+    pub fn check_incompat(&self) -> Result<()> {
+        if !self.is_v5() {
+            return Ok(());
+        }
+        let unknown = self.features_incompat & !XFS_SB_FEAT_INCOMPAT_KNOWN;
+        if unknown != 0 {
+            let mut named: Vec<&str> = Vec::new();
+            if unknown & XFS_SB_FEAT_INCOMPAT_NEEDSREPAIR != 0 {
+                named.push("needsrepair");
+            }
+            if unknown & XFS_SB_FEAT_INCOMPAT_METADIR != 0 {
+                named.push("metadir");
+            }
+            let detail = if named.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", named.join(", "))
+            };
+            return Err(crate::Error::Unsupported(format!(
+                "xfs: superblock requires unsupported incompat features {unknown:#010x}{detail}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// `XFS_SB_FEAT_INCOMPAT_NREXT64` — 64-bit extent counters, which
+    /// move `di_nextents` / `di_anextents` inside `xfs_dinode`.
+    pub fn has_nrext64(&self) -> bool {
+        self.is_v5() && (self.features_incompat & XFS_SB_FEAT_INCOMPAT_NREXT64) != 0
+    }
+
+    /// `XFS_SB_FEAT_INCOMPAT_BIGTIME` — inodes *may* carry
+    /// `XFS_DIFLAG2_BIGTIME`; the per-inode flag is what decides.
+    pub fn has_bigtime(&self) -> bool {
+        self.is_v5() && (self.features_incompat & XFS_SB_FEAT_INCOMPAT_BIGTIME) != 0
     }
 
     /// Total bytes claimed by the volume — `sb_dblocks * sb_blocksize`.

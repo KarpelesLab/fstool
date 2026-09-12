@@ -442,10 +442,11 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Xfs> {
     // Build the root inode in EXTENTS format with one extent mapping
     // logical 0 → physical post_chunk_ag0.
     let ts = XfsTimestamp {
-        sec: opts.mtime,
+        sec: opts.mtime as i64,
         nsec: 0,
     };
     let mut root_inode = V3DinodeBuilder {
+        nrext64: false,
         inodesize: XFS_INODESIZE as usize,
         mode: super::inode::S_IFDIR | 0o755,
         format: /*XFS_DINODE_FMT_EXTENTS*/ 2,
@@ -489,6 +490,7 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Xfs> {
     // sb_rsumino name un-allocated inode slots.
     for (slot, ino_num) in [(1u32, rootino + 1), (2u32, rootino + 2)] {
         let mut buf = V3DinodeBuilder {
+            nrext64: false,
             inodesize: XFS_INODESIZE as usize,
             mode: super::inode::S_IFREG | 0o600,
             format: /*EXTENTS*/ 2,

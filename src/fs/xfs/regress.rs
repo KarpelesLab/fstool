@@ -648,3 +648,245 @@ fn file_too_fragmented_for_the_inline_fork_reports_the_limit() {
         Err(crate::Error::Unsupported(_))
     ));
 }
+
+// ---------------------------------------------------------------------
+// Finding 26 — NREXT64, BIGTIME, and unknown incompat bits.
+// ---------------------------------------------------------------------
+
+/// OR `add` into `sb_features_incompat` and re-stamp the superblock CRC.
+fn patch_sb_incompat(dev: &mut MemoryBackend, add: u32) {
+    let mut sb = vec![0u8; 4096];
+    dev.read_at(0, &mut sb).unwrap();
+    let cur = u32::from_be_bytes(sb[216..220].try_into().unwrap());
+    sb[216..220].copy_from_slice(&(cur | add).to_be_bytes());
+    super::format::stamp_v5_superblock_crc(&mut sb);
+    dev.write_at(0, &sb).unwrap();
+}
+
+/// Rewrite one inode's extent counters in the NREXT64 layout —
+/// `di_big_nextents` (__be64 @ 24) and `di_big_anextents` (__be32 @ 76)
+/// — the way an `mkfs.xfs -m nrext64=1` image would have them.
+fn patch_inode_to_nrext64(xfs: &Xfs, dev: &mut MemoryBackend, ino: u64) {
+    let off = xfs.ino_byte_offset(ino).unwrap();
+    let mut buf = vec![0u8; xfs.inode_size() as usize];
+    dev.read_at(off, &mut buf).unwrap();
+    let nextents = u32::from_be_bytes(buf[76..80].try_into().unwrap());
+    let anextents = u16::from_be_bytes(buf[80..82].try_into().unwrap());
+    buf[24..32].copy_from_slice(&(nextents as u64).to_be_bytes());
+    buf[76..80].copy_from_slice(&(anextents as u32).to_be_bytes());
+    buf[80..82].copy_from_slice(&0u16.to_be_bytes());
+    super::inode::stamp_v3_inode_crc(&mut buf);
+    dev.write_at(off, &buf).unwrap();
+}
+
+#[test]
+fn open_refuses_unknown_incompat_features() {
+    use super::superblock as sbf;
+    for (bit, label) in [
+        (sbf::XFS_SB_FEAT_INCOMPAT_NEEDSREPAIR, "needsrepair"),
+        (sbf::XFS_SB_FEAT_INCOMPAT_METADIR, "metadir"),
+        (1u32 << 20, "a bit from the future"),
+    ] {
+        let (mut dev, _xfs) = fresh(16 * 1024 * 1024);
+        patch_sb_incompat(&mut dev, bit);
+        match Xfs::open(&mut dev) {
+            Err(crate::Error::Unsupported(m)) => {
+                assert!(m.contains("incompat"), "{label}: {m}");
+            }
+            Err(other) => panic!("{label}: expected Unsupported, got {other:?}"),
+            Ok(_) => panic!("{label}: open should have refused the volume"),
+        }
+    }
+}
+
+#[test]
+fn open_accepts_the_incompat_features_we_understand() {
+    use super::superblock as sbf;
+    let known = sbf::XFS_SB_FEAT_INCOMPAT_FTYPE
+        | sbf::XFS_SB_FEAT_INCOMPAT_SPINODES
+        | sbf::XFS_SB_FEAT_INCOMPAT_META_UUID
+        | sbf::XFS_SB_FEAT_INCOMPAT_BIGTIME
+        | sbf::XFS_SB_FEAT_INCOMPAT_NREXT64
+        | sbf::XFS_SB_FEAT_INCOMPAT_EXCHRANGE
+        | sbf::XFS_SB_FEAT_INCOMPAT_PARENT;
+    let (mut dev, _xfs) = fresh(16 * 1024 * 1024);
+    patch_sb_incompat(&mut dev, known);
+    let xfs = Xfs::open(&mut dev).expect("known incompat bits must be accepted");
+    assert!(xfs.superblock().has_nrext64());
+    assert!(xfs.superblock().has_bigtime());
+}
+
+#[test]
+fn bigtime_timestamp_codec_matches_the_kernel() {
+    use super::inode::{XFS_BIGTIME_EPOCH_OFFSET, XfsTimestamp};
+
+    // The bigtime epoch itself is 1901-12-13 20:45:52 UTC = i32::MIN.
+    let zero = XfsTimestamp::decode_bigtime(&0u64.to_be_bytes());
+    assert_eq!(zero.sec, -XFS_BIGTIME_EPOCH_OFFSET);
+    assert_eq!(zero.nsec, 0);
+
+    for ts in [
+        XfsTimestamp { sec: 0, nsec: 0 },
+        XfsTimestamp {
+            sec: 1_700_000_000,
+            nsec: 123_456_789,
+        },
+        // Past 2038 — the whole point of the feature.
+        XfsTimestamp {
+            sec: 4_000_000_000,
+            nsec: 1,
+        },
+        XfsTimestamp {
+            sec: -XFS_BIGTIME_EPOCH_OFFSET,
+            nsec: 999_999_999,
+        },
+    ] {
+        let enc = ts.encode(true);
+        assert_eq!(XfsTimestamp::decode_bigtime(&enc), ts, "{ts:?}");
+    }
+
+    // Legacy seconds are signed, as the kernel reads them.
+    let legacy = XfsTimestamp { sec: -1, nsec: 5 };
+    assert_eq!(XfsTimestamp::decode(&legacy.encode(false)), legacy);
+}
+
+#[test]
+fn bigtime_inode_timestamps_are_decoded() {
+    use super::inode::{XFS_DIFLAG2_BIGTIME, XfsTimestamp};
+
+    let (mut dev, mut xfs) = fresh(16 * 1024 * 1024);
+    let root = xfs.superblock().rootino;
+    let mut src = std::io::Cursor::new(b"hi".to_vec());
+    let ino = xfs
+        .add_file(&mut dev, root, "t", EntryMeta::default(), 2, &mut src)
+        .unwrap();
+    xfs.flush_writes(&mut dev).unwrap();
+
+    // Patch the inode into a BIGTIME inode with a post-2038 mtime, the
+    // way a kernel on a `bigtime=1` volume would write it.
+    let want = XfsTimestamp {
+        sec: 4_000_000_000,
+        nsec: 500_000_000,
+    };
+    let off = xfs.ino_byte_offset(ino).unwrap();
+    let mut buf = vec![0u8; xfs.inode_size() as usize];
+    dev.read_at(off, &mut buf).unwrap();
+    let flags2 = u64::from_be_bytes(buf[120..128].try_into().unwrap()) | XFS_DIFLAG2_BIGTIME;
+    buf[120..128].copy_from_slice(&flags2.to_be_bytes());
+    for base in [32usize, 40, 48, 144] {
+        buf[base..base + 8].copy_from_slice(&want.encode(true));
+    }
+    super::inode::stamp_v3_inode_crc(&mut buf);
+    dev.write_at(off, &buf).unwrap();
+    patch_sb_incompat(&mut dev, super::superblock::XFS_SB_FEAT_INCOMPAT_BIGTIME);
+
+    let mut xfs = Xfs::open(&mut dev).unwrap();
+    let a = xfs
+        .getattr(&mut dev, std::path::Path::new("/t"))
+        .expect("getattr on a bigtime inode");
+    assert_eq!(a.mtime, 4_000_000_000);
+    assert_eq!(a.atime, 4_000_000_000);
+    // A neighbouring legacy inode must be unaffected: the flag is
+    // per-inode, not per-volume.
+    let r = xfs.getattr(&mut dev, std::path::Path::new("/")).unwrap();
+    assert_eq!(r.mtime, 0);
+}
+
+#[test]
+fn nrext64_inode_extent_counters_are_decoded() {
+    let (mut dev, mut xfs) = fresh(16 * 1024 * 1024);
+    let root = xfs.superblock().rootino;
+    let body = vec![b'q'; 9000];
+    let mut src = std::io::Cursor::new(body.clone());
+    let ino = xfs
+        .add_file(
+            &mut dev,
+            root,
+            "n",
+            EntryMeta::default(),
+            body.len() as u64,
+            &mut src,
+        )
+        .unwrap();
+    xfs.add_xattr(&mut dev, ino, "user.a", b"1").unwrap();
+    xfs.flush_writes(&mut dev).unwrap();
+
+    // Convert the two inodes on the lookup path plus the superblock.
+    patch_inode_to_nrext64(&xfs, &mut dev, root);
+    patch_inode_to_nrext64(&xfs, &mut dev, ino);
+    patch_sb_incompat(&mut dev, super::superblock::XFS_SB_FEAT_INCOMPAT_NREXT64);
+
+    let xfs = Xfs::open(&mut dev).unwrap();
+    assert!(xfs.superblock().has_nrext64());
+    let mut out = Vec::new();
+    {
+        let mut r = xfs.open_file_reader(&mut dev, "/n").unwrap();
+        std::io::Read::read_to_end(&mut r, &mut out).unwrap();
+    }
+    assert_eq!(out, body, "nrext64 inode's extent list did not decode");
+    assert_eq!(xfs.read_xattrs(&mut dev, ino).unwrap().len(), 1);
+}
+
+#[test]
+fn nrext64_inode_survives_a_writeback() {
+    use crate::fs::OpenFlags;
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    let (mut dev, mut xfs) = fresh(16 * 1024 * 1024);
+    let root = xfs.superblock().rootino;
+    let body = vec![b'q'; 9000];
+    let mut src = std::io::Cursor::new(body.clone());
+    let ino = xfs
+        .add_file(
+            &mut dev,
+            root,
+            "n",
+            EntryMeta::default(),
+            body.len() as u64,
+            &mut src,
+        )
+        .unwrap();
+    xfs.flush_writes(&mut dev).unwrap();
+    patch_inode_to_nrext64(&xfs, &mut dev, root);
+    patch_inode_to_nrext64(&xfs, &mut dev, ino);
+    patch_sb_incompat(&mut dev, super::superblock::XFS_SB_FEAT_INCOMPAT_NREXT64);
+
+    let mut xfs = Xfs::open(&mut dev).unwrap();
+    {
+        let mut h = Filesystem::open_file_rw(
+            &mut xfs,
+            &mut dev,
+            std::path::Path::new("/n"),
+            OpenFlags::default(),
+            None,
+        )
+        .unwrap();
+        h.seek(SeekFrom::Start(0)).unwrap();
+        h.write_all(b"ABCD").unwrap();
+        h.sync().unwrap();
+    }
+
+    // The rewritten inode must keep the NREXT64 field layout.
+    let xfs = Xfs::open(&mut dev).unwrap();
+    let off = xfs.ino_byte_offset(ino).unwrap();
+    let mut buf = vec![0u8; xfs.inode_size() as usize];
+    dev.read_at(off, &mut buf).unwrap();
+    assert_eq!(
+        u64::from_be_bytes(buf[24..32].try_into().unwrap()),
+        1,
+        "di_big_nextents should hold the data-fork extent count"
+    );
+    assert_eq!(
+        u32::from_be_bytes(buf[76..80].try_into().unwrap()),
+        0,
+        "di_big_anextents should be 0 for an inode with no attr fork"
+    );
+    let mut out = Vec::new();
+    {
+        let mut r = xfs.open_file_reader(&mut dev, "/n").unwrap();
+        std::io::Read::read_to_end(&mut r, &mut out).unwrap();
+    }
+    let mut want = body.clone();
+    want[0..4].copy_from_slice(b"ABCD");
+    assert_eq!(out, want);
+}
