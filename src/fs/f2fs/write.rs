@@ -927,11 +927,28 @@ impl Writer {
         };
         let nid = self.alloc_nid();
         let inode_blk = self.alloc_node_block()?;
-        // Pack devt into the first 8 bytes of inline_payload.
-        let mut payload = vec![0u8; 8];
-        let devt =
-            ((major as u64) << 8) | (minor as u64 & 0xFF) | ((minor as u64 & 0xFFFFFF00) << 12);
-        payload[..8].copy_from_slice(&devt.to_le_bytes());
+        // Device number placement follows __set_inode_rdev() in the
+        // kernel's fs/f2fs/inode.c: a dev_t that fits the historic 8+8
+        // split goes into i_addr[0] as old_encode_dev(), anything wider
+        // leaves i_addr[0] zero and lands in i_addr[1] as
+        // new_encode_dev(). __get_inode_rdev() picks the slot by testing
+        // i_addr[0] for zero, so the two encodings must not both be set.
+        // Only char/block devices carry a dev_t; fifos and sockets have
+        // none. Nothing here may set F2FS_INLINE_DATA: f2fs_may_inline_data()
+        // refuses inline data on anything but a regular file, and fsck
+        // flags a special inode that claims it.
+        let mut i_addr = Vec::new();
+        if matches!(kind, DeviceKind::Char | DeviceKind::Block) {
+            if major < 256 && minor < 256 {
+                // old_encode_dev(): (major << 8) | minor.
+                i_addr.push((major << 8) | minor);
+            } else {
+                // new_encode_dev(): (minor & 0xff) | (major << 8) |
+                //                   ((minor & ~0xff) << 12).
+                i_addr.push(0);
+                i_addr.push((minor & 0xFF) | (major << 8) | ((minor & !0xFF) << 12));
+            }
+        }
 
         self.inodes.insert(
             nid,
@@ -947,10 +964,10 @@ impl Writer {
                 ctime: meta.ctime,
                 mtime: meta.mtime,
                 flags: 0,
-                inline_flags: F2FS_INLINE_DATA | F2FS_DATA_EXIST,
-                i_addr: Vec::new(),
+                inline_flags: 0,
+                i_addr,
                 i_nid: [0; NIDS_PER_INODE],
-                inline_payload: payload,
+                inline_payload: Vec::new(),
                 on_disk_block: inode_blk,
             },
         );
