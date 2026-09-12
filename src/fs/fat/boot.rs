@@ -284,7 +284,23 @@ impl BootSector {
         }
         let clusters =
             ((u64::from(total_sectors) - data_start) / u64::from(sectors_per_cluster)) as u32;
+        if clusters == 0 {
+            return Err(crate::Error::InvalidImage(
+                "fat: volume has no data clusters".into(),
+            ));
+        }
         let kind = FatKind::from_cluster_count(clusters);
+        // Every data cluster needs a FAT entry (plus the two reserved ones)
+        // or a chain walk / allocation would index past the table.
+        let fat_bytes = u64::from(fat_size) * u64::from(bytes_per_sector);
+        let need_fat_bytes = kind.fat_bytes(u64::from(clusters) + 2);
+        if fat_bytes < need_fat_bytes {
+            return Err(crate::Error::InvalidImage(format!(
+                "{}: FAT of {fat_bytes} bytes cannot map {clusters} clusters (needs \
+                 {need_fat_bytes} bytes)",
+                kind.as_str()
+            )));
+        }
         // A FAT32 volume keeps the root as a chain and must not declare a
         // fixed root region; FAT12/16 must declare one.
         if kind == FatKind::Fat32 && root_entry_count != 0 {
@@ -453,6 +469,38 @@ mod tests {
         assert_eq!(bs.data_start_sector(), 2050);
         // (131072 - 2050) / 1 = 129022 clusters.
         assert_eq!(bs.cluster_count(), 129022);
+    }
+
+    #[test]
+    fn rejects_fat_too_small_to_map_every_cluster() {
+        let mut bs = BootSector::defaults_for(FatKind::Fat32);
+        bs.total_sectors = 131072;
+        bs.fat_size = 1009;
+        assert!(BootSector::decode(&bs.encode()).is_ok());
+        // 100 sectors map 12800 entries, far fewer than the ~130k clusters
+        // the rest of the geometry leaves room for.
+        bs.fat_size = 100;
+        match BootSector::decode(&bs.encode()) {
+            Err(crate::Error::InvalidImage(msg)) => assert!(msg.contains("cannot map"), "{msg}"),
+            other => panic!("expected InvalidImage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_zero_data_clusters() {
+        // FAT12 defaults: 1 reserved + 2 FATs of 1 sector + 32 root
+        // sectors = 35 sectors of metadata; one leftover sector is less
+        // than a cluster.
+        let mut bs = BootSector::defaults_for(FatKind::Fat12);
+        bs.sectors_per_cluster = 8;
+        bs.fat_size = 1;
+        bs.total_sectors = 36;
+        match BootSector::decode(&bs.encode()) {
+            Err(crate::Error::InvalidImage(msg)) => {
+                assert!(msg.contains("no data clusters"), "{msg}")
+            }
+            other => panic!("expected InvalidImage, got {other:?}"),
+        }
     }
 
     #[test]

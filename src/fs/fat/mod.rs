@@ -1737,6 +1737,22 @@ mod tests {
         }
     }
 
+    /// A boot sector whose FAT is too short to map every cluster used to
+    /// open fine and then index past the in-memory table on the first
+    /// allocation or flush. It must be rejected up front.
+    #[test]
+    fn open_rejects_fat_too_small_for_cluster_count() {
+        let (mut dev, _fs) = fresh_volume();
+        let mut bs = [0u8; 512];
+        dev.read_at(0, &mut bs).unwrap();
+        bs[36..40].copy_from_slice(&1u32.to_le_bytes()); // fat_size_32 = 1 sector
+        dev.write_at(0, &bs).unwrap();
+        match Fat32::open(&mut dev) {
+            Err(crate::Error::InvalidImage(msg)) => assert!(msg.contains("cannot map"), "{msg}"),
+            other => panic!("expected InvalidImage, got {other:?}"),
+        }
+    }
+
     #[test]
     fn open_file_rw_partial_write_round_trip() {
         let (mut dev, mut fs) = fresh_volume();
