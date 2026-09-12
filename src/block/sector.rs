@@ -408,4 +408,49 @@ mod tests {
             .unwrap();
         assert_eq!(body, b"hi there");
     }
+    /// The SD-card shape end to end: an MBR on the card, a FAT volume in
+    /// its first partition, opened through `slice_partition` — every layer
+    /// of it in the `no_std` core.
+    #[cfg(feature = "fat")]
+    #[test]
+    fn partitioned_card_mounts_through_the_table() {
+        use crate::fs::Filesystem;
+        use crate::fs::fat::{Fat32, FatFormatOpts, FatKind};
+        use crate::part::{Mbr, Partition, PartitionKind, PartitionTable, slice_partition};
+        use crate::path::Path;
+
+        let mut card = card(8192);
+        let table = Mbr::new(vec![Partition::new(2048, 4096, PartitionKind::Fat32)]).unwrap();
+        table.write(&mut card).unwrap();
+        {
+            let mut part = slice_partition(&table, &mut card, 0).unwrap();
+            assert_eq!(part.total_size(), 4096 * 512);
+            let opts = FatFormatOpts {
+                kind: FatKind::Fat12,
+                total_sectors: 4096,
+                ..Default::default()
+            };
+            let mut fs = Fat32::format(&mut part, &opts).unwrap();
+            fs.create_dir(&mut part, Path::new("/logs"), Default::default())
+                .unwrap();
+            fs.flush(&mut part).unwrap();
+        }
+        // Re-read the table from the card, as firmware would after a reset.
+        let table = Mbr::read(&mut card).unwrap();
+        assert_eq!(table.partitions()[0].start_lba, 2048);
+        let mut part = slice_partition(&table, &mut card, 0).unwrap();
+        let mut fs = Fat32::open(&mut part).unwrap();
+        let names: Vec<_> = fs
+            .list(&mut part, Path::new("/"))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["logs"]);
+        // The volume's boot sector landed at the partition start, not LBA 0.
+        let mut lba0 = [0u8; 512];
+        card.read_at(0, &mut lba0).unwrap();
+        assert_eq!(&lba0[510..], &[0x55, 0xaa]);
+        assert_ne!(&lba0[54..59], b"FAT12");
+    }
 }
