@@ -81,7 +81,7 @@ use attribute::{
 };
 use boot::BootSector;
 use index::IndexEntry;
-use run_list::Extent;
+use run_list::{Extent, RunMap};
 use secure::UpcaseTable;
 
 /// Hard-coded MFT record numbers reserved by NTFS.
@@ -145,7 +145,7 @@ pub struct Ntfs {
     boot: BootSector,
     /// Cached MFT run list: where to read MFT record N from. Empty before
     /// `load_mft_runs` has been called.
-    mft_runs: Vec<Extent>,
+    mft_runs: RunMap,
     /// Cached `$UpCase` table for case-insensitive directory lookups.
     /// `None` means "haven't tried yet"; `Some(identity)` means we tried
     /// and the image didn't expose one — names are compared exactly.
@@ -199,7 +199,7 @@ impl Ntfs {
         }
         Ok(Self {
             boot,
-            mft_runs: Vec::new(),
+            mft_runs: RunMap::default(),
             upcase: None,
             sii_cache: None,
             sd_cache: HashMap::new(),
@@ -270,14 +270,14 @@ impl Ntfs {
                     length,
                 })
                 .collect();
-            if live != self.mft_runs {
-                self.mft_runs = live;
+            if live != self.mft_runs.runs() {
+                self.mft_runs = RunMap::new(live)?;
             }
         }
 
         // Bootstrap: read record 0 from the BPB-anchored MFT LCN and
         // reconstruct $MFT's own $DATA run list from it.
-        if self.mft_runs.is_empty() {
+        if self.mft_runs.runs().is_empty() {
             self.bootstrap_mft_runs(dev)?;
         }
 
@@ -288,45 +288,26 @@ impl Ntfs {
             .checked_mul(rec_size as u64)
             .ok_or_else(|| crate::Error::InvalidImage("ntfs: MFT offset overflow".into()))?;
         let cluster_size = u64::from(self.boot.cluster_size());
-        let mut vcn_bytes: u64 = 0;
-        let mut found = false;
-        for ext in &self.mft_runs {
-            let ext_bytes = ext.length.checked_mul(cluster_size).ok_or_else(|| {
-                crate::Error::InvalidImage("ntfs: MFT extent span overflow".into())
-            })?;
-            let vcn_end = vcn_bytes.checked_add(ext_bytes).ok_or_else(|| {
-                crate::Error::InvalidImage("ntfs: MFT run-list offset overflow".into())
-            })?;
-            if mft_byte_offset < vcn_end {
-                let local = mft_byte_offset - vcn_bytes;
-                match ext.lcn {
-                    Some(lcn) => {
-                        let phys = lcn
-                            .checked_mul(cluster_size)
-                            .and_then(|b| b.checked_add(local))
-                            .ok_or_else(|| {
-                                crate::Error::InvalidImage(
-                                    "ntfs: MFT record byte offset overflow".into(),
-                                )
-                            })?;
-                        dev.read_at(phys, out)?;
-                    }
-                    None => {
-                        return Err(crate::Error::InvalidImage(
-                            "ntfs: requested MFT record sits in a sparse run".into(),
-                        ));
-                    }
-                }
-                found = true;
-                break;
-            }
-            vcn_bytes = vcn_end;
-        }
-        if !found {
+        let vcn = mft_byte_offset / cluster_size;
+        let in_cluster = mft_byte_offset % cluster_size;
+        let Some((ext, local)) = self.mft_runs.lookup(vcn) else {
             return Err(crate::Error::InvalidImage(format!(
                 "ntfs: MFT record {rec} is past the end of $MFT"
             )));
-        }
+        };
+        let Some(lcn) = ext.lcn else {
+            return Err(crate::Error::InvalidImage(
+                "ntfs: requested MFT record sits in a sparse run".into(),
+            ));
+        };
+        let phys = lcn
+            .checked_add(local)
+            .and_then(|c| c.checked_mul(cluster_size))
+            .and_then(|b| b.checked_add(in_cluster))
+            .ok_or_else(|| {
+                crate::Error::InvalidImage("ntfs: MFT record byte offset overflow".into())
+            })?;
+        dev.read_at(phys, out)?;
         mft::apply_fixup(out, mft::NTFS_BLOCK_SIZE)?;
         Ok(())
     }
@@ -393,7 +374,7 @@ impl Ntfs {
         }
         // Publish what record 0 knows so the extension records — which
         // sit inside $MFT itself — can be mapped.
-        self.mft_runs = Self::concat_segments(&mut segments);
+        self.mft_runs = RunMap::new(Self::concat_segments(&mut segments))?;
 
         if let Some(alist) = self.read_attribute_list(dev, &rec0)? {
             let mut seen = std::collections::HashSet::from([0u64]);
@@ -409,7 +390,7 @@ impl Ntfs {
                 self.read_mft_record(dev, ext_rec, &mut buf)?;
                 segments.extend(Self::data_segments(&buf)?);
             }
-            self.mft_runs = Self::concat_segments(&mut segments);
+            self.mft_runs = RunMap::new(Self::concat_segments(&mut segments))?;
         }
         Ok(())
     }
@@ -455,7 +436,7 @@ impl Ntfs {
                     let mut reader = NonResidentReader {
                         dev: &mut *dev,
                         cluster_size,
-                        runs,
+                        runs: RunMap::new(runs)?,
                         real_size,
                         initialized_size: real_size,
                         pos: 0,
@@ -915,7 +896,7 @@ impl Ntfs {
                 dev,
                 cluster_size,
                 cu_clusters,
-                runs,
+                RunMap::new(runs)?,
                 real_size,
                 initialized_size,
             )));
@@ -924,7 +905,7 @@ impl Ntfs {
         Ok(NtfsSeekableReader::NonResident(NonResidentReader {
             dev,
             cluster_size,
-            runs,
+            runs: RunMap::new(runs)?,
             real_size,
             initialized_size,
             pos: 0,
@@ -1041,7 +1022,7 @@ impl Ntfs {
                 dev,
                 cluster_size,
                 cu_clusters,
-                runs,
+                RunMap::new(runs)?,
                 real_size,
                 initialized_size,
             )));
@@ -1049,7 +1030,7 @@ impl Ntfs {
         Ok(NtfsSeekableReader::NonResident(NonResidentReader {
             dev,
             cluster_size,
-            runs,
+            runs: RunMap::new(runs)?,
             real_size,
             initialized_size,
             pos: 0,
@@ -1467,7 +1448,7 @@ impl std::io::Seek for ResidentReader {
 pub struct NonResidentReader<'a> {
     dev: &'a mut dyn BlockDevice,
     cluster_size: u64,
-    runs: Vec<Extent>,
+    runs: RunMap,
     real_size: u64,
     initialized_size: u64,
     pos: u64,
@@ -1480,28 +1461,20 @@ impl<'a> NonResidentReader<'a> {
     /// Find the physical byte offset of VCN `vcn`. Returns `None` for
     /// sparse extents.
     fn map_vcn(&self, vcn: u64) -> std::io::Result<Option<u64>> {
-        let mut walked: u64 = 0;
-        for ext in &self.runs {
-            let walked_end = walked
-                .checked_add(ext.length)
-                .ok_or_else(|| std::io::Error::other("ntfs: run-list VCN length overflow"))?;
-            if vcn < walked_end {
-                let local = vcn - walked;
-                return match ext.lcn {
-                    Some(lcn) => lcn
-                        .checked_add(local)
-                        .and_then(|c| c.checked_mul(self.cluster_size))
-                        .map(Some)
-                        .ok_or_else(|| std::io::Error::other("ntfs: VCN byte offset overflow")),
-                    None => Ok(None),
-                };
-            }
-            walked = walked_end;
+        let Some((ext, local)) = self.runs.lookup(vcn) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("ntfs: VCN {vcn} past end of run list"),
+            ));
+        };
+        match ext.lcn {
+            Some(lcn) => lcn
+                .checked_add(local)
+                .and_then(|c| c.checked_mul(self.cluster_size))
+                .map(Some)
+                .ok_or_else(|| std::io::Error::other("ntfs: VCN byte offset overflow")),
+            None => Ok(None),
         }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            format!("ntfs: VCN {vcn} past end of run list"),
-        ))
     }
 }
 
@@ -1588,7 +1561,7 @@ pub struct CompressedReader<'a> {
     cluster_size: u64,
     cu_clusters: u64,
     cu_size: u64,
-    runs: Vec<Extent>,
+    runs: RunMap,
     real_size: u64,
     initialized_size: u64,
     pos: u64,
@@ -1608,7 +1581,7 @@ impl<'a> CompressedReader<'a> {
         dev: &'a mut dyn BlockDevice,
         cluster_size: u64,
         cu_clusters: u64,
-        runs: Vec<Extent>,
+        runs: RunMap,
         real_size: u64,
         initialized_size: u64,
     ) -> Self {
@@ -1631,28 +1604,20 @@ impl<'a> CompressedReader<'a> {
     /// Resolve the `i`th run-list cluster (counted as VCN) to its on-disk
     /// (lcn, length-remaining-in-run) tuple, or `None` for sparse.
     fn map_vcn(&self, vcn: u64) -> std::io::Result<Option<u64>> {
-        let mut walked: u64 = 0;
-        for ext in &self.runs {
-            let walked_end = walked
-                .checked_add(ext.length)
-                .ok_or_else(|| std::io::Error::other("ntfs: run-list VCN length overflow"))?;
-            if vcn < walked_end {
-                let local = vcn - walked;
-                return match ext.lcn {
-                    Some(lcn) => lcn
-                        .checked_add(local)
-                        .and_then(|c| c.checked_mul(self.cluster_size))
-                        .map(Some)
-                        .ok_or_else(|| std::io::Error::other("ntfs: VCN byte offset overflow")),
-                    None => Ok(None),
-                };
-            }
-            walked = walked_end;
+        let Some((ext, local)) = self.runs.lookup(vcn) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("ntfs: VCN {vcn} past end of run list"),
+            ));
+        };
+        match ext.lcn {
+            Some(lcn) => lcn
+                .checked_add(local)
+                .and_then(|c| c.checked_mul(self.cluster_size))
+                .map(Some)
+                .ok_or_else(|| std::io::Error::other("ntfs: VCN byte offset overflow")),
+            None => Ok(None),
         }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            format!("ntfs: VCN {vcn} past end of run list"),
-        ))
     }
 
     /// Walk `cu_clusters` consecutive VCNs and decide how many of them have
