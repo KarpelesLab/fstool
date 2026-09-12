@@ -367,6 +367,265 @@ fn inline_data_oversized_claim_is_an_error_not_a_panic() {
     assert!(matches!(err, crate::Error::InvalidImage(_)), "{err:?}");
 }
 
+// ──────────── findings 4 / 5: uninit_bg flags, GDT_CSUM crc16 ────────────
+
+/// Bitwise CRC-16 (reflected 0x8005), written independently of
+/// `csum::crc16` so the descriptor test has a second opinion.
+fn ref_crc16(mut crc: u16, data: &[u8]) -> u16 {
+    for &b in data {
+        for i in 0..8 {
+            let bit = ((b >> i) & 1) as u16 ^ (crc & 1);
+            crc >>= 1;
+            if bit != 0 {
+                crc ^= 0x8005u16.reverse_bits();
+            }
+        }
+    }
+    crc
+}
+
+/// Read the primary GDT bytes (all groups) from disk.
+fn raw_gdt(ext: &Ext, dev: &mut MemoryBackend) -> Vec<u8> {
+    let bs = ext.layout.block_size as u64;
+    let off = if ext.layout.first_data_block == 1 {
+        2 * bs
+    } else {
+        bs
+    };
+    let mut gdt = vec![0u8; ext.layout.gdt_blocks as usize * bs as usize];
+    dev.read_at(off, &mut gdt).unwrap();
+    gdt
+}
+
+/// An ext3 image with `uninit_bg` (RO_COMPAT_GDT_CSUM) but no
+/// metadata_csum — the mke2fs default for years — must get CRC16
+/// descriptor checksums and a correct `bg_itable_unused` on flush.
+#[test]
+fn gdt_csum_descriptors_are_stamped_with_crc16() {
+    let mut dev = MemoryBackend::new(16 * 1024 * 1024);
+    let opts = FormatOpts {
+        kind: FsKind::Ext3,
+        block_size: 1024,
+        blocks_count: 16 * 1024,
+        inodes_count: 256,
+        uuid: [0x9B; 16],
+        sparse_super: true,
+        ..FormatOpts::default()
+    };
+    let ext = Ext::format_with(&mut dev, &opts).unwrap();
+    assert_eq!(ext.layout.num_groups(), 2);
+    // Turn on uninit_bg the way tune2fs would (feature bit only).
+    let mut sb = vec![0u8; 1024];
+    dev.read_at(1024, &mut sb).unwrap();
+    let ro = u32::from_le_bytes(sb[100..104].try_into().unwrap());
+    sb[100..104].copy_from_slice(&(ro | constants::feature::RO_COMPAT_GDT_CSUM).to_le_bytes());
+    dev.write_at(1024, &sb).unwrap();
+
+    let mut re = Ext::open(&mut dev).unwrap();
+    for i in 0..5 {
+        add_file(
+            &mut re,
+            &mut dev,
+            INO_ROOT_DIR,
+            format!("f{i}").as_bytes(),
+            b"x",
+        );
+    }
+    re.flush(&mut dev).unwrap();
+
+    let gdt = raw_gdt(&re, &mut dev);
+    let ipg = re.layout.inodes_per_group;
+    for g in 0..re.layout.num_groups() as usize {
+        let d = &gdt[g * 32..g * 32 + 32];
+        let stored = u16::from_le_bytes(d[0x1E..0x20].try_into().unwrap());
+        let c = ref_crc16(!0, &opts.uuid);
+        let c = ref_crc16(c, &(g as u32).to_le_bytes());
+        let want = ref_crc16(c, &d[..0x1E]);
+        assert_eq!(stored, want, "group {g}: bg_checksum");
+        let flags = u16::from_le_bytes(d[0x12..0x14].try_into().unwrap());
+        assert_eq!(
+            flags & 0x3,
+            0,
+            "group {g}: UNINIT flags must never be written"
+        );
+        // bg_itable_unused = inodes past the last used slot.
+        let itable_unused = u16::from_le_bytes(d[0x1C..0x1E].try_into().unwrap()) as u32;
+        let mut bm = vec![0u8; 1024];
+        dev.read_at(re.layout.groups[g].inode_bitmap as u64 * 1024, &mut bm)
+            .unwrap();
+        let last_used = (0..ipg)
+            .rev()
+            .find(|&b| super::group::test_bit(&bm, b))
+            .map_or(0, |b| b + 1);
+        assert_eq!(
+            itable_unused,
+            ipg - last_used,
+            "group {g}: bg_itable_unused"
+        );
+    }
+    // Reopens cleanly and the files are there.
+    let again = Ext::open(&mut dev).unwrap();
+    assert_eq!(read_path(&again, &mut dev, "/f4"), b"x");
+}
+
+/// Reproduce mke2fs's lazy layout on a crate-formatted ext4 image: mark
+/// group 2 BLOCK_UNINIT + INODE_UNINIT, clear INODE_ZEROED, and fill its
+/// bitmap blocks and inode table with garbage. Opening must synthesise
+/// the bitmaps from the layout, allocations must avoid the group's
+/// metadata, the flush must clear the UNINIT flags, zero the inode-table
+/// tail and set INODE_ZEROED.
+#[test]
+fn uninit_group_bitmaps_are_synthesised_and_flags_cleared() {
+    let mut dev = MemoryBackend::new(32 * 1024 * 1024);
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 1024,
+        blocks_count: 32 * 1024,
+        inodes_count: 64, // 16 per group: group 0 has 6 usable, others 16
+        journal_blocks: 1024,
+        sparse_super: false, // every group carries an SB+GDT backup
+        ..FormatOpts::default()
+    };
+    let ext = Ext::format_with(&mut dev, &opts).unwrap();
+    assert_eq!(ext.layout.num_groups(), 4);
+    let g2 = ext.layout.groups[2];
+    assert!(g2.has_superblock);
+    let bs = 1024u64;
+
+    // Descriptor of group 2 lives at byte 2*32 of the GDT (block 2).
+    let gdt_off = 2 * bs + 2 * 32;
+    let mut d = vec![0u8; 32];
+    dev.read_at(gdt_off, &mut d).unwrap();
+    let flags = u16::from_le_bytes(d[0x12..0x14].try_into().unwrap());
+    assert_ne!(
+        flags & super::group::BG_INODE_ZEROED,
+        0,
+        "format marks tables zeroed"
+    );
+    let lazy = (flags | super::group::BG_BLOCK_UNINIT | super::group::BG_INODE_UNINIT)
+        & !super::group::BG_INODE_ZEROED;
+    d[0x12..0x14].copy_from_slice(&lazy.to_le_bytes());
+    // itable_unused = everything (no inode ever used in this group).
+    d[0x1C..0x1E].copy_from_slice(&16u16.to_le_bytes());
+    dev.write_at(gdt_off, &d).unwrap();
+    // Garbage in both bitmaps and the whole inode table.
+    dev.write_at(g2.block_bitmap as u64 * bs, &[0xA5u8; 1024])
+        .unwrap();
+    dev.write_at(g2.inode_bitmap as u64 * bs, &[0xFFu8; 1024])
+        .unwrap();
+    let itb = ext.layout.inode_table_blocks as usize;
+    dev.write_at(g2.inode_table as u64 * bs, &vec![0xEEu8; itb * 1024])
+        .unwrap();
+
+    let mut re = Ext::open(&mut dev).unwrap();
+    let synth = &re.groups[2].block_bitmap;
+    let meta_end = g2.data_start - g2.start_block;
+    for bit in 0..meta_end {
+        assert!(
+            super::group::test_bit(synth, bit),
+            "metadata bit {bit} of group 2 not marked in synthesised bitmap"
+        );
+    }
+    assert!(
+        !super::group::test_bit(synth, meta_end),
+        "first data block must be free"
+    );
+    assert_eq!(
+        re.groups[2].desc.flags & 0x3,
+        0,
+        "UNINIT flags dropped at open"
+    );
+    assert!(
+        (0..16).all(|b| !super::group::test_bit(&re.groups[2].inode_bitmap, b)),
+        "INODE_UNINIT group has no used inodes"
+    );
+
+    // 30 one-byte files exhaust groups 0/1's inodes and spill into group
+    // 2; 20 × 1 MiB files push data allocation into group 2 as well.
+    for i in 0..30 {
+        add_file(
+            &mut re,
+            &mut dev,
+            INO_ROOT_DIR,
+            format!("s{i}").as_bytes(),
+            b"s",
+        );
+    }
+    let big = vec![0x42u8; 1024 * 1024];
+    for i in 0..20 {
+        add_file(
+            &mut re,
+            &mut dev,
+            INO_ROOT_DIR,
+            format!("b{i}").as_bytes(),
+            &big,
+        );
+    }
+    re.flush(&mut dev).unwrap();
+
+    let again = Ext::open(&mut dev).unwrap();
+    // Every data block of every file stays clear of group 2's metadata.
+    let mut in_g2 = 0usize;
+    let entries = again.list_inode(&mut dev, INO_ROOT_DIR).unwrap();
+    for e in entries.iter().filter(|e| e.name.starts_with('b')) {
+        let inode = again.read_inode(&mut dev, e.inode).unwrap();
+        let n = inode.file_size().div_ceil(bs) as u32;
+        for lb in 0..n {
+            let phys = again.file_block(&mut dev, &inode, lb).unwrap();
+            if phys >= g2.start_block && phys <= g2.end_block {
+                in_g2 += 1;
+                assert!(
+                    phys >= g2.data_start,
+                    "file {} block {phys} overlaps group 2 metadata (< {})",
+                    e.name,
+                    g2.data_start
+                );
+            }
+        }
+    }
+    assert!(in_g2 > 0, "test must allocate data in group 2");
+    let inodes_in_g2 = entries
+        .iter()
+        .filter(|e| e.inode > 32 && e.inode <= 48)
+        .count();
+    assert!(inodes_in_g2 > 0, "test must allocate inodes in group 2");
+    for i in 0..30 {
+        assert_eq!(read_path(&again, &mut dev, &format!("/s{i}")), b"s");
+    }
+    assert_eq!(read_path(&again, &mut dev, "/b19"), big);
+
+    // On-disk descriptor: no UNINIT, INODE_ZEROED set, itable_unused sane.
+    dev.read_at(gdt_off, &mut d).unwrap();
+    let flags = u16::from_le_bytes(d[0x12..0x14].try_into().unwrap());
+    assert_eq!(flags & 0x3, 0, "UNINIT flags written back");
+    assert_ne!(
+        flags & super::group::BG_INODE_ZEROED,
+        0,
+        "INODE_ZEROED not set"
+    );
+    let itable_unused = u16::from_le_bytes(d[0x1C..0x1E].try_into().unwrap()) as usize;
+    assert_eq!(itable_unused, 16 - inodes_in_g2);
+    // The inode bitmap no longer holds the 0xFF garbage.
+    let mut ibm = vec![0u8; 1024];
+    dev.read_at(g2.inode_bitmap as u64 * bs, &mut ibm).unwrap();
+    let used_bits = (0..16u32)
+        .filter(|&b| super::group::test_bit(&ibm, b))
+        .count();
+    assert_eq!(used_bits, inodes_in_g2);
+    // The inode table beyond the used inodes was zeroed (no 0xEE left).
+    let mut table = vec![0u8; itb * 1024];
+    dev.read_at(g2.inode_table as u64 * bs, &mut table).unwrap();
+    let used_bytes = inodes_in_g2 * 128;
+    assert!(
+        table[used_bytes..].iter().all(|&b| b == 0),
+        "never-zeroed inode-table tail still holds garbage"
+    );
+    assert!(
+        table[..used_bytes].iter().any(|&b| b != 0xEE),
+        "live inodes were written"
+    );
+}
+
 // ─────────────────── finding 2: superblock raw carry ───────────────────
 
 /// Patch unmodelled superblock fields directly on the device, open,

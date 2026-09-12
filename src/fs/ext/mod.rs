@@ -326,6 +326,13 @@ struct GroupState {
     /// bulk-insert workloads, since allocations are append-only and each
     /// call walked the full set prefix before finding the next free bit.
     next_free_block_bit: u32,
+    /// Set at open for groups whose descriptor lacks `BG_INODE_ZEROED`
+    /// on a checksummed filesystem: the inode table past this block
+    /// index (derived from the on-disk `bg_itable_unused`) has never
+    /// been zeroed and holds whatever the disk held. The first flush
+    /// that stages an inode into the group writes that tail as zeros
+    /// (what the kernel's lazy-init thread would do) and sets the flag.
+    zero_itable_from: Option<u32>,
 }
 
 /// An open / under-construction ext filesystem.
@@ -555,12 +562,14 @@ impl Ext {
                 free_inodes_count: 0,
                 used_dirs_count: 0,
                 flags: 0,
+                itable_unused: 0,
             };
             groups.push(GroupState {
                 block_bitmap,
                 inode_bitmap,
                 desc,
                 next_free_block_bit: 0,
+                zero_itable_from: None,
             });
         }
 
@@ -659,6 +668,15 @@ impl Ext {
             ext.sb.feature_incompat |= constants::feature::INCOMPAT_CSUM_SEED;
             ext.sb.checksum_seed = csum::fs_seed(&ext.sb.uuid, None);
         }
+        // Every inode table was zeroed by the `zero_range` above (or is
+        // guaranteed zero by `prezeroed`): say so, as `mke2fs -E
+        // lazy_itable_init=0` does, so the kernel's lazy-init thread has
+        // nothing to do. Only meaningful with group-descriptor checksums.
+        if ext.has_group_desc_csum() {
+            for g in &mut ext.groups {
+                g.desc.flags |= group::BG_INODE_ZEROED;
+            }
+        }
 
         // Reserve inodes 1..first_ino-1 (1..=10 for dynamic rev).
         let first_ino = ext.sb.first_ino;
@@ -693,6 +711,21 @@ impl Ext {
     /// Whether the `metadata_csum` feature is active on this filesystem.
     pub(crate) fn has_metadata_csum(&self) -> bool {
         self.sb.feature_ro_compat & constants::feature::RO_COMPAT_METADATA_CSUM != 0
+    }
+
+    /// Whether the `uninit_bg` feature (`RO_COMPAT_GDT_CSUM`) is set:
+    /// CRC16 group-descriptor checksums. Superseded by `metadata_csum`
+    /// when both are present.
+    fn has_gdt_csum(&self) -> bool {
+        self.sb.feature_ro_compat & constants::feature::RO_COMPAT_GDT_CSUM != 0
+    }
+
+    /// Whether group descriptors carry a checksum at all — and therefore
+    /// whether `bg_flags` (`*_UNINIT`, `INODE_ZEROED`) and
+    /// `bg_itable_unused` are meaningful. The kernel's
+    /// `ext4_has_group_desc_csum`: `uninit_bg || metadata_csum`.
+    fn has_group_desc_csum(&self) -> bool {
+        self.has_gdt_csum() || self.has_metadata_csum()
     }
 
     /// Whether the `inline_data` feature is active. When true, small
@@ -2062,6 +2095,7 @@ impl Ext {
         // serialise the metadata image set; the journal must carry the
         // checksum-stamped versions.
         self.stamp_dir_block_checksums();
+        self.prepare_group_descs();
 
         // Build the block-aligned metadata image set: every full-block
         // write that flush would emit (bitmaps, GDTs, inode-table blocks,
@@ -2094,6 +2128,13 @@ impl Ext {
         // Subsequent flushes (e.g. from open_file_rw) ride the journal.
         self.bootstrap = false;
 
+        // Inode-table tails zeroed in this flush are zeroed for good.
+        for g in &mut self.groups {
+            if g.desc.flags & group::BG_INODE_ZEROED != 0 {
+                g.zero_itable_from = None;
+            }
+        }
+
         // The staged dir / extent leaf / indirect data blocks have
         // landed on disk; drop them so the next flush only journals
         // genuine new edits (not stale snapshots from before this
@@ -2107,6 +2148,36 @@ impl Ext {
         self.dx_root_blocks.clear();
         self.dx_node_blocks.clear();
         Ok(())
+    }
+
+    /// Bring every group descriptor's checksum-era fields up to date
+    /// before the GDT is serialised: `bg_itable_unused` (inode slots at
+    /// the end of the table that have never been used — must never
+    /// undercount a live inode, or e2fsck / lazy-init treat it as free)
+    /// and `BG_INODE_ZEROED` for groups whose never-zeroed table tail
+    /// this flush is about to write as zeros. A no-op without
+    /// group-descriptor checksums, where neither field is defined.
+    fn prepare_group_descs(&mut self) {
+        if !self.has_group_desc_csum() {
+            return;
+        }
+        let ipg = self.layout.inodes_per_group;
+        let mut touched = vec![false; self.groups.len()];
+        for (ino, _) in &self.inodes {
+            let (g, _) = self.inode_location(*ino);
+            touched[g as usize] = true;
+        }
+        for (gi, g) in self.groups.iter_mut().enumerate() {
+            let last_used = (0..ipg).rev().find(|&bit| test_bit(&g.inode_bitmap, bit));
+            let used = last_used.map_or(0, |b| b + 1);
+            g.desc.itable_unused = (ipg - used).min(u16::MAX as u32) as u16;
+            if touched[gi] && g.zero_itable_from.is_some() {
+                g.desc.flags |= group::BG_INODE_ZEROED;
+            }
+            // Never write a descriptor that still claims an uninitialised
+            // bitmap: the bitmaps we flush are the real ones.
+            g.desc.flags &= !(group::BG_BLOCK_UNINIT | group::BG_INODE_UNINIT);
+        }
     }
 
     /// Stamp every staged metadata block's CRC32C tail in place: regular
@@ -2254,6 +2325,13 @@ impl Ext {
                 }
                 let bg = csum::group_desc(seed, i as u32, desc);
                 desc[0x1E..0x20].copy_from_slice(&bg.to_le_bytes());
+            } else if self.has_gdt_csum() {
+                // `uninit_bg` without `metadata_csum`: CRC16 over the
+                // descriptor. Leaving it stale (as this used to) made the
+                // kernel refuse the group and e2fsck rewrite every
+                // descriptor on an image mke2fs made with uninit_bg.
+                let bg = csum::group_desc_crc16(&self.sb.uuid, i as u32, desc);
+                desc[0x1E..0x20].copy_from_slice(&bg.to_le_bytes());
             }
         }
 
@@ -2284,20 +2362,34 @@ impl Ext {
         let inodes_per_block = (bs / inode_size) as u32;
         let mut by_block: std::collections::BTreeMap<u32, Vec<(u32, &Inode)>> =
             std::collections::BTreeMap::new();
+        // Groups whose never-zeroed inode-table tail must be written as
+        // zeros in this flush (see `GroupState::zero_itable_from`): every
+        // table block from the recorded index up is emitted zeroed, and
+        // staged inodes in that range are laid over zeros instead of the
+        // on-disk garbage.
+        let mut zero_tail: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
         for (ino, inode) in &self.inodes {
             let (group, idx_in_group) = self.inode_location(*ino);
             let table_block = self.layout.groups[group as usize].inode_table;
             let block_off = idx_in_group / inodes_per_block;
             let blk = table_block + block_off;
             by_block.entry(blk).or_default().push((*ino, inode));
+            if let Some(from) = self.groups[group as usize].zero_itable_from {
+                for k in from..self.layout.inode_table_blocks {
+                    zero_tail.insert(table_block + k, k);
+                }
+            }
         }
         for (blk, slots) in by_block {
-            // RMW: start from the current on-disk content. We avoid
-            // touching staged data_blocks here because inode-table blocks
-            // are not staged in `data_blocks` (only dirs / extent leaves
-            // / indirects are).
+            // RMW: start from the current on-disk content — unless the
+            // block sits in a never-zeroed table tail, in which case it
+            // starts from zeros. We avoid touching staged data_blocks here
+            // because inode-table blocks are not staged in `data_blocks`
+            // (only dirs / extent leaves / indirects are).
             let mut buf = vec![0u8; bs as usize];
-            dev.read_at(blk as u64 * bs, &mut buf)?;
+            if zero_tail.remove(&blk).is_none() {
+                dev.read_at(blk as u64 * bs, &mut buf)?;
+            }
             for (ino, inode) in slots {
                 let (_, idx_in_group) = self.inode_location(ino);
                 let inblock_idx = idx_in_group % inodes_per_block;
@@ -2306,6 +2398,11 @@ impl Ext {
                 self.encode_inode_into(ino, inode, slot);
             }
             out.push((blk, buf));
+        }
+        // Remaining never-zeroed tail blocks with no staged inode of
+        // their own still get zeroed.
+        for blk in zero_tail.into_keys() {
+            out.push((blk, vec![0u8; bs as usize]));
         }
 
         // Staged data blocks (directories, extent leaves, indirect blocks).
@@ -3886,30 +3983,7 @@ impl Ext {
         let mut gdt = vec![0u8; gdt_bytes as usize];
         dev.read_at(gdt_off, &mut gdt)?;
 
-        let desc_size = layout.desc_size;
-        let mut groups = Vec::with_capacity(layout.groups.len());
-        for i in 0..layout.groups.len() {
-            let off = i * desc_size;
-            let desc = GroupDesc::decode(&gdt[off..off + constants::GROUP_DESC_SIZE]);
-            // The metadata positions in `layout.groups[i]` were *computed*
-            // assuming the classic contiguous layout. With flex_bg (and in
-            // general for any third-party writer) the descriptor is the
-            // authoritative source — overwrite the computed positions with
-            // the on-disk pointers so inode/bitmap reads land correctly.
-            layout.groups[i].block_bitmap = desc.block_bitmap;
-            layout.groups[i].inode_bitmap = desc.inode_bitmap;
-            layout.groups[i].inode_table = desc.inode_table;
-            let mut block_bitmap = vec![0u8; bs as usize];
-            dev.read_at(desc.block_bitmap as u64 * bs, &mut block_bitmap)?;
-            let mut inode_bitmap = vec![0u8; bs as usize];
-            dev.read_at(desc.inode_bitmap as u64 * bs, &mut inode_bitmap)?;
-            groups.push(GroupState {
-                block_bitmap,
-                inode_bitmap,
-                desc,
-                next_free_block_bit: 0,
-            });
-        }
+        let groups = load_group_states(dev, &mut layout, &sb, &gdt)?;
 
         // `next_inode` is only a scan cursor; `alloc_inode` tests the
         // bitmap of every candidate across all groups, so starting at
@@ -3972,23 +4046,9 @@ impl Ext {
         };
         let mut gdt = vec![0u8; self.layout.gdt_blocks as usize * bs as usize];
         dev.read_at(gdt_off, &mut gdt)?;
-        let desc_size = self.layout.desc_size;
-        for i in 0..self.layout.groups.len() {
-            let off = i * desc_size;
-            let desc = GroupDesc::decode(&gdt[off..off + constants::GROUP_DESC_SIZE]);
-            self.layout.groups[i].block_bitmap = desc.block_bitmap;
-            self.layout.groups[i].inode_bitmap = desc.inode_bitmap;
-            self.layout.groups[i].inode_table = desc.inode_table;
-            dev.read_at(
-                desc.block_bitmap as u64 * bs,
-                &mut self.groups[i].block_bitmap,
-            )?;
-            dev.read_at(
-                desc.inode_bitmap as u64 * bs,
-                &mut self.groups[i].inode_bitmap,
-            )?;
-            self.groups[i].desc = desc;
-        }
+        // Same path as `open`, so `*_UNINIT` groups are synthesised (and
+        // never trusted verbatim) after a replay too.
+        self.groups = load_group_states(dev, &mut self.layout, &self.sb, &gdt)?;
         Ok(())
     }
 
@@ -4617,6 +4677,121 @@ impl<'a> crate::fs::FileReadHandle for FileReader<'a> {
         // the low 32 bits here while `read` served the full body.
         self.inode.file_size()
     }
+}
+
+/// Decode every group descriptor in `gdt` and load (or synthesise) each
+/// group's bitmaps. Shared by `open` and the post-replay reload.
+///
+/// On a filesystem with group-descriptor checksums (`uninit_bg` /
+/// `metadata_csum`) mke2fs leaves most groups' bitmaps unwritten and
+/// flags them `BG_BLOCK_UNINIT` / `BG_INODE_UNINIT`; the on-disk bitmap
+/// blocks then hold garbage. Reading them verbatim (as this used to)
+/// let the allocator hand out metadata blocks and "used" inodes. Such
+/// groups get a synthesised bitmap here and lose the flag, so the
+/// bitmap we later flush is authoritative. Groups lacking
+/// `BG_INODE_ZEROED` record where their never-zeroed inode-table tail
+/// starts so the flush can zero it before landing inodes there.
+fn load_group_states(
+    dev: &mut dyn BlockDevice,
+    layout: &mut Layout,
+    sb: &Superblock,
+    gdt: &[u8],
+) -> Result<Vec<GroupState>> {
+    let bs = layout.block_size as u64;
+    let desc_size = layout.desc_size;
+    let group_csum = sb.feature_ro_compat
+        & (constants::feature::RO_COMPAT_GDT_CSUM | constants::feature::RO_COMPAT_METADATA_CSUM)
+        != 0;
+    let mut groups = Vec::with_capacity(layout.groups.len());
+    for i in 0..layout.groups.len() {
+        let off = i * desc_size;
+        let mut desc = GroupDesc::decode(&gdt[off..off + constants::GROUP_DESC_SIZE]);
+        // The metadata positions in `layout.groups[i]` were *computed*
+        // assuming the classic contiguous layout. With flex_bg (and in
+        // general for any third-party writer) the descriptor is the
+        // authoritative source — overwrite the computed positions with
+        // the on-disk pointers so inode/bitmap reads land correctly.
+        layout.groups[i].block_bitmap = desc.block_bitmap;
+        layout.groups[i].inode_bitmap = desc.inode_bitmap;
+        layout.groups[i].inode_table = desc.inode_table;
+        let mut block_bitmap = vec![0u8; bs as usize];
+        let mut inode_bitmap = vec![0u8; bs as usize];
+        let mut zero_itable_from = None;
+        if group_csum && desc.flags & group::BG_BLOCK_UNINIT != 0 {
+            block_bitmap = synth_block_bitmap(layout, sb, i, &desc);
+            desc.flags &= !group::BG_BLOCK_UNINIT;
+        } else {
+            dev.read_at(desc.block_bitmap as u64 * bs, &mut block_bitmap)?;
+        }
+        if group_csum && desc.flags & group::BG_INODE_UNINIT != 0 {
+            // Never-written inode bitmap: every inode is free. Pad the
+            // bits past `inodes_per_group` like the writer does.
+            for bit in layout.inodes_per_group..(bs as u32 * 8) {
+                set_bit(&mut inode_bitmap, bit);
+            }
+            desc.flags &= !group::BG_INODE_UNINIT;
+        } else {
+            dev.read_at(desc.inode_bitmap as u64 * bs, &mut inode_bitmap)?;
+        }
+        if group_csum && desc.flags & group::BG_INODE_ZEROED == 0 {
+            // The inode table past the used prefix was never zeroed
+            // (mke2fs's lazy_itable_init). Remember where the garbage
+            // starts so the first flush that lands an inode here zeroes
+            // it, exactly as the kernel's `ext4_init_inode_table` would.
+            let ipg = layout.inodes_per_group;
+            let used = ipg.saturating_sub(desc.itable_unused as u32);
+            let used_blks = (used as u64 * layout.inode_size as u64)
+                .div_ceil(bs)
+                .min(u32::MAX as u64);
+            zero_itable_from = Some(used_blks as u32);
+        }
+        groups.push(GroupState {
+            block_bitmap,
+            inode_bitmap,
+            desc,
+            next_free_block_bit: 0,
+            zero_itable_from,
+        });
+    }
+    Ok(groups)
+}
+
+/// Synthesise the block bitmap of a `BG_BLOCK_UNINIT` group the way the
+/// kernel's `ext4_init_block_bitmap` does: the group's superblock
+/// backup + GDT + reserved GDT blocks (when it has a backup), its own
+/// block bitmap, inode bitmap and inode table when they lie inside the
+/// group (with flex_bg they may live in the flex leader, whose bitmap
+/// mke2fs always writes), and every bit past the group's last block.
+fn synth_block_bitmap(layout: &Layout, sb: &Superblock, gi: usize, desc: &GroupDesc) -> Vec<u8> {
+    let bs = layout.block_size;
+    let g = layout.groups[gi];
+    let mut bm = vec![0u8; bs as usize];
+    let group_blocks = g.end_block - g.start_block + 1;
+    let in_group = |blk: u32| blk >= g.start_block && blk <= g.end_block;
+    if g.has_superblock {
+        let n = 1u32
+            .saturating_add(layout.gdt_blocks)
+            .saturating_add(sb.reserved_gdt_blocks as u32)
+            .min(group_blocks);
+        for bit in 0..n {
+            set_bit(&mut bm, bit);
+        }
+    }
+    for blk in [desc.block_bitmap, desc.inode_bitmap] {
+        if in_group(blk) {
+            set_bit(&mut bm, blk - g.start_block);
+        }
+    }
+    for k in 0..layout.inode_table_blocks {
+        let blk = desc.inode_table.saturating_add(k);
+        if in_group(blk) {
+            set_bit(&mut bm, blk - g.start_block);
+        }
+    }
+    for bit in group_blocks..(bs * 8) {
+        set_bit(&mut bm, bit);
+    }
+    bm
 }
 
 /// Stamp the `metadata_csum` inode checksum into a full on-disk inode
