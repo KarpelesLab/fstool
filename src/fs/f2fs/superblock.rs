@@ -15,6 +15,17 @@ use crate::block::BlockDevice;
 pub const F2FS_MAGIC: u32 = 0xF2F5_2010;
 /// Byte offset of the primary superblock copy.
 pub const SB_OFFSET_PRIMARY: u64 = 1024;
+
+/// Byte offset of `cp_payload` inside a `struct f2fs_super_block`.
+/// Everything before it is fixed-size: the header through `meta_ino`
+/// (0x6C), a 16-byte uuid, `volume_name[512]` UTF-16 code units
+/// (0x7C..0x47C), `extension_count` (0x47C) and `extension_list[64][8]`
+/// (0x480..0x680).
+pub const CP_PAYLOAD_OFFSET: usize = 0x680;
+
+/// Bytes of the superblock we read and decode. Enough to reach
+/// [`CP_PAYLOAD_OFFSET`]; the struct itself runs to 0xC00.
+pub const SB_DECODE_LEN: usize = CP_PAYLOAD_OFFSET + 4;
 /// Byte offset of the backup superblock copy.
 pub const SB_OFFSET_BACKUP: u64 = 1024 + 0x1000;
 
@@ -142,11 +153,17 @@ impl Superblock {
             String::new()
         };
 
-        // cp_payload sits in the trailing area of the SB (after volume
-        // name and extension list). 0x3FC is the well-known offset used
-        // by mkfs.f2fs to stash this value; if the read region is too
-        // short we default to 0 (the common case for small images).
-        let cp_payload = if buf.len() >= 0x400 { r32(0x3F8) } else { 0 };
+        // `cp_payload` follows the volume name (0x7C, 512 UTF-16 code
+        // units → ends 0x47C), `extension_count` (0x47C) and
+        // `extension_list[64][8]` (0x480 → ends 0x680), so it sits at
+        // 0x680 — not inside the volume name where we used to read it.
+        // A caller that handed us only the first 0x400 bytes gets 0,
+        // the value every image this crate writes carries anyway.
+        let cp_payload = if buf.len() >= CP_PAYLOAD_OFFSET + 4 {
+            r32(CP_PAYLOAD_OFFSET)
+        } else {
+            0
+        };
 
         Some(Self {
             magic,
@@ -212,7 +229,11 @@ pub fn load(dev: &mut dyn BlockDevice) -> Result<Superblock> {
         ));
     }
     let total_size = dev.total_size();
-    let mut buf = vec![0u8; 0x400];
+    // Read far enough to reach `cp_payload`, but never past the end of
+    // the device: the minimum size check above only guarantees the two
+    // 0x400-byte heads, and `decode` copes with a short tail.
+    let want = SB_DECODE_LEN.min((total_size - SB_OFFSET_BACKUP) as usize);
+    let mut buf = vec![0u8; want];
     dev.read_at(SB_OFFSET_PRIMARY, &mut buf)?;
     if let Some(sb) = Superblock::decode(&buf) {
         return validate_geometry(sb, total_size);

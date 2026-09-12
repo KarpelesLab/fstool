@@ -1357,8 +1357,10 @@ impl Writer {
             dev.write_at(ino.on_disk_block as u64 * bs, &blk)?;
         }
 
-        // 5) NAT — write both halves (we don't distinguish active/shadow
-        //    on a fresh image). Each pack maps nid → (version, ino, block).
+        // 5) NAT — write both copies of every page (a fresh image leaves
+        //    the NAT version bitmap all-zero, so the reader always takes
+        //    the first of each pair; the shadow just has to be valid
+        //    too). Each page maps nid → (version, ino, block).
         let nat_pages_per_pack =
             (self.geom.segment_count_nat * self.geom.blocks_per_seg) as usize / 2;
         let mut pages: Vec<Vec<(u8, u32, u32)>> = vec![Vec::new(); nat_pages_per_pack];
@@ -1401,10 +1403,18 @@ impl Writer {
             // mkfs.f2fs uses version=0 across the board on a fresh image.
             pages[page_idx][slot] = (0, owner, blk);
         }
+        // Placement must match the kernel's `current_nat_addr()`: the two
+        // copies of a logical page interleave one segment at a time, so
+        // page `q * blocks_per_seg + r` sits at `2 * q * blocks_per_seg +
+        // r` with its shadow a segment later — not at `pidx` and
+        // `pidx + nat_pages_per_pack`, which only coincide while the NAT
+        // is exactly two segments.
+        let bps = self.geom.blocks_per_seg;
         for (pidx, slots) in pages.iter().enumerate() {
             let page = super::format::encode_nat_page(slots);
-            for half in [0u32, 1u32] {
-                let phys = self.geom.nat_blkaddr + half * (nat_pages_per_pack as u32) + pidx as u32;
+            let (q, r) = (pidx as u32 / bps, pidx as u32 % bps);
+            let first = self.geom.nat_blkaddr + 2 * q * bps + r;
+            for phys in [first, first + bps] {
                 dev.write_at(phys as u64 * bs, &page)?;
             }
         }
@@ -1632,6 +1642,7 @@ impl Writer {
             sit_ver_bitmap_bytesize,
             cur_nat_pack: 0,
             cur_sit_pack: 0,
+            nat_bitmap: Vec::new(),
             nat_journal: Vec::new(),
             cur_node_segno,
             cur_node_blkoff,

@@ -12,7 +12,11 @@
 use crate::Result;
 use crate::block::BlockDevice;
 
-use super::constants::{CP_COMPACT_SUM_FLAG, F2FS_BLK_CSUM_OFFSET, F2FS_BLKSIZE, NAT_ENTRY_SIZE};
+use super::constants::{
+    CP_CHKSUM_OFFSET, CP_COMPACT_SUM_FLAG, CP_LARGE_NAT_BITMAP_FLAG, CP_MIN_CHKSUM_OFFSET,
+    F2FS_BLK_CSUM_OFFSET, F2FS_BLKSIZE, NAT_JOURNAL_ENTRIES, NAT_JOURNAL_ENTRY_SIZE,
+    SUM_ENTRY_SIZE,
+};
 use super::superblock::Superblock;
 
 /// Logical view of a parsed checkpoint pack head.
@@ -52,6 +56,10 @@ pub struct Checkpoint {
     pub cur_nat_pack: u8,
     /// 0 or 1 — which copy of the SIT is current.
     pub cur_sit_pack: u8,
+    /// The NAT version bitmap, one bit per logical NAT page, selecting
+    /// which of that page's two physical copies is current. Located per
+    /// `__bitmap_ptr(NAT_BITMAP)`; empty when the CP declares no bitmap.
+    pub nat_bitmap: Vec<u8>,
     /// Raw NAT journal entries: list of `(nid, ino, block_addr, version)`
     /// pulled from the cp_pack_start_sum block. Newer than the on-disk
     /// NAT pages and must be consulted first.
@@ -131,36 +139,40 @@ impl Checkpoint {
         let cp = decode_cp_head(&head, head_blkaddr)?;
 
         // The CRC lives at the byte offset given by the on-disk
-        // `checksum_offset` field (at +0xA4). It covers bytes 0..crc_off.
-        // mkfs.f2fs defaults this to 4092 (F2FS_BLK_CSUM_OFFSET); fsck
-        // accepts other positions if `checksum_offset` agrees. We
-        // tolerate any value in `[0xA8, F2FS_BLKSIZE-4]`.
+        // `checksum_offset` field (at +0xA4). `get_checkpoint_version()`
+        // rejects anything outside
+        // `[CP_MIN_CHKSUM_OFFSET, CP_CHKSUM_OFFSET]`.
         let crc_off = u32::from_le_bytes(head[0xA4..0xA8].try_into().unwrap()) as usize;
-        let crc_off = if (0xA8..=F2FS_BLK_CSUM_OFFSET).contains(&crc_off) {
-            crc_off
-        } else {
-            F2FS_BLK_CSUM_OFFSET
-        };
+        if !(CP_MIN_CHKSUM_OFFSET..=CP_CHKSUM_OFFSET).contains(&crc_off) {
+            return Err(crate::Error::InvalidImage(format!(
+                "f2fs: cp@{head_blkaddr}: checksum_offset {crc_off} out of range"
+            )));
+        }
         let want = u32::from_le_bytes(head[crc_off..crc_off + 4].try_into().unwrap());
-        let got = super::constants::f2fs_crc32(&head[..crc_off]);
+        let got = cp_chksum(&head, crc_off);
         if got != want {
             return Err(crate::Error::InvalidImage(format!(
                 "f2fs: cp@{head_blkaddr}: crc mismatch (want {want:08x}, got {got:08x})"
             )));
         }
 
-        // The NAT journal lives in the cp_pack_start_sum block (the first
-        // summary page in the pack). We only pull entries when the pack
-        // sets CP_COMPACT_SUM_FLAG OR when the summary is one block —
-        // for v1 we treat any non-empty entry list optimistically.
+        // The NAT journal lives in the pack's first summary block
+        // (`cp_pack_start_sum`). With CP_COMPACT_SUM_FLAG that block is
+        // a bare pair of journals and the NAT one starts at byte 0
+        // (`read_compacted_summaries`); otherwise the block is the
+        // HOT_DATA `f2fs_summary_block` and its `journal` member sits
+        // after the 512 summary entries, at SUM_ENTRY_SIZE.
         let sum_block = head_blkaddr
             .checked_add(cp.cp_pack_start_sum)
             .ok_or_else(|| crate::Error::InvalidImage("f2fs: cp summary overflow".into()))?;
         let mut sumbuf = vec![0u8; F2FS_BLKSIZE];
         dev.read_at(sum_block as u64 * bs, &mut sumbuf)?;
-        let nat_journal = decode_nat_journal(&sumbuf);
+        let compact = cp.flags & CP_COMPACT_SUM_FLAG != 0;
+        let nat_journal = decode_nat_journal(&sumbuf, compact);
 
         let mut out = cp;
+        out.cp_payload = sb.cp_payload;
+        out.nat_bitmap = load_nat_bitmap(dev, sb, &head, &out)?;
         out.nat_journal = nat_journal;
         Ok(out)
     }
@@ -242,6 +254,7 @@ fn decode_cp_head(buf: &[u8], head_blkaddr: u32) -> Result<Checkpoint> {
         sit_ver_bitmap_bytesize,
         cur_nat_pack: 0,
         cur_sit_pack: 0,
+        nat_bitmap: Vec::new(),
         nat_journal: Vec::new(),
         cur_node_segno,
         cur_node_blkoff,
@@ -254,39 +267,114 @@ fn decode_cp_head(buf: &[u8], head_blkaddr: u32) -> Result<Checkpoint> {
     })
 }
 
-/// Decode the NAT journal at the head of the cp_pack_start_sum block.
+/// Offset of `f2fs_checkpoint::sit_nat_version_bitmap`.
+const SIT_NAT_VERSION_BITMAP_OFFSET: usize = 0xC0;
+
+/// Read the NAT version bitmap out of a CP pack, following
+/// `__bitmap_ptr(sbi, NAT_BITMAP)`:
 ///
-/// In a real F2FS image this lives inside a compact or normal summary
-/// footer. For v1 we encode a minimal-but-compatible layout:
+/// - with `CP_LARGE_NAT_BITMAP_FLAG` the bitmaps are checksum-protected
+///   and the NAT one starts one `__le32` past the bitmap area;
+/// - with `cp_payload > 0` the NAT bitmap starts at the bitmap area and
+///   may run on into the payload blocks that follow the head block;
+/// - otherwise the SIT bitmap comes first and the NAT one follows it.
+fn load_nat_bitmap(
+    dev: &mut dyn BlockDevice,
+    sb: &Superblock,
+    head: &[u8],
+    cp: &Checkpoint,
+) -> Result<Vec<u8>> {
+    let len = cp.nat_ver_bitmap_bytesize as usize;
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let large = cp.flags & CP_LARGE_NAT_BITMAP_FLAG != 0;
+    let start = if large {
+        SIT_NAT_VERSION_BITMAP_OFFSET + 4
+    } else if cp.cp_payload > 0 {
+        SIT_NAT_VERSION_BITMAP_OFFSET
+    } else {
+        SIT_NAT_VERSION_BITMAP_OFFSET + cp.sit_ver_bitmap_bytesize as usize
+    };
+    // The checkpoint is (1 + cp_payload) contiguous blocks; a bitmap
+    // that claims to run past them is a malformed image, not a reason
+    // to allocate.
+    let span = (1 + cp.cp_payload as usize).saturating_mul(F2FS_BLKSIZE);
+    if start >= span || len > span - start {
+        return Err(crate::Error::InvalidImage(format!(
+            "f2fs: cp@{}: NAT bitmap ({len} bytes at {start}) overruns the pack",
+            cp.head_blkaddr
+        )));
+    }
+    let mut pack = head.to_vec();
+    if start + len > pack.len() {
+        let bs = sb.block_size() as u64;
+        let extra = (start + len).div_ceil(F2FS_BLKSIZE) - 1;
+        for i in 0..extra {
+            let blk = cp
+                .head_blkaddr
+                .checked_add(1 + i as u32)
+                .ok_or_else(|| crate::Error::InvalidImage("f2fs: cp payload overflow".into()))?;
+            let mut buf = vec![0u8; F2FS_BLKSIZE];
+            dev.read_at(blk as u64 * bs, &mut buf)?;
+            pack.extend_from_slice(&buf);
+        }
+    }
+    Ok(pack[start..start + len].to_vec())
+}
+
+/// Byte offset of the `f2fs_journal` inside the `cp_pack_start_sum`
+/// block. A compact summary block opens with the NAT journal; a normal
+/// one carries it after the 512 `f2fs_summary` entries.
+pub(crate) fn nat_journal_offset(compact: bool) -> usize {
+    if compact { 0 } else { SUM_ENTRY_SIZE }
+}
+
+/// Compute a CP head block's checksum the way `f2fs_checkpoint_chksum()`
+/// does: CRC32 over `[0, crc_off)` and, whenever the CRC does *not* sit
+/// in the block's last four bytes, continued over everything after it,
+/// `[crc_off + 4, F2FS_BLKSIZE)`. Skipping that tail let an image with a
+/// non-default `checksum_offset` pass validation with a corrupt (or
+/// forged) second half.
+pub(crate) fn cp_chksum(block: &[u8], crc_off: usize) -> u32 {
+    let head = super::constants::f2fs_crc32(&block[..crc_off]);
+    if crc_off < CP_CHKSUM_OFFSET {
+        crate::crc::crc32_ieee_raw(head, &block[crc_off + 4..F2FS_BLKSIZE])
+    } else {
+        head
+    }
+}
+
+/// Decode the NAT journal held in the `cp_pack_start_sum` block.
 ///
-/// - bytes 0..2   : `n_nats` (le u16) — number of journal entries
-/// - bytes 2..4   : reserved
-/// - bytes 4.. n*16  : entries, each `nid (u32) | ino (u32) | block_addr
-///                    (u32) | version (u8) | pad (3 B)`.
+/// Layout is `struct f2fs_journal` from `include/linux/f2fs_fs.h`:
 ///
-/// Standard F2FS uses a packed `(u32 nid, f2fs_nat_entry)` representation
-/// — we widen to a fixed 16-byte stride for simpler decoding while
-/// staying inside the same block.
-fn decode_nat_journal(buf: &[u8]) -> Vec<NatJournalEntry> {
-    if buf.len() < 4 {
+/// ```text
+/// +0      __le16 n_nats
+/// +2      struct nat_journal_entry entries[NAT_JOURNAL_ENTRIES]
+/// ```
+///
+/// each entry a packed 13 bytes — `__le32 nid` followed by
+/// `struct f2fs_nat_entry { __u8 version; __le32 ino; __le32 block_addr; }`.
+/// `compact` selects where the journal starts inside the block; see
+/// [`nat_journal_offset`].
+fn decode_nat_journal(buf: &[u8], compact: bool) -> Vec<NatJournalEntry> {
+    let base = nat_journal_offset(compact);
+    if buf.len() < base + 2 {
         return Vec::new();
     }
-    let n = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-    // Defensive: a malicious image can't drag us past the block.
-    let stride = 16usize;
-    let max = (buf.len().saturating_sub(4)) / stride;
-    let n = n.min(max);
+    let n = u16::from_le_bytes([buf[base], buf[base + 1]]) as usize;
+    // Defensive: a crafted image can't push us past the journal area.
+    let room = (buf.len() - base - 2) / NAT_JOURNAL_ENTRY_SIZE;
+    let n = n.min(NAT_JOURNAL_ENTRIES).min(room);
 
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
-        let o = 4 + i * stride;
-        if o + stride > buf.len() {
-            break;
-        }
+        let o = base + 2 + i * NAT_JOURNAL_ENTRY_SIZE;
         let nid = u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
-        let ino = u32::from_le_bytes(buf[o + 4..o + 8].try_into().unwrap());
-        let block_addr = u32::from_le_bytes(buf[o + 8..o + 12].try_into().unwrap());
-        let version = buf[o + 12];
+        let version = buf[o + 4];
+        let ino = u32::from_le_bytes(buf[o + 5..o + 9].try_into().unwrap());
+        let block_addr = u32::from_le_bytes(buf[o + 9..o + 13].try_into().unwrap());
         out.push(NatJournalEntry {
             nid,
             ino,
@@ -337,7 +425,7 @@ pub(crate) fn encode_cp_head_writer(cp: &Checkpoint) -> Vec<u8> {
     // (= F2FS_BLK_CSUM_OFFSET, last 4 bytes of the block).
     let crc_off = F2FS_BLK_CSUM_OFFSET as u32;
     buf[0xA4..0xA8].copy_from_slice(&crc_off.to_le_bytes());
-    let crc = super::constants::f2fs_crc32(&buf[..F2FS_BLK_CSUM_OFFSET]);
+    let crc = cp_chksum(&buf, F2FS_BLK_CSUM_OFFSET);
     buf[F2FS_BLK_CSUM_OFFSET..F2FS_BLK_CSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
     buf
 }
@@ -352,21 +440,22 @@ pub(crate) fn encode_empty_journal_block() -> Vec<u8> {
     encode_nat_journal_block_writer(&[])
 }
 
-/// Encode a NAT-journal block. Layout mirrors [`decode_nat_journal`].
+/// Encode a non-compact `cp_pack_start_sum` block carrying `entries` in
+/// its NAT journal. Layout mirrors [`decode_nat_journal`]; entries past
+/// `NAT_JOURNAL_ENTRIES` don't fit the journal and are dropped (the
+/// kernel spills those to the on-disk NAT pages instead).
 #[allow(dead_code)]
 pub(crate) fn encode_nat_journal_block_writer(entries: &[NatJournalEntry]) -> Vec<u8> {
     let mut buf = vec![0u8; F2FS_BLKSIZE];
-    buf[0..2].copy_from_slice(&(entries.len() as u16).to_le_bytes());
-    let stride = 16usize;
-    for (i, e) in entries.iter().enumerate() {
-        let o = 4 + i * stride;
-        if o + stride > buf.len() {
-            break;
-        }
+    let base = nat_journal_offset(false);
+    let n = entries.len().min(NAT_JOURNAL_ENTRIES);
+    buf[base..base + 2].copy_from_slice(&(n as u16).to_le_bytes());
+    for (i, e) in entries.iter().take(n).enumerate() {
+        let o = base + 2 + i * NAT_JOURNAL_ENTRY_SIZE;
         buf[o..o + 4].copy_from_slice(&e.nid.to_le_bytes());
-        buf[o + 4..o + 8].copy_from_slice(&e.ino.to_le_bytes());
-        buf[o + 8..o + 12].copy_from_slice(&e.block_addr.to_le_bytes());
-        buf[o + 12] = e.version;
+        buf[o + 4] = e.version;
+        buf[o + 5..o + 9].copy_from_slice(&e.ino.to_le_bytes());
+        buf[o + 9..o + 13].copy_from_slice(&e.block_addr.to_le_bytes());
     }
     buf
 }
@@ -383,9 +472,94 @@ pub(crate) fn encode_nat_journal_block(entries: &[NatJournalEntry]) -> Vec<u8> {
     encode_nat_journal_block_writer(entries)
 }
 
-// Silence unused-import warnings when CP_COMPACT_SUM_FLAG isn't read in
-// the cut-down v1.
-#[allow(dead_code)]
-const _CP_FLAGS_REFERENCED: u32 = CP_COMPACT_SUM_FLAG;
-#[allow(dead_code)]
-const _NAT_SIZE_REFERENCED: usize = NAT_ENTRY_SIZE;
+#[cfg(test)]
+mod tests {
+    use super::super::constants::SUM_JOURNAL_SIZE;
+    use super::*;
+
+    /// `f2fs_checkpoint_chksum()` keeps CRCing past the checksum field
+    /// whenever it isn't the last thing in the block. Ignoring that tail
+    /// lets everything after `checksum_offset` be rewritten freely.
+    #[test]
+    fn cp_checksum_covers_the_tail_after_the_crc() {
+        let mut block = vec![0u8; F2FS_BLKSIZE];
+        for (i, b) in block.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let off = CP_MIN_CHKSUM_OFFSET;
+        let full = cp_chksum(&block, off);
+        let head_only = super::super::constants::f2fs_crc32(&block[..off]);
+        assert_ne!(full, head_only, "the tail must contribute");
+        // Changing a byte after the checksum field changes the result.
+        let mut tampered = block.clone();
+        tampered[F2FS_BLKSIZE - 1] ^= 0xFF;
+        assert_ne!(cp_chksum(&tampered, off), full);
+        // Changing the four bytes of the checksum field itself does not.
+        let mut restamped = block.clone();
+        restamped[off..off + 4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        assert_eq!(cp_chksum(&restamped, off), full);
+        // At the canonical offset there is no tail, so it degenerates to
+        // a plain CRC of everything before the field.
+        assert_eq!(
+            cp_chksum(&block, CP_CHKSUM_OFFSET),
+            super::super::constants::f2fs_crc32(&block[..CP_CHKSUM_OFFSET])
+        );
+    }
+
+    /// The journal is `struct f2fs_journal`: `__le16 n_nats` then packed
+    /// 13-byte `nat_journal_entry`s, each `nid` followed by a
+    /// `f2fs_nat_entry` whose `version` comes *before* ino/block_addr.
+    #[test]
+    fn nat_journal_matches_the_kernel_layout() {
+        assert_eq!(SUM_ENTRY_SIZE, 3584);
+        assert_eq!(NAT_JOURNAL_ENTRY_SIZE, 13);
+        assert_eq!(NAT_JOURNAL_ENTRIES, 38);
+
+        let entries = vec![
+            NatJournalEntry {
+                nid: 4,
+                ino: 4,
+                block_addr: 0x1234,
+                version: 7,
+            },
+            NatJournalEntry {
+                nid: 9,
+                ino: 3,
+                block_addr: 0x5678,
+                version: 0,
+            },
+        ];
+        let blk = encode_nat_journal_block_writer(&entries);
+        // Bytes land in the summary block's journal member, not at 0.
+        let base = SUM_ENTRY_SIZE;
+        assert_eq!(&blk[..base], &vec![0u8; base][..]);
+        assert_eq!(u16::from_le_bytes([blk[base], blk[base + 1]]), 2);
+        assert_eq!(&blk[base + 2..base + 6], &4u32.to_le_bytes());
+        assert_eq!(blk[base + 6], 7);
+        assert_eq!(&blk[base + 7..base + 11], &4u32.to_le_bytes());
+        assert_eq!(&blk[base + 11..base + 15], &0x1234u32.to_le_bytes());
+
+        let back = decode_nat_journal(&blk, false);
+        assert_eq!(back.len(), 2);
+        assert_eq!((back[0].nid, back[0].ino, back[0].version), (4, 4, 7));
+        assert_eq!(back[1].block_addr, 0x5678);
+        // Read as a compact block the same bytes decode to nothing: the
+        // journal would start at offset 0 there.
+        assert!(decode_nat_journal(&blk, true).is_empty());
+
+        // A compact pack carries the journal at offset 0.
+        let mut compact = vec![0u8; F2FS_BLKSIZE];
+        compact[..SUM_JOURNAL_SIZE].copy_from_slice(&blk[base..base + SUM_JOURNAL_SIZE]);
+        let back = decode_nat_journal(&compact, true);
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[1].nid, 9);
+    }
+
+    /// A bogus `n_nats` can't walk us out of the journal area.
+    #[test]
+    fn nat_journal_entry_count_is_clamped() {
+        let mut blk = vec![0u8; F2FS_BLKSIZE];
+        blk[SUM_ENTRY_SIZE..SUM_ENTRY_SIZE + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(decode_nat_journal(&blk, false).len(), NAT_JOURNAL_ENTRIES);
+    }
+}

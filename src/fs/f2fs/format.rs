@@ -263,7 +263,7 @@ pub(crate) fn write_superblocks(
     geom: &Geometry,
     opts: &FormatOpts,
 ) -> Result<()> {
-    let mut buf = vec![0u8; 0x400];
+    let mut buf = vec![0u8; super::superblock::SB_DECODE_LEN];
     buf[0x00..0x04].copy_from_slice(&F2FS_MAGIC.to_le_bytes());
     buf[0x04..0x06].copy_from_slice(&1u16.to_le_bytes()); // major_ver
     buf[0x06..0x08].copy_from_slice(&15u16.to_le_bytes()); // minor_ver
@@ -318,8 +318,11 @@ pub(crate) fn write_superblocks(
         buf[o..o + 2].copy_from_slice(&c.to_le_bytes());
     }
 
-    // cp_payload (0 for our small / single-pack layout).
-    buf[0x3F8..0x3FC].copy_from_slice(&0u32.to_le_bytes());
+    // cp_payload (0 for our small / single-pack layout). It follows the
+    // volume name and the extension list; 0x3F8 — where this used to go
+    // — is inside `volume_name`.
+    buf[super::superblock::CP_PAYLOAD_OFFSET..super::superblock::CP_PAYLOAD_OFFSET + 4]
+        .copy_from_slice(&0u32.to_le_bytes());
 
     dev.write_at(SB_OFFSET_PRIMARY, &buf)?;
     dev.write_at(SB_OFFSET_BACKUP, &buf)?;

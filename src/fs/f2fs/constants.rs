@@ -52,6 +52,26 @@ pub const NAT_ENTRY_SIZE: usize = 9;
 /// NAT entries per NAT page: floor(4096 / 9) = 455.
 pub const NAT_ENTRY_PER_BLOCK: usize = F2FS_BLKSIZE / NAT_ENTRY_SIZE;
 
+/// Summary-block layout (`struct f2fs_summary_block`). 512 seven-byte
+/// `f2fs_summary` entries, then the journal, then a five-byte footer.
+pub const SUMMARY_SIZE: usize = 7;
+pub const ENTRIES_IN_SUM: usize = F2FS_BLKSIZE / 8;
+pub const SUM_ENTRY_SIZE: usize = SUMMARY_SIZE * ENTRIES_IN_SUM;
+pub const SUM_FOOTER_SIZE: usize = 5;
+/// Bytes a `struct f2fs_journal` occupies inside a summary block.
+pub const SUM_JOURNAL_SIZE: usize = F2FS_BLKSIZE - SUM_FOOTER_SIZE - SUM_ENTRY_SIZE;
+/// `struct nat_journal_entry` = `__le32 nid` + `struct f2fs_nat_entry`.
+pub const NAT_JOURNAL_ENTRY_SIZE: usize = 4 + NAT_ENTRY_SIZE;
+/// How many NAT entries the journal can hold (`NAT_JOURNAL_ENTRIES`).
+/// The leading `__le16 n_nats` eats the first two bytes.
+pub const NAT_JOURNAL_ENTRIES: usize = (SUM_JOURNAL_SIZE - 2) / NAT_JOURNAL_ENTRY_SIZE;
+
+/// Lowest / highest `checksum_offset` a CP head may declare
+/// (`CP_MIN_CHKSUM_OFFSET` = `offsetof(f2fs_checkpoint,
+/// sit_nat_version_bitmap)`, `CP_CHKSUM_OFFSET`).
+pub const CP_MIN_CHKSUM_OFFSET: usize = 0xC0;
+pub const CP_CHKSUM_OFFSET: usize = F2FS_BLK_CSUM_OFFSET;
+
 /// Dentry block layout — 27-byte bitmap + 3 reserved + 11 × 214 dentries +
 /// 8 × 214 filenames = 4096 bytes total.
 pub const NR_DENTRY_IN_BLOCK: usize = 214;

@@ -136,6 +136,7 @@ impl F2fs {
                 sit_ver_bitmap_bytesize: 64,
                 cur_nat_pack: 0,
                 cur_sit_pack: 0,
+                nat_bitmap: Vec::new(),
                 nat_journal: Vec::new(),
                 cur_node_segno: [0, 1, 2],
                 cur_node_blkoff: [0, 0, 0],
@@ -837,6 +838,7 @@ mod tests {
             sit_ver_bitmap_bytesize: 64,
             cur_nat_pack: 0,
             cur_sit_pack: 0,
+            nat_bitmap: Vec::new(),
             nat_journal: Vec::new(),
             cur_node_segno: [0, 1, 2],
             cur_node_blkoff: [0, 0, 0],
@@ -1030,6 +1032,7 @@ mod tests {
             sit_ver_bitmap_bytesize: 0,
             cur_nat_pack: 1,
             cur_sit_pack: 1,
+            nat_bitmap: Vec::new(),
             nat_journal: Vec::new(),
             cur_node_segno: [0, 1, 2],
             cur_node_blkoff: [0, 0, 0],
@@ -1319,6 +1322,7 @@ mod tests {
             sit_ver_bitmap_bytesize: 64,
             cur_nat_pack: 0,
             cur_sit_pack: 0,
+            nat_bitmap: Vec::new(),
             nat_journal: Vec::new(),
             cur_node_segno: [0, 1, 2],
             cur_node_blkoff: [0, 0, 0],
@@ -1839,6 +1843,31 @@ mod tests {
         let pipe = ro.getattr(&mut dev, std::path::Path::new("/pipe")).unwrap();
         assert_eq!(pipe.kind, crate::fs::EntryKind::Fifo);
         assert_eq!(pipe.rdev, 0);
+    }
+
+    /// `cp_payload` lives at 0x680, after the volume name and the
+    /// extension list. It used to be read and written at 0x3F8, which is
+    /// inside `volume_name[512]` — a label longer than 446 characters
+    /// therefore turned into a nonzero `cp_payload` on reopen.
+    #[test]
+    fn cp_payload_is_not_inside_the_volume_name() {
+        let mut dev = MemoryBackend::new(2 * 1024 * 1024);
+        let opts = super::FormatOpts {
+            log_blocks_per_seg: 2,
+            volume_label: "L".repeat(500),
+            ..super::FormatOpts::default()
+        };
+        let mut fs = F2fs::format(&mut dev, &opts).unwrap();
+        fs.flush(&mut dev).unwrap();
+        // The label really does cover the old offset.
+        let mut probe = [0u8; 4];
+        dev.read_at(SB_OFFSET_PRIMARY + 0x3F8, &mut probe).unwrap();
+        assert_eq!(probe, [b'L', 0, b'L', 0]);
+        let sb = superblock::load(&mut dev).unwrap();
+        assert_eq!(sb.cp_payload, 0);
+        assert!(sb.volume_name.starts_with("LLLL"));
+        // Reopening is what actually breaks when cp_payload is garbage.
+        F2fs::open(&mut dev).unwrap();
     }
 
     /// Hard-linking a directory is forbidden by POSIX; the writer must say
