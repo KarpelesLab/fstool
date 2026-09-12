@@ -187,7 +187,10 @@ pub fn decode_des_etc(buf: &mut [u8], flag_type: u8, mut cycle: i32) {
             bit_convert(chunk, &BIT_SWAP_TABLE_2);
         } else if cnt == 7 && flag_type == 0 {
             let tmp = *chunk;
-            cnt = 0;
+            // The reference (eAthena grfio.c / libgrf) resets `cnt` and then
+            // still runs its unconditional `cnt++` for this block, so the
+            // next shuffle lands 7 non-DES blocks later, not 8.
+            cnt = 1;
             chunk[0] = tmp[3];
             chunk[1] = tmp[4];
             chunk[2] = tmp[6];
@@ -271,6 +274,33 @@ mod tests {
         let original = buf;
         decode_des_etc(&mut buf, 0, 1);
         assert_eq!(buf, original);
+    }
+
+    /// MIXCRYPT shuffle schedule, checked against the reference loop
+    /// (`if (cnt==7 && type==0) { …; cnt=0; } cnt++;`): after the 20
+    /// leading DES blocks, the byte shuffle hits the 8th non-DES block and
+    /// then every 7th one after it (blocks 27, 34, 41, …), never every 8th.
+    #[test]
+    fn decode_des_etc_shuffle_period_matches_reference() {
+        // cycle=100 → 115 after the bump, so no `lop % cycle == 0` DES
+        // blocks land inside the range we inspect (20..50).
+        const BLOCKS: usize = 50;
+        let pattern = [0u8, 1, 2, 3, 4, 5, 6, 0x10];
+        let shuffled = [3u8, 4, 6, 0, 1, 2, 5, 0x10];
+        let mut buf = Vec::new();
+        for _ in 0..BLOCKS {
+            buf.extend_from_slice(&pattern);
+        }
+        decode_des_etc(&mut buf, 0, 100);
+        for blk in 20..BLOCKS {
+            let got: [u8; 8] = buf[blk * 8..blk * 8 + 8].try_into().unwrap();
+            let expect_shuffle = blk >= 27 && (blk - 27) % 7 == 0;
+            if expect_shuffle {
+                assert_eq!(got, shuffled, "block {blk} should be shuffled");
+            } else {
+                assert_eq!(got, pattern, "block {blk} should be untouched");
+            }
+        }
     }
 
     #[test]
