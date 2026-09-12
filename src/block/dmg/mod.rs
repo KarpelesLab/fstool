@@ -231,6 +231,10 @@ pub struct DmgBackend {
     /// a binary search; on a 100 GB image with thousands of chunks
     /// the linear cost would otherwise dominate every read.
     chunks: Vec<Chunk>,
+    /// The most recently decoded chunk (index into `chunks`, plaintext),
+    /// so a run of small reads inside one chunk inflates it once rather
+    /// than once per read.
+    decoded: Option<(usize, Vec<u8>)>,
 }
 
 impl DmgBackend {
@@ -261,6 +265,25 @@ impl DmgBackend {
             .sector_count
             .checked_mul(512)
             .ok_or_else(|| crate::Error::InvalidImage("dmg: sector_count overflows u64".into()))?;
+
+        // The data fork has to lie inside the file. Every per-chunk bound
+        // below is relative to `data_fork_length`, so without this a
+        // descriptor could declare an exabyte fork and have a chunk's
+        // `compressed_length` size an allocation the file can never back.
+        let fork_end = trailer
+            .data_fork_offset
+            .checked_add(trailer.data_fork_length)
+            .ok_or_else(|| {
+                crate::Error::InvalidImage("dmg: data fork extent overflows u64".into())
+            })?;
+        if fork_end > meta.len() {
+            return Err(crate::Error::InvalidImage(format!(
+                "dmg: data fork (offset {} + length {} = {fork_end}) exceeds file length {}",
+                trailer.data_fork_offset,
+                trailer.data_fork_length,
+                meta.len()
+            )));
+        }
 
         // Pull the XML plist out of the resource-fork window.
         if trailer.xml_length == 0 {
@@ -333,12 +356,19 @@ impl DmgBackend {
             }
         }
 
+        // Zero-length chunks map nothing, and one that shares its start
+        // sector with a real chunk would win the "last chunk starting at or
+        // before this sector" lookup and make the real one unreachable.
+        chunks.retain(|c| c.sector_count != 0);
+        if chunks.is_empty() {
+            return Err(crate::Error::InvalidImage(
+                "dmg: mish tables map no sectors".into(),
+            ));
+        }
         chunks.sort_by_key(|c| c.virtual_sector_start);
 
-        // Sanity: chunks shouldn't overlap. We don't fail loud on this
-        // (some images emit zero-byte stub chunks at partition
-        // boundaries that look like duplicates), but adjacent chunks
-        // should be monotonic.
+        // Sanity: chunks shouldn't overlap. We don't fail loud on this,
+        // but adjacent chunks should be monotonic.
         for w in chunks.windows(2) {
             let prev_end = w[0].virtual_sector_start.saturating_add(w[0].sector_count);
             if w[1].virtual_sector_start < prev_end {
@@ -357,6 +387,7 @@ impl DmgBackend {
             virtual_size,
             cursor: 0,
             chunks,
+            decoded: None,
         })
     }
 
@@ -576,17 +607,30 @@ impl BlockDevice for DmgBackend {
                     size: self.virtual_size,
                 })?;
 
-            // Decode the chunk once; we may take a partial slice on
-            // either end. A future optimisation is to LRU-cache the
-            // most recently decoded chunk so sequential reads don't
-            // re-inflate the same buffer for every 4 KiB request.
-            let plain = self.decode_chunk(&chunk)?;
-            debug_assert_eq!(plain.len() as u64, chunk.sector_count * 512);
-
             let local_start = (cursor - chunk_byte_start) as usize;
             let available = (chunk_byte_end - cursor) as usize;
             let want = (buf.len() - filled).min(available);
-            buf[filled..filled + want].copy_from_slice(&plain[local_start..local_start + want]);
+            let out = &mut buf[filled..filled + want];
+            match chunk.kind {
+                // Nothing to decode: these read as zeros, and materialising
+                // a chunk-sized buffer of them would be pure waste.
+                ChunkType::Zero
+                | ChunkType::Ignored
+                | ChunkType::Comment
+                | ChunkType::Terminator => out.fill(0),
+                _ => {
+                    // Decode the chunk once and keep it: we may take a
+                    // partial slice on either end, and the next read is
+                    // likely to land in the same chunk.
+                    if self.decoded.as_ref().map(|(i, _)| *i) != Some(idx) {
+                        let plain = self.decode_chunk(&chunk)?;
+                        debug_assert_eq!(plain.len() as u64, chunk.sector_count * 512);
+                        self.decoded = Some((idx, plain));
+                    }
+                    let plain = &self.decoded.as_ref().expect("just filled").1;
+                    out.copy_from_slice(&plain[local_start..local_start + want]);
+                }
+            }
 
             filled += want;
             cursor += want as u64;
@@ -707,6 +751,18 @@ mod tests {
         chunks: &[Chunk],
         data_payload: &[u8],
     ) -> std::path::PathBuf {
+        build_test_dmg_with_fork_length(dir, sector_count, chunks, data_payload, None)
+    }
+
+    /// [`build_test_dmg`] with the trailer's `data_fork_length` overridden
+    /// (it is the payload length by default), for hostile-header tests.
+    fn build_test_dmg_with_fork_length(
+        dir: &std::path::Path,
+        sector_count: u64,
+        chunks: &[Chunk],
+        data_payload: &[u8],
+        data_fork_length: Option<u64>,
+    ) -> std::path::PathBuf {
         // Layout: [data fork][XML plist][koly trailer].
         let data_offset = 0u64;
         let xml_offset = data_payload.len() as u64;
@@ -737,7 +793,7 @@ mod tests {
             sector_count,
             4,
             data_offset,
-            data_payload.len() as u64,
+            data_fork_length.unwrap_or(data_payload.len() as u64),
             xml_offset,
             xml_length,
         );
@@ -847,6 +903,71 @@ mod tests {
         let mut out2 = vec![0u8; 16];
         dmg.read_at(100, &mut out2).unwrap();
         assert_eq!(out2, &payload[100..116]);
+    }
+
+    /// A zero-length chunk that shares its start sector with a real one
+    /// (some writers emit such stubs at partition boundaries) used to win
+    /// the lookup for that sector and make the real chunk's sectors
+    /// unreadable when it sorted after it.
+    #[test]
+    fn zero_length_chunk_does_not_shadow_a_real_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut payload = vec![0u8; 1024];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let chunks = vec![
+            Chunk {
+                kind: ChunkType::Raw,
+                virtual_sector_start: 0,
+                sector_count: 1,
+                compressed_offset_in_fork: 0,
+                compressed_length: 512,
+            },
+            Chunk {
+                kind: ChunkType::Raw,
+                virtual_sector_start: 1,
+                sector_count: 1,
+                compressed_offset_in_fork: 512,
+                compressed_length: 512,
+            },
+            // The stub: same start as the second chunk, listed after it so a
+            // stable sort keeps it later.
+            Chunk {
+                kind: ChunkType::Zero,
+                virtual_sector_start: 1,
+                sector_count: 0,
+                compressed_offset_in_fork: 0,
+                compressed_length: 0,
+            },
+        ];
+        let p = build_test_dmg(dir.path(), 2, &chunks, &payload);
+        let mut dmg = DmgBackend::open(&p).unwrap();
+        assert_eq!(dmg.chunk_count(), 2, "the stub is dropped");
+        let mut out = vec![0u8; 1024];
+        dmg.read_at(0, &mut out).unwrap();
+        assert_eq!(out, payload);
+        let mut second = vec![0u8; 512];
+        dmg.read_at(512, &mut second).unwrap();
+        assert_eq!(second, &payload[512..]);
+    }
+
+    /// A trailer declaring a data fork longer than the file lets every
+    /// per-chunk extent check pass; the first read would then allocate a
+    /// buffer of the chunk's (hostile) compressed length. Refuse at open.
+    #[test]
+    fn open_rejects_a_data_fork_longer_than_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let chunks = vec![Chunk {
+            kind: ChunkType::Zlib,
+            virtual_sector_start: 0,
+            sector_count: 1,
+            compressed_offset_in_fork: 0,
+            compressed_length: 1 << 39,
+        }];
+        let p = build_test_dmg_with_fork_length(dir.path(), 1, &chunks, &[], Some(1 << 40));
+        let err = DmgBackend::open(&p).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidImage(_)), "{err}");
     }
 
     /// Zero-fill chunks must produce zero bytes without referencing
