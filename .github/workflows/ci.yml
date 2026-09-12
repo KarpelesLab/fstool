@@ -183,7 +183,11 @@ jobs:
         run: |
           set -euo pipefail
           rustup component add llvm-tools
-          (cd examples/embedded-cortex-m && cargo build --release)
+          # The job-level RUSTFLAGS replaces (not merges with) the rustflags in
+          # the example's .cargo/config.toml, which would drop the linker
+          # script and leave an empty image; spell the link arguments here.
+          (cd examples/embedded-cortex-m && \
+             RUSTFLAGS="-D warnings -C link-arg=-Tlink.x -C link-arg=--nmagic" cargo build --release)
           bin=examples/embedded-cortex-m/target/thumbv7em-none-eabihf/release/fstool-embedded-cortex-m
           "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-size "$bin"
           # An empty .text means the linker garbage-collected the program
