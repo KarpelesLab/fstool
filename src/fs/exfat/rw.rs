@@ -228,8 +228,16 @@ impl<'a> ExfatFileHandle<'a> {
         if target_len <= have {
             return Ok(());
         }
-        let need_clusters = target_len.div_ceil(cb) as u32;
-        let extra = need_clusters - self.chain.len() as u32;
+        // Stay in u64: a `target_len` near the top of the range would
+        // otherwise wrap the cluster count and under-allocate.
+        let need_clusters = target_len.div_ceil(cb);
+        if need_clusters > u64::from(self.fs.boot.cluster_count) {
+            return Err(crate::Error::InvalidArgument(format!(
+                "exfat: {target_len} bytes needs {need_clusters} clusters, volume has {}",
+                self.fs.boot.cluster_count
+            )));
+        }
+        let extra = (need_clusters - self.chain.len() as u64) as u32;
         self.grow_chain(extra)
     }
 
@@ -650,5 +658,53 @@ impl<'a> Seek for ReadOnlyExfatHandle<'a> {
 impl<'a> FileReadHandle for ReadOnlyExfatHandle<'a> {
     fn len(&self) -> u64 {
         FileHandle::len(&self.inner)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::MemoryBackend;
+    use crate::fs::{FileMeta, Filesystem, OpenFlags};
+    use alloc::string::ToString;
+
+    /// A write far past any length the volume can hold used to truncate
+    /// the required cluster count to `u32` and grow the chain by a
+    /// nonsense amount. It must fail cleanly, allocating nothing.
+    #[test]
+    fn write_beyond_volume_capacity_is_rejected_without_allocating() {
+        let mut dev = MemoryBackend::new(4 * 1024 * 1024);
+        let opts = super::super::FormatOpts {
+            bytes_per_sector_shift: 9,
+            sectors_per_cluster_shift: 3,
+            volume_serial_number: 1,
+            volume_label: "CAP".to_string(),
+        };
+        let mut fs = Exfat::format(&mut dev, &opts).unwrap();
+        let cb = fs.cluster_size() as u64;
+        let used_before: u32 = fs.bitmap.iter().map(|b| b.count_ones()).sum();
+        {
+            let mut h = fs
+                .open_file_rw(
+                    &mut dev,
+                    crate::path::Path::new("/huge.bin"),
+                    OpenFlags {
+                        create: true,
+                        ..Default::default()
+                    },
+                    Some(FileMeta::default()),
+                )
+                .unwrap();
+            // Exactly 2^32 clusters' worth: the old `as u32` cast made this 0.
+            let target = (1u64 << 32) * cb;
+            h.seek(SeekFrom::Start(target)).unwrap();
+            let err = h.write(b"x").unwrap_err();
+            assert_eq!(err.kind(), crate::io::ErrorKind::Other, "{err}");
+            let err = h.set_len(target + 1).unwrap_err();
+            assert!(matches!(err, crate::Error::InvalidArgument(_)), "{err:?}");
+            assert_eq!(h.len(), 0);
+        }
+        let used_after: u32 = fs.bitmap.iter().map(|b| b.count_ones()).sum();
+        assert_eq!(used_before, used_after, "clusters were allocated");
     }
 }
