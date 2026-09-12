@@ -66,8 +66,14 @@ impl Partition {
 
     /// Last LBA of the partition (inclusive). Used heavily by GPT, which
     /// stores ending LBAs rather than sizes.
+    ///
+    /// An empty partition (`size_lba == 0`) has no last LBA; rather than
+    /// wrap, the result saturates at `start_lba - 1` (or 0). The table
+    /// writers reject such entries before they reach disk.
     pub fn end_lba(&self) -> u64 {
-        self.start_lba + self.size_lba - 1
+        self.start_lba
+            .saturating_add(self.size_lba)
+            .saturating_sub(1)
     }
 }
 
@@ -279,6 +285,21 @@ mod tests {
             0xC9, 0x3B,
         ];
         assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn end_lba_saturates_instead_of_wrapping() {
+        assert_eq!(
+            Partition::new(2048, 2048, PartitionKind::LinuxFilesystem).end_lba(),
+            4095
+        );
+        // Empty partitions used to underflow (`0 + 0 - 1`).
+        assert_eq!(Partition::new(0, 0, PartitionKind::Empty).end_lba(), 0);
+        assert_eq!(Partition::new(5, 0, PartitionKind::Empty).end_lba(), 4);
+        assert_eq!(
+            Partition::new(u64::MAX, 2, PartitionKind::Empty).end_lba(),
+            u64::MAX - 1
+        );
     }
 
     #[test]
