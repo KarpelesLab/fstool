@@ -822,6 +822,13 @@ impl Fat32 {
             let mtime = mutate::host_mtime_secs(&meta);
             if ft.is_file() {
                 let size = meta.len();
+                if size > u64::from(u32::MAX) {
+                    return Err(crate::Error::InvalidArgument(format!(
+                        "{}: {} is {size} bytes; FAT files cannot exceed 4 GiB",
+                        self.boot.kind.as_str(),
+                        path.display()
+                    )));
+                }
                 let cb = self.cluster_bytes();
                 let n_clusters = size.div_ceil(cb).max(1) as u32;
                 let chain = self.alloc_chain(n_clusters)?;
@@ -1752,6 +1759,37 @@ mod tests {
             Err(crate::Error::InvalidImage(msg)) => assert!(msg.contains("cannot map"), "{msg}"),
             other => panic!("expected InvalidImage, got {other:?}"),
         }
+    }
+
+    /// A file of 4 GiB or more cannot be represented (the 8.3 entry has a
+    /// 32-bit size) and must be refused up front, not stored modulo 2^32.
+    #[test]
+    fn files_of_4gib_or_more_are_rejected() {
+        let (mut dev, mut fs) = fresh_volume();
+        let free_before = fs.count_free_clusters();
+        let err = fs
+            .add_file_from_reader(&mut dev, "/big.bin", &mut crate::io::empty(), 1u64 << 32, 0)
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidArgument(_)), "{err:?}");
+        assert_eq!(fs.count_free_clusters(), free_before);
+        assert!(!fs.pending_names.contains_key(&fs.boot.root_cluster));
+
+        // The rw handle refuses a write that would cross the limit.
+        let mut h = fs
+            .open_file_rw(
+                &mut dev,
+                Path::new("/h.bin"),
+                OpenFlags {
+                    create: true,
+                    ..Default::default()
+                },
+                Some(FileMeta::default()),
+            )
+            .unwrap();
+        h.seek(SeekFrom::Start(u64::from(u32::MAX) - 1)).unwrap();
+        let err = h.write(b"abcd").unwrap_err();
+        assert_eq!(err.kind(), crate::io::ErrorKind::InvalidInput, "{err}");
+        assert_eq!(h.len(), 0);
     }
 
     /// With `backup_boot_sector == 0` (no backup region) flush must not

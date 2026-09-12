@@ -265,6 +265,13 @@ impl Fat32 {
         size: u64,
         mtime: u32,
     ) -> Result<()> {
+        // The 8.3 entry stores the size in 32 bits; anything larger would
+        // be recorded modulo 4 GiB.
+        if size > u64::from(u32::MAX) {
+            return Err(crate::Error::InvalidArgument(format!(
+                "fat32: {dest_path:?} is {size} bytes; FAT files cannot exceed 4 GiB"
+            )));
+        }
         let (parent_cluster, leaf) = self.resolve_parent(dev, dest_path)?;
         if self.child_exists(dev, parent_cluster, &leaf)? {
             return Err(crate::Error::InvalidArgument(format!(
