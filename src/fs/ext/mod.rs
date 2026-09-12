@@ -3536,6 +3536,22 @@ impl Ext {
         let new_blocks = new_blocks_u64 as u32;
         // Shrink path: free everything past the new end.
         if new_blocks < old_blocks {
+            // Rebuilding the map from a flat block list cannot express
+            // an unwritten (preallocated) extent, and silently turning
+            // one into initialized data would expose whatever the disk
+            // still holds there. Refuse rather than lie.
+            if inode.flags & constants::EXT4_EXTENTS_FL != 0
+                && self
+                    .extent_tree_contents(dev, &inode)?
+                    .0
+                    .iter()
+                    .any(|r| r.is_unwritten())
+            {
+                return Err(crate::Error::Unsupported(format!(
+                    "ext4: truncating inode {ino} would have to rewrite an \
+                     unwritten (preallocated) extent"
+                )));
+            }
             for n in new_blocks..old_blocks {
                 let phys = self.file_block(dev, &inode, n)?;
                 if phys != 0 {
@@ -3550,6 +3566,15 @@ impl Ext {
             let surviving: Vec<u32> = (0..new_blocks)
                 .map(|n| self.file_block(dev, &inode, n).unwrap_or(0))
                 .collect();
+            // The rebuild hands `i_block` a brand-new structure, so
+            // every block the old one used for its own bookkeeping —
+            // extent-tree index and leaf nodes, indirection blocks —
+            // is orphaned. Release them before the rebuild allocates,
+            // so they are available for re-use and no longer counted
+            // against the filesystem.
+            for blk in self.collect_map_meta_blocks(dev, &inode)? {
+                self.release_map_meta_block(blk);
+            }
             // Clear the old block pointers so fill_block_pointers
             // starts from a known state. Preserve EXTENTS_FL — we'll
             // re-stamp it inside fill_block_pointers_extent.
@@ -3570,11 +3595,19 @@ impl Ext {
             };
             let sectors_per_block = bs / 512;
             let real_blocks: u32 = surviving.iter().filter(|&&b| b != 0).count() as u32;
+            // `i_blocks` counts the external xattr block too
+            // (`ext4_inode_is_fast_symlink` and e2fsck both rely on
+            // that); recomputing it from the data map alone dropped it.
+            let ea_sectors = if inode.file_acl != 0 {
+                sectors_per_block
+            } else {
+                0
+            };
             self.patch_inode(dev, ino, |i| {
                 i.block = staged.block;
                 i.flags = staged.flags;
                 i.set_file_size(new_size);
-                i.blocks_512 = (real_blocks + allocated_meta) * sectors_per_block;
+                i.blocks_512 = (real_blocks + allocated_meta) * sectors_per_block + ea_sectors;
             })?;
         } else {
             // Grow path (or no-op): leave block list alone, just bump
@@ -3752,90 +3785,94 @@ impl Ext {
         inode.file_size() <= 60 && inode.blocks_512.saturating_sub(ea_blocks_512) == 0
     }
 
-    /// Free every block reachable from an extent-mapped inode: the data
-    /// blocks of each leaf extent plus every on-disk index/leaf node of
-    /// the tree.
+    /// Walk an extent-mapped inode's tree and return every leaf extent
+    /// record together with every on-disk block the tree itself
+    /// occupies (index nodes and leaf nodes; a depth-0 tree lives
+    /// entirely in `i_block` and occupies none).
     ///
-    /// The old code walked logical blocks `0..i_size/block_size` through
-    /// `file_block`, which (a) took `i_size` from the low 32 bits only,
-    /// so a file above 4 GiB kept most of its blocks allocated, (b)
-    /// leaked every tree block of a depth >= 1 inode — the comment
-    /// claiming extent inodes keep the whole tree inline is only true
-    /// at depth 0 — and (c) missed the blocks behind unwritten extents,
-    /// which `file_block` reports as holes.
-    fn free_extent_tree(&mut self, dev: &mut dyn BlockDevice, inode: &Inode) -> Result<()> {
+    /// Cycles and nodes whose declared depth doesn't shrink by exactly
+    /// one per level are rejected, so a forged tree can't loop.
+    fn extent_tree_contents(
+        &self,
+        dev: &mut dyn BlockDevice,
+        inode: &Inode,
+    ) -> Result<(Vec<extent::ExtentRun>, Vec<u32>)> {
         let iblock = extent::iblock_to_bytes(&inode.block);
         let header = extent::decode_header(&iblock[..12])?;
         if header.depth == 0 {
             let (_, runs) = extent::decode_depth0_iblock(&iblock)?;
-            self.free_extent_runs(&runs);
-            return Ok(());
+            return Ok((runs, Vec::new()));
         }
         let (_, indices) = extent::decode_idx_iblock(&iblock)?;
-        let child_depth = header.depth - 1;
-        let mut visited: Vec<u32> = Vec::new();
-        for idx in &indices {
-            self.free_extent_subtree(dev, idx.leaf as u32, child_depth, &mut visited)?;
-        }
-        Ok(())
-    }
-
-    /// Free the subtree rooted at on-disk node `blk`, then `blk`
-    /// itself. `visited` rejects cycles in a forged tree (and stops a
-    /// double free of an aliased node).
-    fn free_extent_subtree(
-        &mut self,
-        dev: &mut dyn BlockDevice,
-        blk: u32,
-        expected_depth: u16,
-        visited: &mut Vec<u32>,
-    ) -> Result<()> {
-        if visited.contains(&blk) {
-            return Err(crate::Error::InvalidImage(format!(
-                "ext4: extent tree cycle through physical block {blk}"
-            )));
-        }
-        visited.push(blk);
         let bs = self.layout.block_size as usize;
+        let max_entries = (bs.saturating_sub(12) / 12) as u16;
+        let mut runs = Vec::new();
+        let mut nodes: Vec<u32> = Vec::new();
+        let mut stack: Vec<(u32, u16)> = indices
+            .iter()
+            .rev()
+            .map(|i| (i.leaf as u32, header.depth - 1))
+            .collect();
         let mut buf = vec![0u8; bs];
-        self.read_block(dev, blk, &mut buf)?;
-        let header = extent::decode_header(&buf[..12])?;
-        if header.depth != expected_depth {
-            return Err(crate::Error::InvalidImage(format!(
-                "ext4: extent node depth {} != expected {expected_depth}",
-                header.depth
-            )));
-        }
-        if header.depth == 0 {
-            let (_, runs) = extent::decode_leaf_block(&buf)?;
-            self.free_extent_runs(&runs);
-        } else {
-            let max_entries = (bs.saturating_sub(12) / 12) as u16;
-            if header.entries > max_entries {
+        while let Some((blk, depth)) = stack.pop() {
+            if nodes.contains(&blk) {
                 return Err(crate::Error::InvalidImage(format!(
-                    "ext4: extent index claims {} entries, block holds at most {max_entries}",
-                    header.entries
+                    "ext4: extent tree cycle through physical block {blk}"
                 )));
             }
-            let child_depth = header.depth - 1;
-            for i in 0..header.entries as usize {
+            nodes.push(blk);
+            self.read_block(dev, blk, &mut buf)?;
+            let h = extent::decode_header(&buf[..12])?;
+            if h.depth != depth {
+                return Err(crate::Error::InvalidImage(format!(
+                    "ext4: extent node depth {} != expected {depth}",
+                    h.depth
+                )));
+            }
+            if h.depth == 0 {
+                let (_, mut leaf_runs) = extent::decode_leaf_block(&buf)?;
+                runs.append(&mut leaf_runs);
+                continue;
+            }
+            if h.entries > max_entries {
+                return Err(crate::Error::InvalidImage(format!(
+                    "ext4: extent index claims {} entries, block holds at most {max_entries}",
+                    h.entries
+                )));
+            }
+            for i in (0..h.entries as usize).rev() {
                 let off = 12 + i * 12;
                 let idx = extent::decode_idx(&buf[off..off + 12]);
-                self.free_extent_subtree(dev, idx.leaf as u32, child_depth, visited)?;
+                stack.push((idx.leaf as u32, h.depth - 1));
             }
         }
-        self.free_block(blk);
-        Ok(())
+        Ok((runs, nodes))
     }
 
-    /// Free the data blocks of every leaf extent, unwritten ones
-    /// included — a preallocated range still owns its blocks.
-    fn free_extent_runs(&mut self, runs: &[extent::ExtentRun]) {
-        for r in runs {
+    /// Free every block reachable from an extent-mapped inode: the data
+    /// blocks of each leaf extent plus every on-disk index/leaf node of
+    /// the tree.
+    ///
+    /// The old code walked logical blocks `0..i_size/block_size`
+    /// through `file_block`, which (a) took `i_size` from the low 32
+    /// bits only, so a file above 4 GiB kept most of its blocks
+    /// allocated, (b) leaked every tree block of a depth >= 1 inode —
+    /// the comment claiming extent inodes keep the whole tree inline is
+    /// only true at depth 0 — and (c) missed the blocks behind unwritten
+    /// extents, which `file_block` reports as holes.
+    fn free_extent_tree(&mut self, dev: &mut dyn BlockDevice, inode: &Inode) -> Result<()> {
+        let (runs, nodes) = self.extent_tree_contents(dev, inode)?;
+        // Unwritten extents included: a preallocated range still owns
+        // its blocks.
+        for r in &runs {
             for off in 0..r.actual_len() as u64 {
                 self.free_block((r.physical + off) as u32);
             }
         }
+        for blk in nodes {
+            self.release_map_meta_block(blk);
+        }
+        Ok(())
     }
 
     /// Free every block of a block-mapped (non-extent) inode by walking
@@ -3892,8 +3929,66 @@ impl Ext {
                 self.free_block(p);
             }
         }
-        self.free_block(blk);
+        self.release_map_meta_block(blk);
         Ok(())
+    }
+
+    /// Collect every on-disk block the inode's block map uses for its
+    /// own bookkeeping: the extent tree's index and leaf nodes, or the
+    /// single/double/triple indirection blocks. These are the blocks
+    /// that must be released when the map is rebuilt from scratch.
+    fn collect_map_meta_blocks(
+        &self,
+        dev: &mut dyn BlockDevice,
+        inode: &Inode,
+    ) -> Result<Vec<u32>> {
+        if inode.flags & constants::EXT4_EXTENTS_FL != 0 {
+            return Ok(self.extent_tree_contents(dev, inode)?.1);
+        }
+        let bs = self.layout.block_size as usize;
+        let mut out: Vec<u32> = Vec::new();
+        let mut buf = vec![0u8; bs];
+        for (slot, depth) in [
+            (constants::IDX_INDIRECT, 1u8),
+            (constants::IDX_DOUBLE_INDIRECT, 2),
+            (constants::IDX_TRIPLE_INDIRECT, 3),
+        ] {
+            let root = inode.block[slot];
+            if root == 0 {
+                continue;
+            }
+            let mut stack = vec![(root, depth)];
+            while let Some((blk, d)) = stack.pop() {
+                if out.contains(&blk) {
+                    return Err(crate::Error::InvalidImage(format!(
+                        "ext: indirect-block tree aliases metadata block {blk}"
+                    )));
+                }
+                out.push(blk);
+                if d == 1 {
+                    // Its entries are data blocks, not metadata.
+                    continue;
+                }
+                self.read_block(dev, blk, &mut buf)?;
+                for i in 0..bs / 4 {
+                    let p = u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+                    if p != 0 {
+                        stack.push((p, d - 1));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Release a block that held block-map bookkeeping: clear its
+    /// bitmap bit, drop any staged image of it (so a later read sees
+    /// the new owner's content rather than a stale extent node) and
+    /// stop tracking it for `ext4_extent_tail` CRC stamping.
+    fn release_map_meta_block(&mut self, blk: u32) {
+        self.free_block(blk);
+        self.data_blocks.retain(|(b, _)| *b != blk);
+        self.untrack_extent_leaf_block(blk);
     }
 
     /// Clear the block-bitmap bit for an absolute block number.

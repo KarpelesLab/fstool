@@ -1264,3 +1264,130 @@ fn flush_refuses_to_clobber_an_unreplayed_journal() {
     dev.read_at(log_phys * bs, &mut back).unwrap();
     assert_eq!(back, sentinel, "the unreplayed log must be left intact");
 }
+
+// ───── findings 16 / 17: truncate rebuild leaks, i_blocks vs xattrs ─────
+
+/// `truncate` rebuilds `i_block` from the surviving block list, which
+/// orphans every block the *old* map used for its own bookkeeping
+/// (extent-tree index and leaf nodes, indirection blocks). Those were
+/// never freed, so shrinking a large file leaked its whole tree — and
+/// the subsequent `remove` could only free what the new, smaller map
+/// referenced.
+#[test]
+fn truncate_frees_the_old_block_maps_metadata() {
+    use crate::fs::{Filesystem, OpenFlags};
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+    let opts = FormatOpts {
+        block_size: 1024,
+        blocks_count: 32 * 1024,
+        ..ext4_opts()
+    };
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    ext.flush(&mut dev).unwrap();
+    let baseline = used_block_count(&ext);
+
+    let ino = add_file(&mut ext, &mut dev, INO_ROOT_DIR, b"deep", b"");
+    {
+        let mut h = ext
+            .open_file_rw(
+                &mut dev,
+                std::path::Path::new("/deep"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+        for i in 0..400u64 {
+            h.seek(SeekFrom::Start(i * 1024 * 8)).unwrap();
+            h.write_all(b"X").unwrap();
+        }
+        h.flush().unwrap();
+    }
+    ext.flush(&mut dev).unwrap();
+
+    let mut re = Ext::open(&mut dev).unwrap();
+    let inode = re.read_inode(&mut dev, ino).unwrap();
+    let iblock = super::extent::iblock_to_bytes(&inode.block);
+    assert!(
+        super::extent::decode_header(&iblock[..12]).unwrap().depth >= 1,
+        "test needs a depth >= 1 extent tree"
+    );
+
+    // Shrink to a single block: the tree collapses to a depth-0 inline
+    // one and every old node block becomes garbage.
+    re.truncate(&mut dev, ino, 512).unwrap();
+    re.remove_path(&mut dev, "/deep").unwrap();
+    re.flush(&mut dev).unwrap();
+
+    let after = Ext::open(&mut dev).unwrap();
+    assert_eq!(
+        used_block_count(&after),
+        baseline,
+        "truncate must release the old extent-tree nodes"
+    );
+}
+
+/// `i_blocks` includes the external xattr block. Recomputing it from
+/// the data map alone — which both the rw handle and `truncate` do —
+/// dropped that block, so e2fsck saw the wrong count and
+/// `ext4_inode_is_fast_symlink` mis-classified symlinks.
+#[test]
+fn i_blocks_keeps_counting_the_xattr_block() {
+    use crate::fs::{Filesystem, OpenFlags};
+    use std::io::Write as _;
+
+    let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+    let mut ext = Ext::format_with(&mut dev, &ext4_opts()).unwrap();
+    let ino = add_file(&mut ext, &mut dev, INO_ROOT_DIR, b"f", &[1u8; 8192]);
+    ext.set_xattrs(
+        &mut dev,
+        ino,
+        &[super::xattr::Xattr {
+            name: "user.k".into(),
+            value: vec![9; 48],
+        }],
+    )
+    .unwrap();
+    ext.flush(&mut dev).unwrap();
+    let per_block = ext.layout.block_size / 512;
+
+    let mut re = Ext::open(&mut dev).unwrap();
+    let before = re.read_inode(&mut dev, ino).unwrap();
+    assert_ne!(before.file_acl, 0);
+    assert_eq!(before.blocks_512, 3 * per_block, "2 data + 1 xattr");
+
+    // A write through the rw handle recomputes i_blocks.
+    {
+        let mut h = re
+            .open_file_rw(
+                &mut dev,
+                std::path::Path::new("/f"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+        h.write_all(&[2u8; 4096]).unwrap();
+        h.flush().unwrap();
+    }
+    re.flush(&mut dev).unwrap();
+    let mid = Ext::open(&mut dev)
+        .unwrap()
+        .read_inode(&mut dev, ino)
+        .unwrap();
+    assert_eq!(mid.blocks_512, 3 * per_block, "rw kept the xattr block");
+
+    // So does truncate's rebuild.
+    let mut re = Ext::open(&mut dev).unwrap();
+    re.truncate(&mut dev, ino, 4096).unwrap();
+    re.flush(&mut dev).unwrap();
+    let after = Ext::open(&mut dev)
+        .unwrap()
+        .read_inode(&mut dev, ino)
+        .unwrap();
+    assert_eq!(
+        after.blocks_512,
+        2 * per_block,
+        "1 data + 1 xattr after the shrink"
+    );
+}
