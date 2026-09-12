@@ -82,43 +82,24 @@ pub const XFS_ATTR3_LEAF_CRC_OFF: usize = 12;
 
 // --- entry flag bits -------------------------------------------------
 //
-// These match the public XFS spec / xfs_db column ordering
-// `[hashval,nameidx,incomplete,root,secure,local]` for the leaf flag
-// byte. The shortform-area flag byte uses a *different* convention
-// (see `super::xattr`) — keep the two mappings separate.
+// Shortform (`xfs_attr_sf_entry`) and leaf (`xfs_attr_leaf_entry`) share
+// one flag-byte encoding, so the constants live in `super::xattr` and are
+// re-exported here under the names this module has always used.
 
-/// Leaf-entry flag: value stored inline in this same leaf block.
-pub const XFS_ATTR_LOCAL: u8 = 0x01;
-/// Leaf-entry flag: name belongs to the trusted ("root") namespace.
-pub const XFS_ATTR_ROOT: u8 = 0x02;
-/// Leaf-entry flag: name belongs to the security namespace.
-pub const XFS_ATTR_SECURE: u8 = 0x04;
-/// Leaf-entry flag: attribute is in the middle of being added/removed.
-pub const XFS_ATTR_INCOMPLETE: u8 = 0x80;
+pub use super::xattr::{
+    XFS_ATTR_INCOMPLETE, XFS_ATTR_LOCAL, XFS_ATTR_NSP_ONDISK_MASK, XFS_ATTR_ROOT, XFS_ATTR_SECURE,
+};
 
 /// Map a userland xattr name (`"user.foo"`, `"trusted.bar"`,
-/// `"security.selinux"`) to (suffix, leaf-flag-byte).
+/// `"security.selinux"`) to (suffix, leaf-flag-byte). The namespace
+/// encoding is the same one the shortform area uses.
 pub fn leaf_name_to_disk(name: &str) -> (String, u8) {
-    if let Some(rest) = name.strip_prefix("user.") {
-        (rest.to_string(), 0)
-    } else if let Some(rest) = name.strip_prefix("trusted.") {
-        (rest.to_string(), XFS_ATTR_ROOT)
-    } else if let Some(rest) = name.strip_prefix("security.") {
-        (rest.to_string(), XFS_ATTR_SECURE)
-    } else {
-        (name.to_string(), 0)
-    }
+    super::xattr::name_to_disk(name)
 }
 
 /// Inverse of [`leaf_name_to_disk`].
 pub fn leaf_name_from_disk(suffix: &str, flags: u8) -> String {
-    if flags & XFS_ATTR_ROOT != 0 {
-        format!("trusted.{suffix}")
-    } else if flags & XFS_ATTR_SECURE != 0 {
-        format!("security.{suffix}")
-    } else {
-        format!("user.{suffix}")
-    }
+    super::xattr::name_from_disk(suffix, flags)
 }
 
 /// XFS directory / xattr name hash — same algorithm as
@@ -352,7 +333,7 @@ pub fn decode_leaf(block: &[u8]) -> Result<std::collections::HashMap<String, Vec
             .map_err(|_| crate::Error::InvalidImage("xfs: non-UTF-8 leaf xattr name".into()))?;
         // Mask out LOCAL/INCOMPLETE so leaf_name_from_disk only sees
         // namespace bits.
-        let ns_flags = flags & (XFS_ATTR_ROOT | XFS_ATTR_SECURE);
+        let ns_flags = flags & XFS_ATTR_NSP_ONDISK_MASK;
         let full_name = leaf_name_from_disk(suffix, ns_flags);
         let value = block[name_end..val_end].to_vec();
         out.insert(full_name, value);

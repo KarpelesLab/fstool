@@ -15,7 +15,7 @@
 //!   xfs_attr_sf_entry × count:
 //!     __u8   namelen
 //!     __u8   valuelen
-//!     __u8   flags       // 0 = user, ATTR_ROOT(0x02) = trusted, ATTR_SECURE(0x01) = security
+//!     __u8   flags       // 0 = user, ATTR_ROOT(0x02) = trusted, ATTR_SECURE(0x04) = security
 //!     __u8   nameval[namelen + valuelen]
 //! ```
 //!
@@ -39,10 +39,33 @@ use std::collections::HashMap;
 
 use crate::Result;
 
-/// Flag bit on a shortform entry — XFS_ATTR_ROOT (trusted namespace).
+// --- attribute flag bits (`xfs_da_format.h`) -------------------------
+//
+// One set of values for the whole attribute fork: `xfs_attr_sf_entry`
+// (shortform) and `xfs_attr_leaf_entry` (leaf) share the same flag byte
+// encoding. `super::xattr_leaf` re-exports these.
+//
+//     #define XFS_ATTR_LOCAL      (1u << 0)
+//     #define XFS_ATTR_ROOT       (1u << 1)
+//     #define XFS_ATTR_SECURE     (1u << 2)
+//     #define XFS_ATTR_PARENT     (1u << 3)
+//     #define XFS_ATTR_INCOMPLETE (1u << 7)
+
+/// Attribute flag: the value is stored inline next to the name. Always
+/// implied for shortform entries (which never set the bit); leaf entries
+/// set it explicitly when the value lives in the leaf block.
+pub const XFS_ATTR_LOCAL: u8 = 0x01;
+/// Attribute flag: name belongs to the trusted ("root") namespace.
 pub const XFS_ATTR_ROOT: u8 = 0x02;
-/// Flag bit on a shortform entry — XFS_ATTR_SECURE (security namespace).
-pub const XFS_ATTR_SECURE: u8 = 0x01;
+/// Attribute flag: name belongs to the security namespace.
+pub const XFS_ATTR_SECURE: u8 = 0x04;
+/// Attribute flag: entry is mid-create / mid-delete and must be ignored.
+pub const XFS_ATTR_INCOMPLETE: u8 = 0x80;
+
+/// Namespace bits of an attribute flag byte — everything that is not a
+/// namespace selector (LOCAL / INCOMPLETE / PARENT) is masked out before
+/// a name is reconstructed.
+pub const XFS_ATTR_NSP_ONDISK_MASK: u8 = XFS_ATTR_ROOT | XFS_ATTR_SECURE;
 
 /// Decoded shortform attribute entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +99,7 @@ pub fn name_to_disk(name: &str) -> (String, u8) {
 /// back into a userland xattr name. Suffixes whose flag byte names no
 /// known namespace are surfaced as `user.<suffix>`.
 pub fn name_from_disk(suffix: &str, flags: u8) -> String {
+    let flags = flags & XFS_ATTR_NSP_ONDISK_MASK;
     if flags & XFS_ATTR_ROOT != 0 {
         format!("trusted.{suffix}")
     } else if flags & XFS_ATTR_SECURE != 0 {
