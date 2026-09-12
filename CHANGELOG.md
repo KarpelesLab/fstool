@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.28](https://github.com/KarpelesLab/fstool/compare/v0.4.27...v0.4.28) - 2026-09-12
+
+### Added
+
+- per-format Cargo features and a no_std core for embedded targets
+
+### Fixed
+
+- *(repack)* rebase add_dir_tree under its destination, collapse duplicate stream entries
+- *(cli)* refuse to convert/repack an image onto itself, gate device output on --force
+
+### Other
+
+- pass the example's linker script explicitly under the job-level RUSTFLAGS
+- keep the no_std example's entry point under --gc-sections and fail on an empty image
+- grf implies gzip — every GRF member is zlib-compressed
+- *(block)* mount FAT inside an MBR partition on a SectorDevice
+
 ## [0.4.27](https://github.com/KarpelesLab/fstool/compare/v0.4.26...v0.4.27) - 2026-09-09
 
 ### Added
