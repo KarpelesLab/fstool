@@ -120,6 +120,12 @@ impl FormatOpts {
     }
 }
 
+/// Smallest main area the writer can lay out: main segments 0..=5 are the
+/// six current-segment homes (`write::Writer::new`), plus one free
+/// segment for the first spill-over allocation. `size_plan` mirrors this
+/// as its floor.
+pub const MIN_MAIN_SEGMENTS: u32 = 7;
+
 /// Resolved geometry of the volume we're about to write. Every field is
 /// in 4 KiB blocks unless noted.
 #[derive(Debug, Clone, Copy)]
@@ -206,13 +212,23 @@ pub fn plan_geometry(total_blocks: u64, opts: &FormatOpts) -> Result<Geometry> {
             "f2fs: device has {total_blocks} blocks, need > {meta_blocks} for metadata"
         )));
     }
-    // Main area: rounded down to a whole-segment count.
-    let main_blocks = total_blocks as u32 - meta_blocks;
+    // Main area: rounded down to a whole-segment count. Every region is
+    // block-addressed by a u32, so a device past 16 TiB is rejected
+    // rather than truncated.
+    let main_blocks = u32::try_from(total_blocks - u64::from(meta_blocks)).map_err(|_| {
+        crate::Error::InvalidArgument(format!(
+            "f2fs: device of {total_blocks} blocks exceeds the 32-bit block address space"
+        ))
+    })?;
     let segment_count_main = main_blocks / blocks_per_seg;
-    if segment_count_main == 0 {
-        return Err(crate::Error::InvalidArgument(
-            "f2fs: not enough room for any main-area segment".into(),
-        ));
+    // The writer reserves main segments 0..=5 as the six current-segment
+    // homes (hot/warm/cold × node/data — see `write::Writer::new`), and
+    // needs at least one more for the first spill-over allocation.
+    if segment_count_main < MIN_MAIN_SEGMENTS {
+        return Err(crate::Error::InvalidArgument(format!(
+            "f2fs: main area has {segment_count_main} segment(s); need at least \
+             {MIN_MAIN_SEGMENTS} (six current-segment homes plus one free)"
+        )));
     }
 
     let cp_blkaddr = sb_blocks;
@@ -398,6 +414,29 @@ mod tests {
             ..FormatOpts::default()
         };
         assert!(plan_geometry(8, &opts).is_err());
+    }
+
+    /// Six main segments are the curseg homes the writer indexes
+    /// unconditionally (`seg_state[1..=5]`); a plan with fewer than
+    /// `MIN_MAIN_SEGMENTS` must be refused up front, not panic in flush.
+    #[test]
+    fn geometry_requires_seven_main_segments() {
+        let opts = FormatOpts {
+            log_blocks_per_seg: 3,
+            ..FormatOpts::default()
+        };
+        // meta = 2 + 7 * 8 = 58 blocks; 110 blocks leave 52 → 6 main segments.
+        let err = plan_geometry(110, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::InvalidArgument(ref m) if m.contains("main area")),
+            "got {err:?}"
+        );
+        // 114 blocks leave 56 → 7 main segments: accepted.
+        let g = plan_geometry(114, &opts).unwrap();
+        assert_eq!(g.segment_count_main, MIN_MAIN_SEGMENTS);
+        // A tiny device must format-and-flush cleanly at exactly the floor.
+        let mut dev = crate::block::MemoryBackend::new(114 * F2FS_BLKSIZE as u64);
+        super::super::F2fs::format(&mut dev, &opts).unwrap();
     }
 
     #[test]
