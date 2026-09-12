@@ -842,3 +842,41 @@ fn writing_into_an_unwritten_extent_initialises_it() {
     assert!(!runs[1].is_unwritten() && runs[1].actual_len() == 1);
     assert!(runs[2].is_unwritten() && runs[2].actual_len() == 1);
 }
+
+// ─────────────────── finding 10: INCOMPAT_META_BG ───────────────────
+
+/// `use_64bit` used to also advertise `INCOMPAT_META_BG`, which tells
+/// the kernel the group descriptors are scattered across meta block
+/// groups. Ours are in one contiguous table after the superblock, so
+/// the flag made the image unreadable. And since the reader assumes
+/// the contiguous layout, an image that really does carry meta_bg must
+/// be refused instead of parsed against the wrong blocks.
+#[test]
+fn meta_bg_is_never_emitted_and_is_refused_on_open() {
+    let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+    let opts = FormatOpts {
+        use_64bit: true,
+        ..ext4_opts()
+    };
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    ext.flush(&mut dev).unwrap();
+    assert_eq!(
+        ext.sb.feature_incompat & constants::feature::INCOMPAT_META_BG,
+        0
+    );
+    Ext::open(&mut dev).expect("a 64bit image without meta_bg reopens");
+
+    // Now force the bit on in the on-disk superblock and re-stamp its
+    // checksum the way the kernel would; open must refuse.
+    let mut sb_buf = [0u8; constants::SUPERBLOCK_SIZE];
+    dev.read_at(constants::SUPERBLOCK_OFFSET, &mut sb_buf)
+        .unwrap();
+    let incompat = u32::from_le_bytes(sb_buf[0x60..0x64].try_into().unwrap());
+    sb_buf[0x60..0x64]
+        .copy_from_slice(&(incompat | constants::feature::INCOMPAT_META_BG).to_le_bytes());
+    let csum = super::csum::superblock(&sb_buf);
+    sb_buf[1020..1024].copy_from_slice(&csum.to_le_bytes());
+    dev.write_at(constants::SUPERBLOCK_OFFSET, &sb_buf).unwrap();
+    let err = Ext::open(&mut dev).unwrap_err();
+    assert!(matches!(err, crate::Error::Unsupported(_)), "{err:?}");
+}

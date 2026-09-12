@@ -130,7 +130,8 @@ pub struct FormatOpts {
     /// default for small/medium FSes, 16 groups per unit).
     pub log_groups_per_flex: u8,
     /// When true, emit 64-byte group descriptors and advertise
-    /// `INCOMPAT_64BIT` + `INCOMPAT_META_BG` in the superblock. Required
+    /// `INCOMPAT_64BIT` in the superblock (never `INCOMPAT_META_BG` —
+    /// the group descriptor table stays contiguous). Required
     /// for filesystems whose block count exceeds 2³² (≈ 16 TiB with 4 KiB
     /// blocks). The reader transparently handles either descriptor size.
     /// Off by default — the v1 writer never emits block numbers above 2³²,
@@ -633,12 +634,19 @@ impl Ext {
             ext.sb.log_groups_per_flex = opts.log_groups_per_flex;
         }
         // 64-bit FS: 64-byte group descriptors carry the upper half of the
-        // bitmap/itable block numbers. Kernel docs pair `INCOMPAT_64BIT`
-        // with `INCOMPAT_META_BG`; set both. `s_desc_size = 64` tells the
+        // bitmap/itable block numbers, and `s_desc_size = 64` tells the
         // reader to expect the wider descriptor.
+        //
+        // `INCOMPAT_META_BG` is *not* implied by 64bit and must not be
+        // set here: it changes where the group descriptors live, moving
+        // them out of the contiguous table after the superblock and into
+        // per-meta-group copies (`ext4_group_first_block_no` /
+        // `ext4_bg_has_super` in fs/ext4). mke2fs only turns it on when
+        // asked (or when a resize outgrows the reserved GDT). We lay the
+        // GDT out contiguously, so advertising meta_bg made the kernel
+        // and e2fsck look for descriptors that were never written there.
         if opts.use_64bit {
             ext.sb.feature_incompat |= constants::feature::INCOMPAT_64BIT;
-            ext.sb.feature_incompat |= constants::feature::INCOMPAT_META_BG;
             ext.sb.desc_size = constants::GROUP_DESC_SIZE_64 as u16;
         }
         // sparse_super2: backups only in the two listed groups. Mutually
@@ -3946,6 +3954,16 @@ impl Ext {
                 )));
             }
         }
+        // `meta_bg` scatters the group descriptors across the filesystem
+        // instead of keeping them in one table right after the
+        // superblock. Everything below (and the writer) assumes the
+        // contiguous layout, so a meta_bg image would be parsed against
+        // the wrong blocks; refuse it rather than corrupt it.
+        if sb.feature_incompat & constants::feature::INCOMPAT_META_BG != 0 {
+            return Err(crate::Error::Unsupported(
+                "ext: INCOMPAT_META_BG (scattered group descriptor table) is not supported".into(),
+            ));
+        }
         let mut layout = layout::from_superblock(&sb)?;
 
         // GDT location: same logic as the writer.
@@ -5708,8 +5726,8 @@ mod tests {
 
     #[test]
     fn use_64bit_sets_feature_and_desc_size() {
-        // With `use_64bit` the writer must advertise INCOMPAT_64BIT +
-        // INCOMPAT_META_BG and emit 64-byte descriptors.
+        // With `use_64bit` the writer must advertise INCOMPAT_64BIT and
+        // emit 64-byte descriptors — but never INCOMPAT_META_BG.
         let mut dev = MemoryBackend::new(64u64 * 1024 * 1024);
         let opts = FormatOpts {
             kind: FsKind::Ext4,
@@ -5726,9 +5744,10 @@ mod tests {
             ext.sb.feature_incompat & constants::feature::INCOMPAT_64BIT != 0,
             "INCOMPAT_64BIT must be set"
         );
-        assert!(
-            ext.sb.feature_incompat & constants::feature::INCOMPAT_META_BG != 0,
-            "INCOMPAT_META_BG must be set (the kernel pair with 64BIT)"
+        assert_eq!(
+            ext.sb.feature_incompat & constants::feature::INCOMPAT_META_BG,
+            0,
+            "INCOMPAT_META_BG must NOT be set: the GDT is contiguous"
         );
         assert_eq!(
             ext.layout.desc_size,
