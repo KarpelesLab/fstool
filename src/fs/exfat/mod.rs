@@ -1157,12 +1157,7 @@ impl Exfat {
         data_length: u64,
         timestamp: u32,
     ) -> Result<u32> {
-        // Reject names that contain a path separator.
-        if name.is_empty() || name.contains('/') || name.contains('\\') {
-            return Err(crate::Error::InvalidArgument(format!(
-                "exfat: invalid file name {name:?}"
-            )));
-        }
+        validate_name(name)?;
         self.ensure_name_free(dev, dir_cluster, name)?;
         let cb = self.boot.bytes_per_cluster() as u64;
         let (first_cluster, chain) = if data_length > 0 {
@@ -1235,11 +1230,7 @@ impl Exfat {
         name: &str,
         timestamp: u32,
     ) -> Result<u32> {
-        if name.is_empty() || name.contains('/') || name.contains('\\') {
-            return Err(crate::Error::InvalidArgument(format!(
-                "exfat: invalid directory name {name:?}"
-            )));
-        }
+        validate_name(name)?;
         self.ensure_name_free(dev, dir_cluster, name)?;
         let cb = self.boot.bytes_per_cluster();
         let new_cluster = self.alloc_cluster()?;
@@ -1800,6 +1791,28 @@ fn exfat_timestamp_to_unix(ts: u32) -> u32 {
 /// rule for clarity).
 fn is_leap(year: u32) -> bool {
     (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+}
+
+/// Longest name an exFAT entry set can carry: 255 UTF-16 code units (the
+/// StreamExtension's NameLength is a byte, and 17 FileName entries of 15
+/// units hold 255).
+pub const MAX_NAME_UNITS: usize = 255;
+
+/// Reject a name that cannot be stored in an entry set: empty, carrying
+/// a path separator, or longer than [`MAX_NAME_UNITS`].
+fn validate_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return Err(crate::Error::InvalidArgument(format!(
+            "exfat: invalid name {name:?}"
+        )));
+    }
+    let units = name.encode_utf16().count();
+    if units > MAX_NAME_UNITS {
+        return Err(crate::Error::InvalidArgument(format!(
+            "exfat: name {name:?} is {units} UTF-16 units; the limit is {MAX_NAME_UNITS}"
+        )));
+    }
+    Ok(())
 }
 
 /// Set or clear bit `cluster - 2` in the allocation bitmap. No-op if the
@@ -2521,6 +2534,35 @@ mod tests {
             read_file_contents(&mut fs2, &mut dev, "/data.bin"),
             b"0123456789"
         );
+    }
+
+    #[test]
+    fn names_longer_than_255_units_are_rejected() {
+        let (mut dev, mut fs) = fresh_volume("LONG");
+        let ok = "n".repeat(255);
+        let too_long = "n".repeat(256);
+        fs.create_file(&mut dev, &format!("/{ok}"), &mut crate::io::empty(), 0, 0)
+            .unwrap();
+        for r in [
+            fs.create_file(
+                &mut dev,
+                &format!("/{too_long}"),
+                &mut crate::io::empty(),
+                0,
+                0,
+            ),
+            fs.create_dir(&mut dev, &format!("/{too_long}"), 0),
+        ] {
+            match r {
+                Err(crate::Error::InvalidArgument(msg)) => assert!(msg.contains("limit"), "{msg}"),
+                other => panic!("expected InvalidArgument, got {other:?}"),
+            }
+        }
+        fs.flush(&mut dev).unwrap();
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        let listed = fs2.list_path(&mut dev, "/").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, ok);
     }
 
     #[test]
