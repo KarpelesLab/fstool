@@ -29,6 +29,13 @@ struct Eocd {
     cd_offset: u64,
     cd_size: u64,
     total_entries: u64,
+    /// Bytes of non-zip data prepended to the archive, as implied by the
+    /// gap between where the EOCD actually sits and where the declared
+    /// central-directory geometry says it should end. Non-zero for a
+    /// self-extracting archive, whose offsets are relative to the start
+    /// of the zip data rather than the start of the file. Only a hint:
+    /// [`scan`] applies it when the declared offset misses.
+    prefix_delta: u64,
 }
 
 fn find_eocd(dev: &mut dyn BlockDevice) -> Result<Eocd> {
@@ -55,9 +62,11 @@ fn find_eocd(dev: &mut dyn BlockDevice) -> Result<Eocd> {
     let i = eocd_pos
         .ok_or_else(|| Error::InvalidImage("zip: end-of-central-directory not found".into()))?;
 
+    let eocd_abs = start + i as u64;
     let mut cd_size = le32(&tail, i + 12) as u64;
     let mut cd_offset = le32(&tail, i + 16) as u64;
     let mut total_entries = le16(&tail, i + 10) as u64;
+    let mut zip64 = false;
 
     // ZIP64: a locator sits 20 bytes before the EOCD.
     if i >= 20 && le32(&tail, i - 20) == SIG_ZIP64_LOCATOR {
@@ -72,6 +81,7 @@ fn find_eocd(dev: &mut dyn BlockDevice) -> Result<Eocd> {
         total_entries = le64(&rec, 32);
         cd_size = le64(&rec, 40);
         cd_offset = le64(&rec, 48);
+        zip64 = true;
     }
 
     let cd_end = cd_offset
@@ -82,10 +92,20 @@ fn find_eocd(dev: &mut dyn BlockDevice) -> Result<Eocd> {
             "zip: central directory extends past end of archive".into(),
         ));
     }
+    // The classic EOCD immediately follows the central directory, so any
+    // gap is a prepended stub. With ZIP64 the two extra records sit in
+    // between, and the locator's own offset would need the same
+    // correction, so don't guess there.
+    let prefix_delta = if zip64 {
+        0
+    } else {
+        eocd_abs.saturating_sub(cd_end)
+    };
     Ok(Eocd {
         cd_offset,
         cd_size,
         total_entries,
+        prefix_delta,
     })
 }
 
@@ -130,6 +150,10 @@ fn apply_extras(extra: &[u8], comp: &mut u64, uncomp: &mut u64, offset: &mut u64
     }
 }
 
+/// General-purpose bit 0: the body is encrypted (traditional PKWARE or,
+/// together with bit 6 / method 99, one of the strong variants).
+const GP_ENCRYPTED: u16 = 0x0001;
+
 /// Map a ZIP compression-method id to our [`Method`].
 fn method_for(id: u16) -> Method {
     match id {
@@ -144,6 +168,29 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
     let eocd = find_eocd(dev)?;
     let mut cd = vec![0u8; eocd.cd_size as usize];
     dev.read_at(eocd.cd_offset, &mut cd)?;
+
+    // Self-extracting archives keep offsets relative to the start of the
+    // zip data. When the declared offset doesn't land on a central
+    // record, retry at the offset the EOCD's own position implies and
+    // carry the same correction into every local-header offset.
+    let mut base = 0u64;
+    if cd.len() >= 4 && le32(&cd, 0) != SIG_CENTRAL && eocd.prefix_delta != 0 {
+        let alt = eocd.cd_offset + eocd.prefix_delta;
+        if alt + eocd.cd_size <= dev.total_size() {
+            let mut retry = vec![0u8; eocd.cd_size as usize];
+            dev.read_at(alt, &mut retry)?;
+            if le32(&retry, 0) == SIG_CENTRAL {
+                crate::fstool_log!(
+                    debug,
+                    "zip: central directory found {} bytes past the declared offset \
+                     (self-extracting stub?)",
+                    eocd.prefix_delta
+                );
+                cd = retry;
+                base = eocd.prefix_delta;
+            }
+        }
+    }
 
     let mut idx = ArchiveIndex::new("zip");
     let mut p = 0usize;
@@ -183,6 +230,12 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
 
         // Resolve the data offset from the *local* header (its extra
         // field length may differ from the central one).
+        let local_offset = local_offset
+            .checked_add(base)
+            .filter(|o| o.saturating_add(30) <= dev.total_size())
+            .ok_or_else(|| {
+                Error::InvalidImage("zip: local-header offset past end of archive".into())
+            })?;
         let mut lh = [0u8; 30];
         dev.read_at(local_offset, &mut lh)?;
         let l_name = le16(&lh, 26) as u64;
@@ -210,7 +263,13 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
             0o644
         };
 
-        let method = method_for(method_id);
+        // An encrypted body is ciphertext whatever the method id says;
+        // index it but refuse to hand it to a decompressor.
+        let method = if gp_flags & GP_ENCRYPTED != 0 {
+            Method::Encrypted
+        } else {
+            method_for(method_id)
+        };
         let loc = DataLocator {
             offset: data_off,
             compressed_len: comp,
@@ -251,6 +310,13 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
         seen += 1;
     }
 
+    if seen == 0 && eocd.total_entries != 0 {
+        return Err(Error::InvalidImage(format!(
+            "zip: central directory declares {} entries but holds no readable record \
+             at offset {}",
+            eocd.total_entries, eocd.cd_offset
+        )));
+    }
     if eocd.total_entries != 0 && seen != eocd.total_entries {
         // Not fatal — some tools miscount — but worth surfacing in logs.
         crate::fstool_log!(
@@ -260,4 +326,142 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
         );
     }
     Ok(idx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::SIG_LOCAL;
+    use super::*;
+    use crate::block::MemoryBackend;
+
+    fn u16le(v: &mut Vec<u8>, n: u16) {
+        v.extend_from_slice(&n.to_le_bytes());
+    }
+    fn u32le(v: &mut Vec<u8>, n: u32) {
+        v.extend_from_slice(&n.to_le_bytes());
+    }
+
+    /// A minimal single-entry stored ZIP: local header + body + central
+    /// directory + EOCD. `gp` is the general-purpose flag word.
+    fn one_entry_zip(name: &str, body: &[u8], gp: u16) -> Vec<u8> {
+        let crc = crate::crc::crc32(body);
+        let n = name.as_bytes();
+        let mut z = Vec::new();
+        u32le(&mut z, SIG_LOCAL);
+        u16le(&mut z, 20);
+        u16le(&mut z, gp);
+        u16le(&mut z, METHOD_STORE);
+        u16le(&mut z, 0);
+        u16le(&mut z, 0);
+        u32le(&mut z, crc);
+        u32le(&mut z, body.len() as u32);
+        u32le(&mut z, body.len() as u32);
+        u16le(&mut z, n.len() as u16);
+        u16le(&mut z, 0);
+        z.extend_from_slice(n);
+        z.extend_from_slice(body);
+
+        let cd_offset = z.len() as u32;
+        u32le(&mut z, SIG_CENTRAL);
+        u16le(&mut z, 20);
+        u16le(&mut z, 20);
+        u16le(&mut z, gp);
+        u16le(&mut z, METHOD_STORE);
+        u16le(&mut z, 0);
+        u16le(&mut z, 0);
+        u32le(&mut z, crc);
+        u32le(&mut z, body.len() as u32);
+        u32le(&mut z, body.len() as u32);
+        u16le(&mut z, n.len() as u16);
+        u16le(&mut z, 0); // extra
+        u16le(&mut z, 0); // comment
+        u16le(&mut z, 0); // disk
+        u16le(&mut z, 0); // internal attrs
+        u32le(&mut z, 0); // external attrs
+        u32le(&mut z, 0); // local header offset
+        z.extend_from_slice(n);
+        let cd_size = z.len() as u32 - cd_offset;
+
+        u32le(&mut z, SIG_EOCD);
+        u16le(&mut z, 0);
+        u16le(&mut z, 0);
+        u16le(&mut z, 1);
+        u16le(&mut z, 1);
+        u32le(&mut z, cd_size);
+        u32le(&mut z, cd_offset);
+        u16le(&mut z, 0);
+        z
+    }
+
+    fn dev_from(bytes: &[u8]) -> MemoryBackend {
+        let mut dev = MemoryBackend::new(bytes.len().max(1) as u64);
+        dev.write_at(0, bytes).unwrap();
+        dev
+    }
+
+    /// A self-extracting archive keeps the central-directory and local
+    /// offsets relative to the start of the zip data. The scan used to
+    /// read whatever sat at the declared (too small) offset, find no
+    /// signature, and hand back an empty archive.
+    #[test]
+    fn sfx_prefix_is_corrected() {
+        let zip = one_entry_zip("a.txt", b"hi", 0);
+        let mut sfx = vec![0x7fu8; 4096]; // stand-in for the stub
+        sfx.extend_from_slice(&zip);
+        let mut dev = dev_from(&sfx);
+        let idx = scan(&mut dev).unwrap();
+        let e = idx
+            .entries()
+            .iter()
+            .find(|e| e.path == "/a.txt")
+            .expect("entry");
+        let loc = e.data.as_ref().unwrap();
+        // Local header is at 4096; body follows 30 bytes + the name.
+        assert_eq!(loc.offset, 4096 + 30 + 5);
+        assert_eq!(loc.uncompressed_len, 2);
+    }
+
+    /// Without a plausible prefix to blame, a central directory that
+    /// holds no record while the EOCD counts entries is a broken image,
+    /// not an empty archive.
+    #[test]
+    fn unreadable_central_directory_is_an_error() {
+        let mut zip = one_entry_zip("a.txt", b"hi", 0);
+        // The central record starts right after the 30+5+2 byte member.
+        let cd = 30 + 5 + 2;
+        zip[cd] ^= 0xff;
+        let mut dev = dev_from(&zip);
+        let err = match scan(&mut dev) {
+            Ok(_) => panic!("scan accepted an unreadable central directory"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, Error::InvalidImage(_)),
+            "expected InvalidImage, got {err:?}"
+        );
+    }
+
+    /// General-purpose bit 0 means the body is ciphertext; it must not be
+    /// fed to the method's decoder.
+    #[test]
+    fn encrypted_entry_is_flagged() {
+        let zip = one_entry_zip("secret.txt", b"hi", 0x0001);
+        let mut dev = dev_from(&zip);
+        let idx = scan(&mut dev).unwrap();
+        let e = idx
+            .entries()
+            .iter()
+            .find(|e| e.path == "/secret.txt")
+            .expect("entry");
+        assert_eq!(e.data.as_ref().unwrap().method, Method::Encrypted);
+        let loc = e.data.clone().unwrap();
+        let err = match crate::fs::archive::reader::open(&mut dev, loc) {
+            Ok(_) => panic!("reader opened an encrypted body"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, crate::Error::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+    }
 }

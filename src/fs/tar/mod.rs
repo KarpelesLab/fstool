@@ -106,6 +106,16 @@ impl EntryKind {
             _ => return None,
         })
     }
+
+    /// Like [`Self::from_typeflag`], but also recognises pre-ustar (V7)
+    /// directories, which carry the old regular-file typeflag (`\0`) and a
+    /// name ending in `/`.
+    fn from_header(h: &header::Header) -> Option<Self> {
+        if h.typeflag == header::TYPEFLAG_REG_OLD && h.name.ends_with('/') {
+            return Some(Self::Dir);
+        }
+        Self::from_typeflag(h.typeflag)
+    }
 }
 
 /// One archived entry, fully resolved (PAX overrides applied).
@@ -211,36 +221,51 @@ impl Tar {
                     // Read the PAX body.
                     let body = read_meta_body_at(dev, data_off, h.size, "PAX header")?;
                     pending.merge(pax::decode_records(&body)?);
-                    pos = data_off + size_padded;
+                    let Some(next) = next_entry_pos(data_off, size_padded, total) else {
+                        break;
+                    };
+                    pos = next;
                     continue;
                 }
                 header::TYPEFLAG_PAX_GLOBAL => {
                     // Ignore global headers — we don't propagate them.
-                    pos = data_off + size_padded;
+                    let Some(next) = next_entry_pos(data_off, size_padded, total) else {
+                        break;
+                    };
+                    pos = next;
                     continue;
                 }
                 header::TYPEFLAG_GNU_LONGNAME => {
                     let body = read_meta_body_at(dev, data_off, h.size, "GNU long name")?;
                     pending.path = Some(trim_nul(body));
-                    pos = data_off + size_padded;
+                    let Some(next) = next_entry_pos(data_off, size_padded, total) else {
+                        break;
+                    };
+                    pos = next;
                     continue;
                 }
                 header::TYPEFLAG_GNU_LONGLINK => {
                     let body = read_meta_body_at(dev, data_off, h.size, "GNU long link")?;
                     pending.linkpath = Some(trim_nul(body));
-                    pos = data_off + size_padded;
+                    let Some(next) = next_entry_pos(data_off, size_padded, total) else {
+                        break;
+                    };
+                    pos = next;
                     continue;
                 }
                 _ => {}
             }
-            let Some(kind) = EntryKind::from_typeflag(h.typeflag) else {
+            let Some(kind) = EntryKind::from_header(&h) else {
                 // Unknown typeflag — skip the entry but warn.
                 eprintln!(
                     "tar: skipping entry {:?} with unknown typeflag {:?}",
                     h.full_name(),
                     h.typeflag as char
                 );
-                pos = data_off + size_padded;
+                let Some(next) = next_entry_pos(data_off, size_padded, total) else {
+                    break;
+                };
+                pos = next;
                 continue;
             };
 
@@ -277,16 +302,23 @@ impl Tar {
                 xattrs,
             };
 
-            pos = data_off
-                + if matches!(kind, EntryKind::Regular) {
-                    size.saturating_add(511) & !511
-                } else {
-                    0
-                };
+            let body_padded = if matches!(kind, EntryKind::Regular) {
+                size.saturating_add(511) & !511
+            } else {
+                0
+            };
+            // Yield the entry even when its body is cut short by the end of
+            // the archive (a truncated final member is still listable); the
+            // scan then stops instead of computing a wrapped position.
+            let next = next_entry_pos(data_off, body_padded, total);
 
             if let std::ops::ControlFlow::Break(()) = f(&entry) {
                 return Ok(());
             }
+            let Some(next) = next else {
+                break;
+            };
+            pos = next;
         }
         Ok(())
     }
@@ -765,6 +797,19 @@ fn read_exact_at(dev: &mut dyn BlockDevice, offset: u64, len: usize) -> Result<V
 /// Read a metadata entry body (PAX / GNU long name / long link) at a fixed
 /// offset, rejecting an attacker-inflated `size` before allocating. These
 /// bodies are bounded by [`header::MAX_META_BODY`].
+/// Offset of the header following an entry whose body starts at `data_off`
+/// and occupies `body_padded` bytes (already rounded up to a block).
+///
+/// A GNU base-256 size can be anything up to `u64::MAX`, so the sum can
+/// wrap; a wrapped position would either panic or let the scan spin
+/// forever. `None` means the entry's body runs past the end of the archive
+/// — the scan treats that exactly like a truncated archive and stops.
+fn next_entry_pos(data_off: u64, body_padded: u64, total: u64) -> Option<u64> {
+    data_off
+        .checked_add(body_padded)
+        .filter(|&next| next <= total)
+}
+
 fn read_meta_body_at(
     dev: &mut dyn BlockDevice,
     offset: u64,
@@ -866,7 +911,7 @@ impl<'a> TarWriter<'a> {
         meta: TarEntryMeta,
         xattrs: &[Xattr],
     ) -> Result<()> {
-        let needs_size_pax = size > 0o7777_7777_7777; // 12-octal-digit limit (8 GiB)
+        let needs_size_pax = !header::size_fits_ustar(size);
         let mut records = pax::records_for_entry(path, None, needs_size_pax, xattrs);
         if needs_size_pax {
             records.push(pax::Record {
@@ -1116,12 +1161,20 @@ fn build_header(
         ),
         None => (String::new(), false),
     };
+    // A size beyond the 11-octal-digit ustar field travels in the PAX
+    // `size` record every add_file path emits for it; the ustar field then
+    // holds 0 (readers apply the PAX override) instead of failing to encode.
+    let ustar_size = if header::size_fits_ustar(size) {
+        size
+    } else {
+        0
+    };
     Ok(Header {
         name,
         mode: meta.mode & 0o7777,
         uid: meta.uid,
         gid: meta.gid,
-        size,
+        size: ustar_size,
         mtime: meta.mtime,
         typeflag,
         linkname: linkname_short,
@@ -1238,6 +1291,130 @@ mod tests {
         assert_eq!(normalise_path("./a/./b/"), "/a/b");
         assert_eq!(normalise_path("/a/b/../../.."), "/");
         assert_eq!(normalise_path(".."), "/");
+    }
+
+    fn test_meta() -> TarEntryMeta {
+        TarEntryMeta {
+            mode: 0o640,
+            uid: 1000,
+            gid: 1000,
+            mtime: 0x6000_0000,
+            uname: "user".into(),
+            gname: "group".into(),
+        }
+    }
+
+    /// Recompute the checksum of a hand-patched header block.
+    fn fix_checksum(block: &mut [u8; BLOCK_SIZE]) {
+        block[148..156].copy_from_slice(b"        ");
+        let sum: u32 = block.iter().map(|&b| b as u32).sum();
+        block[148..154].copy_from_slice(format!("{sum:06o}").as_bytes());
+        block[154] = 0;
+        block[155] = b' ';
+    }
+
+    /// A GNU base-256 size near `u64::MAX` used to make `data_off + size`
+    /// wrap, panicking (debug) or spinning the scan forever (release).
+    #[test]
+    fn scan_survives_base256_size_overflow() {
+        let mut block = build_header(
+            "/huge",
+            header::TYPEFLAG_REG,
+            0,
+            None,
+            (0, 0),
+            &test_meta(),
+            false,
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        // size field = base-256 with every payload bit set → u64::MAX.
+        block[124] = 0x80;
+        for b in &mut block[125..136] {
+            *b = 0xFF;
+        }
+        fix_checksum(&mut block);
+        let mut dev = MemoryBackend::new(4 * BLOCK_SIZE as u64);
+        dev.write_at(0, &block).unwrap();
+        let tar = Tar::open(&mut dev).unwrap();
+        // The entry is still reported (like any truncated final member);
+        // the scan then stops instead of wrapping around.
+        let entries = tar.entries(&mut dev).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].size, u64::MAX);
+    }
+
+    /// V7 archives mark directories with the old `\0` typeflag and a
+    /// trailing slash on the name.
+    #[test]
+    fn v7_trailing_slash_entry_is_a_directory() {
+        let mut h = build_header(
+            "sub/",
+            header::TYPEFLAG_REG_OLD,
+            0,
+            None,
+            (0, 0),
+            &test_meta(),
+            false,
+        )
+        .unwrap();
+        h.name = "sub/".into();
+        let block = h.encode().unwrap();
+        let mut dev = MemoryBackend::new(4 * BLOCK_SIZE as u64);
+        dev.write_at(0, &block).unwrap();
+        let tar = Tar::open(&mut dev).unwrap();
+        let e = tar.lookup(&mut dev, "/sub").unwrap().unwrap();
+        assert_eq!(e.kind, EntryKind::Dir);
+
+        // Streaming reader agrees.
+        let mut bytes = block.to_vec();
+        bytes.extend_from_slice(&[0u8; 2 * BLOCK_SIZE]);
+        let mut r = stream::TarStreamReader::new(&bytes[..]);
+        let ent = r.next_entry().unwrap().unwrap();
+        assert_eq!(ent.entry.kind, EntryKind::Dir);
+    }
+
+    /// Sizes past the 11-octal-digit ustar field go through a PAX `size`
+    /// record; the ustar header itself must still encode (with 0 in the
+    /// size field) rather than fail. Header-only: no 10 GiB body needed.
+    #[test]
+    fn header_for_ten_gib_file_encodes_with_pax_size() {
+        let size: u64 = 10 << 30;
+        assert!(!header::size_fits_ustar(size));
+        let h = build_header(
+            "/big.bin",
+            header::TYPEFLAG_REG,
+            size,
+            None,
+            (0, 0),
+            &test_meta(),
+            false,
+        )
+        .unwrap();
+        let block = h.encode().unwrap();
+        assert!(Header::checksum_ok(&block));
+        assert_eq!(Header::decode(&block).unwrap().size, 0);
+        // The PAX record carries the real size and reads back as such.
+        let recs = vec![pax::Record {
+            key: pax::KEY_SIZE.into(),
+            value: size.to_string().into_bytes(),
+        }];
+        let mut over = PaxOverrides::default();
+        over.merge(pax::decode_records(&pax::encode_records(&recs)).unwrap());
+        assert_eq!(over.size, Some(size));
+        // 64 GiB (the old, wrong threshold) behaves the same way.
+        let h = build_header(
+            "/bigger.bin",
+            header::TYPEFLAG_REG,
+            64 << 30,
+            None,
+            (0, 0),
+            &test_meta(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(Header::decode(&h.encode().unwrap()).unwrap().size, 0);
     }
 
     #[test]

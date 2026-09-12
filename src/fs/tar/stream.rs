@@ -98,7 +98,7 @@ impl<W: Write> TarStreamWriter<W> {
         meta: TarEntryMeta,
         xattrs: &[Xattr],
     ) -> Result<()> {
-        let needs_size_pax = size > 0o7777_7777_7777; // 12-octal-digit limit (8 GiB)
+        let needs_size_pax = !header::size_fits_ustar(size);
         let mut records = pax::records_for_entry(path, None, needs_size_pax, xattrs);
         if needs_size_pax {
             records.push(pax::Record {
@@ -382,7 +382,10 @@ impl<R: Read> TarStreamReader<R> {
                 ));
             }
             let h = Header::decode(&block)?;
-            let size_padded = ((h.size + 511) & !511) as usize - h.size as usize;
+            // Padding after the body, computed without `h.size + 511`, which
+            // wraps for a crafted base-256 size.
+            let size_padded =
+                ((BLOCK_SIZE as u64 - (h.size % BLOCK_SIZE as u64)) % BLOCK_SIZE as u64) as usize;
             match h.typeflag {
                 header::TYPEFLAG_PAX => {
                     let body = self.read_meta_body(h.size, "PAX header")?;
@@ -406,14 +409,18 @@ impl<R: Read> TarStreamReader<R> {
                 }
                 _ => {}
             }
-            let Some(kind) = EntryKind::from_typeflag(h.typeflag) else {
+            let Some(kind) = EntryKind::from_header(&h) else {
                 eprintln!(
                     "tar: skipping entry {:?} with unknown typeflag {:?}",
                     h.full_name(),
                     h.typeflag as char
                 );
-                // Consume the body + padding and try again.
-                let _ = self.read_exact_padded(h.size as usize)?;
+                // Consume the body + padding through the fixed pump buffer
+                // (never `vec![0; h.size]` — the size is untrusted) and try
+                // again.
+                self.body_remaining = h.size;
+                self.body_padding = size_padded;
+                self.skip_current_body()?;
                 continue;
             };
             let path = self.pending.path.take().unwrap_or_else(|| h.full_name());
@@ -863,6 +870,32 @@ mod tests {
             uname: "user".into(),
             gname: "group".into(),
         }
+    }
+
+    /// An unknown typeflag's body is skipped through the fixed pump buffer;
+    /// it used to be `vec![0; size]`, so a crafted multi-exabyte size
+    /// aborted the process instead of producing a read error.
+    #[test]
+    fn unknown_typeflag_with_huge_size_does_not_allocate() {
+        let mut block = super::super::build_header("/weird", b'Z', 0, None, (0, 0), &meta(), false)
+            .unwrap()
+            .encode()
+            .unwrap();
+        // GNU base-256 size = 2^63 - 1.
+        block[124] = 0x80 | 0x7F;
+        for b in &mut block[125..136] {
+            *b = 0xFF;
+        }
+        block[148..156].copy_from_slice(b"        ");
+        let sum: u32 = block.iter().map(|&b| b as u32).sum();
+        block[148..154].copy_from_slice(format!("{sum:06o}").as_bytes());
+        block[154] = 0;
+        block[155] = b' ';
+        let mut bytes = block.to_vec();
+        bytes.extend_from_slice(&[0u8; 4 * BLOCK_SIZE]);
+        let mut r = TarStreamReader::new(&bytes[..]);
+        // The stream ends long before the body does: a plain error.
+        assert!(r.next_entry().is_err());
     }
 
     #[test]

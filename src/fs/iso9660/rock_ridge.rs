@@ -40,31 +40,44 @@ pub struct RockRidgeAttrs {
 /// cooked attributes. Returns `None` if the SUA contained nothing of
 /// interest (the caller can then fall back to defaults).
 pub fn parse_system_use(dev: &mut dyn BlockDevice, sua: &[u8]) -> Option<RockRidgeAttrs> {
-    let mut attrs = RockRidgeAttrs::default();
-    let mut name = String::new();
-    let mut symlink = String::new();
-    let mut had_any = false;
+    let mut acc = Acc {
+        attrs: RockRidgeAttrs::default(),
+        name: String::new(),
+        symlink: String::new(),
+        sl_need_sep: false,
+        any: false,
+        ce_budget: MAX_CE_FOLLOWS,
+    };
 
-    parse_block(
-        sua,
-        dev,
-        &mut attrs,
-        &mut name,
-        &mut symlink,
-        &mut had_any,
-        0,
-    );
+    parse_block(sua, dev, &mut acc);
 
-    if !had_any {
+    if !acc.any {
         return None;
     }
-    if !name.is_empty() {
-        attrs.alternate_name = Some(name);
+    let mut attrs = acc.attrs;
+    if !acc.name.is_empty() {
+        attrs.alternate_name = Some(acc.name);
     }
-    if !symlink.is_empty() {
-        attrs.symlink_target = Some(symlink);
+    if !acc.symlink.is_empty() {
+        attrs.symlink_target = Some(acc.symlink);
     }
     Some(attrs)
+}
+
+/// Accumulator threaded through one record's SUA and every continuation
+/// area it points at, so multi-entry `NM` / `SL` state and the `CE`
+/// budget are shared across all of them.
+struct Acc {
+    attrs: RockRidgeAttrs,
+    name: String,
+    symlink: String,
+    /// Whether the next `SL` component must be preceded by a `/`. False
+    /// at the start, after a ROOT component, and after a component whose
+    /// CONTINUE flag says the next record continues the same name.
+    sl_need_sep: bool,
+    any: bool,
+    /// Continuation areas we may still follow for this record.
+    ce_budget: usize,
 }
 
 /// Detect SP / ER on the root's "." entry. If present, Rock Ridge is
@@ -85,46 +98,26 @@ pub fn root_has_rr(dev: &mut dyn BlockDevice, pvd: &PrimaryVolumeDescriptor) -> 
         return Ok(false);
     }
     let dot = DirRecord::decode(&buf[..len_dr])?;
-    // SP signature: "SP" + 2 bytes len + version + 0xBE 0xEF magic.
-    for window in dot.system_use.windows(4) {
-        if &window[..2] == b"SP" && window[2] >= 7 {
-            // Look for the SP magic at offset 4..6 of the SP entry.
-            let off = dot.system_use.as_ptr() as usize - dot.system_use.as_ptr() as usize; // 0
-            let _ = off;
-            // Just check that SP is present and the magic 0xBE 0xEF
-            // follows at the right offset.
-            // Find the SP at its actual position in the SUA.
-            for i in 0..(dot.system_use.len().saturating_sub(7)) {
-                if &dot.system_use[i..i + 2] == b"SP"
-                    && dot.system_use.get(i + 4) == Some(&0xBE)
-                    && dot.system_use.get(i + 5) == Some(&0xEF)
-                {
-                    return Ok(true);
-                }
-            }
-        }
-    }
-    Ok(false)
+    // SP entry (SUSP §5.3): "SP" + len (>= 7) + version + 0xBE 0xEF +
+    // bytes-skipped. The SUA may hold nothing but this 7-byte entry, so
+    // the scan must consider a candidate that ends exactly at the end.
+    let sua = &dot.system_use;
+    Ok(sua
+        .windows(7)
+        .any(|w| &w[..2] == b"SP" && w[2] >= 7 && w[4] == 0xBE && w[5] == 0xEF))
 }
 
 /// Maximum number of `CE` continuation areas we will follow for a single
-/// directory record. A malicious image can otherwise chain (or cycle) `CE`
-/// entries to drive unbounded recursion and disk reads.
-const MAX_CE_DEPTH: usize = 8;
+/// directory record, counted across the whole record (not per nesting
+/// level). A malicious image can otherwise chain, fan out or cycle `CE`
+/// entries to drive unbounded disk reads.
+const MAX_CE_FOLLOWS: usize = 8;
 
 /// Walk a contiguous SUA block, mutating the accumulator in place.
-/// `CE` entries recursively follow into a continuation area on disk.
-/// `depth` counts how many `CE` continuations we have already followed and
-/// is bounded by [`MAX_CE_DEPTH`].
-fn parse_block(
-    sua: &[u8],
-    dev: &mut dyn BlockDevice,
-    attrs: &mut RockRidgeAttrs,
-    name_acc: &mut String,
-    symlink_acc: &mut String,
-    any: &mut bool,
-    depth: usize,
-) {
+/// A `CE` entry continues into its continuation area on disk; per IEEE
+/// P1282 §4.1.5 it is the last entry of the area it sits in, so nothing
+/// after it is looked at.
+fn parse_block(sua: &[u8], dev: &mut dyn BlockDevice, acc: &mut Acc) {
     let mut i = 0;
     while i + 4 <= sua.len() {
         let sig = &sua[i..i + 2];
@@ -136,30 +129,29 @@ fn parse_block(
         match sig {
             b"NM" => {
                 if let Some(payload) = body.get(1..) {
-                    let cont_flag = body.first().copied().unwrap_or(0);
-                    name_acc.push_str(&String::from_utf8_lossy(payload));
-                    if cont_flag & 0x01 == 0 {
-                        // No continuation — name complete.
-                    }
-                    *any = true;
+                    // body[0] is the flags byte; bit 0 (CONTINUE) just
+                    // means another NM follows — we concatenate regardless.
+                    acc.name.push_str(&String::from_utf8_lossy(payload));
+                    acc.any = true;
                 }
             }
             b"PX" if body.len() >= 32 => {
                 if let Ok(mode) = super::vd::decode_both_endian_u32(&body[0..8], "PX.mode") {
-                    attrs.mode = Some(mode);
+                    acc.attrs.mode = Some(mode);
                 }
                 // nlink (body[8..16]) is parsed by the spec but not surfaced today.
                 if let Ok(uid) = super::vd::decode_both_endian_u32(&body[16..24], "PX.uid") {
-                    attrs.uid = Some(uid);
+                    acc.attrs.uid = Some(uid);
                 }
                 if let Ok(gid) = super::vd::decode_both_endian_u32(&body[24..32], "PX.gid") {
-                    attrs.gid = Some(gid);
+                    acc.attrs.gid = Some(gid);
                 }
-                *any = true;
+                acc.any = true;
             }
             b"SL" => {
-                // body[0] = flags, body[1..] = component records.
-                let cont = body.first().copied().unwrap_or(0) & 0x01;
+                // body[0] = flags (bit 0: another SL entry continues this
+                // same target), body[1..] = component records. Separator
+                // state lives in `acc` so it carries across SL entries.
                 let mut j = 1;
                 while j + 2 <= body.len() {
                     let comp_flags = body[j];
@@ -168,35 +160,42 @@ fn parse_block(
                         break;
                     }
                     let comp_bytes = &body[j + 2..j + 2 + comp_len];
-                    if !symlink_acc.is_empty() && (comp_flags & 0x08) == 0 {
-                        symlink_acc.push('/');
-                    }
                     // Bit flags per IEEE P1282 §4.1.3.1:
-                    //   0x01: CONTINUE — concat without a slash
-                    //   0x02: CURRENT  ("./")
-                    //   0x04: PARENT   ("../")
+                    //   0x01: CONTINUE — this component's text continues
+                    //         in the next component record (no slash)
+                    //   0x02: CURRENT  ("." )
+                    //   0x04: PARENT   ("..")
                     //   0x08: ROOT     ("/")
-                    if comp_flags & 0x02 != 0 {
-                        symlink_acc.push('.');
-                    } else if comp_flags & 0x04 != 0 {
-                        symlink_acc.push_str("..");
-                    } else if comp_flags & 0x08 != 0 {
-                        symlink_acc.push('/');
+                    if comp_flags & 0x08 != 0 {
+                        // ROOT is the leading `/` itself; the next
+                        // component follows it directly.
+                        acc.symlink.push('/');
+                        acc.sl_need_sep = false;
                     } else {
-                        symlink_acc.push_str(&String::from_utf8_lossy(comp_bytes));
+                        if acc.sl_need_sep {
+                            acc.symlink.push('/');
+                        }
+                        if comp_flags & 0x02 != 0 {
+                            acc.symlink.push('.');
+                        } else if comp_flags & 0x04 != 0 {
+                            acc.symlink.push_str("..");
+                        } else {
+                            acc.symlink.push_str(&String::from_utf8_lossy(comp_bytes));
+                        }
+                        acc.sl_need_sep = comp_flags & 0x01 == 0;
                     }
                     j += 2 + comp_len;
                 }
-                let _ = cont;
-                *any = true;
+                acc.any = true;
             }
             b"CE" if body.len() >= 24 => {
-                // Bound recursion / disk reads: stop following continuation
-                // areas once we have already chased MAX_CE_DEPTH of them.
-                // This also breaks any CE cycle a malicious image builds.
-                if depth >= MAX_CE_DEPTH {
+                // Bound disk reads: stop following continuation areas once
+                // the record's budget is spent. This also breaks any CE
+                // cycle a malicious image builds.
+                if acc.ce_budget == 0 {
                     break;
                 }
+                acc.ce_budget -= 1;
                 let ce_lba = super::vd::decode_both_endian_u32(&body[0..8], "CE.lba").ok();
                 let ce_off = super::vd::decode_both_endian_u32(&body[8..16], "CE.offset").ok();
                 let ce_len = super::vd::decode_both_endian_u32(&body[16..24], "CE.len").ok();
@@ -214,10 +213,12 @@ fn parse_block(
                         let mut buf = vec![0u8; clen as usize];
                         let abs = u64::from(lba) * sector + off;
                         if dev.read_at(abs, &mut buf).is_ok() {
-                            parse_block(&buf, dev, attrs, name_acc, symlink_acc, any, depth + 1);
+                            parse_block(&buf, dev, acc);
                         }
                     }
                 }
+                // CE is by spec the last entry of its area.
+                break;
             }
             b"TF" => {
                 // Timestamps. body[0] = flags bitmap (0x01 creation,
@@ -233,17 +234,21 @@ fn parse_block(
                 while bit < 7 {
                     if bits & (1 << bit) != 0 && k + entry_size <= body.len() {
                         if bit == 1 {
-                            // mtime
-                            attrs.mtime = Some(decode_iso_short_time(&body[k..k + entry_size]));
+                            let ts = &body[k..k + entry_size];
+                            acc.attrs.mtime = Some(if long {
+                                decode_iso_long_time(ts)
+                            } else {
+                                decode_iso_short_time(ts)
+                            });
                         }
                         k += entry_size;
                     }
                     bit += 1;
                 }
-                *any = true;
+                acc.any = true;
             }
             b"SP" | b"RR" | b"ER" | b"ES" | b"PD" | b"ST" | b"PN" | b"CL" | b"PL" | b"SF" => {
-                *any = true;
+                acc.any = true;
             }
             _ => { /* unknown / vendor entry — skip */ }
         }
@@ -273,4 +278,159 @@ fn decode_iso_short_time(buf: &[u8]) -> i64 {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146097 + doe - 719468;
     days * 86400 + hour * 3600 + minute * 60 + second - gmt_off_qh * 15 * 60
+}
+
+/// ECMA-119 §8.4.26.1 long-form time: 16 ASCII digits
+/// `YYYYMMDDHHMMSScc` (the trailing `cc` is hundredths of a second)
+/// followed by one GMT-offset byte in 15-minute units. Converted through
+/// the short-form path so both forms share one calendar computation.
+fn decode_iso_long_time(buf: &[u8]) -> i64 {
+    if buf.len() < 17 {
+        return 0;
+    }
+    let digits = |r: std::ops::Range<usize>| -> Option<i64> {
+        buf[r].iter().try_fold(0i64, |acc, &b| {
+            if b.is_ascii_digit() {
+                Some(acc * 10 + i64::from(b - b'0'))
+            } else {
+                None
+            }
+        })
+    };
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        digits(0..4),
+        digits(4..6),
+        digits(6..8),
+        digits(8..10),
+        digits(10..12),
+        digits(12..14),
+    ) else {
+        return 0;
+    };
+    // An all-zero field set means "not specified".
+    if year == 0 {
+        return 0;
+    }
+    let years = year - 1900;
+    if !(0..=255).contains(&years) {
+        return 0;
+    }
+    let short = [
+        years as u8,
+        month as u8,
+        day as u8,
+        hour as u8,
+        minute as u8,
+        second as u8,
+        buf[16],
+    ];
+    decode_iso_short_time(&short)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::MemoryBackend;
+
+    /// Build one SUSP entry: signature, length, version 1, body.
+    fn entry(sig: &[u8; 2], body: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(4 + body.len());
+        v.extend_from_slice(sig);
+        v.push((4 + body.len()) as u8);
+        v.push(1);
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// One SL component record.
+    fn comp(flags: u8, text: &[u8]) -> Vec<u8> {
+        let mut v = vec![flags, text.len() as u8];
+        v.extend_from_slice(text);
+        v
+    }
+
+    fn parse(sua: &[u8]) -> RockRidgeAttrs {
+        let mut dev = MemoryBackend::new(4 * SECTOR_SIZE as u64);
+        parse_system_use(&mut dev, sua).expect("attrs")
+    }
+
+    /// Absolute targets start with a single `/`, and components are
+    /// separated by exactly one `/`.
+    #[test]
+    fn sl_absolute_target_has_single_leading_slash() {
+        let mut body = vec![0u8];
+        body.extend(comp(0x08, b""));
+        body.extend(comp(0, b"usr"));
+        body.extend(comp(0, b"lib"));
+        let sua = entry(b"SL", &body);
+        assert_eq!(parse(&sua).symlink_target.as_deref(), Some("/usr/lib"));
+
+        let mut body = vec![0u8];
+        body.extend(comp(0x04, b""));
+        body.extend(comp(0x02, b""));
+        body.extend(comp(0, b"x"));
+        let sua = entry(b"SL", &body);
+        assert_eq!(parse(&sua).symlink_target.as_deref(), Some(".././x"));
+    }
+
+    /// A component's CONTINUE flag glues the next record to it without a
+    /// separator, and the state carries across SL entries.
+    #[test]
+    fn sl_continue_flag_concatenates_components() {
+        let mut body1 = vec![0x01u8]; // SL-level CONTINUE: another SL follows
+        body1.extend(comp(0, b"dir"));
+        body1.extend(comp(0x01, b"long-na"));
+        let mut body2 = vec![0u8];
+        body2.extend(comp(0, b"me.txt"));
+        let mut sua = entry(b"SL", &body1);
+        sua.extend(entry(b"SL", &body2));
+        assert_eq!(
+            parse(&sua).symlink_target.as_deref(),
+            Some("dir/long-name.txt")
+        );
+    }
+
+    /// TF long form (17-byte ASCII timestamps) decodes to the same instant
+    /// as the equivalent short form.
+    #[test]
+    fn tf_long_form_matches_short_form() {
+        // 2024-03-05 06:07:08 UTC.
+        let short = [124u8, 3, 5, 6, 7, 8, 0];
+        let mut long = b"2024030506070800".to_vec();
+        long.push(0);
+        let mut b_short = vec![0x02u8];
+        b_short.extend_from_slice(&short);
+        let mut b_long = vec![0x82u8];
+        b_long.extend_from_slice(&long);
+        let t_short = parse(&entry(b"TF", &b_short)).mtime.unwrap();
+        let t_long = parse(&entry(b"TF", &b_long)).mtime.unwrap();
+        assert_eq!(t_short, t_long);
+        assert_eq!(t_short, 1_709_618_828);
+    }
+
+    /// A CE that points back at itself (or fans out) is followed at most
+    /// MAX_CE_FOLLOWS times in total, and nothing after a CE is parsed.
+    #[test]
+    fn ce_cycle_is_bounded() {
+        let sector = SECTOR_SIZE as u64;
+        let mut dev = MemoryBackend::new(4 * sector);
+        // Continuation area at LBA 1, offset 0: an NM entry, then a CE that
+        // points back at itself, then another NM that must never be seen.
+        let mut ce_body = Vec::new();
+        for v in [1u32, 0, 64] {
+            ce_body.extend_from_slice(&v.to_le_bytes());
+            ce_body.extend_from_slice(&v.to_be_bytes());
+        }
+        let mut area = entry(b"NM", &[0, b'a']);
+        area.extend(entry(b"CE", &ce_body));
+        area.extend(entry(b"NM", &[0, b'Z']));
+        assert!(area.len() <= 64);
+        area.resize(64, 0);
+        dev.write_at(sector, &area).unwrap();
+        let sua = entry(b"CE", &ce_body);
+        let attrs = parse_system_use(&mut dev, &sua).unwrap();
+        let name = attrs.alternate_name.unwrap();
+        assert_eq!(name.len(), MAX_CE_FOLLOWS);
+        assert!(name.bytes().all(|b| b == b'a'), "{name}");
+    }
 }

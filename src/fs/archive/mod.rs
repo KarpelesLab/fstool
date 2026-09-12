@@ -104,6 +104,11 @@ pub enum Method {
     /// A method id we can name but not decode. Indexing still succeeds;
     /// reading the body returns `Unsupported`.
     Unsupported(u16),
+    /// The body is encrypted (zip general-purpose bit 0 / bit 6). We
+    /// have no key handling; indexing succeeds, reading returns
+    /// `Unsupported` naming the cause instead of feeding ciphertext to
+    /// a decompressor.
+    Encrypted,
 }
 
 /// Where an entry's bytes live on the device and how to decode them.
@@ -189,6 +194,10 @@ pub struct ArchiveIndex {
     entries: Vec<ArchiveEntry>,
     by_path: HashMap<String, usize>,
     children: HashMap<String, Vec<String>>,
+    /// Every path already listed in some `children` bucket, so a repeat
+    /// component is an O(1) lookup instead of a scan of its siblings
+    /// (which made indexing a flat directory of N members O(N²)).
+    registered: std::collections::HashSet<String>,
 }
 
 impl ArchiveIndex {
@@ -201,6 +210,7 @@ impl ArchiveIndex {
             entries: Vec::new(),
             by_path: HashMap::new(),
             children,
+            registered: std::collections::HashSet::new(),
         }
     }
 
@@ -226,9 +236,11 @@ impl ArchiveIndex {
             } else {
                 format!("{parent}/{comp}")
             };
-            let kids = self.children.entry(parent.clone()).or_default();
-            if !kids.iter().any(|k| k == comp) {
-                kids.push((*comp).to_string());
+            if self.registered.insert(child_path.clone()) {
+                self.children
+                    .entry(parent.clone())
+                    .or_default()
+                    .push((*comp).to_string());
             }
             let is_leaf = i + 1 == comps.len();
             if !is_leaf {
@@ -381,6 +393,13 @@ pub struct ArchiveFs {
     scaffold: bool,
     /// Archive byte length recorded after `flush` finalises the writer.
     flushed_len: Option<u64>,
+    /// The index produced by the first `rescan`, kept for the life of the
+    /// handle. A sequential handle is read-only (no builder, every write
+    /// is refused), so the device cannot change underneath it and a
+    /// second walk would only rebuild the same index; without this cache
+    /// every `list` / `getattr` / `read_file` re-read the whole archive.
+    /// Does not affect `access_mode`, which keys off `rescan`.
+    scanned: std::sync::OnceLock<ArchiveIndex>,
 }
 
 impl ArchiveFs {
@@ -396,6 +415,7 @@ impl ArchiveFs {
             cap: MutationCapability::Streaming,
             scaffold: false,
             flushed_len: None,
+            scanned: std::sync::OnceLock::new(),
         }
     }
 
@@ -415,6 +435,7 @@ impl ArchiveFs {
             cap: MutationCapability::Streaming,
             scaffold: false,
             flushed_len: None,
+            scanned: std::sync::OnceLock::new(),
         }
     }
 
@@ -428,6 +449,7 @@ impl ArchiveFs {
             cap: MutationCapability::Streaming,
             scaffold: false,
             flushed_len: None,
+            scanned: std::sync::OnceLock::new(),
         }
     }
 
@@ -440,6 +462,7 @@ impl ArchiveFs {
             cap: MutationCapability::Immutable,
             scaffold: true,
             flushed_len: None,
+            scanned: std::sync::OnceLock::new(),
         }
     }
 
@@ -454,7 +477,16 @@ impl ArchiveFs {
         f: impl FnOnce(&ArchiveIndex) -> Result<R>,
     ) -> Result<R> {
         match self.rescan {
-            Some(scan) => f(&scan(dev)?),
+            Some(scan) => {
+                if let Some(idx) = self.scanned.get() {
+                    return f(idx);
+                }
+                let idx = scan(dev)?;
+                // A concurrent initialiser can only have produced the same
+                // index, so losing the race is harmless.
+                let _ = self.scanned.set(idx);
+                f(self.scanned.get().expect("index cached above"))
+            }
             None => f(&self.index),
         }
     }

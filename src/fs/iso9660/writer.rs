@@ -179,6 +179,37 @@ impl Iso9660Writer {
         self.image_len
     }
 
+    /// Refuse an entry whose directory record could not be encoded:
+    /// `len_dr` is a single byte and every Rock Ridge entry (NM, PX, SL)
+    /// has to fit inside it, as do the records of the directories the
+    /// path implicitly creates. Checked on the way in so the caller gets
+    /// the error immediately instead of at `flush`.
+    fn validate_entry(&self, path: &Path, is_dir: bool, target: Option<&Path>) -> Result<()> {
+        let comps: Vec<&str> = path
+            .to_str()
+            .unwrap_or("")
+            .trim_matches('/')
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .collect();
+        let n = comps.len();
+        for (i, comp) in comps.iter().enumerate() {
+            let leaf = i + 1 == n;
+            let (dir, tgt) = if leaf { (is_dir, target) } else { (true, None) };
+            let mut sizes = vec![record_size_for(comp, dir, tgt, self.opts.rock_ridge, false)];
+            if self.opts.joliet {
+                sizes.push(record_size_for(comp, dir, None, false, true));
+            }
+            if let Some(&too_big) = sizes.iter().find(|&&s| s > MAX_DIR_RECORD) {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "iso9660: directory record for {comp:?} would be {too_big} bytes; \
+                     the format allows {MAX_DIR_RECORD} (name or symlink target too long)"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Stream a file body to the device immediately, recording only its
     /// LBA + size. The body is consumed here (the source may be a one-shot
     /// reader), so nothing needs to be re-opened at flush.
@@ -217,6 +248,7 @@ impl Iso9660Writer {
         meta: FileMeta,
     ) -> Result<()> {
         let path = normalize(path)?;
+        self.validate_entry(&path, false, None)?;
         let lba = self.data_cursor;
         let base = u64::from(lba) * SECTOR;
         let mut scratch = vec![0u8; 64 * 1024];
@@ -250,12 +282,14 @@ impl Iso9660Writer {
 
     pub fn add_dir(&mut self, path: &Path, meta: FileMeta) -> Result<()> {
         let path = normalize(path)?;
+        self.validate_entry(&path, true, None)?;
         self.entries.insert(path, PendingEntry::Dir { meta });
         Ok(())
     }
 
     pub fn add_symlink(&mut self, path: &Path, target: &Path, meta: FileMeta) -> Result<()> {
         let path = normalize(path)?;
+        self.validate_entry(&path, false, Some(target))?;
         self.entries.insert(
             path,
             PendingEntry::Symlink {
@@ -275,6 +309,7 @@ impl Iso9660Writer {
         meta: FileMeta,
     ) -> Result<()> {
         let path = normalize(path)?;
+        self.validate_entry(&path, false, None)?;
         self.entries.insert(
             path,
             PendingEntry::Device {
@@ -539,17 +574,20 @@ fn compute_layout(
 }
 
 fn collect_directories(root: &Node) -> Vec<(PathBuf, u16)> {
-    // Returns (path, parent_index_1based) per ECMA-119 path table
-    // ordering — root has parent = 1 (itself). Breadth-first.
+    // Returns (path, parent_index_1based) per ECMA-119 §6.9.1 path table
+    // ordering: by depth, then by parent directory number, then by name
+    // (children iterate in name order) — root has parent = 1 (itself).
+    // That is a breadth-first walk, so the queue must be FIFO.
     let mut out: Vec<(PathBuf, u16)> = vec![(root.path.clone(), 1)];
-    let mut queue: Vec<(usize, &Node)> = vec![(0, root)];
-    while let Some((parent_idx_minus1, parent)) = queue.pop() {
+    let mut queue: std::collections::VecDeque<(usize, &Node)> =
+        std::collections::VecDeque::from([(0, root)]);
+    while let Some((parent_idx_minus1, parent)) = queue.pop_front() {
         for child in parent.children.values() {
             if matches!(child.kind, NodeKind::Dir) {
                 let parent_record = (parent_idx_minus1 + 1) as u16;
                 out.push((child.path.clone(), parent_record));
                 let new_idx = out.len() - 1;
-                queue.push((new_idx, child));
+                queue.push_back((new_idx, child));
             }
         }
     }
@@ -616,18 +654,22 @@ fn iso_name_bytes(name: &str, joliet: bool, directory: bool) -> usize {
 /// recursive).
 fn dir_records_byte_size(dir: &Node, opts: &FormatOpts, joliet: bool, is_root: bool) -> u64 {
     let mut sum: u64 = 0;
-    // "." and ".." entries — both 34 bytes (no name overhead).
-    sum += 34 * 2;
-    // Root's "." gets the 7-byte SP SUSP indicator under Rock Ridge.
-    if is_root && opts.rock_ridge && !joliet {
-        sum += 7;
-    }
     let want_rr = opts.rock_ridge && !joliet;
+    // "." and ".." entries: root's "." also carries the SP SUSP indicator.
+    sum += dot_record_size(is_root && want_rr, want_rr);
+    sum += dot_record_size(false, want_rr);
     for child in dir.children.values() {
-        sum += dir_record_size(child, want_rr, joliet) as u64;
+        let rec = dir_record_size(child, want_rr, joliet) as u64;
+        // Mirror `encode_dir_records` exactly: a record never straddles a
+        // sector boundary, so one that would is pushed to the next sector
+        // and the gap counts against the extent.
+        let sector_used = sum % SECTOR;
+        if sector_used + rec > SECTOR {
+            sum += SECTOR - sector_used;
+        }
+        sum += rec;
     }
-    // Round up to sector — ISO records don't straddle sectors. We
-    // approximate by aligning the dir total to a sector boundary.
+    // Round up to sector — the extent is whole sectors.
     align_records_to_sector(sum)
 }
 
@@ -637,7 +679,34 @@ fn align_records_to_sector(bytes: u64) -> u64 {
 
 /// Length of a single directory record on disk.
 fn dir_record_size(node: &Node, rock_ridge: bool, joliet: bool) -> usize {
-    let name_bytes = iso_name_bytes(&node.name, joliet, matches!(node.kind, NodeKind::Dir));
+    let target = match &node.kind {
+        NodeKind::Symlink { target } => Some(target.as_path()),
+        _ => None,
+    };
+    record_size_for(
+        &node.name,
+        matches!(node.kind, NodeKind::Dir),
+        target,
+        rock_ridge,
+        joliet,
+    )
+}
+
+/// Largest directory record ECMA-119 can describe: `len_dr` is one byte.
+/// Rock Ridge entries share that byte budget (no `CE` continuation areas
+/// are emitted), so long names / symlink targets are refused up front.
+const MAX_DIR_RECORD: usize = 255;
+
+/// The on-disk size of a directory record for an entry named `name`,
+/// exactly as [`encode_child_record`] lays it out.
+fn record_size_for(
+    name: &str,
+    is_dir: bool,
+    symlink_target: Option<&Path>,
+    rock_ridge: bool,
+    joliet: bool,
+) -> usize {
+    let name_bytes = iso_name_bytes(name, joliet, is_dir);
     // Pad name to even length (ECMA-119 §9.1.12).
     let name_pad = if name_bytes.is_multiple_of(2) { 1 } else { 0 };
     let base = 33 + name_bytes + name_pad;
@@ -645,9 +714,9 @@ fn dir_record_size(node: &Node, rock_ridge: bool, joliet: bool) -> usize {
         // Rock Ridge SUA size per child: NM (5 + name) + PX (36) +
         // optional SL for symlinks. The SP marker is on the root's "."
         // record only — `dir_records_byte_size` accounts for that.
-        let nm = 5 + node.name.len();
+        let nm = 5 + name.len();
         let px = 36;
-        let sl = if let NodeKind::Symlink { target } = &node.kind {
+        let sl = if let Some(target) = symlink_target {
             // SL entry: 5 byte header + 1 flag + each component (2 + bytes).
             let mut s = 5;
             for comp in target.to_str().unwrap_or("").split('/') {
@@ -732,7 +801,7 @@ fn write_image(
             opts,
             /*joliet*/ false,
             /*is_root*/ is_root,
-        );
+        )?;
         dev.write_at(u64::from(lba) * SECTOR, &stream)?;
     }
 
@@ -754,7 +823,7 @@ fn write_image(
                 opts,
                 /*joliet*/ true,
                 /*is_root*/ false,
-            );
+            )?;
             dev.write_at(u64::from(lba) * SECTOR, &stream)?;
         }
     }
@@ -1021,23 +1090,32 @@ fn encode_dir_records(
     opts: &FormatOpts,
     joliet: bool,
     is_root: bool,
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let mut buf: Vec<u8> = Vec::new();
     // "." entry — for the root directory under Rock Ridge we append the
     // SP System Use entry so SUSP-aware parsers pick up the RR fields.
     let self_size = dir_lba.get(&dir.path).copied().unwrap().1;
-    let want_sp_on_dot = is_root && opts.rock_ridge && !joliet;
-    if want_sp_on_dot {
-        buf.extend_from_slice(&encode_dot_record_with_sp(self_lba, self_size, 0x00));
-    } else {
-        buf.extend_from_slice(&encode_dot_record(self_lba, self_size, 0x00));
-    }
+    let want_rr = opts.rock_ridge && !joliet;
+    let want_sp_on_dot = is_root && want_rr;
+    buf.extend_from_slice(&encode_dot_record(
+        self_lba,
+        self_size,
+        0x00,
+        want_sp_on_dot,
+        want_rr,
+    ));
     // ".." entry
     let parent_size = dir_lba.get(&parent.path).copied().unwrap().1;
-    buf.extend_from_slice(&encode_dot_record(parent_lba, parent_size, 0x01));
+    buf.extend_from_slice(&encode_dot_record(
+        parent_lba,
+        parent_size,
+        0x01,
+        false,
+        want_rr,
+    ));
 
     for child in dir.children.values() {
-        let rec = encode_child_record(child, dir_lba, file_lba, opts, joliet);
+        let rec = encode_child_record(child, dir_lba, file_lba, opts, joliet)?;
         // Records can't straddle a 2K boundary.
         let sector_used = buf.len() as u64 % SECTOR;
         if sector_used + rec.len() as u64 > SECTOR {
@@ -1052,18 +1130,56 @@ fn encode_dir_records(
         let pad = (SECTOR - used) as usize;
         buf.extend(std::iter::repeat_n(0u8, pad));
     }
-    buf
+    Ok(buf)
 }
 
-fn encode_dot_record(lba: u32, size: u64, ident: u8) -> [u8; 34] {
-    let mut r = [0u8; 34];
-    r[0] = 34;
+/// Rock Ridge `PX` entry (IEEE P1282 §4.1.1): mode, nlink, uid, gid as
+/// both-endian u32s. 36 bytes.
+const PX_LEN: usize = 36;
+
+fn px_entry(mode: u32) -> [u8; PX_LEN] {
+    let mut px = [0u8; PX_LEN];
+    px[0..2].copy_from_slice(b"PX");
+    px[2] = PX_LEN as u8;
+    px[3] = 1; // version
+    put_both_u32(&mut px[4..12], mode);
+    put_both_u32(&mut px[12..20], 1); // nlink
+    put_both_u32(&mut px[20..28], 0); // uid
+    put_both_u32(&mut px[28..36], 0); // gid
+    px
+}
+
+/// Size of a "." / ".." record: 34 bytes, plus the SP marker on the
+/// root's "." and, under Rock Ridge, a PX entry. Readers such as
+/// libarchive refuse a volume where a record carries no SUSP entry at
+/// all once SP has announced them, so every dot record gets PX (as
+/// mkisofs does).
+fn dot_record_size(with_sp: bool, rock_ridge: bool) -> u64 {
+    34 + if with_sp { SP_ENTRY.len() as u64 } else { 0 }
+        + if rock_ridge { PX_LEN as u64 } else { 0 }
+}
+
+/// Encode a "." (`ident` 0x00) or ".." (0x01) record. The identifier is
+/// one byte, so the SUA starts at offset 34 with no pad byte (ECMA-119
+/// §9.1.12). `with_sp` prepends the SP marker (root "." only).
+fn encode_dot_record(lba: u32, size: u64, ident: u8, with_sp: bool, rock_ridge: bool) -> Vec<u8> {
+    let total = dot_record_size(with_sp, rock_ridge) as usize;
+    let mut r = vec![0u8; total];
+    r[0] = total as u8;
     put_both_u32(&mut r[2..10], lba);
     put_both_u32(&mut r[10..18], size as u32);
     r[25] = 0x02; // directory flag
     put_both_u16(&mut r[28..32], 1);
     r[32] = 1;
     r[33] = ident;
+    let mut at = 34;
+    if with_sp {
+        r[at..at + SP_ENTRY.len()].copy_from_slice(&SP_ENTRY);
+        at += SP_ENTRY.len();
+    }
+    if rock_ridge {
+        r[at..at + PX_LEN].copy_from_slice(&px_entry(0o040755));
+    }
     r
 }
 
@@ -1072,30 +1188,13 @@ fn encode_dot_record(lba: u32, size: u64, ident: u8) -> [u8; 34] {
 ///   "SP" + len=7 + version=1 + 0xBE + 0xEF + bytes_skipped=0
 const SP_ENTRY: [u8; 7] = *b"SP\x07\x01\xBE\xEF\x00";
 
-/// Encode the "." record with an SP System Use entry appended. The
-/// identifier is one byte (0x00) so the SUA starts at offset 34 with no
-/// padding (ECMA-119 §9.1.12). Total length: 34 + 7 = 41 bytes.
-fn encode_dot_record_with_sp(lba: u32, size: u64, ident: u8) -> [u8; 41] {
-    let mut r = [0u8; 41];
-    r[0] = 41; // len_dr including SUA
-    put_both_u32(&mut r[2..10], lba);
-    put_both_u32(&mut r[10..18], size as u32);
-    r[25] = 0x02; // directory flag
-    put_both_u16(&mut r[28..32], 1);
-    r[32] = 1;
-    r[33] = ident;
-    // SUA starts at offset 34 (len_fi=1 is odd → no pad byte).
-    r[34..41].copy_from_slice(&SP_ENTRY);
-    r
-}
-
 fn encode_child_record(
     child: &Node,
     dir_lba: &BTreeMap<PathBuf, (u32, u64)>,
     file_lba: &BTreeMap<PathBuf, (u32, u64)>,
     opts: &FormatOpts,
     joliet: bool,
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let (lba, size) = match &child.kind {
         NodeKind::Dir => dir_lba.get(&child.path).copied().unwrap_or((0, 0)),
         NodeKind::File { size } => file_lba.get(&child.path).copied().unwrap_or((0, *size)),
@@ -1125,21 +1224,13 @@ fn encode_child_record(
         sua.push(0); // flags
         sua.extend_from_slice(child.name.as_bytes());
         // PX entry (mode + nlink + uid + gid, both-endian).
-        sua.extend_from_slice(b"PX");
-        sua.push(36); // len
-        sua.push(1); // version
         let mode: u32 = match &child.kind {
             NodeKind::Dir => 0o040755,
             NodeKind::File { .. } => 0o100644,
             NodeKind::Symlink { .. } => 0o120777,
             NodeKind::Device => 0o020644,
         };
-        let mut both = [0u8; 32];
-        put_both_u32(&mut both[0..8], mode);
-        put_both_u32(&mut both[8..16], 1); // nlink
-        put_both_u32(&mut both[16..24], 0); // uid
-        put_both_u32(&mut both[24..32], 0); // gid
-        sua.extend_from_slice(&both);
+        sua.extend_from_slice(&px_entry(mode));
         // SL entry for symlinks.
         if let NodeKind::Symlink { target } = &child.kind {
             let mut comps_bytes: Vec<u8> = Vec::new();
@@ -1165,6 +1256,14 @@ fn encode_child_record(
 
     let base = 33 + name_bytes.len() + name_pad;
     let total = base + sua.len();
+    // `validate_entry` refuses these on the way in; this is the backstop
+    // that keeps `len_dr` from silently wrapping if anything slips past.
+    if total > MAX_DIR_RECORD {
+        return Err(crate::Error::InvalidArgument(format!(
+            "iso9660: directory record for {:?} is {total} bytes; the format allows {MAX_DIR_RECORD}",
+            child.name
+        )));
+    }
     let mut rec = vec![0u8; total];
     rec[0] = total as u8;
     put_both_u32(&mut rec[2..10], lba);
@@ -1181,7 +1280,7 @@ fn encode_child_record(
     rec[33..33 + name_bytes.len()].copy_from_slice(&name_bytes);
     let sua_start = base;
     rec[sua_start..sua_start + sua.len()].copy_from_slice(&sua);
-    rec
+    Ok(rec)
 }
 
 fn normalize(path: &Path) -> Result<PathBuf> {
@@ -1262,6 +1361,170 @@ mod tests {
             dotdot.system_use.len() < 2 || &dotdot.system_use[..2] != b"SP",
             "'..' record unexpectedly carries an SP entry",
         );
+    }
+
+    /// A directory whose records span several sectors: the extent size
+    /// must account for the padding inserted whenever a record would
+    /// straddle a 2 KiB boundary, or the tail of the listing is lost.
+    #[test]
+    fn large_rock_ridge_directory_lists_completely() {
+        const N: usize = 400;
+        let mut dev = MemoryBackend::new(16 * 1024 * 1024);
+        let opts = FormatOpts {
+            volume_id: "BIGDIR".into(),
+            joliet: true,
+            rock_ridge: true,
+            ..FormatOpts::default()
+        };
+        let mut w = Iso9660Writer::new(opts);
+        for i in 0..N {
+            // Odd-sized names so records rarely tile a sector exactly.
+            let name = format!("/big/file-number-{i:03}-with-a-longish-name.txt");
+            let body = format!("{i}\n").into_bytes();
+            let src = FileSource::Reader {
+                reader: Box::new(Cursor::new(body.clone())),
+                len: body.len() as u64,
+            };
+            w.add_file(&mut dev, Path::new(&name), src, FileMeta::default())
+                .unwrap();
+        }
+        w.flush(&mut dev).unwrap();
+
+        let iso = super::super::Iso9660::open(&mut dev).unwrap();
+        let listing = iso.list_path(&mut dev, "/big").unwrap();
+        assert_eq!(listing.len(), N, "directory listing is incomplete");
+        let mut names: Vec<String> = listing.iter().map(|d| d.name.clone()).collect();
+        names.sort();
+        assert_eq!(names[0], "file-number-000-with-a-longish-name.txt");
+        assert_eq!(
+            names[N - 1],
+            format!("file-number-{:03}-with-a-longish-name.txt", N - 1)
+        );
+        // The last file is readable (its record sits in the final sector).
+        let mut r = iso
+            .open_file_reader(&mut dev, &format!("/big/{}", names[N - 1]))
+            .unwrap();
+        let mut got = Vec::new();
+        std::io::Read::read_to_end(&mut r, &mut got).unwrap();
+        assert_eq!(got, format!("{}\n", N - 1).into_bytes());
+    }
+
+    /// Symlinks round-trip through Rock Ridge `SL`, including absolute
+    /// targets (a single leading `/`) and `..` components.
+    #[test]
+    fn symlink_targets_round_trip() {
+        use crate::fs::Filesystem;
+        let mut dev = MemoryBackend::new(4 * 1024 * 1024);
+        let opts = FormatOpts {
+            volume_id: "SYMLINKS".into(),
+            joliet: false,
+            rock_ridge: true,
+            ..FormatOpts::default()
+        };
+        let mut w = Iso9660Writer::new(opts);
+        w.add_dir(Path::new("/sub"), FileMeta::default()).unwrap();
+        for (path, target) in [
+            ("/abs", "/usr/lib/libc.so"),
+            ("/rel", "sub/file.txt"),
+            ("/sub/up", "../abs"),
+            ("/dot", "./here"),
+        ] {
+            w.add_symlink(Path::new(path), Path::new(target), FileMeta::default())
+                .unwrap();
+        }
+        w.flush(&mut dev).unwrap();
+
+        let mut iso = super::super::Iso9660::open(&mut dev).unwrap();
+        assert!(iso.rock_ridge, "Rock Ridge not detected on our own image");
+        for (path, target) in [
+            ("/abs", "/usr/lib/libc.so"),
+            ("/rel", "sub/file.txt"),
+            ("/sub/up", "../abs"),
+            ("/dot", "./here"),
+        ] {
+            let got = iso.read_symlink(&mut dev, Path::new(path)).unwrap();
+            assert_eq!(got, PathBuf::from(target), "target of {path}");
+            let attrs = iso.getattr(&mut dev, Path::new(path)).unwrap();
+            assert_eq!(attrs.kind, crate::fs::EntryKind::Symlink);
+        }
+        assert!(iso.read_symlink(&mut dev, Path::new("/sub")).is_err());
+    }
+
+    /// Names / symlink targets whose directory record would not fit in the
+    /// one-byte `len_dr` are refused when added, not silently truncated.
+    #[test]
+    fn oversized_records_are_refused() {
+        let mut dev = MemoryBackend::new(4 * 1024 * 1024);
+        let opts = FormatOpts {
+            volume_id: "TOOLONG".into(),
+            joliet: false,
+            rock_ridge: true,
+            ..FormatOpts::default()
+        };
+        let mut w = Iso9660Writer::new(opts);
+        let long_name = format!("/{}", "n".repeat(120));
+        assert!(matches!(
+            w.add_dir(Path::new(&long_name), FileMeta::default()),
+            Err(crate::Error::InvalidArgument(_))
+        ));
+        let src = FileSource::Reader {
+            reader: Box::new(Cursor::new(b"x".to_vec())),
+            len: 1,
+        };
+        assert!(matches!(
+            w.add_file(&mut dev, Path::new(&long_name), src, FileMeta::default()),
+            Err(crate::Error::InvalidArgument(_))
+        ));
+        // An intermediate directory that is too long is refused as well.
+        let src = FileSource::Reader {
+            reader: Box::new(Cursor::new(b"x".to_vec())),
+            len: 1,
+        };
+        assert!(matches!(
+            w.add_file(
+                &mut dev,
+                Path::new(&format!("{long_name}/f")),
+                src,
+                FileMeta::default()
+            ),
+            Err(crate::Error::InvalidArgument(_))
+        ));
+        let long_target = "t".repeat(240);
+        assert!(matches!(
+            w.add_symlink(
+                Path::new("/l"),
+                Path::new(&long_target),
+                FileMeta::default()
+            ),
+            Err(crate::Error::InvalidArgument(_))
+        ));
+        // Sane entries are still accepted and the image still flushes.
+        w.add_symlink(Path::new("/ok"), Path::new("target"), FileMeta::default())
+            .unwrap();
+        w.flush(&mut dev).unwrap();
+    }
+
+    /// ECMA-119 §6.9.1: path table records are ordered by depth first,
+    /// then by parent directory number, then by name.
+    #[test]
+    fn path_table_is_level_ordered() {
+        let mut root = Node {
+            path: PathBuf::from("/"),
+            name: "/".into(),
+            kind: NodeKind::Dir,
+            children: BTreeMap::new(),
+        };
+        for p in ["/a/x", "/a/y", "/b/z", "/b/z/deep"] {
+            insert_node(&mut root, Path::new(p), NodeKind::Dir).unwrap();
+        }
+        let dirs = collect_directories(&root);
+        let paths: Vec<&str> = dirs.iter().map(|(p, _)| p.to_str().unwrap()).collect();
+        assert_eq!(
+            paths,
+            ["/", "/a", "/b", "/a/x", "/a/y", "/b/z", "/b/z/deep"]
+        );
+        let parents: Vec<u16> = dirs.iter().map(|(_, p)| *p).collect();
+        assert_eq!(parents, [1, 1, 1, 2, 2, 3, 6]);
     }
 
     #[test]

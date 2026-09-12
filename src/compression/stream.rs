@@ -49,6 +49,24 @@ impl<W: Write> LzoFrameWriter<W> {
         self.pending.clear();
         Ok(())
     }
+
+    /// Emit any buffered data and the end-of-stream sentinel, then
+    /// release the sink. Idempotent: a second call does nothing.
+    ///
+    /// This is deliberately *not* `flush`. `Write::flush` may be called
+    /// at any point by a caller that simply wants the bytes so far on
+    /// their way — writing the terminator there ends the stream early,
+    /// and everything written afterwards sits past a sentinel the
+    /// reader stops at.
+    fn finish(&mut self) -> io::Result<()> {
+        self.emit_chunk()?;
+        if let Some(mut w) = self.inner.take() {
+            // Sentinel: zero-length chunk header marks end of stream.
+            w.write_all(&[0u8; 8])?;
+            w.flush()?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "lzo")]
@@ -66,8 +84,6 @@ impl<W: Write> Write for LzoFrameWriter<W> {
     fn flush(&mut self) -> io::Result<()> {
         self.emit_chunk()?;
         if let Some(w) = self.inner.as_mut() {
-            // Sentinel: zero-length chunk header marks end of stream.
-            w.write_all(&[0u8; 8])?;
             w.flush()?;
         }
         Ok(())
@@ -77,7 +93,10 @@ impl<W: Write> Write for LzoFrameWriter<W> {
 #[cfg(feature = "lzo")]
 impl<W: Write> Drop for LzoFrameWriter<W> {
     fn drop(&mut self) {
-        let _ = self.flush();
+        // The stream is only ever handed out as a `Box<dyn Write>`, so
+        // the terminator has to land here rather than in a public
+        // `finish` the caller could reach.
+        let _ = self.finish();
     }
 }
 
@@ -143,5 +162,35 @@ impl<R: Read> Read for LzoFrameReader<R> {
                 return Ok(0);
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "lzo"))]
+mod tests {
+    use super::*;
+
+    /// `Write::flush` used to emit the end-of-stream sentinel, so a
+    /// caller that flushed mid-stream (any buffered sink does) ended the
+    /// frame early and everything after it was invisible to the reader.
+    #[test]
+    fn mid_stream_flush_does_not_terminate() {
+        let head = b"first half, before the flush; ".repeat(200);
+        let tail = b"second half, after the flush; ".repeat(200);
+
+        let mut out = Vec::new();
+        {
+            let mut w = LzoFrameWriter::new(&mut out);
+            w.write_all(&head).unwrap();
+            w.flush().unwrap();
+            w.write_all(&tail).unwrap();
+        }
+
+        let mut back = Vec::new();
+        LzoFrameReader::new(out.as_slice())
+            .read_to_end(&mut back)
+            .unwrap();
+        let mut want = head.clone();
+        want.extend_from_slice(&tail);
+        assert_eq!(back, want);
     }
 }

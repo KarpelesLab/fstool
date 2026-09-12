@@ -56,7 +56,10 @@ fn read_odc(dev: &mut dyn BlockDevice, pos: u64) -> Result<Hdr> {
     let mut h = [0u8; ODC_HEADER_LEN as usize];
     dev.read_at(pos, &mut h)?;
     let f = |a: usize, b: usize, what: &str| parse_radix(&h[a..b], 8, what);
-    let rdev = f(36, 42, "rdev")? as u32;
+    // odc field layout (POSIX.1 "old character"): magic 0, dev 6, ino 12,
+    // mode 18, uid 24, gid 30, nlink 36, rdev 42, mtime 48 (11), namesize
+    // 59 (6), filesize 65 (11).
+    let rdev = f(42, 48, "rdev")? as u32;
     Ok(Hdr {
         mode: f(18, 24, "mode")? as u32,
         uid: f(24, 30, "uid")? as u32,
@@ -220,6 +223,51 @@ mod tests {
         }
         assert_eq!(h.len(), NEWC_HEADER_LEN as usize);
         h
+    }
+
+    /// Build a 76-byte odc header. Fields are octal, fixed width:
+    /// magic(6) dev(6) ino(6) mode(6) uid(6) gid(6) nlink(6) rdev(6)
+    /// mtime(11) namesize(6) filesize(11).
+    fn odc_header(mode: u32, nlink: u32, rdev: u32, namesize: u32, filesize: u32) -> Vec<u8> {
+        let mut h = Vec::with_capacity(ODC_HEADER_LEN as usize);
+        h.extend_from_slice(MAGIC_ODC);
+        for v in [0u32, 0, mode, 0, 0, nlink, rdev] {
+            h.extend_from_slice(format!("{v:06o}").as_bytes());
+        }
+        h.extend_from_slice(format!("{:011o}", 0).as_bytes()); // mtime
+        h.extend_from_slice(format!("{namesize:06o}").as_bytes());
+        h.extend_from_slice(format!("{filesize:011o}").as_bytes());
+        assert_eq!(h.len(), ODC_HEADER_LEN as usize);
+        h
+    }
+
+    /// odc keeps `rdev` at offset 42, after `nlink` at 36. Reading the
+    /// nlink field instead reported the link count as the device number.
+    #[test]
+    fn odc_reads_rdev_not_nlink() {
+        let name = b"dev/null\0";
+        // Character device 1,3 with an implausible link count, so a
+        // misread is unambiguous.
+        let hdr = odc_header(0o020000 | 0o666, 0o17, (1 << 8) | 3, name.len() as u32, 0);
+        let trailer_name = format!("{TRAILER}\0");
+        let trailer = odc_header(0, 1, 0, trailer_name.len() as u32, 0);
+
+        let mut arc = Vec::new();
+        arc.extend_from_slice(&hdr);
+        arc.extend_from_slice(name);
+        arc.extend_from_slice(&trailer);
+        arc.extend_from_slice(trailer_name.as_bytes());
+
+        let mut dev = MemoryBackend::new(arc.len() as u64);
+        dev.write_at(0, &arc).unwrap();
+        let idx = scan(&mut dev).unwrap();
+        let e = idx
+            .entries()
+            .iter()
+            .find(|e| e.path == "/dev/null")
+            .expect("entry");
+        assert_eq!(e.kind, EntryKind::Char);
+        assert_eq!((e.device_major, e.device_minor), (1, 3));
     }
 
     #[test]

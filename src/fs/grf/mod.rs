@@ -440,9 +440,12 @@ impl crate::fs::Filesystem for Grf {
         use std::collections::BTreeMap as B;
         let mut children: B<String, crate::fs::EntryKind> = B::new();
         let mut sizes: B<String, u64> = B::new();
-        for (name, entry) in &self.entries {
+        // Keys are sorted, so every entry under `prefix` is contiguous:
+        // start at the prefix and stop at the first key outside it
+        // instead of scanning the whole table for each listing.
+        for (name, entry) in self.entries.range(prefix.clone()..) {
             let Some(tail) = name.strip_prefix(&prefix) else {
-                continue;
+                break;
             };
             if tail.is_empty() {
                 continue;
