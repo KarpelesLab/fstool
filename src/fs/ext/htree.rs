@@ -143,7 +143,7 @@ pub fn leaf_max_entries(_block_size: u32) -> usize {
 const MD4_IV: [u32; 4] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
 
 /// Decode `s_hash_seed` (16 bytes, four `__le32`) into the four MD4
-/// state words, falling back to [`MD4_IV`].
+/// state words, falling back to the default MD4 initialisation vector.
 ///
 /// The kernel (`__ext4fs_dirhash`) only honours the seed when **all
 /// four** words are non-zero:
@@ -179,7 +179,7 @@ pub fn half_md4_hash(name: &[u8]) -> (u32, u32) {
 ///
 /// Matches the kernel's `__ext4fs_dirhash`: the state starts at the
 /// filesystem's `s_hash_seed` (or the MD4 IV — see
-/// [`hash_seed_words`]), the name is padded into 32-byte chunks via
+/// [`hash_seed_words`]), the name is then padded into 32-byte chunks via
 /// `str2hashbuf`, each chunk is mixed in with `half_md4_transform`,
 /// then the major hash is `buf[1]` and the minor hash is `buf[2]`. The
 /// low bit of the major hash is cleared (collision-chain marker
