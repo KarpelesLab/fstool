@@ -1214,6 +1214,11 @@ impl Fat32 {
                         "fat32: no such entry {part:?} under {path:?}"
                     ))
                 })?;
+            if next.1.attr & dir::ATTR_DIRECTORY == 0 {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "fat32: {part:?} is not a directory"
+                )));
+            }
             cluster = if next.1.first_cluster == 0 {
                 self.boot.root_cluster
             } else {
@@ -1765,6 +1770,31 @@ mod tests {
             Err(crate::Error::InvalidImage(msg)) => assert!(msg.contains("cannot map"), "{msg}"),
             other => panic!("expected InvalidImage, got {other:?}"),
         }
+    }
+
+    /// A file's cluster chain must not be walked as if it were a directory
+    /// when it appears as a prefix component.
+    #[test]
+    fn resolve_entry_rejects_a_file_as_a_path_prefix() {
+        let (mut dev, mut fs) = fresh_volume();
+        fs.create_file(
+            &mut dev,
+            Path::new("/a.txt"),
+            FileSource::Reader {
+                reader: Box::new(crate::io::Cursor::new(b"abc".to_vec())),
+                len: 3,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+        match fs.resolve_entry(&mut dev, "/a.txt/b") {
+            Err(crate::Error::InvalidArgument(msg)) => {
+                assert!(msg.contains("not a directory"), "{msg}")
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        assert!(fs.open_file_reader(&mut dev, "/a.txt/b").is_err());
     }
 
     /// Short name of the entry at `path`, via the on-disk lookup.
