@@ -1585,6 +1585,38 @@ fn rw_extend_updates_size_in_root_resident_index() {
     assert_eq!(a.size, 9002);
 }
 
+/// On-disk `$I30` order follows `$UpCase` collation, so ntfs-3g's binary
+/// search finds non-ASCII names. `é` folds to `É` (U+00C9) and so lands
+/// before `Ê` (U+00CA), even though its raw code unit (U+00E9) is the
+/// larger of the two; folded ASCII (`E`, `F`) still sorts ahead of both.
+/// `list_path` returns entries in on-disk order.
+#[test]
+fn writer_sorts_non_ascii_names_by_upcase_collation() {
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    ntfs.create_dir(&mut dev, "/u", FileMeta::default())
+        .unwrap();
+    for name in ["Ê.txt", "é.txt", "f.txt", "E.txt"] {
+        ntfs.create_file(
+            &mut dev,
+            &format!("/u/{name}"),
+            FileSource::Zero(0),
+            FileMeta::default(),
+        )
+        .unwrap();
+    }
+    ntfs.flush(&mut dev).unwrap();
+    let mut ro = Ntfs::open(&mut dev).unwrap();
+    let order: Vec<String> = ro
+        .list_path(&mut dev, "/u")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(order, ["E.txt", "f.txt", "é.txt", "Ê.txt"]);
+    // Case-insensitive lookup through the on-disk `$UpCase` still works.
+    assert!(ro.lookup_path(&mut dev, "/u/É.TXT").is_ok());
+}
+
 /// The writer grows `$MFT` past its initial 64 records; the read path on
 /// the *same* handle (lookups, remove, getattr) must follow that growth
 /// instead of serving the run list it cached from record 0 at open.

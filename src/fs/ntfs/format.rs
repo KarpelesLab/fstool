@@ -1707,21 +1707,21 @@ pub fn build_mftmirr_record(
 
 // ----- INDEX_ROOT mutation helpers used by the writer -------------------
 
-/// Insert (or update) a single index entry in a small $INDEX_ROOT that
-/// currently uses only the SMALL_INDEX layout. Returns the new value bytes
-/// (with terminator entry preserved at the end).
-///
-/// Returns `Err(Unsupported)` if the resulting root would exceed the
-/// `max_resident_bytes` budget — the caller should promote the directory
-/// to $INDEX_ALLOCATION at that point.
+/// The upcase table the formatter writes into `$UpCase`, decoded once.
+/// `$I30` collation (`COLLATION_FILE_NAME`) compares names folded through
+/// this exact table, so the writer must sort with it too — anything else
+/// puts a non-ASCII name out of order for the binary search ntfs-3g and
+/// the kernel run over the index.
+fn writer_upcase() -> &'static secure::UpcaseTable {
+    static TABLE: std::sync::OnceLock<secure::UpcaseTable> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| secure::UpcaseTable::from_bytes(&build_upcase_blob()))
+}
+
 /// Extract the NTFS-collation sort key from an `$I30` index entry: the
-/// UTF-16LE name from the embedded `$FILE_NAME` attribute, ASCII-folded
-/// to upper case. For pure-ASCII names (everything fstool's own writer
-/// emits) this matches the canonical `$UpCase` collation byte-for-byte;
-/// for non-ASCII code units we leave them as-is — the result is still a
-/// total order, so user-provided non-ASCII names sort consistently
-/// among themselves even if the exact key isn't strictly identical to
-/// what a Windows-installed `$UpCase` table would produce.
+/// UTF-16LE name from the embedded `$FILE_NAME` attribute, folded to
+/// upper case code unit by code unit through the volume's `$UpCase`
+/// table (the one [`build_upcase_blob`] emits at format time), which is
+/// how `COLLATION_FILE_NAME` orders entries.
 ///
 /// Returns the empty key for malformed entries — those sort first and
 /// surface in tests rather than corrupting the index.
@@ -1738,20 +1738,22 @@ pub fn entry_sort_key(entry: &[u8]) -> Vec<u16> {
     if entry.len() < NAME_OFF + name_chars * 2 {
         return Vec::new();
     }
+    let upcase = writer_upcase();
     let mut key = Vec::with_capacity(name_chars);
     for i in 0..name_chars {
         let cu = u16::from_le_bytes([entry[NAME_OFF + i * 2], entry[NAME_OFF + i * 2 + 1]]);
-        // ASCII-only uppercase fold (a..z -> A..Z); leave the rest alone.
-        let folded = if (b'a' as u16..=b'z' as u16).contains(&cu) {
-            cu - 0x20
-        } else {
-            cu
-        };
-        key.push(folded);
+        key.push(upcase.fold_unit(cu));
     }
     key
 }
 
+/// Insert (or update) a single index entry in a small $INDEX_ROOT that
+/// currently uses only the SMALL_INDEX layout. Returns the new value bytes
+/// (with terminator entry preserved at the end).
+///
+/// Returns `Err(Unsupported)` if the resulting root would exceed the
+/// `max_resident_bytes` budget — the caller should promote the directory
+/// to $INDEX_ALLOCATION at that point.
 pub fn insert_into_index_root(
     root_value: &[u8],
     new_entry: &[u8],
@@ -2634,6 +2636,27 @@ mod tests {
         // header low nibble = len_size = 2, high nibble = off_size = 1.
         assert_eq!(r[0] & 0x0f, 2);
         assert_eq!(&r[1..3], &[0x80, 0x00]);
+    }
+
+    /// `$I30` keys fold through `$UpCase`, not an ASCII-only table: `é`
+    /// (U+00E9 → U+00C9) must sort before `Ê` (U+00CA), and `ÿ` (U+00FF →
+    /// U+0178) after `Ā` (U+0100) — the opposite of a raw code-unit order.
+    #[test]
+    fn entry_sort_key_folds_through_upcase_table() {
+        let entry_for = |name: &str| {
+            let fn_value = build_file_name_value(0, name, 0, 0, 0, 0, 1);
+            let mut e = vec![0u8; 16];
+            e.extend_from_slice(&fn_value);
+            e
+        };
+        assert!(entry_sort_key(&entry_for("é.txt")) < entry_sort_key(&entry_for("Ê.txt")));
+        assert!(entry_sort_key(&entry_for("Ā")) < entry_sort_key(&entry_for("ÿ")));
+        // ASCII still folds as before, and the key is case-insensitive.
+        assert_eq!(
+            entry_sort_key(&entry_for("abc")),
+            entry_sort_key(&entry_for("ABC"))
+        );
+        assert!(entry_sort_key(&entry_for("B")) < entry_sort_key(&entry_for("c")));
     }
 
     #[test]
