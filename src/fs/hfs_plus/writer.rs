@@ -41,7 +41,8 @@ use super::catalog::{
     ROOT_PARENT_ID, UniStr, compare_unistr,
 };
 use super::extents::{
-    EXTENT_KEY_PAYLOAD_LEN, EXTENT_RECORD_SIZE, ExtentKey, FORK_DATA, decode_extent_record,
+    EXTENT_KEY_PAYLOAD_LEN, EXTENT_RECORD_SIZE, ExtentKey, FORK_DATA, FORK_RESOURCE,
+    decode_extent_record,
 };
 use super::volume_header::{
     ExtentDescriptor, FORK_DATA_SIZE, FORK_EXTENT_COUNT, ForkData, SIG_HFS_PLUS,
@@ -2331,32 +2332,43 @@ pub(crate) fn remove_entry(writer: &mut Writer, parent_id: u32, name: &UniStr) -
         }
         REC_FILE => {
             let cnid = u32::from_be_bytes(body[8..12].try_into().unwrap());
-            // Decode data fork to find blocks to free.
-            // dataFork starts at offset 88, 80 bytes.
-            let mut buf = [0u8; FORK_DATA_SIZE];
-            buf.copy_from_slice(&body[88..88 + FORK_DATA_SIZE]);
-            let fork = ForkData::decode(&buf);
-            for ext in &fork.extents {
-                if ext.block_count == 0 {
+            // Free both forks. An HFSPlusCatalogFile carries dataFork at
+            // offset 88 and rsrcFork immediately after it at 168, each an
+            // 80-byte HFSPlusForkData; forgetting the resource fork leaks
+            // its blocks (and its extents-overflow records) for the life
+            // of the volume.
+            let mut to_free: Vec<(u32, u32)> = Vec::new();
+            for fork_off in [88usize, 88 + FORK_DATA_SIZE] {
+                if body.len() < fork_off + FORK_DATA_SIZE {
                     continue;
                 }
-                writer.free(ext.start_block, ext.block_count);
+                let mut buf = [0u8; FORK_DATA_SIZE];
+                buf.copy_from_slice(&body[fork_off..fork_off + FORK_DATA_SIZE]);
+                for ext in &ForkData::decode(&buf).extents {
+                    if ext.block_count != 0 {
+                        to_free.push((ext.start_block, ext.block_count));
+                    }
+                }
+            }
+            for (start, count) in to_free {
+                writer.free(start, count);
             }
             // Drain any spilled extents-overflow records for this file
-            // and free the blocks they describe. Records keyed by
-            // (FORK_DATA, cnid, _) belong to this file.
-            let overflow_keys: Vec<(u8, u32, u32)> = writer
-                .overflow_extents
-                .range((FORK_DATA, cnid, 0)..=(FORK_DATA, cnid, u32::MAX))
-                .map(|(k, _)| *k)
-                .collect();
-            for key in overflow_keys {
-                if let Some(group) = writer.overflow_extents.remove(&key) {
-                    for ext in &group {
-                        if ext.block_count == 0 {
-                            continue;
+            // and free the blocks they describe — for both fork types.
+            for fork_type in [FORK_DATA, FORK_RESOURCE] {
+                let overflow_keys: Vec<(u8, u32, u32)> = writer
+                    .overflow_extents
+                    .range((fork_type, cnid, 0)..=(fork_type, cnid, u32::MAX))
+                    .map(|(k, _)| *k)
+                    .collect();
+                for key in overflow_keys {
+                    if let Some(group) = writer.overflow_extents.remove(&key) {
+                        for ext in &group {
+                            if ext.block_count == 0 {
+                                continue;
+                            }
+                            writer.free(ext.start_block, ext.block_count);
                         }
-                        writer.free(ext.start_block, ext.block_count);
                     }
                 }
             }
@@ -3407,6 +3419,81 @@ mod tests {
         remove_entry(&mut writer, ROOT_FOLDER_ID, &name).unwrap();
         assert!(writer.overflow_extents.is_empty());
         assert_eq!(writer.free_blocks, before_free);
+
+        flush(&mut writer, &mut vh, &mut dev).unwrap();
+    }
+
+    /// `remove` used to free only the data fork, so a file with a
+    /// resource fork leaked the resource fork's inline extents *and*
+    /// its extents-overflow records for the life of the volume. Our
+    /// own writer never creates resource forks, but `open_writable`
+    /// adopts catalog records from volumes that do.
+    #[test]
+    fn remove_frees_the_resource_fork_too() {
+        let mut dev = MemoryBackend::new(16 * 1024 * 1024);
+        let opts = FormatOpts::default();
+        let (mut vh, mut writer) = format(&mut dev, &opts).unwrap();
+
+        let before_free = writer.free_blocks;
+        let bs = writer.block_size as usize;
+        let payload = vec![0xAB; bs * 2];
+        let cnid = writer.next_cnid;
+        writer.next_cnid += 1;
+        let mut src = std::io::Cursor::new(&payload);
+        let fork =
+            stream_data_to_blocks(&mut writer, &mut dev, &mut src, payload.len() as u64, cnid)
+                .unwrap();
+        let name = UniStr::from_str_lossy("with-rsrc.bin");
+        insert_file(
+            &mut writer,
+            ROOT_FOLDER_ID,
+            &name,
+            cnid,
+            0o644 | crate::fs::hfs_plus::catalog::mode::S_IFREG,
+            0,
+            0,
+            0,
+            *b"\0\0\0\0",
+            *b"\0\0\0\0",
+            &fork,
+            0,
+        )
+        .unwrap();
+
+        // Give the record a resource fork: three inline blocks plus a
+        // two-block extents-overflow group, the way an adopted record
+        // from a Mac-written volume would look.
+        let rsrc_inline = writer.allocate(3).unwrap();
+        let rsrc_spill = writer.allocate(2).unwrap();
+        let key = OwnedKey {
+            parent_id: ROOT_FOLDER_ID,
+            name: name.clone(),
+        };
+        let body = writer.catalog.get_mut(&key).unwrap();
+        let roff = 88 + FORK_DATA_SIZE;
+        let rsrc_bytes = (3 * bs) as u64;
+        body[roff..roff + 8].copy_from_slice(&rsrc_bytes.to_be_bytes()); // logicalSize
+        body[roff + 12..roff + 16].copy_from_slice(&3u32.to_be_bytes()); // totalBlocks
+        body[roff + 16..roff + 20].copy_from_slice(&rsrc_inline.to_be_bytes());
+        body[roff + 20..roff + 24].copy_from_slice(&3u32.to_be_bytes());
+        writer.overflow_extents.insert((FORK_RESOURCE, cnid, 3), {
+            let mut group = [ExtentDescriptor::default(); 8];
+            group[0] = ExtentDescriptor {
+                start_block: rsrc_spill,
+                block_count: 2,
+            };
+            group
+        });
+
+        remove_entry(&mut writer, ROOT_FOLDER_ID, &name).unwrap();
+        assert!(
+            writer.overflow_extents.is_empty(),
+            "resource-fork overflow records must be dropped"
+        );
+        assert_eq!(
+            writer.free_blocks, before_free,
+            "both forks' blocks must come back"
+        );
 
         flush(&mut writer, &mut vh, &mut dev).unwrap();
     }

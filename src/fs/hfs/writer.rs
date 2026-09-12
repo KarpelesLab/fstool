@@ -236,15 +236,29 @@ impl HfsWriter {
     fn bit_used(&self, b: u16) -> bool {
         self.bitmap[(b / 8) as usize] & (0x80 >> (b % 8)) != 0
     }
-    fn mark(&mut self, start: u16, count: u16, used: bool) {
-        for b in start..start + count {
+    /// Set/clear bitmap bits for `start..start+count`. Extents read back
+    /// off disk are unvalidated `u16`s, so clamp to the volume's block
+    /// count (and guard the `start + count` overflow) — out-of-range
+    /// bits would index past the bitmap and panic. Returns how many
+    /// bits were actually touched so the free-block counter stays in
+    /// step with the bitmap.
+    fn mark(&mut self, start: u16, count: u16, used: bool) -> u16 {
+        if start >= self.total_blocks {
+            return 0;
+        }
+        let end = start.saturating_add(count).min(self.total_blocks);
+        for b in start..end {
             let (byi, mask) = ((b / 8) as usize, 0x80u8 >> (b % 8));
+            if byi >= self.bitmap.len() {
+                return b - start;
+            }
             if used {
                 self.bitmap[byi] |= mask;
             } else {
                 self.bitmap[byi] &= !mask;
             }
         }
+        end - start
     }
 
     /// Allocate `n` blocks as one or more runs (greedy from the bump cursor,
@@ -280,7 +294,8 @@ impl HfsWriter {
                 cur += 1;
                 len += 1;
             }
-            self.mark(start, len, true);
+            let marked = self.mark(start, len, true);
+            debug_assert_eq!(marked, len);
             self.free_blocks -= len;
             need -= len;
             runs.push((start, len));
@@ -293,8 +308,11 @@ impl HfsWriter {
         if count == 0 {
             return;
         }
-        self.mark(start, count, false);
-        self.free_blocks += count;
+        let freed = self.mark(start, count, false);
+        if freed == 0 {
+            return;
+        }
+        self.free_blocks = self.free_blocks.saturating_add(freed);
         if start < self.next_alloc {
             self.next_alloc = start;
         }
@@ -388,21 +406,28 @@ impl HfsWriter {
             }
             Some(CDR_FILE) => {
                 let cnid = u32::from_be_bytes([body[20], body[21], body[22], body[23]]);
-                let ext = super::ext_rec(body, 74);
+                // Both forks: filExtRec at +74 (data) and filRExtRec at
+                // +86 (resource). Freeing only the data fork leaks the
+                // resource fork's blocks for the life of the volume.
+                let mut ext: Vec<(u16, u16)> = super::ext_rec(body, 74).to_vec();
+                ext.extend_from_slice(&super::ext_rec(body, 86));
                 self.catalog.remove(&key);
                 for (s, c) in ext {
                     self.free_run(s, c);
                 }
-                // Free any extents-overflow runs for this file's data fork.
-                let keys: Vec<_> = self
-                    .overflow
-                    .range((0x00u8, cnid, 0u16)..=(0x00u8, cnid, u16::MAX))
-                    .map(|(&k, _)| k)
-                    .collect();
-                for k in keys {
-                    if let Some(grp) = self.overflow.remove(&k) {
-                        for (s, c) in grp {
-                            self.free_run(s, c);
+                // Free any extents-overflow runs for either fork
+                // (`xkrFkType` 0x00 = data, 0xFF = resource).
+                for fork_type in [0x00u8, 0xFFu8] {
+                    let keys: Vec<_> = self
+                        .overflow
+                        .range((fork_type, cnid, 0u16)..=(fork_type, cnid, u16::MAX))
+                        .map(|(&k, _)| k)
+                        .collect();
+                    for k in keys {
+                        if let Some(grp) = self.overflow.remove(&k) {
+                            for (s, c) in grp {
+                                self.free_run(s, c);
+                            }
                         }
                     }
                 }
@@ -812,6 +837,10 @@ fn encode_extent_record(fork: u8, cnid: u32, start: u16, ext: &ExtRec) -> Vec<u8
 
 // ---- B-tree builder -----------------------------------------------------
 
+/// Bits in the header node's node-allocation bitmap (bytes 248..504 of
+/// the 512-byte header node). A B-tree larger than this needs map nodes.
+const HEADER_MAP_BITS: usize = (504 - 248) * 8;
+
 /// Build a complete B-tree (header + leaf + index nodes) from sorted leaf
 /// `records`. `key_len_max` is the B-tree's `bthKeyLen`. Returns the node images
 /// in node-number order (node 0 = header).
@@ -852,6 +881,17 @@ fn build_btree(records: &[Vec<u8>], key_len_max: u16) -> Result<Vec<[u8; NODE]>>
 
     // Assign node numbers (header = 0, then each level in order) and emit bytes.
     let total_nodes = 1 + levels.iter().map(|l| l.len()).sum::<usize>();
+    // The header node's allocation bitmap is the 256 bytes between the
+    // BTHeaderRec and the offset table (bytes 248..504), i.e. 2048
+    // bits. Past that the writes below would run into the offset table
+    // and then off the end of the node. A real HFS B-tree chains extra
+    // map nodes (`ndType` 2) off the header's `ndFLink`; we don't emit
+    // those, so refuse rather than corrupt the tree.
+    if total_nodes > HEADER_MAP_BITS {
+        return Err(Error::Unsupported(format!(
+            "hfs: B-tree needs {total_nodes} nodes but the header node's allocation              bitmap only covers {HEADER_MAP_BITS} (map nodes are not implemented)"
+        )));
+    }
     let mut nodes: Vec<[u8; NODE]> = Vec::with_capacity(total_nodes);
     nodes.push([0u8; NODE]); // placeholder header
 
@@ -990,9 +1030,10 @@ fn write_header_node(
     put_u16(&mut node, h + 20, key_len_max); // bthKeyLen
     put_u32(&mut node, h + 22, total_nodes); // bthNNodes
     put_u32(&mut node, h + 26, 0); // bthFree (we size files exactly)
-    // Node-allocation bitmap at +248: mark the used nodes.
+    // Node-allocation bitmap at +248: mark the used nodes. `build_btree`
+    // has already refused anything that wouldn't fit in HEADER_MAP_BITS.
     let bm = 248;
-    for n in 0..total_nodes as usize {
+    for n in 0..(total_nodes as usize).min(HEADER_MAP_BITS) {
         node[bm + n / 8] |= 0x80 >> (n % 8);
     }
     // Offset table: records at 14, 120, 248, free space at 504.
@@ -1092,6 +1133,105 @@ mod tests {
             parid,
             name: name.as_bytes().to_vec(),
         }
+    }
+
+    /// `remove` used to free only the data fork (`filExtRec` at +74),
+    /// leaking the resource fork's inline extents (`filRExtRec` at
+    /// +86) and its extents-overflow records. Our writer never creates
+    /// resource forks, but `Hfs::open_writable` adopts catalog records
+    /// from Mac-written volumes that do.
+    #[test]
+    fn remove_frees_the_resource_fork_too() {
+        use crate::block::MemoryBackend;
+        let mut dev = MemoryBackend::new(4 * 1024 * 1024);
+        let opts = HfsFormatOpts {
+            volume_name: "Rsrc".into(),
+            block_size: None,
+        };
+        let mut w = HfsWriter::format(&mut dev, &opts).unwrap();
+        let before = w.free_blocks;
+        w.insert_file(&mut dev, "/f.bin", &mut &b"data fork\n"[..], 10, 0)
+            .unwrap();
+
+        // Attach a resource fork: two inline blocks plus one spilled
+        // into the extents-overflow file.
+        let inline = w.allocate(2).unwrap();
+        let spill = w.allocate(1).unwrap();
+        let key = OwnedKey {
+            parid: ROOT_CNID,
+            name: encode_component("f.bin").unwrap(),
+        };
+        let cnid = {
+            let body = w.catalog.get(&key).unwrap();
+            u32::from_be_bytes([body[20], body[21], body[22], body[23]])
+        };
+        {
+            let body = w.catalog.get_mut(&key).unwrap();
+            put_u32(body, 36, 3 * 512); // filRLgLen
+            put_u32(body, 40, 3 * 512); // filRPyLen
+            for (i, &(st, ct)) in inline.iter().enumerate() {
+                put_u16(body, 86 + i * 4, st);
+                put_u16(body, 86 + i * 4 + 2, ct);
+            }
+        }
+        let mut grp: ExtRec = [(0, 0); 3];
+        grp[0] = spill[0];
+        w.overflow.insert((0xFF, cnid, 2), grp);
+
+        w.remove("/f.bin").unwrap();
+        assert!(
+            !w.overflow.keys().any(|k| k.1 == cnid),
+            "resource-fork overflow records must be dropped"
+        );
+        assert_eq!(
+            w.free_blocks, before,
+            "both forks' blocks must come back to the bitmap"
+        );
+    }
+
+    /// Extents read back off disk are unvalidated `u16`s. A run that
+    /// starts (or ends) past the volume's block count must be ignored,
+    /// not indexed into the bitmap.
+    #[test]
+    fn free_run_clamps_out_of_range_extents() {
+        use crate::block::MemoryBackend;
+        let mut dev = MemoryBackend::new(2 * 1024 * 1024);
+        let opts = HfsFormatOpts {
+            volume_name: "Clamp".into(),
+            block_size: None,
+        };
+        let mut w = HfsWriter::format(&mut dev, &opts).unwrap();
+        let before = w.free_blocks;
+        let total = w.total_blocks;
+        w.free_run(total, 100); // entirely past the end
+        assert_eq!(w.free_blocks, before);
+        w.free_run(total - 1, u16::MAX); // straddles the end
+        assert_eq!(w.free_blocks, before + 1, "only the in-range block frees");
+    }
+
+    /// The header node's node-allocation bitmap covers only 2048 nodes.
+    /// Past that the bitmap writes used to run into the offset table
+    /// (silent corruption) and then off the end of the node (panic).
+    /// Until map nodes exist, the builder must refuse.
+    #[test]
+    fn build_btree_refuses_more_nodes_than_the_header_bitmap_covers() {
+        let mut entries: Vec<(OwnedKey, Vec<u8>)> = (0..24_000)
+            .map(|i| (key(2, &format!("file{i:06}")), vec![0u8; 40]))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let records: Vec<Vec<u8>> = entries
+            .iter()
+            .map(|(k, b)| encode_leaf_record(k, b))
+            .collect();
+        let err = build_btree(&records, 37).unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(ref m) if m.contains("map nodes")),
+            "{err}"
+        );
+        // And the largest tree that does fit still builds cleanly.
+        let small: Vec<Vec<u8>> = records[..2_000].to_vec();
+        let nodes = build_btree(&small, 37).unwrap();
+        assert!(nodes.len() <= HEADER_MAP_BITS);
     }
 
     /// The B-tree builder must emit a structurally valid, strictly key-ordered

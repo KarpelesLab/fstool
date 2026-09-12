@@ -3029,6 +3029,14 @@ fn find_live_nxsb(
                 continue;
             }
         }
+        // A stale descriptor slot can still carry a syntactically
+        // valid NXSB from a torn or half-written checkpoint. Only the
+        // Fletcher-64 in `o_cksum` distinguishes it from a good one,
+        // and picking a torn superblock means mounting a checkpoint
+        // whose trees were never fully written.
+        if !checksum::verify(&buf) {
+            continue;
+        }
         let sb = match NxSuperblock::decode(&buf) {
             Ok(s) => s,
             Err(_) => continue,
