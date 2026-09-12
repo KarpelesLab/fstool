@@ -184,8 +184,14 @@ jobs:
           set -euo pipefail
           rustup component add llvm-tools
           (cd examples/embedded-cortex-m && cargo build --release)
-          "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-size \
-            examples/embedded-cortex-m/target/thumbv7em-none-eabihf/release/fstool-embedded-cortex-m
+          bin=examples/embedded-cortex-m/target/thumbv7em-none-eabihf/release/fstool-embedded-cortex-m
+          "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-size "$bin"
+          # An empty .text means the linker garbage-collected the program
+          # (a dropped entry point), which would make the check meaningless.
+          text=$("$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-size "$bin" | awk 'NR==2 {print $1}')
+          if [ "$text" -lt 20000 ]; then
+            echo "::error::the no_std example linked to only $text bytes of .text"; exit 1
+          fi
 
   # macOS proves the lib + CLI compile and unit-test cleanly on a
   # non-Linux Unix. `qemu-img` is available via Homebrew so the qcow2

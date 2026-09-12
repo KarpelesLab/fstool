@@ -47,7 +47,10 @@ fn sink(v: u32) {
     unsafe { ptr::write_volatile(0x2000_0000 as *mut u32, v) }
 }
 
+// Pinned into its own section so the linker script can KEEP it: under
+// `--gc-sections` an entry point nothing references is otherwise fair game.
 #[unsafe(no_mangle)]
+#[unsafe(link_section = ".text.reset")]
 pub extern "C" fn reset() -> ! {
     // Format a 1 MiB FAT12 volume in RAM, add a file, list, read it back.
     let mut dev = MemoryBackend::new(1 << 20);
