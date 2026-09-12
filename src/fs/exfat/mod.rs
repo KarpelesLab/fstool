@@ -972,6 +972,19 @@ impl Exfat {
         name: &str,
     ) -> Result<Option<(u64, FileEntrySet, usize)>> {
         let bytes = self.read_dir_bytes(dev, first_cluster)?;
+        self.find_set_in_bytes(&bytes, name)
+    }
+
+    /// [`find_entry_in_dir`](Self::find_entry_in_dir) over an already-read
+    /// flat directory buffer (every cluster of the chain concatenated), for
+    /// callers that also need the bytes — an entry set may straddle two
+    /// clusters that are not adjacent on disk, so it must be taken from
+    /// this buffer rather than re-read as one contiguous disk range.
+    fn find_set_in_bytes(
+        &self,
+        bytes: &[u8],
+        name: &str,
+    ) -> Result<Option<(u64, FileEntrySet, usize)>> {
         let mut i = 0;
         while i + ENTRY_SIZE <= bytes.len() {
             let slot: &[u8; ENTRY_SIZE] = (&bytes[i..i + ENTRY_SIZE]).try_into().unwrap();
@@ -1112,6 +1125,24 @@ impl Exfat {
         dir::name_hash(&bytes)
     }
 
+    /// Error unless no entry named `name` (case-insensitively) exists
+    /// under `dir_cluster`, on disk or staged in the pending batch.
+    fn ensure_name_free(
+        &self,
+        dev: &mut dyn BlockDevice,
+        dir_cluster: u32,
+        name: &str,
+    ) -> Result<()> {
+        if self.pending_child(dir_cluster, name).is_some()
+            || self.find_entry_in_dir(dev, dir_cluster, name)?.is_some()
+        {
+            return Err(crate::Error::InvalidArgument(format!(
+                "exfat: {name:?} already exists"
+            )));
+        }
+        Ok(())
+    }
+
     /// Create a new empty regular file under `dir_cluster` named `name`.
     /// Returns the new entry's first cluster (or 0 if the file is empty).
     /// `data_length` clusters are allocated up-front; bytes are then
@@ -1132,6 +1163,7 @@ impl Exfat {
                 "exfat: invalid file name {name:?}"
             )));
         }
+        self.ensure_name_free(dev, dir_cluster, name)?;
         let cb = self.boot.bytes_per_cluster() as u64;
         let (first_cluster, chain) = if data_length > 0 {
             let n_clusters = data_length.div_ceil(cb) as u32;
@@ -1208,6 +1240,7 @@ impl Exfat {
                 "exfat: invalid directory name {name:?}"
             )));
         }
+        self.ensure_name_free(dev, dir_cluster, name)?;
         let cb = self.boot.bytes_per_cluster();
         let new_cluster = self.alloc_cluster()?;
         // Zero the new directory cluster.
@@ -1383,19 +1416,17 @@ impl Exfat {
             parent_cluster = next.first_cluster;
         }
 
-        let (pos, set, total) = self
-            .find_entry_in_dir(dev, parent_cluster, last)?
-            .ok_or_else(|| {
-                crate::Error::InvalidArgument(format!(
-                    "exfat: no such entry {last:?} under {path:?}"
-                ))
-            })?;
-
-        // Read the full entry set (primary + secondaries) so we can
-        // recompute the SetChecksum after mutating the primary.
+        // Take the full entry set (primary + secondaries) from the flat
+        // directory buffer so we can recompute the SetChecksum after
+        // mutating the primary. The set may straddle two clusters that
+        // are not adjacent on disk, so it must not be re-read as one
+        // contiguous disk range.
+        let dir_bytes = self.read_dir_bytes(dev, parent_cluster)?;
+        let (pos, set, total) = self.find_set_in_bytes(&dir_bytes, last)?.ok_or_else(|| {
+            crate::Error::InvalidArgument(format!("exfat: no such entry {last:?} under {path:?}"))
+        })?;
+        let mut set_bytes = dir_bytes[pos as usize..pos as usize + total].to_vec();
         let disk_off = self.dir_pos_to_disk_offset(parent_cluster, pos)?;
-        let mut set_bytes = vec![0u8; total];
-        dev.read_at(disk_off, &mut set_bytes)?;
 
         // Mutate FileAttributes (bytes 4..6 of the primary).
         if let Some(m) = mode {
@@ -1417,7 +1448,8 @@ impl Exfat {
         let csum = dir::set_checksum(&set_bytes);
         set_bytes[2..4].copy_from_slice(&csum.to_le_bytes());
 
-        // Only the primary entry's bytes changed, so write just that slot.
+        // Only the primary entry's bytes changed, so write just that slot
+        // (a 32-byte slot never straddles a cluster boundary).
         dev.write_at(disk_off, &set_bytes[..ENTRY_SIZE])?;
         Ok(())
     }
@@ -2433,6 +2465,99 @@ mod tests {
         // four clusters. The backing Vec is zero-allocated, so only the
         // touched pages cost anything.
         check_multi_cluster_bitmap(512 * 1024 * 1024, 3);
+    }
+
+    /// `set_attrs` used to read the entry set as one contiguous disk range
+    /// from the primary slot's offset. When the set straddles two root
+    /// clusters that are not adjacent on disk, that pulled in whatever
+    /// followed the first cluster (here: a file's data) and wrote back a
+    /// checksum computed over garbage.
+    #[test]
+    fn set_attrs_on_entry_set_straddling_non_adjacent_clusters() {
+        let (mut dev, mut fs) = fresh_volume("STRADDLE");
+        let cb = fs.cluster_size() as u64;
+        let root = fs.root_directory_cluster();
+        // Take the cluster right after the root for file data, so the
+        // root's growth cluster is not adjacent to it.
+        let mut reader: &[u8] = b"0123456789";
+        let data_cluster = fs
+            .create_file(&mut dev, "/data.bin", &mut reader, 10, 0)
+            .unwrap();
+        assert_eq!(data_cluster, root + 1);
+        // Root holds 3 metadata slots + data.bin's 3-slot set; 122 slots
+        // remain in the first cluster — 40 whole 3-slot sets plus two
+        // slots, so the 41st set straddles into the growth cluster.
+        let slots_per_cluster = cb as usize / ENTRY_SIZE;
+        let used = 3 + 3;
+        let whole = (slots_per_cluster - used) / 3;
+        assert_eq!((slots_per_cluster - used) % 3, 2, "layout assumption");
+        let n = whole + 1;
+        for i in 0..n {
+            fs.create_file(
+                &mut dev,
+                &format!("/s{i:02}"),
+                &mut crate::io::empty(),
+                0,
+                0,
+            )
+            .unwrap();
+        }
+        fs.flush(&mut dev).unwrap();
+        let chain = fs.dir_chain(root).unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_ne!(chain[1], root + 1, "growth cluster must not be adjacent");
+
+        let last = format!("/s{:02}", n - 1);
+        fs.set_attrs(&mut dev, &last, Some(0o444), None).unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        // Every entry set in the root still checksums, and the change took.
+        let mut fs2 = Exfat::open(&mut dev).unwrap();
+        let listed = fs2.list_path(&mut dev, "/").unwrap();
+        assert_eq!(listed.len(), n + 1);
+        let attrs = Filesystem::getattr(&mut fs2, &mut dev, crate::path::Path::new(&last)).unwrap();
+        assert_eq!(attrs.mode, 0o444);
+        assert_eq!(
+            read_file_contents(&mut fs2, &mut dev, "/data.bin"),
+            b"0123456789"
+        );
+    }
+
+    #[test]
+    fn create_rejects_duplicate_names() {
+        let (mut dev, mut fs) = fresh_volume("DUP");
+        let mut reader: &[u8] = b"one";
+        fs.create_file(&mut dev, "/Dup.txt", &mut reader, 3, 0)
+            .unwrap();
+        let dup = |r: Result<u32>| match r {
+            Err(crate::Error::InvalidArgument(msg)) => {
+                assert!(msg.contains("already exists"), "{msg}")
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        };
+        // Still staged in the batch: exact and case-insensitive.
+        let mut reader: &[u8] = b"two";
+        dup(fs.create_file(&mut dev, "/Dup.txt", &mut reader, 3, 0));
+        let mut reader: &[u8] = b"two";
+        dup(fs.create_file(&mut dev, "/DUP.TXT", &mut reader, 3, 0));
+        dup(fs.create_dir(&mut dev, "/dup.txt", 0));
+        // On disk after a flush, too.
+        fs.flush(&mut dev).unwrap();
+        let mut reader: &[u8] = b"two";
+        dup(fs.create_file(&mut dev, "/dup.txt", &mut reader, 3, 0));
+        fs.create_dir(&mut dev, "/d", 0).unwrap();
+        dup(fs.create_dir(&mut dev, "/D", 0));
+        let mut reader: &[u8] = b"x";
+        dup(fs.create_file(&mut dev, "/d", &mut reader, 1, 0));
+        fs.flush(&mut dev).unwrap();
+
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        let listed = fs2.list_path(&mut dev, "/").unwrap();
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        let used: u32 = fs2.bitmap.iter().map(|b| b.count_ones()).sum();
+        // bitmap + upcase + root + Dup.txt's cluster + d's cluster: the
+        // rejected creates allocated nothing.
+        assert_eq!(used, 5);
     }
 
     #[test]
