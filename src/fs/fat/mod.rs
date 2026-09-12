@@ -1237,6 +1237,18 @@ impl Fat32 {
         Ok((found.1, cluster))
     }
 
+    /// The first-cluster value to use from a decoded 8.3 entry. Bytes
+    /// 20..22 of the entry (the high 16 bits) are only defined on FAT32;
+    /// FAT12/16 leave them reserved and readers must ignore whatever a
+    /// previous writer left there.
+    pub(super) fn first_cluster_for_kind(&self, raw: u32) -> u32 {
+        if self.boot.kind == FatKind::Fat32 {
+            raw
+        } else {
+            raw & 0xFFFF
+        }
+    }
+
     /// Read every 32-byte slot of the directory at `dir_cluster` — walking
     /// its cluster chain to the end, or spanning the fixed root region on
     /// FAT12/16. Returns the raw bytes concatenated.
@@ -1264,7 +1276,7 @@ impl Fat32 {
                 dir::RawSlot::Lfn(frag) => {
                     lfn_run.push(frag);
                 }
-                dir::RawSlot::ShortEntry(entry) => {
+                dir::RawSlot::ShortEntry(mut entry) => {
                     if entry.attr & dir::ATTR_VOLUME_ID != 0
                         && entry.attr & dir::ATTR_DIRECTORY == 0
                     {
@@ -1272,6 +1284,7 @@ impl Fat32 {
                         lfn_run.clear();
                         continue;
                     }
+                    entry.first_cluster = self.first_cluster_for_kind(entry.first_cluster);
                     let short_name = entry.short_name_string();
                     if short_name == "." || short_name == ".." {
                         lfn_run.clear();
@@ -1770,6 +1783,67 @@ mod tests {
             Err(crate::Error::InvalidImage(msg)) => assert!(msg.contains("cannot map"), "{msg}"),
             other => panic!("expected InvalidImage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn names_longer_than_255_units_are_rejected() {
+        let (mut dev, mut fs) = fresh_volume();
+        let ok = "n".repeat(255);
+        let too_long = "n".repeat(256);
+        fs.add_file_from_reader(&mut dev, &format!("/{ok}"), &mut crate::io::empty(), 0, 0)
+            .unwrap();
+        for r in [
+            fs.add_file_from_reader(
+                &mut dev,
+                &format!("/{too_long}"),
+                &mut crate::io::empty(),
+                0,
+                0,
+            ),
+            fs.add_dir(&mut dev, &format!("/{too_long}"), 0),
+        ] {
+            match r {
+                Err(crate::Error::InvalidArgument(msg)) => assert!(msg.contains("limit"), "{msg}"),
+                other => panic!("expected InvalidArgument, got {other:?}"),
+            }
+        }
+        fs.flush(&mut dev).unwrap();
+        let mut fs2 = Fat32::open(&mut dev).unwrap();
+        let listed = fs2.list(&mut dev, Path::new("/")).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, ok);
+    }
+
+    /// On FAT12/16 bytes 20..22 of an 8.3 entry are reserved, not the high
+    /// half of the first cluster; a reader must ignore whatever is there.
+    #[test]
+    fn fat12_ignores_high_first_cluster_bits() {
+        use crate::io::Read as _;
+        let mut dev = MemoryBackend::new(1440 * 1024);
+        let opts = FatFormatOpts {
+            kind: FatKind::Fat12,
+            total_sectors: 2880,
+            ..Default::default()
+        };
+        let mut fs = Fat32::format(&mut dev, &opts).unwrap();
+        assert_eq!(fs.kind(), FatKind::Fat12);
+        fs.add_file_from_reader(&mut dev, "/a.txt", &mut &b"abc"[..], 3, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+        // Scribble on the reserved high half of the entry's cluster field.
+        let (parent, leaf) = fs.resolve_parent(&mut dev, "/a.txt").unwrap();
+        let found = fs.find_entry(&mut dev, parent, &leaf).unwrap().unwrap();
+        let off = found.layout.offset_of(found.entry_pos);
+        dev.write_at(off + 20, &0xABCDu16.to_le_bytes()).unwrap();
+
+        let mut fs2 = Fat32::open(&mut dev).unwrap();
+        let (entry, _) = fs2.resolve_entry(&mut dev, "/a.txt").unwrap();
+        assert!(entry.first_cluster < 0x1_0000, "{:#x}", entry.first_cluster);
+        assert_eq!(read_all(&mut fs2, &mut dev, "/a.txt"), b"abc");
+        let mut h = fs2.open_file_ro(&mut dev, Path::new("/a.txt")).unwrap();
+        let mut got = Vec::new();
+        h.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"abc");
     }
 
     /// A file's cluster chain must not be walked as if it were a directory

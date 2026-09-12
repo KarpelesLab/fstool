@@ -180,7 +180,7 @@ impl Fat32 {
                     }
                     lfn_run.push(frag);
                 }
-                dir::RawSlot::ShortEntry(entry) => {
+                dir::RawSlot::ShortEntry(mut entry) => {
                     if entry.attr & dir::ATTR_VOLUME_ID != 0
                         && entry.attr & dir::ATTR_DIRECTORY == 0
                     {
@@ -189,6 +189,7 @@ impl Fat32 {
                         i += dir::ENTRY_SIZE;
                         continue;
                     }
+                    entry.first_cluster = self.first_cluster_for_kind(entry.first_cluster);
                     let short = entry.short_name_string();
                     let long = dir::assemble_lfn(&lfn_run, &entry.name_83);
                     let matches_short = short.eq_ignore_ascii_case(name);
@@ -274,6 +275,7 @@ impl Fat32 {
             )));
         }
         let (parent_cluster, leaf) = self.resolve_parent(dev, dest_path)?;
+        validate_leaf_name(&leaf)?;
         let Some(taken) = self.scan_dir_for_create(dev, parent_cluster, &leaf)? else {
             return Err(crate::Error::InvalidArgument(format!(
                 "fat32: {dest_path:?} already exists"
@@ -345,6 +347,7 @@ impl Fat32 {
         mtime: u32,
     ) -> Result<()> {
         let (parent_cluster, leaf) = self.resolve_parent(dev, dest_path)?;
+        validate_leaf_name(&leaf)?;
         let Some(taken) = self.scan_dir_for_create(dev, parent_cluster, &leaf)? else {
             return Err(crate::Error::InvalidArgument(format!(
                 "fat32: {dest_path:?} already exists"
@@ -730,6 +733,21 @@ impl Fat32 {
         entries.extend_from_slice(&entry.encode());
         Ok(())
     }
+}
+
+/// Longest file name VFAT can store: 255 UTF-16 code units (20 LFN
+/// slots of 13 characters, minus the terminator).
+pub const MAX_NAME_UNITS: usize = 255;
+
+/// Reject a leaf name the on-disk LFN run cannot represent.
+fn validate_leaf_name(leaf: &str) -> Result<()> {
+    let units = leaf.encode_utf16().count();
+    if units > MAX_NAME_UNITS {
+        return Err(crate::Error::InvalidArgument(format!(
+            "fat32: name {leaf:?} is {units} UTF-16 units; the limit is {MAX_NAME_UNITS}"
+        )));
+    }
+    Ok(())
 }
 
 fn dot_entry(name_83: &[u8; 11], cluster: u32) -> [u8; dir::ENTRY_SIZE] {
