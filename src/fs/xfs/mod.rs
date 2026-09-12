@@ -1299,15 +1299,18 @@ mod tests {
         //   [0..2]  level    = 1
         //   [2..4]  numrecs  = 1
         //   [4..12] keys[0]  = 0      (br_startoff)
-        //   [72..80] ptrs[0] = leaf_fsb   (tail layout — decode_root prefers it)
+        //   ptrs[] start at 4 + maxrecs*8 where maxrecs = (80 - 4) / 16 = 4,
+        //   i.e. at byte 36 of the fork (XFS_BMDR_PTR_ADDR).
         let lit_off = 176;
         let lit_end = inodesize;
         let lit_len = lit_end - lit_off;
         assert_eq!(lit_len, 80, "literal area for 256-byte v3 inode is 80 B");
+        let pp = lit_off + bmbt::bmdr_ptrs_offset(lit_len);
+        assert_eq!(pp - lit_off, 36);
         ino_buf[lit_off..lit_off + 2].copy_from_slice(&1u16.to_be_bytes());
         ino_buf[lit_off + 2..lit_off + 4].copy_from_slice(&1u16.to_be_bytes());
         ino_buf[lit_off + 4..lit_off + 12].copy_from_slice(&0u64.to_be_bytes());
-        ino_buf[lit_end - 8..lit_end].copy_from_slice(&leaf_fsb.to_be_bytes());
+        ino_buf[pp..pp + 8].copy_from_slice(&leaf_fsb.to_be_bytes());
 
         dev.write_at(off, &ino_buf).unwrap();
 
@@ -1468,12 +1471,12 @@ mod tests {
         let lit_off = 176;
         let lit_end = inodesize as usize;
         ino_buf[lit_off..lit_off + 2].copy_from_slice(&2u16.to_be_bytes());
+        let pp = lit_off + bmbt::bmdr_ptrs_offset(lit_end - lit_off);
         ino_buf[lit_off + 2..lit_off + 4].copy_from_slice(&2u16.to_be_bytes());
         ino_buf[lit_off + 4..lit_off + 12].copy_from_slice(&0u64.to_be_bytes()); // key 0
         ino_buf[lit_off + 12..lit_off + 20].copy_from_slice(&((2 * 5) as u64).to_be_bytes()); // key 1
-        // tail layout for ptrs.
-        ino_buf[lit_end - 16..lit_end - 8].copy_from_slice(&intern_fsbs[0].to_be_bytes());
-        ino_buf[lit_end - 8..lit_end].copy_from_slice(&intern_fsbs[1].to_be_bytes());
+        ino_buf[pp..pp + 8].copy_from_slice(&intern_fsbs[0].to_be_bytes());
+        ino_buf[pp + 8..pp + 16].copy_from_slice(&intern_fsbs[1].to_be_bytes());
         dev.write_at(off, &ino_buf).unwrap();
 
         // List and validate.

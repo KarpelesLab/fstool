@@ -382,3 +382,51 @@ fn directory_xattr_survives_entry_add_and_remove() {
     assert_eq!(attrs.get("user.dirattr"), Some(&b"yes".to_vec()));
     assert_eq!(attrs.get("trusted.t"), Some(&b"1".to_vec()));
 }
+
+// ---------------------------------------------------------------------
+// Finding 25 — `xfs_bmdr_block` pointer-array offset.
+// ---------------------------------------------------------------------
+
+#[test]
+fn bmdr_root_pointers_sit_after_the_full_key_array() {
+    use super::bmbt::{bmdr_ptrs_offset, decode_root};
+
+    // XFS_BMDR_PTR_ADDR: ptrs start at sizeof(hdr) + maxrecs * sizeof(key),
+    // with maxrecs = xfs_bmdr_maxrecs(dfork_size, 0) = (size - 4) / 16.
+    for (size, want) in [(64usize, 28usize), (80, 36), (336, 164), (96, 44)] {
+        assert_eq!(bmdr_ptrs_offset(size), want, "dfork_size {size}");
+    }
+
+    // A root with slack: 3 key/ptr slots' worth of room, 2 in use. The
+    // pointers must be read from the reserved position, not from directly
+    // after the two used keys and not from the tail of the fork.
+    let mut root = vec![0u8; 64];
+    root[0..2].copy_from_slice(&1u16.to_be_bytes()); // level
+    root[2..4].copy_from_slice(&2u16.to_be_bytes()); // numrecs
+    root[4..12].copy_from_slice(&0u64.to_be_bytes());
+    root[12..20].copy_from_slice(&64u64.to_be_bytes());
+    // Decoys at the two wrong places the old heuristic would have picked.
+    root[20..28].copy_from_slice(&0xDEADu64.to_be_bytes()); // packed
+    root[48..56].copy_from_slice(&0xBEEFu64.to_be_bytes()); // tail
+    let pp = bmdr_ptrs_offset(64);
+    root[pp..pp + 8].copy_from_slice(&111u64.to_be_bytes());
+    root[pp + 8..pp + 16].copy_from_slice(&222u64.to_be_bytes());
+
+    let (level, numrecs, keys, ptrs) = decode_root(&root).unwrap();
+    assert_eq!((level, numrecs), (1, 2));
+    assert_eq!(keys, vec![0, 64]);
+    assert_eq!(ptrs, vec![111, 222]);
+}
+
+#[test]
+fn bmdr_root_rejects_more_records_than_the_fork_can_hold() {
+    use super::bmbt::decode_root;
+    // maxrecs for a 64-byte fork is 3; claim 4.
+    let mut root = vec![0u8; 64];
+    root[0..2].copy_from_slice(&1u16.to_be_bytes());
+    root[2..4].copy_from_slice(&4u16.to_be_bytes());
+    assert!(matches!(
+        decode_root(&root),
+        Err(crate::Error::InvalidImage(_))
+    ));
+}
