@@ -49,7 +49,7 @@ use crate::block::BlockDevice;
 use crate::fs::FileHandle;
 
 use super::Xfs;
-use super::bmbt::Extent;
+use super::bmbt::{Extent, MAX_EXTENT_BLOCKS};
 use super::format::{XFS_INODESIZE, stamp_v5_superblock_crc};
 use super::inode::{DiFormat, S_IFREG, V3DinodeBuilder, XfsTimestamp, stamp_v3_inode_crc};
 use super::journal::{
@@ -62,7 +62,7 @@ use super::write::EntryMeta;
 
 /// Maximum extent count we can store inline in a v3 inode's literal area
 /// when no xattr fork is present: 336 / 16 = 21. Stay conservative.
-const MAX_INLINE_EXTENTS: usize = 20;
+pub(super) const MAX_INLINE_EXTENTS: usize = 20;
 
 /// Prepare the log for read+write access.
 ///
@@ -219,6 +219,13 @@ pub struct XfsFileHandle<'a> {
     pub(crate) keep_ctime: XfsTimestamp,
     pub(crate) keep_crtime: XfsTimestamp,
     pub(crate) keep_forkoff: u8,
+    /// `di_aformat` / `di_anextents` as found on disk. The writeback path
+    /// restores both verbatim: an inode whose xattrs spilled to a leaf
+    /// block is EXTENTS-format with one attr extent, not LOCAL.
+    pub(crate) keep_aformat: u8,
+    pub(crate) keep_anextents: u16,
+    /// `di_flags2` as found on disk (REFLINK / BIGTIME / …).
+    pub(crate) keep_flags2: u64,
     /// Bytes the attr fork occupies (forkoff*8 .. literal_end). Read off
     /// disk so we can restore it byte-for-byte on writeback.
     pub(crate) attr_bytes: Vec<u8>,
@@ -256,9 +263,11 @@ impl<'a> XfsFileHandle<'a> {
     fn grow_alloc(&mut self, need_blocks: u64) -> Result<()> {
         let mut have = self.nblocks();
         while have < need_blocks {
-            let want_u64 = (need_blocks - have).min((1u64 << 21) - 1);
-            let want = want_u64 as u32;
-            let fsb = self.fs.alloc_blocks_fsb(want)?;
+            let want_u64 = (need_blocks - have).min(MAX_EXTENT_BLOCKS as u64);
+            // Take whatever contiguous run is available rather than
+            // insisting on the whole remainder in one piece; the loop
+            // comes back for the rest as a further extent.
+            let (fsb, want) = self.fs.alloc_file_blocks_fsb(want_u64 as u32)?;
             let byte = self.fsb_to_byte(fsb);
             let total = (want as u64) * self.blocksize();
             self.dev.zero_range(byte, total)?;
@@ -483,11 +492,12 @@ impl<'a> XfsFileHandle<'a> {
         // Encode the extent list.
         let mut lit: Vec<u8> = Vec::with_capacity(self.extents.len() * 16);
         for ext in &self.extents {
-            lit.extend_from_slice(&ext.encode());
+            lit.extend_from_slice(&ext.encode()?);
         }
         // Build the inode buffer.
         let nblocks = self.nblocks();
         let builder = V3DinodeBuilder {
+            nrext64: self.fs.sb.has_nrext64(),
             inodesize: XFS_INODESIZE as usize,
             mode: self.keep_mode,
             format: 2, // EXTENTS
@@ -502,13 +512,14 @@ impl<'a> XfsFileHandle<'a> {
             nblocks,
             extsize: 0,
             nextents: self.extents.len() as u32,
+            anextents: self.keep_anextents,
             forkoff: self.keep_forkoff,
-            aformat: 1, // LOCAL (only attr-fork format we round-trip)
+            aformat: self.keep_aformat,
             flags: self.keep_flags,
             generation: self.keep_generation,
             di_ino: self.ino,
             uuid: self.fs.sb.uuid,
-            flags2: 0,
+            flags2: self.keep_flags2,
         };
         let mut buf = builder.build();
         let data_end = 176 + lit.len();
@@ -517,6 +528,17 @@ impl<'a> XfsFileHandle<'a> {
             return Err(crate::Error::Unsupported(format!(
                 "xfs: encoded extent list ({} bytes) overruns inode literal area",
                 lit.len()
+            )));
+        }
+        // With an attribute fork present the data fork may only occupy the
+        // first `di_forkoff * 8` bytes — growing past that would corrupt
+        // the xattrs sitting right after it.
+        if self.keep_forkoff != 0 && lit.len() > (self.keep_forkoff as usize) * 8 {
+            return Err(crate::Error::Unsupported(format!(
+                "xfs: extent list ({} bytes) would overrun the attribute fork at \
+                 di_forkoff = {} — bmbt promotion not implemented",
+                lit.len(),
+                self.keep_forkoff
             )));
         }
         buf[176..data_end].copy_from_slice(&lit);
@@ -805,6 +827,9 @@ impl Xfs {
             keep_ctime: core.ctime,
             keep_crtime: crtime,
             keep_forkoff: core.forkoff,
+            keep_aformat: if core.forkoff == 0 { 2 } else { core.aformat },
+            keep_anextents: core.anextents,
+            keep_flags2: core.flags2,
             attr_bytes,
         };
         // Keep S_IFREG referenced so its import isn't flagged dead.

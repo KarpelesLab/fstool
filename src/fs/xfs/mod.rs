@@ -49,6 +49,9 @@ pub mod write;
 pub mod xattr;
 pub mod xattr_leaf;
 
+#[cfg(test)]
+mod regress;
+
 pub use format::{FormatOpts, format};
 pub use write::{DeviceKind, EntryMeta, WriteState};
 
@@ -84,6 +87,9 @@ impl Xfs {
         let mut buf = [0u8; 512];
         dev.read_at(0, &mut buf)?;
         let sb = Superblock::decode(&buf)?;
+        // "Incompat" means a reader without support for the bit cannot
+        // interpret the metadata; refuse rather than misread it.
+        sb.check_incompat()?;
         // Refuse exotic configurations that would silently break reads.
         if sb.rblocks != 0 {
             return Err(crate::Error::Unsupported(
@@ -162,12 +168,31 @@ impl Xfs {
             .ok_or_else(overflow)
     }
 
+    /// Device number of a char/block special inode, in the crate-wide
+    /// interchange encoding ([`crate::fs::devnum`]). XFS keeps the raw
+    /// `xfs_dev_t` (SysV packing) as a 4-byte big-endian word at the head
+    /// of the data fork of a `XFS_DINODE_FMT_DEV` inode; every other
+    /// inode type reports 0.
+    fn dinode_rdev(&self, ino_buf: &[u8], core: &DinodeCore) -> u32 {
+        let is_special = matches!(core.mode & inode::S_IFMT, inode::S_IFCHR | inode::S_IFBLK);
+        if !is_special || core.format != DiFormat::Dev {
+            return 0;
+        }
+        let lit = core.literal_area(ino_buf, self.sb.inodesize as usize);
+        if lit.len() < 4 {
+            return 0;
+        }
+        let raw = u32::from_be_bytes(lit[0..4].try_into().unwrap());
+        let (major, minor) = inode::decode_xfs_dev(raw);
+        crate::fs::devnum::encode_devnum(major, minor)
+    }
+
     /// Read an inode by number, returning the raw bytes plus the decoded core.
     fn read_inode(&self, dev: &mut dyn BlockDevice, ino: u64) -> Result<(Vec<u8>, DinodeCore)> {
         let off = self.ino_byte_offset(ino)?;
         let mut buf = vec![0u8; self.sb.inodesize as usize];
         dev.read_at(off, &mut buf)?;
-        let core = DinodeCore::decode(&buf)?;
+        let core = DinodeCore::decode_with(&buf, self.sb.has_nrext64())?;
         // For v3 inodes the di_ino field should match the address we used.
         if let Some(self_ino) = core.di_ino
             && self_ino != ino
@@ -703,6 +728,13 @@ pub fn probe(dev: &mut dyn BlockDevice) -> Result<bool> {
 
 /// Split a `/`-rooted path into non-empty components. Treats `/`, `""`,
 /// and `.` as "the root" (empty vec). Multiple slashes are collapsed.
+/// Squeeze a decoded inode timestamp into the 32-bit Unix-seconds field
+/// the generic `FileAttrs` exposes. BIGTIME inodes can hold dates
+/// outside that range; saturate instead of wrapping.
+fn clamp_secs_u32(sec: i64) -> u32 {
+    sec.clamp(0, u32::MAX as i64) as u32
+}
+
 fn split_path(path: &str) -> Vec<&str> {
     path.split('/')
         .filter(|p| !p.is_empty() && *p != ".")
@@ -895,7 +927,7 @@ impl crate::fs::Filesystem for Xfs {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("xfs: non-UTF-8 path".into()))?;
-        let (ino, _buf, core) = self.resolve_path(dev, s)?;
+        let (ino, ino_buf, core) = self.resolve_path(dev, s)?;
         let kind = match core.mode & xi::S_IFMT {
             xi::S_IFREG => crate::fs::EntryKind::Regular,
             xi::S_IFDIR => crate::fs::EntryKind::Dir,
@@ -914,11 +946,12 @@ impl crate::fs::Filesystem for Xfs {
             size: core.size,
             blocks: core.size.div_ceil(512),
             nlink: core.nlink,
-            atime: core.atime.sec,
-            mtime: core.mtime.sec,
-            ctime: core.ctime.sec,
-            // Device-node rdev lives in the data fork; not surfaced yet.
-            rdev: 0,
+            // `FileAttrs` carries 32-bit Unix seconds; clamp rather
+            // than wrap for a pre-1970 or post-2106 bigtime stamp.
+            atime: clamp_secs_u32(core.atime.sec),
+            mtime: clamp_secs_u32(core.mtime.sec),
+            ctime: clamp_secs_u32(core.ctime.sec),
+            rdev: self.dinode_rdev(&ino_buf, &core),
             inode: ino as u32,
         })
     }
@@ -1260,7 +1293,7 @@ mod tests {
             blockcount: 1,
             unwritten: false,
         };
-        leaf[72..72 + 16].copy_from_slice(&extent.encode());
+        leaf[72..72 + 16].copy_from_slice(&extent.encode().unwrap());
         let leaf_byte = xfs.fsb_to_byte(leaf_fsb);
         dev.write_at(leaf_byte, &leaf).unwrap();
 
@@ -1278,15 +1311,18 @@ mod tests {
         //   [0..2]  level    = 1
         //   [2..4]  numrecs  = 1
         //   [4..12] keys[0]  = 0      (br_startoff)
-        //   [72..80] ptrs[0] = leaf_fsb   (tail layout — decode_root prefers it)
+        //   ptrs[] start at 4 + maxrecs*8 where maxrecs = (80 - 4) / 16 = 4,
+        //   i.e. at byte 36 of the fork (XFS_BMDR_PTR_ADDR).
         let lit_off = 176;
         let lit_end = inodesize;
         let lit_len = lit_end - lit_off;
         assert_eq!(lit_len, 80, "literal area for 256-byte v3 inode is 80 B");
+        let pp = lit_off + bmbt::bmdr_ptrs_offset(lit_len);
+        assert_eq!(pp - lit_off, 36);
         ino_buf[lit_off..lit_off + 2].copy_from_slice(&1u16.to_be_bytes());
         ino_buf[lit_off + 2..lit_off + 4].copy_from_slice(&1u16.to_be_bytes());
         ino_buf[lit_off + 4..lit_off + 12].copy_from_slice(&0u64.to_be_bytes());
-        ino_buf[lit_end - 8..lit_end].copy_from_slice(&leaf_fsb.to_be_bytes());
+        ino_buf[pp..pp + 8].copy_from_slice(&leaf_fsb.to_be_bytes());
 
         dev.write_at(off, &ino_buf).unwrap();
 
@@ -1407,7 +1443,7 @@ mod tests {
                     blockcount: 1,
                     unwritten: false,
                 };
-                leaf[hdr + j * 16..hdr + (j + 1) * 16].copy_from_slice(&e.encode());
+                leaf[hdr + j * 16..hdr + (j + 1) * 16].copy_from_slice(&e.encode().unwrap());
             }
             dev.write_at(xfs.fsb_to_byte(*leaf_fsb), &leaf).unwrap();
         }
@@ -1447,12 +1483,12 @@ mod tests {
         let lit_off = 176;
         let lit_end = inodesize as usize;
         ino_buf[lit_off..lit_off + 2].copy_from_slice(&2u16.to_be_bytes());
+        let pp = lit_off + bmbt::bmdr_ptrs_offset(lit_end - lit_off);
         ino_buf[lit_off + 2..lit_off + 4].copy_from_slice(&2u16.to_be_bytes());
         ino_buf[lit_off + 4..lit_off + 12].copy_from_slice(&0u64.to_be_bytes()); // key 0
         ino_buf[lit_off + 12..lit_off + 20].copy_from_slice(&((2 * 5) as u64).to_be_bytes()); // key 1
-        // tail layout for ptrs.
-        ino_buf[lit_end - 16..lit_end - 8].copy_from_slice(&intern_fsbs[0].to_be_bytes());
-        ino_buf[lit_end - 8..lit_end].copy_from_slice(&intern_fsbs[1].to_be_bytes());
+        ino_buf[pp..pp + 8].copy_from_slice(&intern_fsbs[0].to_be_bytes());
+        ino_buf[pp + 8..pp + 16].copy_from_slice(&intern_fsbs[1].to_be_bytes());
         dev.write_at(off, &ino_buf).unwrap();
 
         // List and validate.

@@ -43,6 +43,11 @@ use crate::block::BlockDevice;
 /// Bytes per extent record on disk.
 pub const BMBT_REC_SIZE: usize = 16;
 
+/// Largest block count a single `xfs_bmbt_rec` can express — the
+/// on-disk field is 21 bits (`MAXEXTLEN` / `XFS_MAX_BMBT_EXTLEN` in
+/// `fs/xfs/libxfs/xfs_format.h`).
+pub const MAX_EXTENT_BLOCKS: u32 = (1 << 21) - 1;
+
 /// Bytes per key in a bmbt B-tree node.
 pub const BMBT_KEY_SIZE: usize = 8;
 
@@ -108,17 +113,40 @@ impl Extent {
     /// Encode this record as the on-disk packed 128-bit form. Used by
     /// the writer to lay extent lists into the inode literal area and
     /// into bmbt leaf blocks; also used by the round-trip unit test.
-    pub fn encode(&self) -> [u8; BMBT_REC_SIZE] {
+    ///
+    /// Every field is narrower than its in-memory type: the logical
+    /// offset is 54 bits, the start block 52, and the block count only
+    /// [`MAX_EXTENT_BLOCKS`] (21 bits). A value that does not fit is an
+    /// error — masking it would write a record describing a different
+    /// range than the caller allocated.
+    pub fn encode(&self) -> Result<[u8; BMBT_REC_SIZE]> {
+        if self.blockcount == 0 || self.blockcount > MAX_EXTENT_BLOCKS {
+            return Err(crate::Error::InvalidArgument(format!(
+                "xfs: extent blockcount {} outside 1..={MAX_EXTENT_BLOCKS} \
+                 (the bmbt record field is 21 bits)",
+                self.blockcount
+            )));
+        }
+        if self.offset >= 1 << 54 {
+            return Err(crate::Error::InvalidArgument(format!(
+                "xfs: extent logical offset {} does not fit in 54 bits",
+                self.offset
+            )));
+        }
+        if self.startblock >= 1 << 52 {
+            return Err(crate::Error::InvalidArgument(format!(
+                "xfs: extent startblock {} does not fit in 52 bits",
+                self.startblock
+            )));
+        }
         let unwritten = if self.unwritten { 1u64 } else { 0 };
-        let hi = (unwritten << 63)
-            | ((self.offset & ((1 << 54) - 1)) << 9)
-            | ((self.startblock >> 43) & ((1 << 9) - 1));
-        let lo = ((self.startblock & ((1 << 43) - 1)) << 21)
-            | (self.blockcount as u64 & ((1 << 21) - 1));
+        let hi =
+            (unwritten << 63) | (self.offset << 9) | ((self.startblock >> 43) & ((1 << 9) - 1));
+        let lo = ((self.startblock & ((1 << 43) - 1)) << 21) | (self.blockcount as u64);
         let mut out = [0u8; 16];
         out[0..8].copy_from_slice(&hi.to_be_bytes());
         out[8..16].copy_from_slice(&lo.to_be_bytes());
-        out
+        Ok(out)
     }
 }
 
@@ -174,8 +202,24 @@ impl BmbtLayout {
 /// Returns the root `(level, numrecs, keys, ptrs)`. Keys are
 /// `br_startoff` u64 values; pointers are FSB block numbers of children.
 ///
-/// `lit` is the literal area, `forkoff_words` is the value `di_forkoff`
-/// (size in 8-byte words of the data fork, or 0 to use the full literal).
+/// `lit` must be exactly the data fork region of the inode —
+/// `XFS_DFORK_DSIZE`, i.e. `di_forkoff * 8` bytes when an attribute fork
+/// is present and the whole literal area otherwise. The pointer array's
+/// position depends on that size: the on-disk `xfs_bmdr_block` reserves
+/// room for the *maximum* number of keys the fork could hold and starts
+/// the pointers after it, so the two arrays are generally NOT adjacent.
+///
+/// ```text
+///   0      bb_level   __be16
+///   2      bb_numrecs __be16
+///   4      keys[numrecs]  __be64 …                    (slack up to maxrecs)
+///   4 + maxrecs*8
+///          ptrs[numrecs]  __be64 …
+/// ```
+///
+/// with `maxrecs = (dfork_size - 4) / 16` — `xfs_bmdr_maxrecs()` and
+/// `XFS_BMDR_PTR_ADDR()` in `fs/xfs/libxfs/xfs_bmap_btree.c` /
+/// `xfs_btree.h`.
 pub fn decode_root(lit: &[u8]) -> Result<(u16, u16, Vec<u64>, Vec<u64>)> {
     if lit.len() < 4 {
         return Err(crate::Error::InvalidImage(
@@ -185,53 +229,34 @@ pub fn decode_root(lit: &[u8]) -> Result<(u16, u16, Vec<u64>, Vec<u64>)> {
     let level = u16::from_be_bytes(lit[0..2].try_into().unwrap());
     let numrecs = u16::from_be_bytes(lit[2..4].try_into().unwrap());
     let nrec = numrecs as usize;
-    let keys_bytes = nrec
-        .checked_mul(BMBT_KEY_SIZE)
-        .ok_or_else(|| crate::Error::InvalidImage("xfs: bmbt root keys length overflows".into()))?;
-    let ptrs_bytes = nrec
-        .checked_mul(BMBT_PTR_SIZE)
-        .ok_or_else(|| crate::Error::InvalidImage("xfs: bmbt root ptrs length overflows".into()))?;
-    // The bmdr root uses a SPLIT layout: keys[] is at [4 .. 4+keys_bytes],
-    // ptrs[] starts where the inode-fork's max keys would end. In practice
-    // for the root we use the kernel's "tightly-packed" alternative where
-    // ptrs immediately follow keys. Both layouts coexist in the wild but we
-    // implement the packed variant — the keys + ptrs lengths derived from
-    // `numrecs` exactly fill the fork, so the only ambiguity is whether
-    // there's slack between them. We tolerate either: ptrs are placed at
-    // the END of the literal area when slack is present.
-    if 4 + keys_bytes + ptrs_bytes > lit.len() {
+    // `xfs_bmdr_maxrecs(blocklen, leaf = 0)`.
+    let maxrecs = (lit.len() - 4) / (BMBT_KEY_SIZE + BMBT_PTR_SIZE);
+    // Mirrors the `XFS_BMDR_SPACE_CALC(nrecs) > XFS_DFORK_SIZE` check in
+    // `xfs_iformat_btree`.
+    if nrec > maxrecs {
         return Err(crate::Error::InvalidImage(format!(
-            "xfs: bmbt root needs {} bytes but literal area is {}",
-            4 + keys_bytes + ptrs_bytes,
+            "xfs: bmbt root claims {nrec} records but the {}-byte data fork holds at most {maxrecs}",
             lit.len()
         )));
     }
     let keys_start = 4;
-    let keys_end = keys_start + keys_bytes;
+    let ptrs_start = 4 + maxrecs * BMBT_KEY_SIZE;
     let mut keys = Vec::with_capacity(nrec);
-    for i in 0..nrec {
-        let off = keys_start + i * BMBT_KEY_SIZE;
-        keys.push(u64::from_be_bytes(lit[off..off + 8].try_into().unwrap()));
-    }
-    // Try packed first: ptrs follow keys directly.
-    let ptrs_start_packed = keys_end;
-    let ptrs_start_tail = lit.len() - ptrs_bytes;
-    // Heuristic: if packed and tail differ, pick whichever yields plausible
-    // pointer values (non-zero, < 2^48). The two are equal only when the
-    // literal area is exactly filled.
-    let ptrs_start = if ptrs_start_packed == ptrs_start_tail {
-        ptrs_start_packed
-    } else {
-        // Prefer the tail layout (matches the on-disk bmdr root format used
-        // by the kernel when there is slack between key and ptr arrays).
-        ptrs_start_tail
-    };
     let mut ptrs = Vec::with_capacity(nrec);
     for i in 0..nrec {
-        let off = ptrs_start + i * BMBT_PTR_SIZE;
-        ptrs.push(u64::from_be_bytes(lit[off..off + 8].try_into().unwrap()));
+        let k = keys_start + i * BMBT_KEY_SIZE;
+        keys.push(u64::from_be_bytes(lit[k..k + 8].try_into().unwrap()));
+        let p = ptrs_start + i * BMBT_PTR_SIZE;
+        ptrs.push(u64::from_be_bytes(lit[p..p + 8].try_into().unwrap()));
     }
     Ok((level, numrecs, keys, ptrs))
+}
+
+/// Byte offset of the pointer array inside a `xfs_bmdr_block` root that
+/// occupies `dfork_size` bytes of the inode literal area. Test helper +
+/// the inverse of what [`decode_root`] computes.
+pub fn bmdr_ptrs_offset(dfork_size: usize) -> usize {
+    4 + ((dfork_size.saturating_sub(4)) / (BMBT_KEY_SIZE + BMBT_PTR_SIZE)) * BMBT_KEY_SIZE
 }
 
 /// Read a non-root BMBT block from disk and return its `(level, numrecs,
@@ -466,7 +491,7 @@ mod tests {
             },
         ];
         for c in cases {
-            let bytes = c.encode();
+            let bytes = c.encode().unwrap();
             let back = Extent::decode(&bytes).unwrap();
             assert_eq!(back, c);
         }
@@ -539,8 +564,8 @@ mod tests {
             blockcount: 8,
             unwritten: false,
         };
-        leaf0[72..72 + 16].copy_from_slice(&e0.encode());
-        leaf0[72 + 16..72 + 32].copy_from_slice(&e1.encode());
+        leaf0[72..72 + 16].copy_from_slice(&e0.encode().unwrap());
+        leaf0[72 + 16..72 + 32].copy_from_slice(&e1.encode().unwrap());
         // Write at FSB 10.
         dev.write_at(fsb_to_byte(agblklog, blocksize, agblocks, 10), &leaf0)
             .unwrap();
@@ -561,23 +586,23 @@ mod tests {
             blockcount: 1,
             unwritten: false,
         };
-        leaf1[72..72 + 16].copy_from_slice(&e2.encode());
-        leaf1[72 + 16..72 + 32].copy_from_slice(&e3.encode());
+        leaf1[72..72 + 16].copy_from_slice(&e2.encode().unwrap());
+        leaf1[72 + 16..72 + 32].copy_from_slice(&e3.encode().unwrap());
         dev.write_at(fsb_to_byte(agblklog, blocksize, agblocks, 11), &leaf1)
             .unwrap();
 
         // Build the root in a 64-byte buffer (typical inode-fork size).
+        // maxrecs = (64 - 4) / 16 = 3, so keys sit at [4..28] (three slots,
+        // two used) and ptrs start at 4 + 3*8 = 28.
         let mut root = vec![0u8; 64];
+        let pp = bmdr_ptrs_offset(root.len());
+        assert_eq!(pp, 28);
         root[0..2].copy_from_slice(&1u16.to_be_bytes()); // level
         root[2..4].copy_from_slice(&2u16.to_be_bytes()); // numrecs
-        // Packed layout for 64-byte root with 2 entries:
-        //   header(4) + 2*8 keys + 2*8 ptrs = 36 bytes; tail layout places
-        //   ptrs at the very end. Our decoder prefers tail when slack exists.
-        // keys at [4..20]; ptrs at [48..64].
         root[4..12].copy_from_slice(&0u64.to_be_bytes()); // key 0 = offset 0
         root[12..20].copy_from_slice(&12u64.to_be_bytes()); // key 1 = offset 12
-        root[48..56].copy_from_slice(&10u64.to_be_bytes()); // ptr 0 = FSB 10
-        root[56..64].copy_from_slice(&11u64.to_be_bytes()); // ptr 1 = FSB 11
+        root[pp..pp + 8].copy_from_slice(&10u64.to_be_bytes()); // ptr 0 = FSB 10
+        root[pp + 8..pp + 16].copy_from_slice(&11u64.to_be_bytes()); // ptr 1 = FSB 11
 
         let extents = walk_btree(&mut dev, &layout, &root).unwrap();
         assert_eq!(extents.len(), 4);
@@ -620,9 +645,10 @@ mod tests {
 
         // Root: level=2, one pointer to the self-referential node.
         let mut root = vec![0u8; 64];
+        let pp = bmdr_ptrs_offset(root.len());
         root[0..2].copy_from_slice(&2u16.to_be_bytes());
         root[2..4].copy_from_slice(&1u16.to_be_bytes());
-        root[56..64].copy_from_slice(&10u64.to_be_bytes());
+        root[pp..pp + 8].copy_from_slice(&10u64.to_be_bytes());
 
         let r = walk_btree(&mut dev, &layout, &root);
         assert!(matches!(r, Err(crate::Error::InvalidImage(_))));
@@ -671,8 +697,8 @@ mod tests {
             blockcount: 8,
             unwritten: false,
         };
-        leaf0[72..72 + 16].copy_from_slice(&e0.encode());
-        leaf0[72 + 16..72 + 32].copy_from_slice(&e1.encode());
+        leaf0[72..72 + 16].copy_from_slice(&e0.encode().unwrap());
+        leaf0[72 + 16..72 + 32].copy_from_slice(&e1.encode().unwrap());
         dev.write_at(fsb_to_byte(agblklog, blocksize, agblocks, 10), &leaf0)
             .unwrap();
 
@@ -691,19 +717,20 @@ mod tests {
             blockcount: 1,
             unwritten: false,
         };
-        leaf1[72..72 + 16].copy_from_slice(&e2.encode());
-        leaf1[72 + 16..72 + 32].copy_from_slice(&e3.encode());
+        leaf1[72..72 + 16].copy_from_slice(&e2.encode().unwrap());
+        leaf1[72 + 16..72 + 32].copy_from_slice(&e3.encode().unwrap());
         dev.write_at(fsb_to_byte(agblklog, blocksize, agblocks, 11), &leaf1)
             .unwrap();
 
         // Root: level=1, two child pointers at FSBs 10 and 11.
         let mut root = vec![0u8; 64];
+        let pp = bmdr_ptrs_offset(root.len());
         root[0..2].copy_from_slice(&1u16.to_be_bytes()); // level
         root[2..4].copy_from_slice(&2u16.to_be_bytes()); // numrecs
         root[4..12].copy_from_slice(&0u64.to_be_bytes());
         root[12..20].copy_from_slice(&12u64.to_be_bytes());
-        root[48..56].copy_from_slice(&10u64.to_be_bytes());
-        root[56..64].copy_from_slice(&11u64.to_be_bytes());
+        root[pp..pp + 8].copy_from_slice(&10u64.to_be_bytes());
+        root[pp + 8..pp + 16].copy_from_slice(&11u64.to_be_bytes());
 
         let extents = read_btree_dir_extents(&mut dev, &layout, &root).unwrap();
         assert_eq!(extents, vec![e0, e1, e2, e3]);
@@ -731,7 +758,7 @@ mod tests {
             blockcount: 3,
             unwritten: false,
         };
-        root[4..20].copy_from_slice(&e.encode());
+        root[4..20].copy_from_slice(&e.encode().unwrap());
         let got = read_btree_dir_extents(&mut dev, &layout, &root).unwrap();
         assert_eq!(got, vec![e]);
     }
@@ -793,7 +820,7 @@ mod tests {
             leaf[0..4].copy_from_slice(&XFS_BMAP_CRC_MAGIC.to_be_bytes());
             leaf[4..6].copy_from_slice(&0u16.to_be_bytes()); // level=0
             leaf[6..8].copy_from_slice(&1u16.to_be_bytes()); // numrecs=1
-            leaf[hdr..hdr + 16].copy_from_slice(&e.encode());
+            leaf[hdr..hdr + 16].copy_from_slice(&e.encode().unwrap());
             dev.write_at(fsb_to_byte(agblklog, blocksize, agblocks, *fsb), &leaf)
                 .unwrap();
         }
@@ -823,13 +850,14 @@ mod tests {
 
         // Root at level=2, two child pointers (the two internal nodes).
         let mut root = vec![0u8; 64];
+        let pp = bmdr_ptrs_offset(root.len());
         root[0..2].copy_from_slice(&2u16.to_be_bytes()); // level=2
         root[2..4].copy_from_slice(&2u16.to_be_bytes()); // numrecs=2
         root[4..12].copy_from_slice(&leaf_extents[0].offset.to_be_bytes());
         root[12..20].copy_from_slice(&leaf_extents[2].offset.to_be_bytes());
         // tail layout (slack between keys and ptrs).
-        root[48..56].copy_from_slice(&intern_fsbs[0].to_be_bytes());
-        root[56..64].copy_from_slice(&intern_fsbs[1].to_be_bytes());
+        root[pp..pp + 8].copy_from_slice(&intern_fsbs[0].to_be_bytes());
+        root[pp + 8..pp + 16].copy_from_slice(&intern_fsbs[1].to_be_bytes());
 
         let extents = read_btree_dir_extents(&mut dev, &layout, &root).unwrap();
         assert_eq!(extents, leaf_extents.to_vec());

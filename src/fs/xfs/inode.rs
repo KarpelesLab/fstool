@@ -96,22 +96,94 @@ pub const S_IFREG: u16 = 0o100_000;
 pub const S_IFLNK: u16 = 0o120_000;
 pub const S_IFSOCK: u16 = 0o140_000;
 
-/// A timestamp the way XFS v3 stores it on disk: 32-bit big-endian seconds
-/// followed by 32-bit big-endian nanoseconds. XFS v5 with the BIGTIME
-/// feature reinterprets this as a single 64-bit count; we don't enable that
-/// path here.
-#[derive(Debug, Clone, Copy, Default)]
+/// Encode a `(major, minor)` device number pair the way XFS stores it in
+/// the data fork of a `XFS_DINODE_FMT_DEV` inode: a 4-byte big-endian
+/// `xfs_dev_t` holding the SysV ("old") encoding the kernel produces with
+/// `sysv_encode_dev()` — `minor & 0x3ffff | (major << 18)`.
+///
+/// See `xfs_dinode_put_rdev` / `xfs_inode_to_disk` in
+/// `fs/xfs/libxfs/xfs_inode_buf.c` and `sysv_encode_dev` in
+/// `include/linux/kdev_t.h`.
+pub fn encode_xfs_dev(major: u32, minor: u32) -> u32 {
+    (minor & 0x3_ffff) | ((major & 0x3fff) << 18)
+}
+
+/// Inverse of [`encode_xfs_dev`] — `(major, minor)` out of an on-disk
+/// `xfs_dev_t` (`sysv_major` / `sysv_minor`).
+pub fn decode_xfs_dev(raw: u32) -> (u32, u32) {
+    ((raw >> 18) & 0x3fff, raw & 0x3_ffff)
+}
+
+/// Offset between the bigtime epoch (1901-12-13 20:45:52 UTC — the
+/// smallest 32-bit signed `time_t`) and the Unix epoch, in seconds.
+/// `XFS_BIGTIME_EPOCH_OFFSET` in `fs/xfs/libxfs/xfs_format.h` is
+/// `-(int64_t)S32_MIN`.
+pub const XFS_BIGTIME_EPOCH_OFFSET: i64 = 2_147_483_648;
+
+const NSEC_PER_SEC: u64 = 1_000_000_000;
+
+/// `di_flags2` bit: this inode's timestamps use the bigtime encoding.
+pub const XFS_DIFLAG2_BIGTIME: u64 = 0x8;
+
+/// A decoded inode timestamp: seconds since the Unix epoch plus a
+/// nanosecond remainder.
+///
+/// Two on-disk encodings exist. The legacy `xfs_legacy_timestamp` is a
+/// 32-bit **signed** big-endian second count followed by a 32-bit
+/// nanosecond count. An inode with `XFS_DIFLAG2_BIGTIME` set instead
+/// stores one 64-bit big-endian count of nanoseconds since the bigtime
+/// epoch — see `xfs_inode_from_disk_ts` / `xfs_inode_decode_bigtime` in
+/// `fs/xfs/libxfs/xfs_inode_buf.c`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct XfsTimestamp {
-    pub sec: u32,
+    pub sec: i64,
     pub nsec: u32,
 }
 
 impl XfsTimestamp {
+    /// Decode the legacy `{__be32 sec, __be32 nsec}` form. The seconds
+    /// field is signed, exactly as the kernel reads it.
     pub fn decode(buf: &[u8]) -> Self {
         Self {
-            sec: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
+            sec: i32::from_be_bytes(buf[0..4].try_into().unwrap()) as i64,
             nsec: u32::from_be_bytes(buf[4..8].try_into().unwrap()),
         }
+    }
+
+    /// Decode the BIGTIME form: one `__be64` nanosecond count measured
+    /// from 1901-12-13 20:45:52 UTC.
+    pub fn decode_bigtime(buf: &[u8]) -> Self {
+        let ts = u64::from_be_bytes(buf[0..8].try_into().unwrap());
+        Self {
+            sec: (ts / NSEC_PER_SEC) as i64 - XFS_BIGTIME_EPOCH_OFFSET,
+            nsec: (ts % NSEC_PER_SEC) as u32,
+        }
+    }
+
+    /// Decode whichever form `bigtime` selects.
+    pub fn decode_with(buf: &[u8], bigtime: bool) -> Self {
+        if bigtime {
+            Self::decode_bigtime(buf)
+        } else {
+            Self::decode(buf)
+        }
+    }
+
+    /// Encode back to the on-disk form. `bigtime` must match the
+    /// inode's `XFS_DIFLAG2_BIGTIME` state.
+    pub fn encode(&self, bigtime: bool) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        if bigtime {
+            let secs = self.sec.saturating_add(XFS_BIGTIME_EPOCH_OFFSET).max(0) as u64;
+            let ns = secs
+                .saturating_mul(NSEC_PER_SEC)
+                .saturating_add(self.nsec.min((NSEC_PER_SEC - 1) as u32) as u64);
+            out.copy_from_slice(&ns.to_be_bytes());
+        } else {
+            out[0..4].copy_from_slice(&(self.sec as i32).to_be_bytes());
+            out[4..8].copy_from_slice(&self.nsec.to_be_bytes());
+        }
+        out
     }
 }
 
@@ -132,9 +204,17 @@ pub struct DinodeCore {
     pub size: u64,
     pub nblocks: u64,
     pub nextents: u32,
+    /// `di_anextents` — number of extents in the attribute fork.
+    pub anextents: u16,
     pub forkoff: u8,
+    /// `di_aformat` — attribute-fork format (same encoding as
+    /// `di_format`). Meaningless when `forkoff == 0`.
+    pub aformat: u8,
     pub flags: u16,
     pub generation: u32,
+    /// `di_flags2` (v3 only; 0 on v2 inodes). Carries REFLINK / BIGTIME /
+    /// COWEXTSIZE / DAX.
+    pub flags2: u64,
     /// v3 (CRC) only: self-reference inode number.
     pub di_ino: Option<u64>,
     /// Byte offset within the inode where the data-fork literal area begins.
@@ -143,8 +223,28 @@ pub struct DinodeCore {
 }
 
 impl DinodeCore {
-    /// Decode the core. `buf` must be at least `inodesize` bytes.
+    /// Decode the core of an inode on a volume without
+    /// `XFS_SB_FEAT_INCOMPAT_NREXT64`. Prefer
+    /// [`decode_with`](Self::decode_with), which takes the feature from
+    /// the superblock.
     pub fn decode(buf: &[u8]) -> Result<Self> {
+        Self::decode_with(buf, false)
+    }
+
+    /// Decode the core. `buf` must be at least `inodesize` bytes.
+    ///
+    /// `nrext64` is the volume's `XFS_SB_FEAT_INCOMPAT_NREXT64` state,
+    /// which moves the extent counters inside `xfs_dinode`:
+    ///
+    /// ```text
+    ///                     without NREXT64          with NREXT64
+    ///   24  8   di_v3_pad / di_big_nextents  pad   __be64 nextents
+    ///   76  4   di_nextents                  __be32 __be32 big_anextents
+    ///   80  2   di_anextents                 __be16 __be16 nrext64_pad
+    /// ```
+    ///
+    /// Timestamps follow `di_flags2 & XFS_DIFLAG2_BIGTIME` per inode.
+    pub fn decode_with(buf: &[u8], nrext64: bool) -> Result<Self> {
         if buf.len() < 96 {
             return Err(crate::Error::InvalidImage(
                 "xfs: inode buffer too small".into(),
@@ -162,13 +262,42 @@ impl DinodeCore {
         let uid = u32::from_be_bytes(buf[8..12].try_into().unwrap());
         let gid = u32::from_be_bytes(buf[12..16].try_into().unwrap());
         let nlink = u32::from_be_bytes(buf[16..20].try_into().unwrap());
-        let atime = XfsTimestamp::decode(&buf[32..40]);
-        let mtime = XfsTimestamp::decode(&buf[40..48]);
-        let ctime = XfsTimestamp::decode(&buf[48..56]);
+        // di_flags2 (and therefore BIGTIME) only exists on v3 inodes.
+        let flags2 = if version >= 3 && buf.len() >= 128 {
+            u64::from_be_bytes(buf[120..128].try_into().unwrap())
+        } else {
+            0
+        };
+        let bigtime = (flags2 & XFS_DIFLAG2_BIGTIME) != 0;
+        let atime = XfsTimestamp::decode_with(&buf[32..40], bigtime);
+        let mtime = XfsTimestamp::decode_with(&buf[40..48], bigtime);
+        let ctime = XfsTimestamp::decode_with(&buf[48..56], bigtime);
         let size = u64::from_be_bytes(buf[56..64].try_into().unwrap());
         let nblocks = u64::from_be_bytes(buf[64..72].try_into().unwrap());
-        let nextents = u32::from_be_bytes(buf[76..80].try_into().unwrap());
+        let (nextents, anextents) = if nrext64 {
+            let big_nextents = u64::from_be_bytes(buf[24..32].try_into().unwrap());
+            let big_anextents = u32::from_be_bytes(buf[76..80].try_into().unwrap());
+            let nextents = u32::try_from(big_nextents).map_err(|_| {
+                crate::Error::Unsupported(format!(
+                    "xfs: inode has {big_nextents} data-fork extents (> u32); \
+                     64-bit extent counts beyond u32 are not supported"
+                ))
+            })?;
+            let anextents = u16::try_from(big_anextents).map_err(|_| {
+                crate::Error::Unsupported(format!(
+                    "xfs: inode has {big_anextents} attr-fork extents (> u16); \
+                     64-bit extent counts beyond u16 are not supported"
+                ))
+            })?;
+            (nextents, anextents)
+        } else {
+            (
+                u32::from_be_bytes(buf[76..80].try_into().unwrap()),
+                u16::from_be_bytes(buf[80..82].try_into().unwrap()),
+            )
+        };
         let forkoff = buf[82];
+        let aformat = buf[83];
         let flags = u16::from_be_bytes(buf[90..92].try_into().unwrap());
         let generation = u32::from_be_bytes(buf[92..96].try_into().unwrap());
 
@@ -204,9 +333,12 @@ impl DinodeCore {
             size,
             nblocks,
             nextents,
+            anextents,
             forkoff,
+            aformat,
             flags,
             generation,
+            flags2,
             di_ino,
             literal_offset,
         })
@@ -250,6 +382,10 @@ pub const V3_CORE_SIZE: usize = 176;
 #[derive(Debug, Clone)]
 pub struct V3DinodeBuilder {
     pub inodesize: usize,
+    /// The volume's `XFS_SB_FEAT_INCOMPAT_NREXT64` state — it decides
+    /// where `di_nextents` / `di_anextents` live. Timestamps switch to
+    /// the bigtime encoding from `flags2` instead.
+    pub nrext64: bool,
     pub mode: u16,
     pub format: u8,
     pub uid: u32,
@@ -263,6 +399,9 @@ pub struct V3DinodeBuilder {
     pub nblocks: u64,
     pub extsize: u32,
     pub nextents: u32,
+    /// `di_anextents` — extent count of the attribute fork. Zero for a
+    /// shortform (LOCAL) attr fork and for an inode with no attrs.
+    pub anextents: u16,
     pub forkoff: u8,
     pub aformat: u8,
     pub flags: u16,
@@ -296,13 +435,22 @@ impl V3DinodeBuilder {
         buf[8..12].copy_from_slice(&self.uid.to_be_bytes());
         buf[12..16].copy_from_slice(&self.gid.to_be_bytes());
         buf[16..20].copy_from_slice(&self.nlink.to_be_bytes());
-        buf[32..40].copy_from_slice(&encode_ts(self.atime));
-        buf[40..48].copy_from_slice(&encode_ts(self.mtime));
-        buf[48..56].copy_from_slice(&encode_ts(self.ctime));
+        let bigtime = (self.flags2 & XFS_DIFLAG2_BIGTIME) != 0;
+        buf[32..40].copy_from_slice(&self.atime.encode(bigtime));
+        buf[40..48].copy_from_slice(&self.mtime.encode(bigtime));
+        buf[48..56].copy_from_slice(&self.ctime.encode(bigtime));
         buf[56..64].copy_from_slice(&self.size.to_be_bytes());
         buf[64..72].copy_from_slice(&self.nblocks.to_be_bytes());
         buf[72..76].copy_from_slice(&self.extsize.to_be_bytes());
-        buf[76..80].copy_from_slice(&self.nextents.to_be_bytes());
+        if self.nrext64 {
+            // di_big_nextents (__be64 @ 24) + di_big_anextents (__be32 @ 76);
+            // 80..82 is di_nrext64_pad and stays zero.
+            buf[24..32].copy_from_slice(&(self.nextents as u64).to_be_bytes());
+            buf[76..80].copy_from_slice(&(self.anextents as u32).to_be_bytes());
+        } else {
+            buf[76..80].copy_from_slice(&self.nextents.to_be_bytes());
+            buf[80..82].copy_from_slice(&self.anextents.to_be_bytes());
+        }
         buf[82] = self.forkoff;
         buf[83] = self.aformat;
         buf[90..92].copy_from_slice(&self.flags.to_be_bytes());
@@ -312,18 +460,11 @@ impl V3DinodeBuilder {
         // di_crc at 100..104 — caller's responsibility via stamp_v3_inode_crc
         // di_flags2 at 120..128 — REFLINK / BIGTIME / NREXT64 etc.
         buf[120..128].copy_from_slice(&self.flags2.to_be_bytes());
-        buf[144..152].copy_from_slice(&encode_ts(self.crtime));
+        buf[144..152].copy_from_slice(&self.crtime.encode(bigtime));
         buf[152..160].copy_from_slice(&self.di_ino.to_be_bytes());
         buf[160..176].copy_from_slice(&self.uuid);
         buf
     }
-}
-
-fn encode_ts(ts: XfsTimestamp) -> [u8; 8] {
-    let mut out = [0u8; 8];
-    out[0..4].copy_from_slice(&ts.sec.to_be_bytes());
-    out[4..8].copy_from_slice(&ts.nsec.to_be_bytes());
-    out
 }
 
 /// Compute and store the v3 dinode CRC. CRC32C is taken over the full

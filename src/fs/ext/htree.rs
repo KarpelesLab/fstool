@@ -138,24 +138,67 @@ pub fn leaf_max_entries(_block_size: u32) -> usize {
 
 // ─── DX_HASH_HALF_MD4 ───────────────────────────────────────────────
 
-/// Compute the (major, minor) HTree hash of `name` under
-/// `DX_HASH_HALF_MD4_UNSIGNED`. Matches the kernel's `ext4fs_dirhash`
-/// for the unsigned variant: the seed defaults to the MD4 IV, the name
-/// is padded into 32-byte chunks via `str2hashbuf`, each chunk is mixed
-/// in with `half_md4_transform`, then the major hash is `buf[1]` and
-/// the minor hash is `buf[2]`. The low bit of the major hash is
-/// cleared (collision-chain marker reservation); the EOF sentinel
-/// `0xFFFF_FFFE` is remapped to `0xFFFF_FFFC`.
+/// Default MD4 initialisation vector, used when the filesystem carries
+/// no `s_hash_seed` (or carries one that the kernel rejects).
+const MD4_IV: [u32; 4] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
+
+/// Decode `s_hash_seed` (16 bytes, four `__le32`) into the four MD4
+/// state words, falling back to the default MD4 initialisation vector.
+///
+/// The kernel (`__ext4fs_dirhash`) only honours the seed when **all
+/// four** words are non-zero:
+///
+/// ```text
+///     if (hinfo->seed) {
+///         for (i = 0; i < 4; i++)
+///             if (hinfo->seed[i] == 0) break;
+///         if (i == 4) memcpy(buf, hinfo->seed, sizeof(buf));
+///     }
+/// ```
+///
+/// so a partially-zero seed silently falls back to the IV. Mirror that
+/// exactly — getting it wrong puts every name in the wrong hash bucket.
+pub fn hash_seed_words(seed: &[u8; 16]) -> [u32; 4] {
+    let mut words = [0u32; 4];
+    for (i, w) in words.iter_mut().enumerate() {
+        *w = u32::from_le_bytes(seed[i * 4..i * 4 + 4].try_into().unwrap());
+    }
+    if words.contains(&0) { MD4_IV } else { words }
+}
+
+/// Compute the (major, minor) HTree hash of `name` with the default
+/// (unseeded) `DX_HASH_HALF_MD4_UNSIGNED`. Thin wrapper over
+/// [`half_md4_hash_with`].
 pub fn half_md4_hash(name: &[u8]) -> (u32, u32) {
-    // Default MD4 seed (no per-FS hash-seed override yet).
-    let mut buf: [u32; 4] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
+    half_md4_hash_with(name, &[0u8; 16], true)
+}
+
+/// Compute the (major, minor) HTree hash of `name` under
+/// `DX_HASH_HALF_MD4` (`unsigned = false`) or
+/// `DX_HASH_HALF_MD4_UNSIGNED` (`unsigned = true`).
+///
+/// Matches the kernel's `__ext4fs_dirhash`: the state starts at the
+/// filesystem's `s_hash_seed` (or the MD4 IV — see
+/// [`hash_seed_words`]), the name is then padded into 32-byte chunks via
+/// `str2hashbuf`, each chunk is mixed in with `half_md4_transform`,
+/// then the major hash is `buf[1]` and the minor hash is `buf[2]`. The
+/// low bit of the major hash is cleared (collision-chain marker
+/// reservation); the EOF sentinel `0xFFFF_FFFE` is remapped to
+/// `0xFFFF_FFFC`.
+///
+/// The two variants differ only in how `str2hashbuf` widens each name
+/// byte — as `u8` or as `i8`. They agree on pure-ASCII names and
+/// diverge the moment a byte has its top bit set, which is why the
+/// filesystem has to say which one it means (`EXT2_FLAGS_SIGNED_HASH`
+/// / `EXT2_FLAGS_UNSIGNED_HASH` in `s_flags`).
+pub fn half_md4_hash_with(name: &[u8], seed: &[u8; 16], unsigned: bool) -> (u32, u32) {
+    let mut buf = hash_seed_words(seed);
     let mut remaining = name;
     let mut in_buf = [0u32; 8];
     // Matches the kernel's `while (len > 0)` — empty names skip the
-    // transform entirely so their hash is the raw MD4 IV's middle
-    // words.
+    // transform entirely so their hash is the raw seed's middle words.
     while !remaining.is_empty() {
-        str2hashbuf_unsigned(remaining, &mut in_buf, 8);
+        str2hashbuf(remaining, &mut in_buf, 8, unsigned);
         half_md4_transform(&mut buf, &in_buf);
         if remaining.len() <= 32 {
             break;
@@ -170,18 +213,17 @@ pub fn half_md4_hash(name: &[u8]) -> (u32, u32) {
 }
 
 /// Pack the next ≤ 32 bytes of `msg` into `out[..num]` as u32 words
-/// for half-MD4 input. Matches the kernel's `str2hashbuf_unsigned`
-/// exactly — including its quirk of carrying the held partial word
-/// into the trailing slot (so a length-5 name still has its 5th byte
-/// fold into the hash, just in the slot following the first full
-/// word). The signed variant differs by interpreting bytes as `i8`;
-/// modern Linux defaults to unsigned and so do we.
+/// for half-MD4 input. Matches the kernel's `str2hashbuf_unsigned` /
+/// `str2hashbuf_signed` exactly — including their quirk of carrying
+/// the held partial word into the trailing slot (so a length-5 name
+/// still has its 5th byte fold into the hash, just in the slot
+/// following the first full word).
 ///
 /// The pad word `pad = len_byte | len_byte << 8 | len_byte << 16 |
 /// len_byte << 24` fills any position the actual name doesn't reach,
 /// distinguishing two short names of different lengths from each
 /// other (both would otherwise hash on identical prefixes).
-fn str2hashbuf_unsigned(msg: &[u8], out: &mut [u32; 8], num: usize) {
+fn str2hashbuf(msg: &[u8], out: &mut [u32; 8], num: usize, unsigned: bool) {
     let mut len = msg.len();
     let len_byte = (len & 0xff) as u32;
     let pad = len_byte | (len_byte << 8) | (len_byte << 16) | (len_byte << 24);
@@ -192,8 +234,15 @@ fn str2hashbuf_unsigned(msg: &[u8], out: &mut [u32; 8], num: usize) {
         len = num * 4;
     }
     for (i, &b) in msg.iter().take(len).enumerate() {
-        // Kernel: val = ((int) ucp[i]) + (val << 8)
-        val = (b as u32).wrapping_add(val.wrapping_shl(8));
+        // Kernel: val = ((int) ucp[i]) + (val << 8) for the unsigned
+        // variant; the signed one widens through `signed char`, so a
+        // byte ≥ 0x80 sign-extends to 0xFFFFFF80..=0xFFFFFFFF.
+        let widened = if unsigned {
+            b as u32
+        } else {
+            b as i8 as i32 as u32
+        };
+        val = widened.wrapping_add(val.wrapping_shl(8));
         if i % 4 == 3 {
             out[written] = val;
             written += 1;

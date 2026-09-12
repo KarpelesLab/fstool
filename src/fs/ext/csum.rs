@@ -75,6 +75,39 @@ pub fn group_desc(seed: u32, group: u32, desc: &[u8]) -> u16 {
     (c & 0xffff) as u16
 }
 
+/// CRC-16 as e2fsprogs' `ext2fs_crc16` / the kernel's `crc16()`: the
+/// reflected 0x8005 polynomial (table constant 0xA001), no final XOR,
+/// running state passed in and returned (callers seed with `!0`).
+pub fn crc16(mut crc: u16, data: &[u8]) -> u16 {
+    for &b in data {
+        crc ^= b as u16;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xA001
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc
+}
+
+/// Group-descriptor checksum for the `uninit_bg` (`RO_COMPAT_GDT_CSUM`)
+/// feature *without* `metadata_csum`: `crc16(~0, uuid)` → the
+/// little-endian group number → the descriptor up to `bg_checksum`
+/// (offset 0x1E) → for 64-byte descriptors, the bytes after the
+/// checksum field (`0x20..desc_size`). Mirrors `ext4_group_desc_csum`.
+pub fn group_desc_crc16(uuid: &[u8; 16], group: u32, desc: &[u8]) -> u16 {
+    let c = crc16(!0, uuid);
+    let c = crc16(c, &group.to_le_bytes());
+    let c = crc16(c, &desc[..0x1E]);
+    if desc.len() > 0x20 {
+        crc16(c, &desc[0x20..])
+    } else {
+        c
+    }
+}
+
 /// Inode checksum. Chained: seed → inode number → inode generation → the
 /// inode body with both checksum fields zeroed. `inode` is the full on-disk
 /// inode (`inode_size` bytes) with `i_checksum_lo` / `i_checksum_hi` zeroed.
@@ -153,6 +186,41 @@ mod tests {
         let desc = [0u8; 64];
         // Different group numbers yield different descriptor checksums.
         assert_ne!(group_desc(seed, 0, &desc), group_desc(seed, 1, &desc));
+    }
+
+    /// CRC-16/MODBUS catalogue check value: reflected 0x8005, init
+    /// 0xFFFF, no final XOR — exactly `ext2fs_crc16(~0, "123456789", 9)`.
+    #[test]
+    fn crc16_matches_catalogue_check_value() {
+        assert_eq!(crc16(!0, b"123456789"), 0x4B37);
+        // Chaining equals one-shot.
+        assert_eq!(crc16(crc16(!0, b"1234"), b"56789"), 0x4B37);
+    }
+
+    #[test]
+    fn group_desc_crc16_skips_the_checksum_field() {
+        let uuid = [0x5Au8; 16];
+        let mut a = [0u8; 64];
+        let mut b = [0u8; 64];
+        a[0] = 1;
+        b[0] = 1;
+        a[0x1E] = 0xAA;
+        b[0x1E] = 0x55; // differs only in bg_checksum
+        assert_eq!(
+            group_desc_crc16(&uuid, 3, &a),
+            group_desc_crc16(&uuid, 3, &b)
+        );
+        // The tail past the checksum field IS covered for 64-byte descs.
+        b[0x30] = 1;
+        assert_ne!(
+            group_desc_crc16(&uuid, 3, &a),
+            group_desc_crc16(&uuid, 3, &b)
+        );
+        // And the group number matters.
+        assert_ne!(
+            group_desc_crc16(&uuid, 3, &a),
+            group_desc_crc16(&uuid, 4, &a)
+        );
     }
 
     #[test]

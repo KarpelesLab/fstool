@@ -783,6 +783,62 @@ fn fuzz_ext4() {
     );
 }
 
+/// libFuzzer crash input for the `ext_list_corrupt_dir` target
+/// (`fuzz/fuzz_targets/ext_list_corrupt_dir.rs`): the first four bytes
+/// are a little-endian offset (mod image size) and the remainder is
+/// splattered over a freshly-formatted 2 MiB ext4 image. This one lands
+/// in the superblock and zeroes `s_first_ino`, which used to underflow
+/// `first_ino - 1` in `Ext::open`. Embedded so it runs under plain
+/// `cargo test`.
+#[cfg(feature = "ext")]
+const EXT_CORRUPT_DIR_CRASH_FIRST_INO_ZERO: &[u8] = &[
+    0x45, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe2, 0x1b, 0x00, 0x00, 0x10, 0x00, 0xff, 0xff, 0xff,
+    0xf7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7e, 0x00, 0x00, 0x60, 0x00,
+    0x00, 0x29, 0x04, 0x00, 0x00, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0a, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x0c, 0x00, 0x21, 0x00, 0x0f, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x0a,
+];
+
+/// Replays a fuzz input through the same steps as the
+/// `ext_list_corrupt_dir` target: format, splatter, reopen, list the
+/// root, read the first 16 inodes. Everything must terminate without a
+/// panic.
+#[cfg(feature = "ext")]
+fn replay_ext_corrupt_dir_input(data: &[u8]) {
+    use fstool::fs::ext::{Ext, FormatOpts, FsKind};
+    assert!(data.len() >= 32);
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 1024,
+        blocks_count: 2048,
+        inodes_count: 16,
+        journal_blocks: 1024,
+        ..FormatOpts::default()
+    };
+    let total = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = MemoryBackend::new(total);
+    let Ok(_) = Ext::format_with(&mut dev, &opts) else {
+        return;
+    };
+    let off = u32::from_le_bytes(data[..4].try_into().unwrap()) as u64;
+    let off = off % total;
+    let payload = &data[4..];
+    let n = (payload.len() as u64).min(total - off);
+    let _ = dev.write_at(off, &payload[..n as usize]);
+    if let Ok(ext) = Ext::open(&mut dev) {
+        let _ = ext.list_inode(&mut dev, 2);
+        for ino in 1..=16 {
+            let _ = ext.read_inode(&mut dev, ino);
+        }
+    }
+}
+
+#[cfg(feature = "ext")]
+#[test]
+fn ext_corrupt_dir_crash_first_ino_zero_does_not_panic() {
+    replay_ext_corrupt_dir_input(EXT_CORRUPT_DIR_CRASH_FIRST_INO_ZERO);
+}
+
 #[cfg(feature = "fat")]
 #[test]
 fn fuzz_fat32() {

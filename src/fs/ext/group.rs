@@ -2,6 +2,20 @@
 
 use super::constants::GROUP_DESC_SIZE;
 
+/// `bg_flags`: the group's inode bitmap has never been written — treat
+/// it as all zero (`EXT4_BG_INODE_UNINIT`). Only meaningful when the
+/// filesystem has group-descriptor checksums (`uninit_bg` /
+/// `metadata_csum`).
+pub const BG_INODE_UNINIT: u16 = 0x0001;
+/// `bg_flags`: the group's block bitmap has never been written — it
+/// must be synthesised from the group's metadata layout
+/// (`EXT4_BG_BLOCK_UNINIT`).
+pub const BG_BLOCK_UNINIT: u16 = 0x0002;
+/// `bg_flags`: the group's inode table has been zeroed on disk
+/// (`EXT4_BG_INODE_ZEROED`). When clear, the kernel's lazy init thread
+/// zeroes the table past the used prefix before trusting it.
+pub const BG_INODE_ZEROED: u16 = 0x0004;
+
 /// One block group descriptor (32 bytes, classic ext2 layout).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GroupDesc {
@@ -17,8 +31,13 @@ pub struct GroupDesc {
     pub free_inodes_count: u16,
     /// Number of directories allocated in this group.
     pub used_dirs_count: u16,
-    /// Padding / flags. Zero for classic ext2.
+    /// `bg_flags` (`BG_INODE_UNINIT` / `BG_BLOCK_UNINIT` /
+    /// `BG_INODE_ZEROED`). Zero for classic ext2.
     pub flags: u16,
+    /// `bg_itable_unused`: number of inode slots at the *end* of this
+    /// group's inode table that have never been used. e2fsck and the
+    /// kernel's lazy-init skip them; must never claim a live inode.
+    pub itable_unused: u16,
 }
 
 impl GroupDesc {
@@ -32,7 +51,9 @@ impl GroupDesc {
         buf[14..16].copy_from_slice(&self.free_inodes_count.to_le_bytes());
         buf[16..18].copy_from_slice(&self.used_dirs_count.to_le_bytes());
         buf[18..20].copy_from_slice(&self.flags.to_le_bytes());
-        // 20..32 reserved, leave zero.
+        // 20..24: bg_exclude_bitmap_lo, 24..28: bitmap checksums (stamped
+        // by the writer), 28..30: bg_itable_unused, 30..32: bg_checksum.
+        buf[28..30].copy_from_slice(&self.itable_unused.to_le_bytes());
         buf
     }
 
@@ -52,6 +73,7 @@ impl GroupDesc {
             free_inodes_count: u16::from_le_bytes(buf[14..16].try_into().unwrap()),
             used_dirs_count: u16::from_le_bytes(buf[16..18].try_into().unwrap()),
             flags: u16::from_le_bytes(buf[18..20].try_into().unwrap()),
+            itable_unused: u16::from_le_bytes(buf[28..30].try_into().unwrap()),
         }
     }
 }
@@ -102,9 +124,11 @@ mod tests {
             free_blocks_count: 1000,
             free_inodes_count: 500,
             used_dirs_count: 7,
-            flags: 0,
+            flags: BG_INODE_ZEROED,
+            itable_unused: 123,
         };
         let buf = gd.encode();
+        assert_eq!(&buf[28..30], &123u16.to_le_bytes());
         let decoded = GroupDesc::decode(&buf);
         assert_eq!(decoded.block_bitmap, gd.block_bitmap);
         assert_eq!(decoded.inode_bitmap, gd.inode_bitmap);
@@ -112,6 +136,8 @@ mod tests {
         assert_eq!(decoded.free_blocks_count, gd.free_blocks_count);
         assert_eq!(decoded.free_inodes_count, gd.free_inodes_count);
         assert_eq!(decoded.used_dirs_count, gd.used_dirs_count);
+        assert_eq!(decoded.flags, BG_INODE_ZEROED);
+        assert_eq!(decoded.itable_unused, 123);
     }
 
     #[test]

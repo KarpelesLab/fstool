@@ -76,6 +76,7 @@ use super::inode::{
     stamp_v3_inode_crc,
 };
 use super::journal::DEFAULT_LOG_BLOCKS;
+use super::rw::MAX_INLINE_EXTENTS;
 use super::symlink::XFS_SYMLINK_HDR_SIZE;
 
 /// Streaming-write scratch buffer size — never grow this above 64 KiB.
@@ -87,6 +88,12 @@ const INOBT_RECS_PER_LEAF: usize = (XFS_BLOCKSIZE as usize - XFS_BTREE_SBLOCK_V5
 /// INOBT node fan-out (= node `maxrecs`): each child costs a 4 B key plus a
 /// 4 B pointer. The pointer array begins at `header + maxrecs * 4`.
 const INOBT_PTRS_PER_NODE: usize = (XFS_BLOCKSIZE as usize - XFS_BTREE_SBLOCK_V5_SIZE) / 8;
+
+/// Free-space B+tree fan-out: each BNO / CNT leaf record is a 4-byte
+/// start block plus a 4-byte length, so one leaf holds 505 records at
+/// the writer's 4 KiB block size. The writer emits single-leaf
+/// free-space trees only, which caps how fragmented an AG may get.
+const ABT_RECS_PER_LEAF: usize = (XFS_BLOCKSIZE as usize - XFS_BTREE_SBLOCK_V5_SIZE) / 8;
 
 /// Special-file kind for [`Xfs::add_device`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,15 +153,15 @@ impl EntryMeta {
     fn ts(&self) -> (XfsTimestamp, XfsTimestamp, XfsTimestamp) {
         (
             XfsTimestamp {
-                sec: self.atime,
+                sec: self.atime as i64,
                 nsec: 0,
             },
             XfsTimestamp {
-                sec: self.mtime,
+                sec: self.mtime as i64,
                 nsec: 0,
             },
             XfsTimestamp {
-                sec: self.ctime,
+                sec: self.ctime as i64,
                 nsec: 0,
             },
         )
@@ -162,6 +169,37 @@ impl EntryMeta {
 }
 
 /// In-memory state of an active inode chunk within a single AG.
+/// An inode's attribute fork, lifted off disk so a rebuild of the data
+/// fork can write it back unchanged. See
+/// [`Xfs::attr_fork_copy`](super::Xfs::attr_fork_copy).
+#[derive(Debug, Clone)]
+struct AttrFork {
+    /// `di_aformat` to restore.
+    aformat: u8,
+    /// `di_anextents` to restore.
+    anextents: u16,
+    /// The fork payload, exactly `bytes.len()` bytes long.
+    bytes: Vec<u8>,
+}
+
+impl AttrFork {
+    /// Pick the `di_forkoff` (in 8-byte words) for a rebuilt inode whose
+    /// data fork now needs `data_len` bytes. Never shrinks below the
+    /// inode's previous boundary — an unchanged fork layout is the common
+    /// case and keeps the rewrite byte-stable.
+    fn forkoff_for(&self, data_len: usize, prev_forkoff: u8, lit_size: usize) -> Result<u8> {
+        let want = data_len.div_ceil(8).max(prev_forkoff as usize).max(1);
+        if want * 8 + self.bytes.len() > lit_size {
+            return Err(crate::Error::Unsupported(format!(
+                "xfs: data fork ({data_len} bytes) and attribute fork ({} bytes) \
+                 do not both fit in the {lit_size}-byte inode literal area",
+                self.bytes.len()
+            )));
+        }
+        Ok(want as u8)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct InodeChunk {
     /// AG-relative inode number of slot 0.
@@ -220,6 +258,36 @@ struct AgState {
     /// a fresh allocation tries the most recently freed extent before
     /// bumping the pointer.
     freed_extents: Vec<(u32, u32)>,
+    /// AG-relative blocks reserved for the INOBT's leaf blocks when the
+    /// tree needs two levels (block 6 becomes the root node). Held in
+    /// the persistent state — and therefore excluded from the free-space
+    /// B+trees and from further allocation — so a flush cannot hand the
+    /// same blocks out twice. Empty for a single-leaf INOBT, whose leaf
+    /// is the pre-reserved block 6.
+    inobt_leaves: Vec<u32>,
+}
+
+/// The AG's free space as BNO/CNT leaf records: every explicitly freed
+/// extent plus whatever the bump pointer has not handed out yet, sorted
+/// by start block and coalesced.
+fn coalesce_free_extents(st: &AgState, this_ag_blocks: u32) -> Vec<(u32, u32)> {
+    let mut extents: Vec<(u32, u32)> = st.freed_extents.clone();
+    let tail = this_ag_blocks.saturating_sub(st.next_agblock);
+    if tail > 0 {
+        extents.push((st.next_agblock, tail));
+    }
+    extents.sort_by_key(|(s, _)| *s);
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(extents.len());
+    for (s, c) in extents {
+        if let Some((ls, lc)) = out.last_mut()
+            && *ls + *lc == s
+        {
+            *lc += c;
+            continue;
+        }
+        out.push((s, c));
+    }
+    out
 }
 
 impl AgState {
@@ -290,6 +358,7 @@ impl WriteState {
                 next_agblock,
                 chunks,
                 freed_extents: Vec::new(),
+                inobt_leaves: Vec::new(),
             });
         }
         Self {
@@ -493,6 +562,7 @@ impl Xfs {
                 next_agblock,
                 chunks,
                 freed_extents,
+                inobt_leaves: Vec::new(),
             });
         }
 
@@ -585,7 +655,147 @@ impl Xfs {
     /// which AG was picked.
     pub(super) fn alloc_blocks_fsb(&mut self, n: u32) -> Result<u64> {
         let (ag, agblk) = self.alloc_blocks_in_any_ag(n)?;
-        Ok(((ag as u64) << self.sb.agblklog as u32) | (agblk as u64))
+        Ok(self.ag_agblock_to_fsb(ag, agblk))
+    }
+
+    /// `(ag, agblock)` → FSB.
+    fn ag_agblock_to_fsb(&self, ag: u32, agblk: u32) -> u64 {
+        ((ag as u64) << self.sb.agblklog as u32) | (agblk as u64)
+    }
+
+    /// Real block count of AG `ag` — the last AG is usually short of
+    /// `sb_agblocks`, and handing out blocks past `sb_dblocks` would
+    /// address bytes beyond the end of the volume.
+    fn ag_block_count(&self, ag: u32) -> u32 {
+        let agblocks = self.sb.agblocks as u64;
+        let start = (ag as u64) * agblocks;
+        self.sb.dblocks.saturating_sub(start).min(agblocks) as u32
+    }
+
+    /// Allocate **up to** `want` contiguous blocks for file data, and
+    /// report how many were actually taken. Tries for the whole run
+    /// first (so a file that fits stays a single extent, and the
+    /// freed-extent reuse in [`alloc_blocks_in_any_ag`] still applies);
+    /// otherwise falls back to the largest contiguous run any AG can
+    /// offer. Never returns zero blocks — it errors instead.
+    ///
+    /// This is what lets a file larger than one AG's longest free run
+    /// be written as several extents rather than failing with
+    /// "out of space".
+    pub(super) fn alloc_file_blocks_fsb(&mut self, want: u32) -> Result<(u64, u32)> {
+        let want = want.clamp(1, super::bmbt::MAX_EXTENT_BLOCKS);
+        if let Ok((ag, agblk)) = self.alloc_blocks_in_any_ag(want) {
+            return Ok((self.ag_agblock_to_fsb(ag, agblk), want));
+        }
+        let (ag, agblk, got) = self.alloc_largest_run(want)?;
+        Ok((self.ag_agblock_to_fsb(ag, agblk), got))
+    }
+
+    /// Take the longest contiguous free run available across every AG,
+    /// clamped to `want` blocks. Returns `(ag, agblock, count)`.
+    fn alloc_largest_run(&mut self, want: u32) -> Result<(u32, u32, u32)> {
+        let agcount = self.ws_mut()?.ags.len() as u32;
+        // Per-AG usable size, computed before the mutable borrow below.
+        let ag_sizes: Vec<u32> = (0..agcount).map(|ag| self.ag_block_count(ag)).collect();
+        let ws = self.ws_mut()?;
+        // (ag, index into freed_extents or None for the bump region,
+        //  start agblock, run length)
+        let mut best: Option<(u32, Option<usize>, u32, u32)> = None;
+        for offset in 0..agcount {
+            let ag = (ws.next_block_ag + offset) % agcount;
+            let st = &ws.ags[ag as usize];
+            for (i, (start, len)) in st.freed_extents.iter().enumerate() {
+                if best.is_none_or(|b| b.3 < *len) {
+                    best = Some((ag, Some(i), *start, *len));
+                }
+            }
+            let tail = ag_sizes[ag as usize].saturating_sub(st.next_agblock);
+            if tail > 0 && best.is_none_or(|b| b.3 < tail) {
+                best = Some((ag, None, st.next_agblock, tail));
+            }
+        }
+        let (ag, freed_idx, start, len) = best.ok_or_else(|| {
+            crate::Error::InvalidArgument(format!(
+                "xfs: out of space across all {agcount} AGs (requested {want} blocks)"
+            ))
+        })?;
+        let take = len.min(want);
+        let st = &mut ws.ags[ag as usize];
+        match freed_idx {
+            Some(i) => {
+                st.freed_extents.swap_remove(i);
+                if len > take {
+                    st.freed_extents.push((start + take, len - take));
+                }
+            }
+            None => st.next_agblock = start + take,
+        }
+        ws.next_block_ag = (ag + 1) % agcount;
+        Ok((ag, start, take))
+    }
+
+    /// Allocate `nblocks` blocks of file data as a list of extents,
+    /// merging runs that happen to be physically adjacent. Rolls the
+    /// whole allocation back when the extent list outgrows what the
+    /// inline data fork can describe (bmbt promotion is not
+    /// implemented), so a failure leaves no leaked blocks behind.
+    fn alloc_file_extents(&mut self, nblocks: u64) -> Result<Vec<Extent>> {
+        let mut extents: Vec<Extent> = Vec::new();
+        let mut remaining = nblocks;
+        let mut logical = 0u64;
+        while remaining > 0 {
+            let want = remaining.min(super::bmbt::MAX_EXTENT_BLOCKS as u64) as u32;
+            let got = match self.alloc_file_blocks_fsb(want) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.free_extent_list(&extents);
+                    return Err(e);
+                }
+            };
+            let (fsb, count) = got;
+            // Merge with the previous run when the allocator happened to
+            // hand back the physically-next blocks.
+            let merged = match extents.last_mut() {
+                Some(tail)
+                    if tail.startblock + tail.blockcount as u64 == fsb
+                        && tail.offset + tail.blockcount as u64 == logical
+                        && (tail.blockcount as u64) + (count as u64)
+                            <= super::bmbt::MAX_EXTENT_BLOCKS as u64 =>
+                {
+                    tail.blockcount += count;
+                    true
+                }
+                _ => false,
+            };
+            if !merged {
+                extents.push(Extent {
+                    offset: logical,
+                    startblock: fsb,
+                    blockcount: count,
+                    unwritten: false,
+                });
+                if extents.len() > MAX_INLINE_EXTENTS {
+                    self.free_extent_list(&extents);
+                    return Err(crate::Error::Unsupported(format!(
+                        "xfs: file needs more than {MAX_INLINE_EXTENTS} extents \
+                         (free space is too fragmented, or the file spans too many \
+                         allocation groups) — bmbt promotion is not implemented"
+                    )));
+                }
+            }
+            logical += count as u64;
+            remaining -= count as u64;
+        }
+        Ok(extents)
+    }
+
+    /// Give every extent in `list` back to the allocator. Used to roll a
+    /// partial file allocation back; errors are swallowed because the
+    /// caller is already returning one.
+    fn free_extent_list(&mut self, list: &[Extent]) {
+        for e in list {
+            let _ = self.free_blocks_fsb(e.startblock, e.blockcount);
+        }
     }
 
     /// Allocate one inode. Tries existing chunks across AGs in
@@ -674,6 +884,7 @@ impl Xfs {
             let rel = startino_ag + slot;
             let ino = ((ag as u64) << (inopblog + agblklog)) | (rel as u64);
             let builder = V3DinodeBuilder {
+                nrext64: self.sb.has_nrext64(),
                 inodesize: isize,
                 mode: 0, // free
                 format: 0,
@@ -688,6 +899,7 @@ impl Xfs {
                 nblocks: 0,
                 extsize: 0,
                 nextents: 0,
+                anextents: 0,
                 forkoff: 0,
                 aformat: 0,
                 flags: 0,
@@ -770,19 +982,97 @@ impl Xfs {
         builder: V3DinodeBuilder,
         literal: &[u8],
     ) -> Result<()> {
+        self.write_inode_forks(dev, ino, builder, literal, &[])
+    }
+
+    /// Like [`write_inode`](Self::write_inode) but also lays an attribute
+    /// fork down at the `di_forkoff` boundary the builder carries. Used by
+    /// the rebuild paths so an inode that already had xattrs keeps them.
+    fn write_inode_forks(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        ino: u64,
+        builder: V3DinodeBuilder,
+        data_fork: &[u8],
+        attr_fork: &[u8],
+    ) -> Result<()> {
         let off = self.ino_byte_offset(ino)?;
+        let forkoff = builder.forkoff as usize;
         let mut buf = builder.build();
         let lit_max = (XFS_INODESIZE as usize) - 176;
-        if literal.len() > lit_max {
-            return Err(crate::Error::InvalidArgument(format!(
-                "xfs: literal area {} > {lit_max}",
-                literal.len()
+        // With an attribute fork present the data fork may only use the
+        // first `di_forkoff * 8` bytes of the literal area.
+        let data_max = if forkoff == 0 { lit_max } else { forkoff * 8 };
+        if data_fork.len() > data_max {
+            return Err(crate::Error::Unsupported(format!(
+                "xfs: data fork {} bytes > {data_max} available (di_forkoff = {forkoff})",
+                data_fork.len()
             )));
         }
-        buf[176..176 + literal.len()].copy_from_slice(literal);
+        buf[176..176 + data_fork.len()].copy_from_slice(data_fork);
+        if !attr_fork.is_empty() {
+            let attr_off = 176 + forkoff * 8;
+            if forkoff == 0 || attr_off + attr_fork.len() > XFS_INODESIZE as usize {
+                return Err(crate::Error::Unsupported(format!(
+                    "xfs: attribute fork ({} bytes at di_forkoff = {forkoff}) overruns the inode",
+                    attr_fork.len()
+                )));
+            }
+            buf[attr_off..attr_off + attr_fork.len()].copy_from_slice(attr_fork);
+        }
         stamp_v3_inode_crc(&mut buf);
         dev.write_at(off, &buf)?;
         Ok(())
+    }
+
+    /// Copy an inode's attribute fork out of its on-disk bytes so a
+    /// rebuild of the *data* fork can put it back untouched. Returns
+    /// `None` when the inode carries no attribute fork (`di_forkoff == 0`).
+    ///
+    /// The payload length is derived from `di_aformat`: a shortform
+    /// (LOCAL) fork states its own `totsize` in its first two bytes, an
+    /// EXTENTS fork is `di_anextents` packed 16-byte records. A BTREE
+    /// attr fork is refused rather than silently mangled.
+    fn attr_fork_copy(
+        &self,
+        ino_buf: &[u8],
+        core: &super::inode::DinodeCore,
+    ) -> Result<Option<AttrFork>> {
+        if core.forkoff == 0 {
+            return Ok(None);
+        }
+        let inodesize = self.sb.inodesize as usize;
+        let attr_off = core.literal_offset + (core.forkoff as usize) * 8;
+        if attr_off >= inodesize || attr_off >= ino_buf.len() {
+            return Ok(None);
+        }
+        let avail = &ino_buf[attr_off..inodesize.min(ino_buf.len())];
+        let len = match core.aformat {
+            // LOCAL — shortform attribute area, self-describing.
+            1 => {
+                if avail.len() < 2 {
+                    return Ok(None);
+                }
+                (u16::from_be_bytes(avail[0..2].try_into().unwrap()) as usize).min(avail.len())
+            }
+            // EXTENTS — packed bmbt records pointing at leaf blocks.
+            2 => ((core.anextents as usize) * 16).min(avail.len()),
+            // BTREE — we cannot size (or relocate) this safely.
+            3 => {
+                return Err(crate::Error::Unsupported(
+                    "xfs: inode has a BTREE-format attribute fork; rebuild would drop it".into(),
+                ));
+            }
+            _ => 0,
+        };
+        if len == 0 {
+            return Ok(None);
+        }
+        Ok(Some(AttrFork {
+            aformat: core.aformat,
+            anextents: core.anextents,
+            bytes: avail[..len].to_vec(),
+        }))
     }
 
     /// Read the parent-directory inode, append a new directory entry,
@@ -890,6 +1180,7 @@ impl Xfs {
             self.rebuild_dir_inode(
                 dev,
                 parent_ino,
+                &parent_buf,
                 &parent_core,
                 nlink,
                 atime,
@@ -1028,6 +1319,7 @@ impl Xfs {
         self.rebuild_dir_inode(
             dev,
             parent_ino,
+            &parent_buf,
             &parent_core,
             nlink,
             atime,
@@ -1044,10 +1336,12 @@ impl Xfs {
     /// Rewrite a directory inode in EXTENTS format with the given extent
     /// list and metadata. `extents` must be sorted by logical offset.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn rebuild_dir_inode(
         &mut self,
         dev: &mut dyn BlockDevice,
         ino: u64,
+        ino_buf: &[u8],
         core: &super::inode::DinodeCore,
         nlink: u32,
         atime: XfsTimestamp,
@@ -1058,7 +1352,26 @@ impl Xfs {
         extents: &[Extent],
         uuid: &[u8; 16],
     ) -> Result<()> {
+        let mut lit = Vec::with_capacity(extents.len() * 16);
+        for ext in extents {
+            lit.extend_from_slice(&ext.encode()?);
+        }
+        // A directory can carry xattrs too; the rebuild must not drop
+        // them. Lift the attribute fork off the inode we just read and
+        // put it back at (at least) the same di_forkoff boundary.
+        let attr = self.attr_fork_copy(ino_buf, core)?;
+        let lit_size = (XFS_INODESIZE as usize) - 176;
+        let (forkoff, aformat, anextents, attr_bytes) = match &attr {
+            Some(a) => (
+                a.forkoff_for(lit.len(), core.forkoff, lit_size)?,
+                a.aformat,
+                a.anextents,
+                a.bytes.as_slice(),
+            ),
+            None => (0u8, 2u8, 0u16, &[][..]),
+        };
         let builder = V3DinodeBuilder {
+            nrext64: self.sb.has_nrext64(),
             inodesize: XFS_INODESIZE as usize,
             mode: core.mode,
             format: 2, // EXTENTS
@@ -1073,19 +1386,16 @@ impl Xfs {
             nblocks,
             extsize: 0,
             nextents: extents.len() as u32,
-            forkoff: 0,
-            aformat: 2,
+            anextents,
+            forkoff,
+            aformat,
             flags: core.flags,
             generation: core.generation,
             di_ino: ino,
             uuid: *uuid,
-            flags2: 0,
+            flags2: core.flags2,
         };
-        let mut lit = Vec::with_capacity(extents.len() * 16);
-        for ext in extents {
-            lit.extend_from_slice(&ext.encode());
-        }
-        self.write_inode(dev, ino, builder, &lit)
+        self.write_inode_forks(dev, ino, builder, &lit, attr_bytes)
     }
 
     /// Serialize every pending directory batch (at flush, or before a
@@ -1151,49 +1461,50 @@ impl Xfs {
         src: &mut R,
     ) -> Result<u64> {
         let bs = self.sb.blocksize as u64;
-        let nblocks = if size == 0 { 0 } else { size.div_ceil(bs) } as u32;
+        let nblocks = if size == 0 { 0 } else { size.div_ceil(bs) };
 
-        // Allocate the file data extent first.
-        let startblock = if nblocks > 0 {
-            self.alloc_blocks_fsb(nblocks)?
-        } else {
-            0
-        };
-        // Stream bytes through a fixed 64 KiB buffer.
+        // Allocate the file's data blocks. A file that does not fit in
+        // one contiguous run inside one AG is spread over several
+        // extents rather than refused.
+        let extents = self.alloc_file_extents(nblocks)?;
+
+        // Stream bytes through a fixed 64 KiB buffer, extent by extent.
         if nblocks > 0 {
             let mut scratch = [0u8; SCRATCH_SIZE];
             let mut remaining = size;
-            let mut dev_offset = self.fsb_to_byte(startblock);
-            while remaining > 0 {
-                let want = (remaining.min(SCRATCH_SIZE as u64)) as usize;
-                let n = read_exact_or_eof(src, &mut scratch[..want])?;
-                if n == 0 {
-                    return Err(crate::Error::InvalidArgument(format!(
-                        "xfs: source for {name:?} returned EOF before {size} bytes (short by {remaining})"
-                    )));
+            for ext in &extents {
+                if remaining == 0 {
+                    break;
                 }
-                dev.write_at(dev_offset, &scratch[..n])?;
-                // Zero-pad the tail of the last write if it didn't
-                // cover a full FS block — keeps unallocated tail bytes
-                // deterministically zero.
-                dev_offset += n as u64;
-                remaining -= n as u64;
-            }
-            // Pad up to the next FS-block boundary so the trailing
-            // partial block reads back as the user's bytes followed by
-            // zeros.
-            let tail = (size % bs) as usize;
-            if tail != 0 {
-                let pad = (bs as usize) - tail;
-                let zero = [0u8; SCRATCH_SIZE];
-                let n = pad.min(SCRATCH_SIZE);
-                dev.write_at(dev_offset, &zero[..n])?;
+                let mut dev_offset = self.fsb_to_byte(ext.startblock);
+                let mut ext_left = (ext.blockcount as u64) * bs;
+                while remaining > 0 && ext_left > 0 {
+                    let want = remaining.min(ext_left).min(SCRATCH_SIZE as u64) as usize;
+                    let n = read_exact_or_eof(src, &mut scratch[..want])?;
+                    if n == 0 {
+                        self.free_extent_list(&extents);
+                        return Err(crate::Error::InvalidArgument(format!(
+                            "xfs: source for {name:?} returned EOF before {size} bytes (short by {remaining})"
+                        )));
+                    }
+                    dev.write_at(dev_offset, &scratch[..n])?;
+                    dev_offset += n as u64;
+                    ext_left -= n as u64;
+                    remaining -= n as u64;
+                }
+                // Pad the rest of this extent so blocks we allocated but
+                // did not fill read back as zeros rather than as whatever
+                // the device held before.
+                if ext_left > 0 {
+                    dev.zero_range(dev_offset, ext_left)?;
+                }
             }
         }
         // Allocate + write inode.
         let ino = self.alloc_inode(dev)?;
         let (atime, mtime, ctime) = meta.ts();
         let builder = V3DinodeBuilder {
+            nrext64: self.sb.has_nrext64(),
             inodesize: XFS_INODESIZE as usize,
             mode: S_IFREG | (meta.mode & 0o7777),
             format: 2, // EXTENTS
@@ -1205,9 +1516,10 @@ impl Xfs {
             ctime,
             crtime: mtime,
             size,
-            nblocks: nblocks as u64,
+            nblocks,
             extsize: 0,
-            nextents: if nblocks > 0 { 1 } else { 0 },
+            nextents: extents.len() as u32,
+            anextents: 0,
             forkoff: 0,
             aformat: 2,
             flags: 0,
@@ -1216,17 +1528,10 @@ impl Xfs {
             uuid: self.uuid_for_writes(),
             flags2: 0,
         };
-        let lit = if nblocks > 0 {
-            let ext = Extent {
-                offset: 0,
-                startblock,
-                blockcount: nblocks,
-                unwritten: false,
-            };
-            ext.encode().to_vec()
-        } else {
-            Vec::new()
-        };
+        let mut lit = Vec::with_capacity(extents.len() * 16);
+        for ext in &extents {
+            lit.extend_from_slice(&ext.encode()?);
+        }
         self.write_inode(dev, ino, builder, &lit)?;
         self.append_dir_entry(dev, parent_ino, name, ino, XFS_DIR3_FT_REG_FILE)?;
         Ok(ino)
@@ -1253,6 +1558,7 @@ impl Xfs {
 
         let (atime, mtime, ctime) = meta.ts();
         let builder = V3DinodeBuilder {
+            nrext64: self.sb.has_nrext64(),
             inodesize: XFS_INODESIZE as usize,
             mode: S_IFDIR | (meta.mode & 0o7777),
             format: 2, // EXTENTS
@@ -1267,6 +1573,7 @@ impl Xfs {
             nblocks: 1,
             extsize: 0,
             nextents: 1,
+            anextents: 0,
             forkoff: 0,
             aformat: 2,
             flags: 0,
@@ -1281,7 +1588,7 @@ impl Xfs {
             blockcount: 1,
             unwritten: false,
         };
-        self.write_inode(dev, ino, builder, &ext.encode())?;
+        self.write_inode(dev, ino, builder, &ext.encode()?)?;
         self.append_dir_entry(dev, parent_ino, name, ino, XFS_DIR3_FT_DIR)?;
         Ok(ino)
     }
@@ -1306,6 +1613,7 @@ impl Xfs {
         if target_bytes.len() <= lit_max {
             // Inline (local) symlink.
             let builder = V3DinodeBuilder {
+                nrext64: self.sb.has_nrext64(),
                 inodesize: XFS_INODESIZE as usize,
                 mode: S_IFLNK | 0o777,
                 format: 1, // LOCAL
@@ -1320,6 +1628,7 @@ impl Xfs {
                 nblocks: 0,
                 extsize: 0,
                 nextents: 0,
+                anextents: 0,
                 forkoff: 0,
                 aformat: 2,
                 flags: 0,
@@ -1353,6 +1662,7 @@ impl Xfs {
             dev.write_at(blk_byte, &blkbuf)?;
 
             let builder = V3DinodeBuilder {
+                nrext64: self.sb.has_nrext64(),
                 inodesize: XFS_INODESIZE as usize,
                 mode: S_IFLNK | 0o777,
                 format: 2, // EXTENTS
@@ -1367,6 +1677,7 @@ impl Xfs {
                 nblocks: 1,
                 extsize: 0,
                 nextents: 1,
+                anextents: 0,
                 forkoff: 0,
                 aformat: 2,
                 flags: 0,
@@ -1381,7 +1692,7 @@ impl Xfs {
                 blockcount: 1,
                 unwritten: false,
             };
-            self.write_inode(dev, ino, builder, &ext.encode())?;
+            self.write_inode(dev, ino, builder, &ext.encode()?)?;
         } else {
             return Err(crate::Error::Unsupported(format!(
                 "xfs: symlink target {} bytes > one-block remote limit ({max_remote})",
@@ -1408,12 +1719,13 @@ impl Xfs {
         let ino = self.alloc_inode(dev)?;
         let uuid = self.uuid_for_writes();
         let (atime, mtime, ctime) = meta.ts();
-        // For dev nodes the literal area holds an 8-byte big-endian
-        // packed dev number: major << 20 | minor (Linux MKDEV scheme).
-        let packed = ((major as u64) << 20) | (minor as u64 & 0xFFFFF);
-        let mut lit = [0u8; 8];
-        lit.copy_from_slice(&packed.to_be_bytes());
+        // For dev nodes the data fork holds a 4-byte big-endian
+        // `xfs_dev_t` in the SysV encoding (`minor | major << 18`) —
+        // see `xfs_dinode_put_rdev` in fs/xfs/libxfs/xfs_inode_buf.c.
+        // FIFOs and sockets use XFS_DINODE_FMT_DEV too, with rdev 0.
+        let lit = super::inode::encode_xfs_dev(major, minor).to_be_bytes();
         let builder = V3DinodeBuilder {
+            nrext64: self.sb.has_nrext64(),
             inodesize: XFS_INODESIZE as usize,
             mode: kind.s_ifmt() | (meta.mode & 0o7777),
             format: 0, // DEV
@@ -1428,6 +1740,7 @@ impl Xfs {
             nblocks: 0,
             extsize: 0,
             nextents: 0,
+            anextents: 0,
             forkoff: 0,
             aformat: 2,
             flags: 0,
@@ -1558,7 +1871,22 @@ impl Xfs {
             parent_core.nlink
         };
         let (atime, mtime, ctime) = (parent_core.atime, parent_core.mtime, parent_core.ctime);
+        let mut lit = Vec::with_capacity(16);
+        lit.extend_from_slice(&parent_self_extent.encode()?);
+        // Keep the parent's attribute fork across the rewrite.
+        let attr = self.attr_fork_copy(&parent_buf, &parent_core)?;
+        let lit_size = (XFS_INODESIZE as usize) - 176;
+        let (forkoff, aformat, anextents, attr_bytes) = match &attr {
+            Some(a) => (
+                a.forkoff_for(lit.len(), parent_core.forkoff, lit_size)?,
+                a.aformat,
+                a.anextents,
+                a.bytes.as_slice(),
+            ),
+            None => (0u8, 2u8, 0u16, &[][..]),
+        };
         let builder = V3DinodeBuilder {
+            nrext64: self.sb.has_nrext64(),
             inodesize: XFS_INODESIZE as usize,
             mode: parent_core.mode,
             format: 2, // EXTENTS
@@ -1573,17 +1901,16 @@ impl Xfs {
             nblocks: 1,
             extsize: 0,
             nextents: 1,
-            forkoff: 0,
-            aformat: 2,
+            anextents,
+            forkoff,
+            aformat,
             flags: parent_core.flags,
             generation: parent_core.generation,
             di_ino: parent_ino,
             uuid,
-            flags2: 0,
+            flags2: parent_core.flags2,
         };
-        let mut lit = Vec::with_capacity(16);
-        lit.extend_from_slice(&parent_self_extent.encode());
-        self.write_inode(dev, parent_ino, builder, &lit)?;
+        self.write_inode_forks(dev, parent_ino, builder, &lit, attr_bytes)?;
 
         Ok(target_ino)
     }
@@ -1794,6 +2121,7 @@ impl Xfs {
             - if prev_leaf_fsb.is_some() { 1 } else { 0 };
 
         let builder = V3DinodeBuilder {
+            nrext64: self.sb.has_nrext64(),
             inodesize: XFS_INODESIZE as usize,
             mode: core.mode,
             format: match core.format {
@@ -1814,6 +2142,7 @@ impl Xfs {
             nblocks: new_nblocks,
             extsize: 0,
             nextents: core.nextents,
+            anextents,
             forkoff,
             aformat,
             flags: core.flags,
@@ -1830,8 +2159,6 @@ impl Xfs {
             let attr_off = (forkoff as usize) * 8;
             buf[176 + attr_off..176 + attr_off + attr_payload.len()].copy_from_slice(&attr_payload);
         }
-        // di_anextents at offset 80..82.
-        buf[80..82].copy_from_slice(&anextents.to_be_bytes());
         stamp_v3_inode_crc(&mut buf);
         let ino_off = self.ino_byte_offset(ino)?;
         dev.write_at(ino_off, &buf)?;
@@ -1876,7 +2203,7 @@ impl Xfs {
             blockcount: 1,
             unwritten: false,
         };
-        let payload = ext.encode().to_vec();
+        let payload = ext.encode()?.to_vec();
         // 16 bytes = 2 8-byte words.
         Ok((2u8, 2usize, payload, Some(leaf_fsb)))
     }
@@ -1969,6 +2296,68 @@ impl Xfs {
             + agblk * (self.sb.blocksize as u64)
     }
 
+    /// Planning pass for [`flush_writes`](Self::flush_writes): reserve
+    /// the blocks the flush is about to consume and reject anything the
+    /// writer cannot express — all of it **before** the first device
+    /// write, so a rejected flush leaves the image exactly as it was
+    /// rather than half-rewritten.
+    ///
+    /// Two things happen here:
+    ///
+    /// * A two-level INOBT needs its leaf blocks carved out of the AG.
+    ///   They are taken through the persistent allocator and remembered
+    ///   in `AgState::inobt_leaves`, so a later `add_*` cannot be handed
+    ///   the same blocks and a repeated flush reuses the reservation
+    ///   instead of leaking a fresh one.
+    /// * The writer emits single-leaf BNO / CNT trees, which hold at
+    ///   most [`ABT_RECS_PER_LEAF`] free-space records per AG. Past that
+    ///   the flush is refused up front.
+    fn plan_flush(&mut self) -> Result<()> {
+        let agcount = self.ws_mut()?.ags.len() as u32;
+        let ag_sizes: Vec<u32> = (0..agcount)
+            .map(|ag| self.ag_block_count(ag).max(1))
+            .collect();
+        let ws = self.ws_mut()?;
+        for ag in 0..agcount {
+            let this_ag_blocks = ag_sizes[ag as usize];
+            let st = &mut ws.ags[ag as usize];
+            let n_chunks = st.chunks.len();
+            let n_leaves = n_chunks.div_ceil(INOBT_RECS_PER_LEAF).max(1);
+            if n_leaves > INOBT_PTRS_PER_NODE {
+                return Err(crate::Error::Unsupported(format!(
+                    "xfs: ag {ag}: INOBT would need more than 2 levels                      ({n_chunks} inode chunks, {INOBT_PTRS_PER_NODE} leaves per node)"
+                )));
+            }
+            // Only a multi-leaf tree needs blocks beyond the reserved
+            // root at AG block 6.
+            let need = if n_leaves > 1 { n_leaves as u32 } else { 0 };
+            if st.inobt_leaves.len() as u32 != need {
+                // Hand any stale reservation back before taking a fresh
+                // contiguous run (the leaves are chained siblings).
+                for b in std::mem::take(&mut st.inobt_leaves) {
+                    st.freed_extents.push((b, 1));
+                }
+                if need > 0 {
+                    let start = st.next_agblock;
+                    if start.checked_add(need).is_none_or(|e| e > this_ag_blocks) {
+                        return Err(crate::Error::InvalidArgument(format!(
+                            "xfs: ag {ag} has no room for {need} INOBT leaf blocks                              (bump pointer at {start} of {this_ag_blocks})"
+                        )));
+                    }
+                    st.next_agblock = start + need;
+                    st.inobt_leaves = (start..start + need).collect();
+                }
+            }
+            let records = coalesce_free_extents(st, this_ag_blocks).len();
+            if records > ABT_RECS_PER_LEAF {
+                return Err(crate::Error::Unsupported(format!(
+                    "xfs: ag {ag} free space is split into {records} extents but a                      single-leaf BNO/CNT holds at most {ABT_RECS_PER_LEAF};                      multi-level free-space B+trees are not implemented"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Flush in-memory allocator state to disk: rewrite the AGF / AGI /
     /// BNO / CNT / INOBT roots + the superblock counters to reflect the
     /// current `WriteState`. Multi-AG safe: every AG's headers and
@@ -1988,8 +2377,10 @@ impl Xfs {
         // Serialize any pending directory batches first, so the AG
         // free-space / inode accounting below reflects the final state.
         self.flush_dir_batches(dev)?;
+        // Reserve blocks + reject what we cannot express BEFORE writing
+        // anything, so a failure never leaves a half-rewritten image.
+        self.plan_flush()?;
         let agblocks = self.sb.agblocks;
-        let total_blocks = self.sb.dblocks as u32;
         let uuid = self.uuid_for_writes();
         let ws = self
             .write_state
@@ -2002,6 +2393,9 @@ impl Xfs {
             .clone();
         let bs = XFS_BLOCKSIZE as u64;
         let agcount = ws.ags.len() as u32;
+        let ag_sizes: Vec<u32> = (0..agcount)
+            .map(|ag| self.ag_block_count(ag).max(1))
+            .collect();
 
         let mut total_free_blocks_u64: u64 = 0;
 
@@ -2009,48 +2403,19 @@ impl Xfs {
             let ag = ag_idx as u32;
             let ag_byte = (ag as u64) * (agblocks as u64) * bs;
             // The last AG can be short; quote the real block count.
-            let this_ag_blocks = if ag == agcount - 1 {
-                total_blocks.saturating_sub(ag * agblocks).max(1)
-            } else {
-                agblocks
-            };
-            // Plan the INOBT. A single leaf (≤ INOBT_RECS_PER_LEAF chunks)
-            // lives at the pre-reserved block 6 (level 0, AGI level 1).
-            // More chunks need a 2-level tree: block 6 becomes the root
-            // node (level 1) and the leaves are carved off the AG tail so
-            // they're excluded from the free-space btrees below.
+            let this_ag_blocks = ag_sizes[ag_idx];
+            // The INOBT shape was decided (and its leaf blocks reserved)
+            // by `plan_flush`. A single leaf (≤ INOBT_RECS_PER_LEAF
+            // chunks) lives at the pre-reserved block 6 (level 0, AGI
+            // level 1); more chunks make block 6 the root node (level 1)
+            // over the reserved leaves.
             let n_chunks = ag_state.chunks.len();
-            let n_leaves = n_chunks.div_ceil(INOBT_RECS_PER_LEAF).max(1);
-            if n_leaves > INOBT_PTRS_PER_NODE {
-                return Err(crate::Error::Unsupported(
-                    "xfs: INOBT needs >2 levels (too many inode chunks)".into(),
-                ));
-            }
-            let inobt_multi = n_leaves > 1;
-            let inobt_leaf_start = ag_state.next_agblock;
-            let inobt_extra = if inobt_multi { n_leaves as u32 } else { 0 };
-            let effective_next = ag_state.next_agblock + inobt_extra;
+            let inobt_multi = !ag_state.inobt_leaves.is_empty();
+            let n_leaves = ag_state.inobt_leaves.len();
 
             // Collect this AG's free-space extents: the trailing
-            // bump-pointer region (after any INOBT leaves) plus any
-            // explicitly freed extents.
-            let mut extents: Vec<(u32, u32)> = ag_state.freed_extents.clone();
-            let tail_free = this_ag_blocks.saturating_sub(effective_next);
-            if tail_free > 0 {
-                extents.push((effective_next, tail_free));
-            }
-            // Sort by start-block, then coalesce adjacent extents.
-            extents.sort_by_key(|(s, _)| *s);
-            let mut coalesced: Vec<(u32, u32)> = Vec::with_capacity(extents.len());
-            for (s, c) in extents {
-                if let Some((ls, lc)) = coalesced.last_mut()
-                    && *ls + *lc == s
-                {
-                    *lc += c;
-                    continue;
-                }
-                coalesced.push((s, c));
-            }
+            // bump-pointer region plus any explicitly freed extents.
+            let coalesced = coalesce_free_extents(ag_state, this_ag_blocks);
             let total_free_in_ag: u32 = coalesced.iter().map(|(_, c)| *c).sum();
             let longest = coalesced.iter().map(|(_, c)| *c).max().unwrap_or(0);
             total_free_blocks_u64 += total_free_in_ag as u64;
@@ -2147,10 +2512,14 @@ impl Xfs {
                     let lo = j * per_leaf;
                     let hi = ((j + 1) * per_leaf).min(n_chunks);
                     let recs = &ag_state.chunks[lo..hi];
-                    let leaf_agblk = inobt_leaf_start + j as u32;
-                    let leftsib = if j > 0 { leaf_agblk - 1 } else { u32::MAX };
+                    let leaf_agblk = ag_state.inobt_leaves[j];
+                    let leftsib = if j > 0 {
+                        ag_state.inobt_leaves[j - 1]
+                    } else {
+                        u32::MAX
+                    };
                     let rightsib = if j + 1 < n_leaves {
-                        leaf_agblk + 1
+                        ag_state.inobt_leaves[j + 1]
                     } else {
                         u32::MAX
                     };
@@ -2414,6 +2783,7 @@ impl Xfs {
 
         // 6) Build dst inode core (mirror src's, except di_ino + REFLINK flag).
         let dst_builder = V3DinodeBuilder {
+            nrext64: self.sb.has_nrext64(),
             inodesize: XFS_INODESIZE as usize,
             mode: src_core.mode,
             format: 2, // EXTENTS
@@ -2430,6 +2800,7 @@ impl Xfs {
             nblocks: src_core.nblocks,
             extsize: src_extsize,
             nextents: src_core.nextents,
+            anextents: 0,
             forkoff: src_core.forkoff,
             aformat: src_aformat,
             flags: src_core.flags,
@@ -2443,7 +2814,7 @@ impl Xfs {
         //    same physical FSBs the source points at.
         let mut lit: Vec<u8> = Vec::with_capacity(extents.len() * 16);
         for e in &extents {
-            lit.extend_from_slice(&e.encode());
+            lit.extend_from_slice(&e.encode()?);
         }
 
         // 8) Write dst inode + add the entry to dst's parent directory.
@@ -3393,5 +3764,105 @@ mod tests {
             std::io::Read::read_to_string(&mut r, &mut got).unwrap();
             assert_eq!(got, format!("contents-of-file-{i:03}"));
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Findings 29 / 30 — flush_writes must reserve the INOBT leaf
+    // blocks it carves, and must refuse an over-fragmented AG before it
+    // has written anything.
+    // -----------------------------------------------------------------
+
+    fn snapshot(dev: &mut MemoryBackend) -> Vec<u8> {
+        let mut all = vec![0u8; dev.total_size() as usize];
+        dev.read_at(0, &mut all).unwrap();
+        all
+    }
+
+    fn fresh_16m() -> (MemoryBackend, super::super::Xfs) {
+        let mut dev = MemoryBackend::new(16 * 1024 * 1024);
+        let opts = super::super::FormatOpts::default();
+        let mut xfs = super::super::format(&mut dev, &opts).unwrap();
+        xfs.begin_writes([0u8; 16]);
+        (dev, xfs)
+    }
+
+    #[test]
+    fn flush_reserves_inobt_leaf_blocks_instead_of_handing_them_out_twice() {
+        let (mut dev, mut xfs) = fresh_16m();
+        // Force a two-level INOBT: one more chunk than a single leaf holds.
+        let want_chunks = INOBT_RECS_PER_LEAF + 1;
+        while xfs.write_state.as_ref().unwrap().ags[0].chunks.len() < want_chunks {
+            xfs.alloc_inode(&mut dev).unwrap();
+        }
+        xfs.flush_writes(&mut dev).unwrap();
+
+        let leaves = xfs.write_state.as_ref().unwrap().ags[0]
+            .inobt_leaves
+            .clone();
+        assert_eq!(
+            leaves.len(),
+            want_chunks.div_ceil(INOBT_RECS_PER_LEAF),
+            "expected a multi-leaf INOBT reservation"
+        );
+        // Every leaf block must carry the INOBT magic on disk.
+        let bs = XFS_BLOCKSIZE as u64;
+        for &b in &leaves {
+            let mut blk = vec![0u8; 4];
+            dev.read_at((b as u64) * bs, &mut blk).unwrap();
+            assert_eq!(
+                u32::from_be_bytes(blk.try_into().unwrap()),
+                XFS_IBT_CRC_MAGIC,
+                "ag block {b} is not an INOBT leaf"
+            );
+        }
+
+        // A later allocation must not be handed those same blocks
+        // (single AG, so FSB == AG block).
+        let mut handed = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            handed.insert(xfs.alloc_blocks_fsb(1).unwrap() as u32);
+        }
+        for b in &leaves {
+            assert!(
+                !handed.contains(b),
+                "INOBT leaf block {b} was allocated a second time"
+            );
+        }
+
+        // A repeated flush reuses the reservation rather than leaking a
+        // fresh set of blocks, and the leaves still read back as INOBT.
+        xfs.flush_writes(&mut dev).unwrap();
+        assert_eq!(
+            xfs.write_state.as_ref().unwrap().ags[0].inobt_leaves,
+            leaves
+        );
+    }
+
+    #[test]
+    fn flush_refuses_overfragmented_ag_without_writing_anything() {
+        let (mut dev, mut xfs) = fresh_16m();
+        xfs.flush_writes(&mut dev).unwrap();
+
+        // Carve a run, then hand back every other block so the AG's free
+        // list needs more records than one BNO/CNT leaf can hold.
+        let holes = ABT_RECS_PER_LEAF as u32 + 8;
+        let base = xfs.alloc_blocks_fsb(2 * holes).unwrap();
+        for i in 0..holes as u64 {
+            xfs.free_blocks_fsb(base + 2 * i, 1).unwrap();
+        }
+
+        let before = snapshot(&mut dev);
+        let err = xfs.flush_writes(&mut dev).unwrap_err();
+        match &err {
+            crate::Error::Unsupported(m) => assert!(
+                m.contains(&ABT_RECS_PER_LEAF.to_string()),
+                "error should name the per-leaf record limit, got: {m}"
+            ),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+        assert!(
+            snapshot(&mut dev) == before,
+            "flush_writes modified the image before reporting the failure"
+        );
     }
 }
