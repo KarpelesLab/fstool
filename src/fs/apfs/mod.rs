@@ -534,14 +534,20 @@ impl Apfs {
         // For a fresh image with no live NXSB in the xp_desc area
         // (label NXSB at block 0 only), start at slot 1 (the
         // canonical first NXSB slot = `NXSB_LIVE_PADDR`).
-        let blocks = ctx.live_sb.xp_desc_blocks as u64;
-        let nxsb_slots = blocks.saturating_sub(1).max(1); // skip slot 0
-        let next_offset = match ctx.live_xp_desc_offset {
-            Some(off) if off >= 1 => ((off - 1 + 1) % nxsb_slots) + 1,
-            // Live NXSB came from slot 0 somehow, or no live NXSB at
-            // all — start at the first NXSB slot.
-            _ => 1,
+        // A checkpoint spans `CHECKPOINT_DESC_SLOTS` consecutive
+        // descriptor slots — its map block then its superblock — so the
+        // ring advances a pair at a time and the superblock always
+        // lands on an odd offset. Advancing one slot at a time would
+        // put the new checkpoint's map block on top of the previous
+        // checkpoint's superblock.
+        let slots_per_ckpt = write::CHECKPOINT_DESC_SLOTS as u64;
+        let pairs = (ctx.live_sb.xp_desc_blocks as u64 / slots_per_ckpt).max(1);
+        let live_pair = match ctx.live_xp_desc_offset {
+            Some(off) if off >= 1 => (off - 1) / slots_per_ckpt,
+            _ => pairs - 1,
         };
+        let next_pair = (live_pair + 1) % pairs;
+        let next_offset = next_pair * slots_per_ckpt + 1;
         let next_xp_desc_slot = ctx.live_sb.xp_desc_base + next_offset;
 
         // A checkpoint rebuilds the container omap from scratch with a
@@ -975,6 +981,40 @@ impl Apfs {
         Ok(out)
     }
 
+    /// Read a symbolic link's target.
+    ///
+    /// APFS keeps the target in the `com.apple.fs.symlink` xattr on the
+    /// link's inode, as a NUL-terminated path; the inode itself has no
+    /// data stream. Images written by fstool before that was understood
+    /// stored the target as a one-extent file body instead, so fall
+    /// back to reading the inode's data when the xattr is absent.
+    pub fn read_symlink(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<String> {
+        let xattrs = self.read_xattrs(dev, path)?;
+        if let Some(raw) = xattrs.get(write::APFS_SYMLINK_XATTR) {
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            return String::from_utf8(raw[..end].to_vec()).map_err(|e| {
+                crate::Error::InvalidImage(format!(
+                    "apfs: symlink target for {path:?} is not valid UTF-8: {e}"
+                ))
+            });
+        }
+        // Legacy fstool layout: the target as the inode's file body.
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut self.open_file_reader(dev, path)?, &mut buf)?;
+        if buf.is_empty() {
+            return Err(crate::Error::InvalidImage(format!(
+                "apfs: {path:?} has no symlink target (no {} xattr and no file body)",
+                write::APFS_SYMLINK_XATTR
+            )));
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8(buf[..end].to_vec()).map_err(|e| {
+            crate::Error::InvalidImage(format!(
+                "apfs: symlink target for {path:?} is not valid UTF-8: {e}"
+            ))
+        })
+    }
+
     /// Open a regular file for streaming reads. The returned reader
     /// borrows `dev` so it can fetch data blocks lazily.
     pub fn open_file_reader<'a>(
@@ -1404,8 +1444,9 @@ impl Apfs {
 
     /// Create a symbolic link at `path` pointing at `target` (the
     /// raw string is stored verbatim — APFS doesn't normalise it).
-    /// Symlink targets are stored as a single-extent file body, the
-    /// same way `Apfs::read_symlink` reads them back.
+    /// The target goes into the `com.apple.fs.symlink` xattr, which is
+    /// where APFS keeps it and the only place macOS looks; see
+    /// [`Apfs::read_symlink`].
     pub fn create_symlink_at(
         &mut self,
         dev: &mut dyn BlockDevice,
@@ -1431,20 +1472,11 @@ impl Apfs {
             }
             let oid = cx.alloc_oid();
             let bs = cx.block_size();
-            let paddr = cx.alloc_extent(size)?;
-            cx.write_extent_bytes(paddr, target_bytes)?;
-            for (k, v) in write::build_file_extent_records(oid, 0, size, paddr, bs) {
-                cx.records.push((k, v));
-            }
-            let (ik, iv) = write::build_inode_record(
-                oid,
-                parent_oid,
-                write::mode_lnk(mode),
-                size,
-                bs,
-                mtime_ns,
-            );
+            let (ik, iv) =
+                write::build_inode_record(oid, parent_oid, write::mode_lnk(mode), 0, bs, mtime_ns);
             cx.records.push((ik, iv));
+            let (xk, xv) = write::build_symlink_xattr_record(oid, target)?;
+            cx.records.push((xk, xv));
             let (dk, dv) =
                 write::build_drec_record(parent_oid, &name, oid, DT_LNK, layout, case_fold)?;
             cx.records.push((dk, dv));
@@ -1790,6 +1822,19 @@ impl Apfs {
 /// [`write::ApfsWriter`]. After `flush` the [`Apfs`] is in read mode
 /// and behaves like a freshly-opened image.
 impl crate::fs::Filesystem for Apfs {
+    fn read_symlink(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<std::path::PathBuf> {
+        let path_str = path.to_str().ok_or_else(|| {
+            crate::Error::InvalidArgument("apfs: non-UTF-8 path in read_symlink".into())
+        })?;
+        Ok(std::path::PathBuf::from(Apfs::read_symlink(
+            self, dev, path_str,
+        )?))
+    }
+
     fn create_file(
         &mut self,
         dev: &mut dyn BlockDevice,

@@ -247,6 +247,23 @@ fn apfs_writer_passes_fsck_apfs() {
                         o.status.signal()
                     );
                 }
+                // The container layer — superblock, checkpoint
+                // descriptor area, checkpoint map, and both object maps
+                // — must validate. (The space manager still doesn't:
+                // our internal pool and free queues are a stub, which
+                // is why hdiutil won't mount these images.) Lock the
+                // container in so it can't regress.
+                for bad in [
+                    "Container superblock is invalid",
+                    "Most recent checkpoint is invalid",
+                    "no valid checkpoint",
+                    "failed consistency check",
+                ] {
+                    assert!(
+                        !so.contains(bad) && !se.contains(bad),
+                        "fsck_apfs rejected the container on {dev}: {bad}\n{so}\n{se}"
+                    );
+                }
             }
             Err(e) => eprintln!("fsck_apfs {dev} could not run: {e}"),
         }
@@ -351,6 +368,10 @@ fn apfs_writer_round_trips_through_macos_mount() {
         let mut r = Cursor::new(payload.as_ref());
         w.add_file_from_reader(2, "rt.txt", 0o644, &mut r, payload.len() as u64)
             .unwrap();
+        // macOS only follows a symlink whose target lives in the
+        // `com.apple.fs.symlink` xattr; a target stored as a file body
+        // reads back as an empty link.
+        w.add_symlink(2, "rt.link", 0o777, "rt.txt").unwrap();
         w.finish().unwrap();
         dev.sync().unwrap();
     }
@@ -419,9 +440,14 @@ fn apfs_writer_round_trips_through_macos_mount() {
         }
     };
 
-    // ls + cat through the macOS VFS.
+    // ls + cat through the macOS VFS, plus readlink + cat *through*
+    // the symlink so the kernel has to resolve it.
     let ls = Command::new("ls").arg(&mp).output();
     let cat = Command::new("cat").arg(format!("{mp}/rt.txt")).output();
+    let readlink = Command::new("readlink")
+        .arg(format!("{mp}/rt.link"))
+        .output();
+    let cat_link = Command::new("cat").arg(format!("{mp}/rt.link")).output();
     hdiutil_detach(&whole);
 
     let ls = ls.expect("ls failed to spawn");
@@ -444,6 +470,27 @@ fn apfs_writer_round_trips_through_macos_mount() {
     assert_eq!(
         cat.stdout, payload,
         "macOS VFS returned different bytes than we wrote"
+    );
+    let readlink = readlink.expect("readlink failed to spawn");
+    assert!(
+        readlink.status.success(),
+        "readlink {mp}/rt.link failed:\n{}",
+        String::from_utf8_lossy(&readlink.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&readlink.stdout).trim_end(),
+        "rt.txt",
+        "macOS VFS resolved our symlink to the wrong target"
+    );
+    let cat_link = cat_link.expect("cat failed to spawn");
+    assert!(
+        cat_link.status.success(),
+        "cat {mp}/rt.link failed:\n{}",
+        String::from_utf8_lossy(&cat_link.stderr)
+    );
+    assert_eq!(
+        cat_link.stdout, payload,
+        "reading through our symlink returned the wrong bytes"
     );
 }
 
@@ -937,10 +984,26 @@ fn apfs_write_state_create_symlink_round_trips() {
     }
     let mut dev = FileBackend::open(img.path()).unwrap();
     let fs = Apfs::open(&mut dev).unwrap();
-    let mut r = fs.open_file_reader(&mut dev, "/link").unwrap();
-    let mut target = String::new();
-    std::io::Read::read_to_string(&mut r, &mut target).unwrap();
-    assert_eq!(target, "/usr/bin/sh", "symlink target wrong");
+    assert_eq!(
+        fs.read_symlink(&mut dev, "/link").unwrap(),
+        "/usr/bin/sh",
+        "symlink target wrong"
+    );
+    // Stored exactly the way macOS stores it: an embedded,
+    // filesystem-owned xattr holding the NUL-terminated target, and no
+    // data stream on the inode.
+    let xattrs = fs.read_xattrs(&mut dev, "/link").unwrap();
+    assert_eq!(
+        xattrs.get("com.apple.fs.symlink").map(Vec::as_slice),
+        Some(&b"/usr/bin/sh\0"[..])
+    );
+    let entry = fs
+        .list_path(&mut dev, "/")
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "link")
+        .unwrap();
+    assert_eq!(entry.size, 0, "an APFS symlink inode has no data stream");
 }
 
 /// Write-state set_xattr + remove_xattr: set on a fresh file, verify
@@ -2239,6 +2302,11 @@ fn apfs_reads_hdiutil_srcfolder_image() {
         .map(|e| e.name)
         .collect();
     assert_eq!(sub, vec!["link-to-foo".to_string()]);
+    assert_eq!(
+        fs.read_symlink(&mut dev, "/sub/link-to-foo").unwrap(),
+        "../foo",
+        "failed to resolve a symlink macOS wrote"
+    );
 }
 
 /// Two separate write sessions must not hand out the same blocks.
