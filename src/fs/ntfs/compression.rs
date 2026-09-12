@@ -169,15 +169,18 @@ pub fn decompress_unit(src: &[u8], dst: &mut [u8]) -> crate::Result<usize> {
 /// high bits the 16-bit back-reference token devotes to the offset field;
 /// the remaining `16 - U` bits encode (length − 3).
 fn bit_allocator_u(emitted: u32) -> u32 {
-    // U starts at 4 and grows by one each time the emitted size doubles past
-    // 16. The classical formulation is:
-    //   U = ceil(log2(emitted))
-    //   clamped to the [4, 12] range
-    // We compute that directly: how many bits are needed to represent the
-    // largest possible offset (which is the current chunk-local position).
+    // U starts at 4 and grows by one each time the emitted size passes a
+    // power of two from 16 upward: 4 bits while at most 16 bytes have been
+    // emitted, 5 for 17..=32, 6 for 33..=64, … clamped to 12. That is the
+    // number of bits needed to encode the largest legal displacement
+    // (`emitted - 1`, since a back-reference cannot reach before the
+    // chunk start) — the same `for (i = emitted - 1; i >= 0x10; i >>= 1)
+    // lg++` walk ntfs-3g / the kernel decoders use. Bumping one byte early
+    // (`>=`) misdecodes every back-reference issued at exactly 16, 32, 64,
+    // … bytes into a chunk.
     let mut u = 4u32;
     let mut threshold = 1u32 << 4; // 16
-    while emitted >= threshold && u < 12 {
+    while emitted > threshold && u < 12 {
         u += 1;
         threshold <<= 1;
     }
@@ -262,13 +265,46 @@ mod tests {
         assert_eq!(&dst[..6], b"XXXXXX");
     }
 
+    /// A back-reference issued when exactly 16 bytes have been emitted
+    /// still uses a 4-bit displacement (ntfs-3g: `lg` only grows once
+    /// `emitted - 1 >= 16`). With the old `>=` bump the token below was
+    /// split 5/11 and decoded to a different (offset, length) pair.
+    #[test]
+    fn back_reference_at_sixteen_bytes_uses_four_offset_bits() {
+        // 16 literals "ABCDEFGHIJKLMNOP", then one back-ref token with
+        // offset 16 (offset-1 = 15 → top 4 bits) and length 4 (len-3 = 1
+        // → low 12 bits): token = (15 << 12) | 1 = 0xF001.
+        // Flag bytes: first group 8 literals (0x00), second group 8
+        // literals (0x00), third group: token first (0x01).
+        let mut payload = vec![0x00u8];
+        payload.extend_from_slice(b"ABCDEFGH");
+        payload.push(0x00);
+        payload.extend_from_slice(b"IJKLMNOP");
+        payload.push(0x01);
+        payload.extend_from_slice(&0xF001u16.to_le_bytes());
+        let header = 0xB000u16 | (payload.len() as u16 - 1);
+        let mut src = header.to_le_bytes().to_vec();
+        src.extend_from_slice(&payload);
+        src.extend_from_slice(&[0u8, 0u8]);
+        let mut dst = vec![0u8; 32];
+        let n = decompress_unit(&src, &mut dst).unwrap();
+        assert_eq!(n, 20);
+        assert_eq!(&dst[..20], b"ABCDEFGHIJKLMNOPABCD");
+    }
+
     #[test]
     fn bit_allocator_clamps() {
         assert_eq!(bit_allocator_u(0), 4);
         assert_eq!(bit_allocator_u(15), 4);
-        assert_eq!(bit_allocator_u(16), 5);
+        assert_eq!(bit_allocator_u(16), 4);
+        assert_eq!(bit_allocator_u(17), 5);
         assert_eq!(bit_allocator_u(31), 5);
-        assert_eq!(bit_allocator_u(32), 6);
+        assert_eq!(bit_allocator_u(32), 5);
+        assert_eq!(bit_allocator_u(33), 6);
+        assert_eq!(bit_allocator_u(64), 6);
+        assert_eq!(bit_allocator_u(65), 7);
+        assert_eq!(bit_allocator_u(2048), 11);
+        assert_eq!(bit_allocator_u(2049), 12);
         assert_eq!(bit_allocator_u(4095), 12);
         assert_eq!(bit_allocator_u(8192), 12); // clamped
     }
