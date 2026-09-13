@@ -15,12 +15,32 @@
 //! thread-locals, a panic hook — and a few hundred bytes of that would
 //! otherwise look like a finding. A leak scales with the number of cycles;
 //! warm-up noise does not.
+//!
+//! And it counts *per thread*. The harness runs each test on a thread of its
+//! own, several at once, so a process-wide counter sees every other test's
+//! setup too — a formatter building its image while this one measures reads
+//! as megabytes that stayed live. A lock around the measurement cannot keep
+//! that out: it would have to cover every allocation any other test makes.
+//! A cycle allocates and frees on the thread that runs it, so a thread's own
+//! count is exactly what it left behind, however busy the others are.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::cell::Cell;
 
-/// Live bytes handed out by this binary's allocator.
-static LIVE: AtomicIsize = AtomicIsize::new(0);
+thread_local! {
+    /// Live bytes this thread has been handed and not yet returned.
+    ///
+    /// `const`-initialised, so reaching it never allocates — it is read from
+    /// inside the allocator, where lazy initialisation would recurse.
+    static LIVE: Cell<isize> = const { Cell::new(0) };
+}
+
+/// Credit `delta` bytes to the current thread. A thread being torn down has
+/// already dropped its locals, and anything it frees then is not a
+/// measurement's concern.
+fn count(delta: isize) {
+    let _ = LIVE.try_with(|live| live.set(live.get() + delta));
+}
 
 struct Counting;
 
@@ -30,20 +50,20 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         let p = unsafe { System.alloc(l) };
         if !p.is_null() {
-            LIVE.fetch_add(l.size() as isize, Ordering::Relaxed);
+            count(l.size() as isize);
         }
         p
     }
 
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        LIVE.fetch_sub(l.size() as isize, Ordering::Relaxed);
+        count(-(l.size() as isize));
         unsafe { System.dealloc(p, l) }
     }
 
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
         let q = unsafe { System.realloc(p, l, new) };
         if !q.is_null() {
-            LIVE.fetch_add(new as isize - l.size() as isize, Ordering::Relaxed);
+            count(new as isize - l.size() as isize);
         }
         q
     }
@@ -53,13 +73,8 @@ unsafe impl GlobalAlloc for Counting {
 static ALLOC: Counting = Counting;
 
 fn live() -> isize {
-    LIVE.load(Ordering::Relaxed)
+    LIVE.with(Cell::get)
 }
-
-/// One counter, one test at a time: cargo runs the tests in this binary on
-/// several threads, and another test's live allocations would otherwise look
-/// like this one's leak.
-static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Cycles measured per test.
 const CYCLES: isize = 4;
@@ -71,7 +86,6 @@ const CYCLES: isize = 4;
 /// was unmounted — what a leak would strand, and the scale the measurement
 /// is judged against.
 fn assert_no_leak(what: &str, mut cycle: impl FnMut() -> usize) {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     // Warm-up: whatever the harness allocates lazily happens here.
     let held = cycle();
     assert!(
