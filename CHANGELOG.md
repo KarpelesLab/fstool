@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/KarpelesLab/fstool/compare/v0.4.30...v0.5.0) - 2026-09-13
+
+### Added
+
+- *(device)* [**breaking**] allocator-free exFAT and littlefs drivers on a shared storage layer
+
+### Fixed
+
+- *(test)* count the leak test's allocations per thread
+
 ### Added
 
 - *(crc)* `crc::crc32_small` / `crc32_small_append`: the same CRC-32 as
