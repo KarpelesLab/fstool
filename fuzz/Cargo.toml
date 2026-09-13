@@ -35,6 +35,27 @@ doc = false
 bench = false
 
 [[bin]]
+name = "device_tables"
+path = "fuzz_targets/device_tables.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "exfat_volume"
+path = "fuzz_targets/exfat_volume.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "littlefs_volume"
+path = "fuzz_targets/littlefs_volume.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fat_volume"
 path = "fuzz_targets/fat_volume.rs"
 test = false

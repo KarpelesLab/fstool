@@ -1,26 +1,33 @@
 # fstool on a Cortex-M4F, without an OS
 
-Two `#![no_std] #![no_main]` programs, each pulling in one of fstool's two
-FAT drivers. Both format a volume on a RAM-backed "card", create a file,
-list the root and read the file back. They exist to prove the crate builds
-and links for a real microcontroller target, and to measure what it costs.
+Three `#![no_std] #![no_main]` programs, each pulling in one of fstool's
+allocator-free or allocator-backed drivers. All of them format a volume on
+RAM-backed storage, create a file, list a directory and read the file back.
+They exist to prove the crate builds and links for a real microcontroller
+target, and to measure what it costs.
 
 | binary | feature | fstool features | driver | heap |
 |--------|---------|-----------------|--------|------|
 | `fstool-embedded-cortex-m` | `alloc-demo` (default) | `fat`, `alloc` | `fs::fat::Fat32` | 64 KiB bump allocator |
-| `fstool-embedded-heapless` | `heapless` | `fat` | `fs::fat::Volume` | **none** |
+| `fstool-embedded-heapless` | `heapless` | `fat`, `exfat` | `fs::fat::Volume` + `fs::exfat::Volume` | **none** |
+| `fstool-embedded-littlefs` | `heapless-littlefs` | `littlefs` | `fs::littlefs::Volume` | **none** |
 
-The second one is the interesting one: it defines no `#[global_allocator]`
-and never links the `alloc` crate, so if anything reachable behind the
-`fat` feature ever started allocating, it would stop linking.
-That is a compile-time guarantee, not a runtime check, and CI builds it on
-every push.
+The last two are the interesting ones: they define no
+`#[global_allocator]` and never link the `alloc` crate, so if anything
+reachable behind the `fat`, `exfat` or `littlefs` features ever started
+allocating, they would stop linking. That is a compile-time guarantee, not a
+runtime check, and CI builds both on every push.
+
+The heapless binary asks the exFAT driver about the card before it mounts it
+as FAT, which is what a card reader does — and which means that driver is
+linked into the same allocator-free program.
 
 ```sh
 rustup target add thumbv7em-none-eabihf
 cd examples/embedded-cortex-m
 cargo build --release                                   # the allocator one
 cargo build --release --no-default-features --features heapless
+cargo build --release --no-default-features --features heapless-littlefs
 # with the llvm-tools component (or arm-none-eabi-size / cargo-binutils):
 $(rustc --print sysroot)/lib/rustlib/*/bin/llvm-size \
     target/thumbv7em-none-eabihf/release/fstool-embedded-cortex-m
@@ -43,15 +50,32 @@ no symbols from the allocation-free driver at all.)
 `.bss` is the 64 KiB allocator arena plus a few words; the driver itself
 keeps the allocation table and one cluster resident.
 
-The heapless binary, measured the same way on 2026-09-13, is **~19 KB** of
-`.text` — it carries the FAT12 layout code this example writes by hand as
-well as the driver — and its `.bss` is just the 512 KiB RAM card. The
-driver's own state is one sector of scratch plus the handles you hold, so
-on real hardware reading an SD card it costs well under 1 KiB of RAM
-regardless of how large the card is.
+The heapless binary, measured the same way on 2026-09-13, is **~23.6 KB** of
+`.text` — the FAT driver, the exFAT driver's mount path (which brings the MBR
+and GPT readers with it), and the FAT12 layout code this example writes by
+hand — and its `.bss` is just the 512 KiB RAM card. Each driver's own state is
+one sector of scratch plus the handles you hold, so on real hardware reading
+an SD card either costs well under 1 KiB of RAM regardless of how large the
+card is.
+
+GPT support is about 700 bytes of that, because the header's CRC-32 goes
+through `crc::crc32_small` — bit by bit, no tables. The table-driven `crc32`
+the hosted filesystems use would have added 8 KiB of lookup tables to check a
+92-byte header.
+
+The littlefs binary, measured the same way on 2026-09-13, is **~28 KB** of
+`.text` — format, `mkdir`, write, a user attribute, read, a listing and a
+remount — and its `.bss` is the 128 KiB RAM "flash" plus the driver's own
+state: one block of scratch (4 KiB here, the erase block), a 256-byte
+staging buffer for the commit being programmed, and a 32-byte allocation
+window. That footprint does not grow with the size of the flash. It needs
+no formatter of its own, unlike the FAT binaries: a littlefs format is one
+metadata commit, so `Volume::format` is right there in the driver.
 
 There is no board support here: `reset` is the entry point named in
 `link.x`, the vector table is left to you, and the allocator is the
 simplest thing that works. Replace the `MemoryBackend` with a
 [`SectorDevice`](../../src/block/sector.rs) over your SD/SDIO driver to
-mount a real card.
+mount a real card, or the `RamFlash` in `heapless_littlefs.rs` with a
+[`FlashDriver`](../../src/fs/littlefs/volume/mod.rs) over your QSPI
+peripheral to mount real flash.

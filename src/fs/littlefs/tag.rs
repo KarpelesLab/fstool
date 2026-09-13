@@ -74,7 +74,10 @@ pub const T1_STRUCT: u16 = 0x200;
 pub const T1_USERATTR: u16 = 0x300;
 /// type1 of splice (create / delete) tags.
 pub const T1_SPLICE: u16 = 0x400;
-/// type1 of CRC tags (both commit CRCs and FCRCs).
+/// type1 of CRC tags (both commit CRCs and FCRCs). Only the hosted half
+/// matches on it — the driver takes its program size from the flash rather
+/// than from the last commit's forward CRC.
+#[allow(dead_code)]
 pub const T1_CRC: u16 = 0x500;
 /// type1 of tail tags.
 pub const T1_TAIL: u16 = 0x600;

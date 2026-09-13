@@ -1,0 +1,3702 @@
+//! The hosted half of the exFAT backend: the `Filesystem` implementation,
+//! built on a heap.
+//!
+//! The format itself is described in the [module
+//! docs](crate::fs::exfat); this file is what a machine with an allocator
+//! does with it. A volume is opened over a
+//! [`BlockDevice`](crate::block::BlockDevice) rather than a
+//! [`SectorDriver`](super::SectorDriver), and the FAT, the allocation
+//! bitmap and the up-case table are all read into memory whole — which is
+//! right for building and converting images and wrong for a
+//! microcontroller, which is what [`Volume`](super::Volume) is for.
+//!
+//! The root directory lives at `FirstClusterOfRootDirectory` and is a
+//! normal directory — i.e. the same 32-byte entry-set scheme as every
+//! other directory, with the addition of three "metadata" entries:
+//! AllocationBitmap (0x81), UpcaseTable (0x82), and VolumeLabel (0x83).
+
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
+// These were sibling modules when this file was the module root; it is now
+// one half of it, so they are mounted here by path. They reach into
+// `Exfat`'s internals, so they must stay its descendants — and `super`
+// re-exports them, keeping the public paths (`fs::exfat::boot`, …) as they
+// have always been.
+#[path = "boot.rs"]
+pub mod boot;
+#[path = "dir.rs"]
+pub mod dir;
+#[path = "fat.rs"]
+pub mod fat;
+#[path = "format.rs"]
+pub mod format;
+#[path = "rw.rs"]
+pub mod rw;
+#[path = "upcase.rs"]
+pub mod upcase;
+
+// The on-disk vocabulary both halves speak lives in the module root; the
+// re-export keeps `super::layout` resolving for the submodules above.
+pub(super) use super::layout;
+
+use boot::BootSector;
+use dir::{ENTRY_FILE, ENTRY_INUSE, ENTRY_SIZE, FileEntrySet, RawSlot};
+use fat::Fat;
+use upcase::Upcase;
+
+use crate::Result;
+use crate::block::BlockDevice;
+use crate::fs::dir_batch::{DEFAULT_CAPACITY, DirBatch};
+
+/// One child entry staged in [`Exfat`]'s directory-batch cache instead of
+/// being written to the parent's cluster chain immediately. `bytes` is
+/// the assembled file entry set (primary + stream-extension + name slots,
+/// checksum already computed); `name` / `first_cluster` / `is_dir` let
+/// path lookups resolve the staged child as an in-memory overlay.
+#[derive(Debug, Clone)]
+struct PendingEntry {
+    bytes: Vec<u8>,
+    name: String,
+    first_cluster: u32,
+    is_dir: bool,
+}
+
+pub use format::FormatOpts;
+
+/// Streaming buffer size used when copying host-file bytes through the
+/// writer. Per project rule: never load a whole file in memory.
+const SCRATCH_BUF_BYTES: usize = 64 * 1024;
+
+/// What [`Exfat::scan_root_metadata`] returns: the volume label, the
+/// up-case table read from the root directory, and the
+/// `(first_cluster, data_length)` pair of the allocation bitmap if one
+/// was found.
+struct RootMetadata {
+    volume_label: String,
+    upcase: Upcase,
+    bitmap_info: Option<(u32, u64)>,
+}
+
+/// An opened exFAT volume. Supports both read and write — call
+/// [`Exfat::flush`] before dropping the volume to ensure the FAT,
+/// allocation bitmap and boot-region copies are persisted.
+pub struct Exfat {
+    boot: BootSector,
+    fat: Fat,
+    upcase: Upcase,
+    volume_label: String,
+    /// Allocation bitmap: one bit per data cluster, bit N → cluster N+2.
+    /// `bitmap[i]` is the byte covering clusters `2 + 8*i..2 + 8*(i+1)`.
+    bitmap: Vec<u8>,
+    /// First cluster of the allocation bitmap. 0 → bitmap unknown
+    /// (read-only image we couldn't fully introspect).
+    bitmap_first_cluster: u32,
+    /// DataLength of the bitmap in bytes.
+    bitmap_data_length: u64,
+    /// Next-cluster hint for [`Exfat::alloc_cluster`] — the allocator
+    /// starts scanning here, bounding cost on a near-empty volume.
+    next_free_hint: u32,
+    /// True if the FAT has unwritten changes.
+    fat_dirty: bool,
+    /// True if the bitmap has unwritten changes.
+    bitmap_dirty: bool,
+    /// Pending child entries keyed by parent directory start cluster.
+    /// Staged instead of rewriting the parent's cluster chain on every
+    /// child; serialized once on eviction or at flush.
+    dir_batch: DirBatch<u32, PendingEntry>,
+    /// Parent directory of every directory this session has walked
+    /// through or created (child first cluster → parent first cluster).
+    /// Lets a grown directory's entry set be found without a tree search.
+    dir_parents: BTreeMap<u32, u32>,
+    /// Directories whose cluster chain grew (first cluster → new byte
+    /// length) and whose DataLength / ValidDataLength in the parent's
+    /// entry set still says otherwise. Applied once every batch is on
+    /// disk, in [`Exfat::flush_dir_batches`].
+    dir_len_patches: BTreeMap<u32, u64>,
+}
+
+impl Exfat {
+    /// Open the volume on `dev`: decode the boot sector, load the
+    /// primary FAT into memory, scan the root directory for the
+    /// AllocationBitmap / UpcaseTable / VolumeLabel metadata entries,
+    /// and read the up-case table.
+    pub fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
+        let mut bs = [0u8; boot::BOOT_SECTOR_PARSE_SIZE];
+        dev.read_at(0, &mut bs)?;
+        let boot = BootSector::decode(&bs)?;
+
+        // Read the primary FAT. exFAT may have NumberOfFats == 2 (TexFAT);
+        // we only need the primary copy for read.
+        let fat_off = boot.fat_byte_offset();
+        let fat_byte_len = boot.fat_byte_length();
+        if fat_byte_len == 0 {
+            return Err(crate::Error::InvalidImage(
+                "exfat: FatLength is zero".into(),
+            ));
+        }
+        // Validate the FAT region lies wholly within the volume, that the
+        // volume itself fits the device, and that the FAT is large enough
+        // to map every cluster — `(cluster_count + 2)` 32-bit entries.
+        // This bounds the allocation below against untrusted FatLength.
+        let bps = boot.bytes_per_sector() as u64;
+        let volume_bytes = boot
+            .volume_length
+            .checked_mul(bps)
+            .ok_or_else(|| crate::Error::InvalidImage("exfat: VolumeLength overflow".into()))?;
+        if volume_bytes > dev.total_size() {
+            return Err(crate::Error::InvalidImage(format!(
+                "exfat: VolumeLength {volume_bytes} bytes exceeds device size {}",
+                dev.total_size()
+            )));
+        }
+        let fat_end = fat_off
+            .checked_add(fat_byte_len)
+            .ok_or_else(|| crate::Error::InvalidImage("exfat: FAT region overflow".into()))?;
+        if fat_end > volume_bytes {
+            return Err(crate::Error::InvalidImage(format!(
+                "exfat: FAT region [{fat_off}, {fat_end}) overruns volume of {volume_bytes} bytes"
+            )));
+        }
+        // The FAT must hold at least (cluster_count + 2) 32-bit entries.
+        let need_fat_bytes = (boot.cluster_count as u64)
+            .checked_add(2)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| crate::Error::InvalidImage("exfat: ClusterCount overflow".into()))?;
+        if fat_byte_len < need_fat_bytes {
+            return Err(crate::Error::InvalidImage(format!(
+                "exfat: FatLength covers {fat_byte_len} bytes but ClusterCount needs {need_fat_bytes}"
+            )));
+        }
+        let fat_len = fat_byte_len as usize;
+        let mut fat_bytes = vec![0u8; fat_len];
+        dev.read_at(fat_off, &mut fat_bytes)?;
+        let fat = Fat::decode(&fat_bytes);
+
+        // Walk the root directory to find the volume metadata. We do this
+        // with a temporary `Self` lacking an upcase table — case-
+        // insensitive matching isn't required for metadata-entry
+        // discovery, which is keyed by entry type.
+        let mut tmp = Self {
+            boot,
+            fat,
+            upcase: Upcase::default(),
+            volume_label: String::new(),
+            bitmap: Vec::new(),
+            bitmap_first_cluster: 0,
+            bitmap_data_length: 0,
+            next_free_hint: 2,
+            fat_dirty: false,
+            bitmap_dirty: false,
+            dir_batch: DirBatch::new(DEFAULT_CAPACITY),
+            dir_parents: BTreeMap::new(),
+            dir_len_patches: BTreeMap::new(),
+        };
+        let root_bytes = tmp.read_chain_bytes(
+            dev,
+            tmp.boot.first_cluster_of_root_directory,
+            /* no_fat_chain */ false,
+            /* hint_byte_len */ None,
+        )?;
+
+        let RootMetadata {
+            volume_label,
+            upcase,
+            bitmap_info,
+        } = tmp.scan_root_metadata(dev, &root_bytes)?;
+        tmp.upcase = upcase;
+        tmp.volume_label = volume_label;
+        if let Some((first_cluster, data_length)) = bitmap_info {
+            // Read the bitmap into memory so the writer can flip bits.
+            let bm = tmp.read_chain_bytes(dev, first_cluster, false, Some(data_length))?;
+            tmp.bitmap_first_cluster = first_cluster;
+            tmp.bitmap_data_length = data_length;
+            tmp.bitmap = bm;
+        }
+        Ok(tmp)
+    }
+
+    /// Format a fresh exFAT volume on `dev`. Overwrites the boot region,
+    /// FAT, and root directory cluster. Returns a writable [`Exfat`].
+    pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Self> {
+        let geom = format::compute_geometry(dev.total_size(), opts)?;
+        let ss = geom.bytes_per_sector as usize;
+
+        // --- 1. Boot region (main + backup). ----------------------------
+        format::write_boot_region(dev, &geom, 0)?;
+        format::write_boot_region(dev, &geom, 12 * ss as u64)?;
+
+        // --- 2. FAT. Initialise reserved entries; chain the bitmap's
+        //        clusters (2..) and make the up-case table and root each a
+        //        one-cluster EOC chain after it.
+        let mut fat = Fat::new_blank(geom.cluster_count as usize + 2);
+        const CL_BITMAP: u32 = 2;
+        let cl_upcase: u32 = CL_BITMAP + geom.bitmap_clusters;
+        let cl_root: u32 = cl_upcase + 1;
+        debug_assert_eq!(cl_root, geom.first_cluster_of_root_directory);
+        for c in CL_BITMAP..cl_upcase {
+            let next = if c + 1 == cl_upcase { fat::EOC } else { c + 1 };
+            fat.set_raw(c, next);
+        }
+        fat.set_raw(cl_upcase, fat::EOC);
+        fat.set_raw(cl_root, fat::EOC);
+
+        // --- 3. Allocation bitmap. -------------------------------------
+        let bitmap_byte_len = (geom.cluster_count as u64).div_ceil(8);
+        let mut bitmap = vec![0u8; bitmap_byte_len as usize];
+        for c in CL_BITMAP..=cl_root {
+            set_bitmap_bit(&mut bitmap, c, true);
+        }
+
+        // --- 4. Up-case table. -----------------------------------------
+        let (upcase_bytes, upcase_csum) = format::make_ascii_upcase_table();
+        let upcase = Upcase::decode(&upcase_bytes, upcase_bytes.len() as u64)?;
+
+        // --- 5. Root directory: VolumeLabel + Bitmap + UpcaseTable. ----
+        let mut root = Vec::new();
+        if !opts.volume_label.is_empty() {
+            root.extend_from_slice(&format::make_volume_label_entry(&opts.volume_label));
+        }
+        root.extend_from_slice(&format::make_bitmap_entry(CL_BITMAP, bitmap_byte_len));
+        root.extend_from_slice(&format::make_upcase_entry(
+            upcase_csum,
+            cl_upcase,
+            upcase_bytes.len() as u64,
+        ));
+
+        // --- 6. Write everything. --------------------------------------
+        // Zero the boot-region tail clusters that fall within the FAT or
+        // first three data clusters so reads see clean data.
+        let fat_bytes = fat.encode();
+        // Ensure the FAT region in the file matches what we built.
+        // (The FAT length covers the whole table including unused tail
+        // entries, which are all-zero FREE.)
+        let fat_byte_off = geom.fat_byte_offset();
+        let fat_byte_len = geom.fat_byte_length() as usize;
+        let mut fat_image = vec![0u8; fat_byte_len];
+        let n_copy = fat_bytes.len().min(fat_byte_len);
+        fat_image[..n_copy].copy_from_slice(&fat_bytes[..n_copy]);
+        dev.write_at(fat_byte_off, &fat_image)?;
+
+        // Zero the whole metadata run (bitmap clusters, up-case, root)
+        // first, then overwrite the populated prefix of each. The bitmap's
+        // clusters are contiguous on disk, so one write covers its chain.
+        let bpc = geom.bytes_per_cluster as u64;
+        let bm_off = geom.cluster_byte_offset(CL_BITMAP);
+        let up_off = geom.cluster_byte_offset(cl_upcase);
+        let root_off = geom.cluster_byte_offset(cl_root);
+        dev.zero_range(bm_off, (geom.bitmap_clusters as u64 + 2) * bpc)?;
+
+        dev.write_at(bm_off, &bitmap)?;
+        dev.write_at(up_off, &upcase_bytes)?;
+        dev.write_at(root_off, &root)?;
+
+        // --- 7. Build the in-memory BootSector mirror. -----------------
+        let mut bs_buf = [0u8; boot::BOOT_SECTOR_PARSE_SIZE];
+        let mb = format::make_main_boot_sector(&geom, boot::BOOT_SECTOR_PARSE_SIZE);
+        bs_buf.copy_from_slice(&mb[..boot::BOOT_SECTOR_PARSE_SIZE]);
+        let boot = BootSector::decode(&bs_buf)?;
+
+        Ok(Self {
+            boot,
+            fat,
+            upcase,
+            volume_label: opts.volume_label.clone(),
+            bitmap,
+            bitmap_first_cluster: CL_BITMAP,
+            bitmap_data_length: bitmap_byte_len,
+            next_free_hint: cl_root + 1, // first free cluster after metadata
+            fat_dirty: false,
+            bitmap_dirty: false,
+            dir_batch: DirBatch::new(DEFAULT_CAPACITY),
+            dir_parents: BTreeMap::new(),
+            dir_len_patches: BTreeMap::new(),
+        })
+    }
+
+    /// Total volume size in bytes (per `VolumeLength` in the boot sector).
+    pub fn total_bytes(&self) -> u64 {
+        self.boot.volume_length * self.boot.bytes_per_sector() as u64
+    }
+
+    /// Cluster size in bytes.
+    pub fn cluster_size(&self) -> u32 {
+        self.boot.bytes_per_cluster()
+    }
+
+    /// Sectors per cluster (the cluster size in sector units).
+    pub fn sectors_per_cluster(&self) -> u32 {
+        self.boot.sectors_per_cluster()
+    }
+
+    /// First cluster of the root directory.
+    pub fn root_directory_cluster(&self) -> u32 {
+        self.boot.first_cluster_of_root_directory
+    }
+
+    /// Decoded volume label, or empty string if none was set.
+    pub fn volume_label(&self) -> &str {
+        &self.volume_label
+    }
+
+    /// List the entries of a directory by absolute path. `/`, `""`, and
+    /// "." all resolve to the root.
+    pub fn list_path(
+        &self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<Vec<crate::fs::DirEntry>> {
+        let dir_cluster = self.resolve_dir(dev, path)?;
+        // For directories we don't know the byte length up-front; read
+        // the whole cluster chain (directories are not marked NoFatChain
+        // in practice — they grow via the FAT).
+        let bytes = self.read_chain_bytes(dev, dir_cluster, false, None)?;
+        let mut out = Vec::new();
+        for entry in iter_file_sets(&bytes)? {
+            let kind = if entry.is_directory {
+                crate::fs::EntryKind::Dir
+            } else {
+                crate::fs::EntryKind::Regular
+            };
+            out.push(crate::fs::DirEntry {
+                name: entry.name,
+                inode: entry.first_cluster,
+                kind,
+                // DataLength is the file's size; bytes past ValidDataLength
+                // read as zero (see `open_file_reader`).
+                size: if entry.is_directory {
+                    0
+                } else {
+                    entry.data_length
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    /// Open a streaming reader for a regular file at `path`.
+    pub fn open_file_reader<'a>(
+        &self,
+        dev: &'a mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<ExfatFileReader<'a>> {
+        let (entry, _parent_cluster) = self.resolve_entry(dev, path)?;
+        if entry.is_directory {
+            return Err(crate::Error::InvalidArgument(format!(
+                "exfat: {path:?} is a directory, not a file"
+            )));
+        }
+        let cluster_bytes = self.boot.bytes_per_cluster() as u64;
+        let chain =
+            self.build_data_chain(entry.first_cluster, entry.no_fat_chain(), entry.data_length)?;
+        // DataLength is the file's size. ValidDataLength marks how much of
+        // it has been written; the bytes between the two are defined to
+        // read as zero whatever the clusters hold (a pre-allocation left
+        // by another implementation typically contains stale data).
+        Ok(ExfatFileReader {
+            dev,
+            chain,
+            cluster_heap_offset: self.boot.cluster_heap_byte_offset(),
+            cluster_bytes,
+            remaining: entry.data_length,
+            valid: entry.valid_data_length.min(entry.data_length),
+            pos: 0,
+            cluster_idx: 0,
+            cluster_off: 0,
+        })
+    }
+
+    // -- internals --------------------------------------------------------
+
+    /// Resolve `path` to the cluster number of the named directory.
+    fn resolve_dir(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<u32> {
+        let mut cluster = self.boot.first_cluster_of_root_directory;
+        for part in split_path(path) {
+            let bytes = self.read_chain_bytes(dev, cluster, false, None)?;
+            let entries = iter_file_sets(&bytes)?;
+            let next = entries
+                .into_iter()
+                .find(|e| self.name_matches(&e.name_utf16, part))
+                .ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!(
+                        "exfat: no such entry {part:?} under {path:?}"
+                    ))
+                })?;
+            if !next.is_directory {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "exfat: {part:?} is not a directory"
+                )));
+            }
+            cluster = next.first_cluster;
+        }
+        Ok(cluster)
+    }
+
+    /// Resolve `path` to its file entry set plus the cluster of the
+    /// containing directory. Errors if `path` is the root.
+    fn resolve_entry(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<(FileEntrySet, u32)> {
+        let parts = split_path(path);
+        if parts.is_empty() {
+            return Err(crate::Error::InvalidArgument(
+                "exfat: cannot resolve root as a file entry".into(),
+            ));
+        }
+        let mut cluster = self.boot.first_cluster_of_root_directory;
+        let (last, prefix) = parts.split_last().unwrap();
+        for part in prefix {
+            let bytes = self.read_chain_bytes(dev, cluster, false, None)?;
+            let entries = iter_file_sets(&bytes)?;
+            let next = entries
+                .into_iter()
+                .find(|e| self.name_matches(&e.name_utf16, part))
+                .ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!(
+                        "exfat: no such entry {part:?} under {path:?}"
+                    ))
+                })?;
+            if !next.is_directory {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "exfat: {part:?} is not a directory"
+                )));
+            }
+            cluster = next.first_cluster;
+        }
+        let bytes = self.read_chain_bytes(dev, cluster, false, None)?;
+        let entries = iter_file_sets(&bytes)?;
+        let found = entries
+            .into_iter()
+            .find(|e| self.name_matches(&e.name_utf16, last))
+            .ok_or_else(|| {
+                crate::Error::InvalidArgument(format!(
+                    "exfat: no such entry {last:?} under {path:?}"
+                ))
+            })?;
+        Ok((found, cluster))
+    }
+
+    /// Case-insensitive name comparison via the volume's up-case table.
+    fn name_matches(&self, on_disk: &[u16], query: &str) -> bool {
+        let q: Vec<u16> = query.encode_utf16().collect();
+        self.upcase.eq_ignore_case(on_disk, &q)
+    }
+
+    /// Build the ordered list of clusters that hold a file's data.
+    ///
+    /// `no_fat_chain == true` means the file is contiguous starting at
+    /// `first_cluster` and the FAT entries are not required to be valid
+    /// — the cluster count is derived from `data_length`.
+    fn build_data_chain(
+        &self,
+        first_cluster: u32,
+        no_fat_chain: bool,
+        data_length: u64,
+    ) -> Result<Vec<u32>> {
+        if data_length == 0 {
+            return Ok(Vec::new());
+        }
+        let cb = self.boot.bytes_per_cluster() as u64;
+        let n_u64 = data_length.div_ceil(cb);
+        // `data_length` is attacker-controlled; reject any value implying
+        // more clusters than the volume actually has before allocating a
+        // vector sized by `n`.
+        if n_u64 > self.boot.cluster_count as u64 {
+            return Err(crate::Error::InvalidImage(format!(
+                "exfat: DataLength {data_length} implies {n_u64} clusters, exceeds ClusterCount {}",
+                self.boot.cluster_count
+            )));
+        }
+        let n = n_u64 as u32;
+        if no_fat_chain {
+            // Contiguous run. Bounds-check each cluster against the valid
+            // data range [2, cluster_count + 2) and use checked addition.
+            let max_cluster = self.boot.cluster_count + 2;
+            let mut chain = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                let c = first_cluster
+                    .checked_add(i)
+                    .ok_or_else(|| crate::Error::InvalidImage("exfat: cluster overflow".into()))?;
+                if c < 2 || c >= max_cluster {
+                    return Err(crate::Error::InvalidImage(format!(
+                        "exfat: contiguous cluster {c} out of range [2, {max_cluster})"
+                    )));
+                }
+                chain.push(c);
+            }
+            return Ok(chain);
+        }
+        // Otherwise walk the FAT chain — but only return as many clusters
+        // as the file actually needs. (The FAT chain may, in principle,
+        // run longer; in well-formed images it does not.)
+        let chain = self.fat.chain(first_cluster, self.boot.cluster_count)?;
+        if (chain.len() as u32) < n {
+            return Err(crate::Error::InvalidImage(format!(
+                "exfat: FAT chain has {} clusters but file needs {n}",
+                chain.len()
+            )));
+        }
+        Ok(chain.into_iter().take(n as usize).collect())
+    }
+
+    /// Read every byte of the data referenced by a cluster chain.
+    /// `hint_byte_len` truncates the result; `None` reads the full
+    /// chain.
+    fn read_chain_bytes(
+        &self,
+        dev: &mut dyn BlockDevice,
+        first_cluster: u32,
+        no_fat_chain: bool,
+        hint_byte_len: Option<u64>,
+    ) -> Result<Vec<u8>> {
+        if first_cluster == 0 {
+            return Ok(Vec::new());
+        }
+        let cb = self.boot.bytes_per_cluster() as u64;
+        let chain = if no_fat_chain {
+            let n_u64 = match hint_byte_len {
+                Some(b) if b > 0 => b.div_ceil(cb),
+                _ => 1,
+            };
+            // `hint_byte_len` is attacker-controlled; clamp the contiguous
+            // run to the volume's cluster count and bounds-check each
+            // cluster before building the vector.
+            if n_u64 > self.boot.cluster_count as u64 {
+                return Err(crate::Error::InvalidImage(format!(
+                    "exfat: length implies {n_u64} clusters, exceeds ClusterCount {}",
+                    self.boot.cluster_count
+                )));
+            }
+            let max_cluster = self.boot.cluster_count + 2;
+            let mut v = Vec::with_capacity(n_u64 as usize);
+            for i in 0..n_u64 as u32 {
+                let c = first_cluster
+                    .checked_add(i)
+                    .ok_or_else(|| crate::Error::InvalidImage("exfat: cluster overflow".into()))?;
+                if c < 2 || c >= max_cluster {
+                    return Err(crate::Error::InvalidImage(format!(
+                        "exfat: contiguous cluster {c} out of range [2, {max_cluster})"
+                    )));
+                }
+                v.push(c);
+            }
+            v
+        } else {
+            self.fat.chain(first_cluster, self.boot.cluster_count)?
+        };
+        // `chain` is now bounded by ClusterCount (both the NoFatChain branch
+        // above and `Fat::chain` clamp to it), so `total` can never exceed
+        // `cluster_count * cb` — the buffer allocation is bounded by the
+        // real volume size rather than by an attacker-supplied length.
+        let total = chain.len() as u64 * cb;
+        let out_len = match hint_byte_len {
+            Some(b) => b.min(total),
+            None => total,
+        };
+        let mut out = vec![0u8; out_len as usize];
+        let mut pos = 0usize;
+        for &c in &chain {
+            if pos >= out.len() {
+                break;
+            }
+            let take = (out.len() - pos).min(cb as usize);
+            let off = self.boot.cluster_byte_offset(c);
+            dev.read_at(off, &mut out[pos..pos + take])?;
+            pos += take;
+        }
+        Ok(out)
+    }
+
+    /// Walk the root directory's slots looking for the three metadata
+    /// entries we care about (AllocationBitmap, UpcaseTable,
+    /// VolumeLabel). Returns the parsed volume label, up-case table, and
+    /// the AllocationBitmap's `(first_cluster, data_length)` pair if found.
+    fn scan_root_metadata(
+        &self,
+        dev: &mut dyn BlockDevice,
+        root_bytes: &[u8],
+    ) -> Result<RootMetadata> {
+        let mut volume_label = String::new();
+        let mut upcase = Upcase::ascii();
+        let mut bitmap_info: Option<(u32, u64)> = None;
+
+        let mut i = 0;
+        while i + ENTRY_SIZE <= root_bytes.len() {
+            let slot: &[u8; ENTRY_SIZE] = (&root_bytes[i..i + ENTRY_SIZE]).try_into().unwrap();
+            match dir::classify_slot(slot) {
+                RawSlot::EndOfDirectory => break,
+                RawSlot::Unused => {
+                    i += ENTRY_SIZE;
+                }
+                RawSlot::VolumeLabel(units) => {
+                    volume_label = dir::decode_volume_label(&units);
+                    i += ENTRY_SIZE;
+                }
+                RawSlot::UpcaseTable {
+                    first_cluster,
+                    data_length,
+                    ..
+                } => {
+                    // Read DataLength bytes from the up-case table's
+                    // cluster chain. The up-case table is typically a
+                    // single FAT chain (not NoFatChain), but the spec
+                    // permits either; we always walk the FAT.
+                    let raw = self.read_chain_bytes(
+                        dev,
+                        first_cluster,
+                        /* no_fat_chain */ false,
+                        Some(data_length),
+                    )?;
+                    upcase = match Upcase::decode(&raw, data_length) {
+                        Ok(u) => u,
+                        Err(_) => Upcase::ascii(),
+                    };
+                    i += ENTRY_SIZE;
+                }
+                RawSlot::AllocationBitmap {
+                    first_cluster,
+                    data_length,
+                    ..
+                } => {
+                    bitmap_info = Some((first_cluster, data_length));
+                    i += ENTRY_SIZE;
+                }
+                RawSlot::File {
+                    secondary_count, ..
+                } => {
+                    // Skip the whole set — we're only metadata-mining
+                    // here.
+                    i += (1 + secondary_count as usize) * ENTRY_SIZE;
+                }
+                RawSlot::Other { .. } => {
+                    i += ENTRY_SIZE;
+                }
+            }
+        }
+        Ok(RootMetadata {
+            volume_label,
+            upcase,
+            bitmap_info,
+        })
+    }
+
+    // ===================================================================
+    // Writer API — section below covers cluster allocation, FAT updates,
+    // directory-entry mutation, file/dir create + remove, and flush.
+    // ===================================================================
+
+    /// The allocation-bitmap bit for `cluster`: `Some(true)` allocated,
+    /// `Some(false)` free, `None` when the bitmap does not cover it (no
+    /// bitmap was found, or a truncated one).
+    fn bitmap_bit(&self, cluster: u32) -> Option<bool> {
+        if cluster < 2 {
+            return None;
+        }
+        let bit = (cluster - 2) as usize;
+        let byte = *self.bitmap.get(bit / 8)?;
+        Some(byte & (1u8 << (bit % 8)) != 0)
+    }
+
+    /// `true` when `cluster` may be handed out by the allocator.
+    ///
+    /// On exFAT the allocation bitmap is the sole authority: a file marked
+    /// NoFatChain owns its clusters with FAT entries left at zero, so a
+    /// FAT-only scan would hand its data out again. The FAT check stays as
+    /// a belt-and-braces guard against a stale bitmap — a cluster is free
+    /// only when *both* agree.
+    fn cluster_is_free(&self, cluster: u32) -> bool {
+        self.bitmap_bit(cluster) == Some(false) && self.fat.raw(cluster) == Some(fat::FREE)
+    }
+
+    /// Error out unless the volume has a readable allocation bitmap.
+    ///
+    /// Every write path depends on one: it is the only record of which
+    /// clusters a NoFatChain file owns, so without it the allocator cannot
+    /// tell free space from live data and `free_*` cannot release anything.
+    pub(super) fn require_allocation_bitmap(&self) -> Result<()> {
+        if self.bitmap_first_cluster < 2 || self.bitmap.is_empty() {
+            return Err(crate::Error::InvalidImage(
+                "exfat: volume has no allocation bitmap; refusing to modify it".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Allocate one free cluster, mark it used in the FAT (as a one-cluster
+    /// EOC chain) and in the allocation bitmap. Returns the cluster number.
+    ///
+    /// Refuses when the volume has no readable allocation bitmap: without
+    /// it there is no way to tell a free cluster from one owned by a
+    /// NoFatChain file.
+    fn alloc_cluster(&mut self) -> Result<u32> {
+        self.require_allocation_bitmap()?;
+        let max = self.boot.cluster_count + 2;
+        let start = self.next_free_hint.clamp(2, max);
+        // Scan from the hint to the end, then wrap to cluster 2.
+        let candidates = (start..max).chain(2..start);
+        for cluster in candidates {
+            if self.cluster_is_free(cluster) {
+                self.fat.set_raw(cluster, fat::EOC);
+                self.fat_dirty = true;
+                set_bitmap_bit(&mut self.bitmap, cluster, true);
+                self.bitmap_dirty = true;
+                self.next_free_hint = cluster.saturating_add(1);
+                return Ok(cluster);
+            }
+        }
+        Err(crate::Error::InvalidArgument(
+            "exfat: out of clusters".into(),
+        ))
+    }
+
+    /// Allocate `n` clusters and link them into a single FAT chain
+    /// (terminated with EOC). Returns the first cluster of the chain.
+    fn alloc_chain(&mut self, n: u32) -> Result<u32> {
+        if n == 0 {
+            return Err(crate::Error::InvalidArgument(
+                "exfat: alloc_chain(0)".into(),
+            ));
+        }
+        let first = self.alloc_cluster()?;
+        let mut prev = first;
+        for _ in 1..n {
+            let next = self.alloc_cluster()?;
+            self.fat.set_raw(prev, next);
+            prev = next;
+        }
+        // Last cluster stays EOC.
+        Ok(first)
+    }
+
+    /// Free the FAT chain starting at `first_cluster` (no-op if already
+    /// free / cluster is zero). Clears the matching bitmap bits.
+    fn free_chain(&mut self, first_cluster: u32) -> Result<()> {
+        if first_cluster < 2 {
+            return Ok(());
+        }
+        let max = self.boot.cluster_count + 2;
+        let mut cur = first_cluster;
+        let mut steps = 0u64;
+        loop {
+            if cur < 2 || cur >= max {
+                break;
+            }
+            steps += 1;
+            if steps > self.boot.cluster_count as u64 + 2 {
+                return Err(crate::Error::InvalidImage(
+                    "exfat: cluster chain loops while freeing".into(),
+                ));
+            }
+            let raw = self.fat.raw(cur).unwrap_or(fat::FREE);
+            self.fat.set_raw(cur, fat::FREE);
+            set_bitmap_bit(&mut self.bitmap, cur, false);
+            if self.next_free_hint > cur {
+                self.next_free_hint = cur;
+            }
+            match fat::classify(raw) {
+                fat::FatEntry::Eoc | fat::FatEntry::Free | fat::FatEntry::Bad => break,
+                fat::FatEntry::Next(n) => cur = n,
+            }
+        }
+        self.fat_dirty = true;
+        self.bitmap_dirty = true;
+        Ok(())
+    }
+
+    /// Free the contiguous run of `n` clusters starting at `first_cluster`
+    /// — the allocation of a NoFatChain file, whose FAT entries carry no
+    /// chain to walk. Clears the bitmap bits and resets any FAT entries in
+    /// the run.
+    fn free_contiguous(&mut self, first_cluster: u32, n: u64) -> Result<()> {
+        if first_cluster < 2 || n == 0 {
+            return Ok(());
+        }
+        let max = u64::from(self.boot.cluster_count) + 2;
+        let end = u64::from(first_cluster)
+            .checked_add(n)
+            .ok_or_else(|| crate::Error::InvalidImage("exfat: cluster overflow".into()))?;
+        if end > max {
+            return Err(crate::Error::InvalidImage(format!(
+                "exfat: contiguous run {first_cluster}..{end} exceeds ClusterCount {}",
+                self.boot.cluster_count
+            )));
+        }
+        for c in first_cluster..end as u32 {
+            self.fat.set_raw(c, fat::FREE);
+            set_bitmap_bit(&mut self.bitmap, c, false);
+        }
+        if self.next_free_hint > first_cluster {
+            self.next_free_hint = first_cluster;
+        }
+        self.fat_dirty = true;
+        self.bitmap_dirty = true;
+        Ok(())
+    }
+
+    /// Walk the FAT chain of a directory and collect every cluster.
+    fn dir_chain(&self, first_cluster: u32) -> Result<Vec<u32>> {
+        self.fat.chain(first_cluster, self.boot.cluster_count)
+    }
+
+    /// Read the entire byte content of a directory (all its clusters in
+    /// FAT order).
+    fn read_dir_bytes(&self, dev: &mut dyn BlockDevice, first_cluster: u32) -> Result<Vec<u8>> {
+        self.read_chain_bytes(dev, first_cluster, false, None)
+    }
+
+    /// Resolve a path to the cluster of the *parent directory* of the
+    /// terminal component, plus the terminal component name. Errors on
+    /// the root path.
+    fn split_path_for_create<'p>(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &'p str,
+    ) -> Result<(u32, &'p str)> {
+        let parts = split_path(path);
+        if parts.is_empty() {
+            return Err(crate::Error::InvalidArgument(
+                "exfat: cannot create root".into(),
+            ));
+        }
+        let (last, prefix) = parts.split_last().unwrap();
+        let mut cluster = self.boot.first_cluster_of_root_directory;
+        for part in prefix {
+            let bytes = self.read_dir_bytes(dev, cluster)?;
+            // On-disk entry, or one still staged in this directory's batch
+            // (created this session, not yet serialized).
+            let (first_cluster, is_dir) = match iter_file_sets(&bytes)?
+                .into_iter()
+                .find(|e| self.name_matches(&e.name_utf16, part))
+            {
+                Some(e) => (e.first_cluster, e.is_directory),
+                None => self.pending_child(cluster, part).ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!(
+                        "exfat: no such entry {part:?} under {path:?}"
+                    ))
+                })?,
+            };
+            if !is_dir {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "exfat: {part:?} is not a directory"
+                )));
+            }
+            self.note_parent(first_cluster, cluster);
+            cluster = first_cluster;
+        }
+        Ok((cluster, last))
+    }
+
+    /// Remember that directory `child` lives in directory `parent`, so a
+    /// later growth of `child` can patch its entry set without a search.
+    pub(super) fn note_parent(&mut self, child: u32, parent: u32) {
+        if child >= 2 && child != self.boot.first_cluster_of_root_directory {
+            self.dir_parents.insert(child, parent);
+        }
+    }
+
+    /// Stage a child entry for `dir_cluster` instead of rewriting the
+    /// parent's cluster chain immediately. Serialized once on eviction or
+    /// at flush; [`split_path_for_create`](Self::split_path_for_create)
+    /// reads the batch as an overlay so staged children stay resolvable.
+    fn stage_dir_entry(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dir_cluster: u32,
+        entry: PendingEntry,
+    ) -> Result<()> {
+        if let Some((victim, entries)) = self.dir_batch.stage(dir_cluster, entry) {
+            self.serialize_one_dir(dev, victim, entries)?;
+        }
+        Ok(())
+    }
+
+    /// Serialize every pending directory batch (at flush, or before a
+    /// read path that consumes on-disk directory entries), then bring the
+    /// DataLength of every directory that grew up to date in its parent.
+    fn flush_dir_batches(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        for (dir_cluster, entries) in self.dir_batch.drain_all() {
+            self.serialize_one_dir(dev, dir_cluster, entries)?;
+        }
+        self.apply_dir_len_patches(dev)
+    }
+
+    /// Rewrite the StreamExtension of every directory recorded in
+    /// `dir_len_patches` so its DataLength / ValidDataLength equal the
+    /// chain's byte length. Runs once all batches are on disk, so the
+    /// parent's entry set can be found and patched in place.
+    fn apply_dir_len_patches(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        let patches = core::mem::take(&mut self.dir_len_patches);
+        for (dir, len) in patches {
+            let parent = match self.dir_parents.get(&dir) {
+                Some(&p) => Some(p),
+                None => self.find_parent_of_dir(dev, dir)?,
+            };
+            // No entry anywhere refers to it (an orphan): nothing to patch.
+            let Some(parent) = parent else { continue };
+            self.dir_parents.insert(dir, parent);
+            self.patch_dir_entry_length(dev, parent, dir, len)?;
+        }
+        Ok(())
+    }
+
+    /// Set DataLength and ValidDataLength to `len` in the entry set under
+    /// `parent` that describes directory `dir`, recomputing the
+    /// SetChecksum. Returns `false` when `parent` holds no such entry.
+    fn patch_dir_entry_length(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        parent: u32,
+        dir: u32,
+        len: u64,
+    ) -> Result<bool> {
+        let bytes = self.read_dir_bytes(dev, parent)?;
+        let mut i = 0;
+        while i + ENTRY_SIZE <= bytes.len() {
+            let slot: &[u8; ENTRY_SIZE] = (&bytes[i..i + ENTRY_SIZE]).try_into().unwrap();
+            match dir::classify_slot(slot) {
+                RawSlot::EndOfDirectory => break,
+                RawSlot::File {
+                    secondary_count, ..
+                } => {
+                    let total = (1 + secondary_count as usize) * ENTRY_SIZE;
+                    if i + total > bytes.len() {
+                        break;
+                    }
+                    let set = dir::parse_file_set(&bytes[i..i + total])?;
+                    if set.is_directory && set.first_cluster == dir {
+                        let mut set_bytes = bytes[i..i + total].to_vec();
+                        let stream = ENTRY_SIZE;
+                        set_bytes[stream + 8..stream + 16].copy_from_slice(&len.to_le_bytes());
+                        set_bytes[stream + 24..stream + 32].copy_from_slice(&len.to_le_bytes());
+                        let csum = dir::set_checksum(&set_bytes);
+                        set_bytes[2..4].copy_from_slice(&csum.to_le_bytes());
+                        // Primary and stream slots changed; each 32-byte
+                        // slot lies within one cluster, but the two may
+                        // sit in different clusters, so map them separately.
+                        for k in 0..2 {
+                            let pos = (i + k * ENTRY_SIZE) as u64;
+                            let off = self.dir_pos_to_disk_offset(parent, pos)?;
+                            dev.write_at(off, &set_bytes[k * ENTRY_SIZE..(k + 1) * ENTRY_SIZE])?;
+                        }
+                        return Ok(true);
+                    }
+                    i += total;
+                }
+                _ => i += ENTRY_SIZE,
+            }
+        }
+        Ok(false)
+    }
+
+    /// Depth-first search from the root for the directory whose entry set
+    /// points at `target`. Fallback for a directory reached through a
+    /// cluster number the session never resolved by path.
+    fn find_parent_of_dir(&self, dev: &mut dyn BlockDevice, target: u32) -> Result<Option<u32>> {
+        let root = self.boot.first_cluster_of_root_directory;
+        let mut stack = vec![root];
+        let mut visited: BTreeSet<u32> = BTreeSet::new();
+        while let Some(cur) = stack.pop() {
+            if !visited.insert(cur) {
+                continue;
+            }
+            let bytes = self.read_dir_bytes(dev, cur)?;
+            for e in iter_file_sets(&bytes)? {
+                if !e.is_directory || e.first_cluster < 2 {
+                    continue;
+                }
+                if e.first_cluster == target {
+                    return Ok(Some(cur));
+                }
+                if !visited.contains(&e.first_cluster) {
+                    stack.push(e.first_cluster);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Resolve a child of `dir_cluster` by name from the pending batch
+    /// (staged but not yet written). Returns `(first_cluster, is_dir)`.
+    fn pending_child(&self, dir_cluster: u32, name: &str) -> Option<(u32, bool)> {
+        let want: Vec<u16> = name.encode_utf16().collect();
+        self.dir_batch.peek(&dir_cluster)?.iter().find_map(|e| {
+            let have: Vec<u16> = e.name.encode_utf16().collect();
+            if self.upcase.eq_ignore_case(&have, &want) {
+                Some((e.first_cluster, e.is_dir))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Append a directory's whole pending batch to its cluster chain in
+    /// one pass: read the chain once, place every staged entry set
+    /// contiguously at the end-of-directory point (growing the chain as
+    /// needed), and write back only the affected clusters. Equivalent to
+    /// appending each entry set individually, but O(1) chain scans.
+    fn serialize_one_dir(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        first_cluster: u32,
+        entries: Vec<PendingEntry>,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut combined = Vec::new();
+        for e in &entries {
+            combined.extend_from_slice(&e.bytes);
+        }
+        let cb = self.boot.bytes_per_cluster() as usize;
+        let mut chain = self.dir_chain(first_cluster)?;
+        // Read the whole directory into a flat buffer.
+        let mut buf = vec![0u8; chain.len() * cb];
+        for (i, &c) in chain.iter().enumerate() {
+            dev.read_at(
+                self.boot.cluster_byte_offset(c),
+                &mut buf[i * cb..(i + 1) * cb],
+            )?;
+        }
+        // Find the end-of-directory point: the first slot whose type byte
+        // is 0x00 (never-used). Skip past in-use file sets so we don't
+        // mistake a set's secondary slot for the end.
+        let mut end_pos = buf.len();
+        let mut i = 0;
+        while i + ENTRY_SIZE <= buf.len() {
+            let t = buf[i];
+            if t == 0x00 {
+                end_pos = i;
+                break;
+            } else if t & ENTRY_INUSE != 0 && t == ENTRY_FILE {
+                let sec = buf[i + 1] as usize;
+                i += (1 + sec) * ENTRY_SIZE;
+            } else {
+                i += ENTRY_SIZE;
+            }
+        }
+        let need = combined.len();
+        let avail = buf.len() - end_pos;
+        if avail < need {
+            // Grow the chain by enough clusters to hold the overflow.
+            let extra = (need - avail).div_ceil(cb);
+            let mut last = *chain.last().unwrap();
+            for _ in 0..extra {
+                let nc = self.alloc_cluster()?;
+                self.fat.set_raw(last, nc);
+                self.fat_dirty = true;
+                chain.push(nc);
+                last = nc;
+            }
+            buf.resize(chain.len() * cb, 0);
+            // The directory's own entry set (in its parent) records the
+            // chain's byte length; it is patched once every batch is on
+            // disk. The root has no entry set.
+            if first_cluster != self.boot.first_cluster_of_root_directory {
+                self.dir_len_patches
+                    .insert(first_cluster, chain.len() as u64 * cb as u64);
+            }
+        }
+        buf[end_pos..end_pos + need].copy_from_slice(&combined);
+        // Write back only the clusters the new entries touched.
+        let first_ci = end_pos / cb;
+        let last_ci = (end_pos + need - 1) / cb;
+        for ci in first_ci..=last_ci {
+            dev.write_at(
+                self.boot.cluster_byte_offset(chain[ci]),
+                &buf[ci * cb..(ci + 1) * cb],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Find an existing entry by name in the directory at `first_cluster`,
+    /// returning its byte offset within the directory bytes plus the
+    /// parsed file entry set. Used by `remove`.
+    fn find_entry_in_dir(
+        &self,
+        dev: &mut dyn BlockDevice,
+        first_cluster: u32,
+        name: &str,
+    ) -> Result<Option<(u64, FileEntrySet, usize)>> {
+        let bytes = self.read_dir_bytes(dev, first_cluster)?;
+        self.find_set_in_bytes(&bytes, name)
+    }
+
+    /// [`find_entry_in_dir`](Self::find_entry_in_dir) over an already-read
+    /// flat directory buffer (every cluster of the chain concatenated), for
+    /// callers that also need the bytes — an entry set may straddle two
+    /// clusters that are not adjacent on disk, so it must be taken from
+    /// this buffer rather than re-read as one contiguous disk range.
+    fn find_set_in_bytes(
+        &self,
+        bytes: &[u8],
+        name: &str,
+    ) -> Result<Option<(u64, FileEntrySet, usize)>> {
+        let mut i = 0;
+        while i + ENTRY_SIZE <= bytes.len() {
+            let slot: &[u8; ENTRY_SIZE] = (&bytes[i..i + ENTRY_SIZE]).try_into().unwrap();
+            match dir::classify_slot(slot) {
+                RawSlot::EndOfDirectory => break,
+                RawSlot::Unused => {
+                    i += ENTRY_SIZE;
+                }
+                RawSlot::File {
+                    secondary_count, ..
+                } => {
+                    let total = (1 + secondary_count as usize) * ENTRY_SIZE;
+                    if i + total > bytes.len() {
+                        break;
+                    }
+                    let set = dir::parse_file_set(&bytes[i..i + total])?;
+                    if self.name_matches(&set.name_utf16, name) {
+                        return Ok(Some((i as u64, set, total)));
+                    }
+                    i += total;
+                }
+                _ => {
+                    i += ENTRY_SIZE;
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Compute the on-disk byte offset of a position within a directory
+    /// whose chain begins at `first_cluster`. `pos_in_dir` is the byte
+    /// offset within the directory's logical bytes (all clusters
+    /// concatenated).
+    fn dir_pos_to_disk_offset(&self, first_cluster: u32, pos_in_dir: u64) -> Result<u64> {
+        let cb = self.boot.bytes_per_cluster() as u64;
+        let chain = self.dir_chain(first_cluster)?;
+        let cluster_idx = (pos_in_dir / cb) as usize;
+        let cluster_off = pos_in_dir % cb;
+        if cluster_idx >= chain.len() {
+            return Err(crate::Error::InvalidImage(
+                "exfat: dir position past chain".into(),
+            ));
+        }
+        Ok(self.boot.cluster_byte_offset(chain[cluster_idx]) + cluster_off)
+    }
+
+    /// Mark an entry set's slots as deleted (clear the InUse high bit on
+    /// every entry-type byte). Writes back through `dev`.
+    fn clear_entry_set(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        parent_first_cluster: u32,
+        pos_in_dir: u64,
+        total_bytes: usize,
+    ) -> Result<()> {
+        let cb = self.boot.bytes_per_cluster() as u64;
+        let n_slots = total_bytes / ENTRY_SIZE;
+        let chain = self.dir_chain(parent_first_cluster)?;
+        for k in 0..n_slots {
+            let p = pos_in_dir + (k as u64) * ENTRY_SIZE as u64;
+            let cluster_idx = (p / cb) as usize;
+            let cluster_off = p % cb;
+            let cluster = chain[cluster_idx];
+            let disk_off = self.boot.cluster_byte_offset(cluster) + cluster_off;
+            // Read 1 byte, clear high bit, write 1 byte.
+            let mut byte = [0u8; 1];
+            dev.read_at(disk_off, &mut byte)?;
+            byte[0] &= !dir::ENTRY_INUSE;
+            dev.write_at(disk_off, &byte)?;
+        }
+        Ok(())
+    }
+
+    /// Stream the bytes of `reader` into the cluster chain starting at
+    /// `first_cluster`. Reads up to `total_len` bytes from the reader in
+    /// 64 KiB chunks. Trailing bytes of the last cluster are zeroed.
+    fn stream_into_chain(
+        &self,
+        dev: &mut dyn BlockDevice,
+        chain: &[u32],
+        reader: &mut dyn crate::io::Read,
+        total_len: u64,
+    ) -> Result<()> {
+        let cb = self.boot.bytes_per_cluster() as u64;
+        let mut scratch = vec![0u8; SCRATCH_BUF_BYTES];
+        let mut remaining = total_len;
+        let mut cluster_idx = 0usize;
+        let mut cluster_off: u64 = 0;
+        while remaining > 0 {
+            if cluster_idx >= chain.len() {
+                return Err(crate::Error::InvalidImage(
+                    "exfat: writer exhausted cluster chain".into(),
+                ));
+            }
+            let want = (remaining as usize)
+                .min(scratch.len())
+                .min((cb - cluster_off) as usize);
+            let mut got = 0;
+            while got < want {
+                let n = reader
+                    .read(&mut scratch[got..want])
+                    .map_err(crate::Error::Io)?;
+                if n == 0 {
+                    return Err(crate::Error::InvalidArgument(
+                        "exfat: reader produced fewer bytes than declared length".into(),
+                    ));
+                }
+                got += n;
+            }
+            let disk_off = self.boot.cluster_byte_offset(chain[cluster_idx]) + cluster_off;
+            dev.write_at(disk_off, &scratch[..got])?;
+            remaining -= got as u64;
+            cluster_off += got as u64;
+            if cluster_off == cb {
+                cluster_idx += 1;
+                cluster_off = 0;
+            }
+        }
+        // Zero the tail of the last cluster (if we ended mid-cluster).
+        if !chain.is_empty() && cluster_off > 0 && cluster_off < cb {
+            let zeros = vec![0u8; (cb - cluster_off) as usize];
+            let disk_off = self.boot.cluster_byte_offset(chain[cluster_idx]) + cluster_off;
+            dev.write_at(disk_off, &zeros)?;
+        }
+        Ok(())
+    }
+
+    /// Compute the exFAT NameHash over a file name, using the volume's
+    /// up-case table. The hash is computed over the up-cased name as a
+    /// little-endian byte stream.
+    fn name_hash_for(&self, name: &str) -> u16 {
+        let units: Vec<u16> = name.encode_utf16().collect();
+        let upcased = self.upcase.up_slice(&units);
+        let mut bytes = Vec::with_capacity(upcased.len() * 2);
+        for u in &upcased {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        dir::name_hash(&bytes)
+    }
+
+    /// Error unless no entry named `name` (case-insensitively) exists
+    /// under `dir_cluster`, on disk or staged in the pending batch.
+    fn ensure_name_free(
+        &self,
+        dev: &mut dyn BlockDevice,
+        dir_cluster: u32,
+        name: &str,
+    ) -> Result<()> {
+        if self.pending_child(dir_cluster, name).is_some()
+            || self.find_entry_in_dir(dev, dir_cluster, name)?.is_some()
+        {
+            return Err(crate::Error::InvalidArgument(format!(
+                "exfat: {name:?} already exists"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Create a new empty regular file under `dir_cluster` named `name`.
+    /// Returns the new entry's first cluster (or 0 if the file is empty).
+    /// `data_length` clusters are allocated up-front; bytes are then
+    /// streamed through `reader`. If `data_length == 0` no clusters are
+    /// allocated and the entry's `first_cluster` is left zero.
+    pub fn create_file_in(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dir_cluster: u32,
+        name: &str,
+        reader: &mut dyn crate::io::Read,
+        data_length: u64,
+        timestamp: u32,
+    ) -> Result<u32> {
+        validate_name(name)?;
+        self.ensure_name_free(dev, dir_cluster, name)?;
+        let cb = self.boot.bytes_per_cluster() as u64;
+        let (first_cluster, chain) = if data_length > 0 {
+            let n_clusters = data_length.div_ceil(cb) as u32;
+            let first = self.alloc_chain(n_clusters)?;
+            let chain = self.dir_chain(first)?;
+            (first, chain)
+        } else {
+            (0, Vec::new())
+        };
+        if data_length > 0 {
+            self.stream_into_chain(dev, &chain, reader, data_length)?;
+        }
+
+        // Per the spec, when DataLength == 0 the FirstCluster must be 0
+        // and the AllocationPossible flag must be clear.
+        let secondary_flags = if data_length == 0 {
+            0
+        } else {
+            dir::SECFLAG_ALLOC_POSSIBLE
+        };
+        let entry = format::make_file_entry_set(
+            name,
+            /* is_directory */ false,
+            secondary_flags,
+            first_cluster,
+            data_length,
+            data_length,
+            timestamp,
+            self.name_hash_for(name),
+        )?;
+        self.stage_dir_entry(
+            dev,
+            dir_cluster,
+            PendingEntry {
+                bytes: entry,
+                name: name.to_string(),
+                first_cluster,
+                is_dir: false,
+            },
+        )?;
+        Ok(first_cluster)
+    }
+
+    /// Public helper: create a regular file at `path` with bytes from
+    /// `reader`. `data_length` must equal the number of bytes the
+    /// reader will produce. Use `0` for an empty file (reader is not
+    /// consulted).
+    pub fn create_file(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        reader: &mut dyn crate::io::Read,
+        data_length: u64,
+        timestamp: u32,
+    ) -> Result<u32> {
+        let (parent_cluster, name) = {
+            let (c, n) = self.split_path_for_create(dev, path)?;
+            (c, n.to_string())
+        };
+        self.create_file_in(dev, parent_cluster, &name, reader, data_length, timestamp)
+    }
+
+    /// Create a new directory under `dir_cluster` named `name`. Returns
+    /// the first cluster of the new directory.
+    pub fn create_dir_in(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dir_cluster: u32,
+        name: &str,
+        timestamp: u32,
+    ) -> Result<u32> {
+        validate_name(name)?;
+        self.ensure_name_free(dev, dir_cluster, name)?;
+        let cb = self.boot.bytes_per_cluster();
+        let new_cluster = self.alloc_cluster()?;
+        // Zero the new directory cluster.
+        let zeros = vec![0u8; cb as usize];
+        dev.write_at(self.boot.cluster_byte_offset(new_cluster), &zeros)?;
+
+        let entry = format::make_file_entry_set(
+            name,
+            /* is_directory */ true,
+            dir::SECFLAG_ALLOC_POSSIBLE,
+            new_cluster,
+            cb as u64,
+            cb as u64,
+            timestamp,
+            self.name_hash_for(name),
+        )?;
+        self.note_parent(new_cluster, dir_cluster);
+        self.stage_dir_entry(
+            dev,
+            dir_cluster,
+            PendingEntry {
+                bytes: entry,
+                name: name.to_string(),
+                first_cluster: new_cluster,
+                is_dir: true,
+            },
+        )?;
+        Ok(new_cluster)
+    }
+
+    /// Public helper: create a directory at `path`.
+    pub fn create_dir(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        timestamp: u32,
+    ) -> Result<u32> {
+        let (parent_cluster, name) = {
+            let (c, n) = self.split_path_for_create(dev, path)?;
+            (c, n.to_string())
+        };
+        self.create_dir_in(dev, parent_cluster, &name, timestamp)
+    }
+
+    /// Remove the entry at `path`. For directories, fails if non-empty.
+    pub fn remove(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<()> {
+        let parts = split_path(path);
+        if parts.is_empty() {
+            return Err(crate::Error::InvalidArgument(
+                "exfat: cannot remove root".into(),
+            ));
+        }
+        // The splice + emptiness check below read on-disk directory
+        // entries; serialize all staged entries first so they are present.
+        self.flush_dir_batches(dev)?;
+        let (last, prefix) = parts.split_last().unwrap();
+        let mut parent_cluster = self.boot.first_cluster_of_root_directory;
+        for part in prefix {
+            let bytes = self.read_dir_bytes(dev, parent_cluster)?;
+            let next = iter_file_sets(&bytes)?
+                .into_iter()
+                .find(|e| self.name_matches(&e.name_utf16, part))
+                .ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!(
+                        "exfat: no such entry {part:?} under {path:?}"
+                    ))
+                })?;
+            if !next.is_directory {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "exfat: {part:?} is not a directory"
+                )));
+            }
+            parent_cluster = next.first_cluster;
+        }
+        let (pos, set, total) = self
+            .find_entry_in_dir(dev, parent_cluster, last)?
+            .ok_or_else(|| {
+                crate::Error::InvalidArgument(format!(
+                    "exfat: no such entry {last:?} under {path:?}"
+                ))
+            })?;
+        if set.is_directory {
+            // Verify the directory is empty (only EndOfDir / unused slots).
+            let bytes = self.read_dir_bytes(dev, set.first_cluster)?;
+            let mut i = 0;
+            let mut has_entries = false;
+            while i + ENTRY_SIZE <= bytes.len() {
+                let slot: &[u8; ENTRY_SIZE] = (&bytes[i..i + ENTRY_SIZE]).try_into().unwrap();
+                match dir::classify_slot(slot) {
+                    RawSlot::EndOfDirectory => break,
+                    RawSlot::Unused => {
+                        i += ENTRY_SIZE;
+                    }
+                    RawSlot::File { .. } => {
+                        has_entries = true;
+                        break;
+                    }
+                    _ => i += ENTRY_SIZE,
+                }
+            }
+            if has_entries {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "exfat: directory {last:?} is not empty"
+                )));
+            }
+        }
+        // Clear the in-use bits on each slot of the entry set.
+        let _ = self.dir_pos_to_disk_offset(parent_cluster, pos)?; // sanity
+        self.clear_entry_set(dev, parent_cluster, pos, total)?;
+        // Free the data clusters (only if first_cluster > 0). A NoFatChain
+        // entry owns `ceil(DataLength / cluster)` contiguous clusters and
+        // its FAT entries are zero — walking the FAT would free only the
+        // first cluster and leak the rest.
+        if set.first_cluster >= 2 {
+            if set.no_fat_chain() {
+                let cb = u64::from(self.boot.bytes_per_cluster());
+                self.free_contiguous(set.first_cluster, set.data_length.div_ceil(cb))?;
+            } else {
+                self.free_chain(set.first_cluster)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply attribute changes to the file/dir at `path`.
+    ///
+    /// exFAT has no Unix permission model — the only writable permission
+    /// bit is FileAttributes' READ-ONLY flag (bit 0). We map the requested
+    /// mode's owner-write bit onto it: clearing owner-write sets READ-ONLY,
+    /// setting owner-write clears it. uid/gid are ignored (no owners).
+    /// `mtime`, if given, is written to the LastModified timestamp.
+    ///
+    /// Because the FileAttributes word and the LastModified timestamp both
+    /// live in the primary FileDirectoryEntry and are covered by the set's
+    /// EntrySetChecksum, the checksum is recomputed over the whole set and
+    /// the primary entry is rewritten in place.
+    pub fn set_attrs(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        mode: Option<u16>,
+        mtime: Option<u32>,
+    ) -> Result<()> {
+        if mode.is_none() && mtime.is_none() {
+            return Ok(());
+        }
+        // The lookup + write below touch on-disk directory entries;
+        // serialize any staged entries first so they are present.
+        self.flush_dir_batches(dev)?;
+
+        let parts = split_path(path);
+        if parts.is_empty() {
+            return Err(crate::Error::InvalidArgument(
+                "exfat: cannot set attributes on root".into(),
+            ));
+        }
+        let (last, prefix) = parts.split_last().unwrap();
+        let mut parent_cluster = self.boot.first_cluster_of_root_directory;
+        for part in prefix {
+            let bytes = self.read_dir_bytes(dev, parent_cluster)?;
+            let next = iter_file_sets(&bytes)?
+                .into_iter()
+                .find(|e| self.name_matches(&e.name_utf16, part))
+                .ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!(
+                        "exfat: no such entry {part:?} under {path:?}"
+                    ))
+                })?;
+            if !next.is_directory {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "exfat: {part:?} is not a directory"
+                )));
+            }
+            parent_cluster = next.first_cluster;
+        }
+
+        // Take the full entry set (primary + secondaries) from the flat
+        // directory buffer so we can recompute the SetChecksum after
+        // mutating the primary. The set may straddle two clusters that
+        // are not adjacent on disk, so it must not be re-read as one
+        // contiguous disk range.
+        let dir_bytes = self.read_dir_bytes(dev, parent_cluster)?;
+        let (pos, set, total) = self.find_set_in_bytes(&dir_bytes, last)?.ok_or_else(|| {
+            crate::Error::InvalidArgument(format!("exfat: no such entry {last:?} under {path:?}"))
+        })?;
+        let mut set_bytes = dir_bytes[pos as usize..pos as usize + total].to_vec();
+        let disk_off = self.dir_pos_to_disk_offset(parent_cluster, pos)?;
+
+        // Mutate FileAttributes (bytes 4..6 of the primary).
+        if let Some(m) = mode {
+            let mut attrs = set.file_attributes;
+            if m & 0o200 == 0 {
+                attrs |= dir::ATTR_READ_ONLY;
+            } else {
+                attrs &= !dir::ATTR_READ_ONLY;
+            }
+            set_bytes[4..6].copy_from_slice(&attrs.to_le_bytes());
+        }
+        // Mutate LastModified timestamp (bytes 12..16 of the primary).
+        if let Some(t) = mtime {
+            set_bytes[12..16].copy_from_slice(&t.to_le_bytes());
+        }
+
+        // Recompute the SetChecksum (skips the primary's bytes 2..3) and
+        // write it into the primary's checksum field.
+        let csum = dir::set_checksum(&set_bytes);
+        set_bytes[2..4].copy_from_slice(&csum.to_le_bytes());
+
+        // Only the primary entry's bytes changed, so write just that slot
+        // (a 32-byte slot never straddles a cluster boundary).
+        dev.write_at(disk_off, &set_bytes[..ENTRY_SIZE])?;
+        Ok(())
+    }
+
+    /// Flush all dirty state back to disk: rewrite the FAT image (both
+    /// copies if NumberOfFats == 2 — currently we only emit one), rewrite
+    /// the allocation bitmap, and `sync()` the device.
+    pub fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        // Serialize pending directory batches first — they may allocate
+        // clusters the FAT/bitmap written below must reflect.
+        self.flush_dir_batches(dev)?;
+        if self.fat_dirty {
+            let fat_off = self.boot.fat_byte_offset();
+            let fat_byte_len = self.boot.fat_byte_length() as usize;
+            let mut buf = vec![0u8; fat_byte_len];
+            let enc = self.fat.encode();
+            let n = enc.len().min(fat_byte_len);
+            buf[..n].copy_from_slice(&enc[..n]);
+            dev.write_at(fat_off, &buf)?;
+            // If a backup FAT exists, mirror to it.
+            if self.boot.number_of_fats == 2 {
+                let backup_off = fat_off + fat_byte_len as u64;
+                if backup_off + fat_byte_len as u64
+                    <= self.boot.volume_length * self.boot.bytes_per_sector() as u64
+                {
+                    dev.write_at(backup_off, &buf)?;
+                }
+            }
+            self.fat_dirty = false;
+        }
+        if self.bitmap_dirty && self.bitmap_first_cluster >= 2 {
+            // Walk the bitmap's cluster chain and write the bitmap bytes
+            // across them.
+            let chain = self.dir_chain(self.bitmap_first_cluster)?;
+            let cb = self.boot.bytes_per_cluster() as usize;
+            let bm = &self.bitmap;
+            let mut pos = 0usize;
+            for cluster in chain {
+                if pos >= bm.len() {
+                    break;
+                }
+                let take = (bm.len() - pos).min(cb);
+                let mut chunk = vec![0u8; cb];
+                chunk[..take].copy_from_slice(&bm[pos..pos + take]);
+                dev.write_at(self.boot.cluster_byte_offset(cluster), &chunk)?;
+                pos += take;
+            }
+            self.bitmap_dirty = false;
+        }
+        dev.sync()?;
+        Ok(())
+    }
+}
+
+/// `Filesystem` adapter so `inspect::open(dev)` can return a
+/// `Box<dyn Filesystem>` that walks and mutates an exFAT image. Symlinks
+/// and device nodes have no representation in exFAT and return
+/// `Unsupported`. The caller must call `flush` to persist FAT + bitmap
+/// changes before dropping the volume.
+impl crate::fs::Filesystem for Exfat {
+    fn create_file(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &crate::path::Path,
+        src: crate::fs::FileSource,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        let (mut reader, len) = src.open()?;
+        let ts = unix_to_exfat_timestamp(meta.mtime);
+        Exfat::create_file(self, dev, s, &mut reader, len, ts).map(|_| ())
+    }
+
+    fn create_file_streaming(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &crate::path::Path,
+        body: &mut dyn crate::io::Read,
+        len: u64,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        let ts = unix_to_exfat_timestamp(meta.mtime);
+        Exfat::create_file(self, dev, s, body, len, ts).map(|_| ())
+    }
+
+    fn create_dir(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &crate::path::Path,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        let ts = unix_to_exfat_timestamp(meta.mtime);
+        Exfat::create_dir(self, dev, s, ts).map(|_| ())
+    }
+
+    fn create_symlink(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _path: &crate::path::Path,
+        _target: &crate::path::Path,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "exfat: filesystem does not support symbolic links".into(),
+        ))
+    }
+
+    fn create_device(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _path: &crate::path::Path,
+        _kind: crate::fs::DeviceKind,
+        _major: u32,
+        _minor: u32,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "exfat: filesystem does not support device / FIFO / socket nodes".into(),
+        ))
+    }
+
+    fn remove(&mut self, dev: &mut dyn BlockDevice, path: &crate::path::Path) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        Exfat::remove(self, dev, s)
+    }
+
+    fn list(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &crate::path::Path,
+    ) -> Result<Vec<crate::fs::DirEntry>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        // Materialize staged entries so the listing reflects them.
+        self.flush_dir_batches(dev)?;
+        Exfat::list_path(self, dev, s)
+    }
+
+    fn read_file<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &crate::path::Path,
+    ) -> Result<Box<dyn crate::io::Read + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        self.flush_dir_batches(dev)?;
+        let r = self.open_file_reader(dev, s)?;
+        Ok(Box::new(r))
+    }
+
+    fn open_file_ro<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &crate::path::Path,
+    ) -> Result<Box<dyn crate::fs::FileReadHandle + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        self.flush_dir_batches(dev)?;
+        Exfat::open_ro(self, dev, s)
+    }
+
+    fn open_file_rw<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &crate::path::Path,
+        flags: crate::fs::OpenFlags,
+        meta: Option<crate::fs::FileMeta>,
+    ) -> Result<Box<dyn crate::fs::FileHandle + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        Exfat::open_rw(self, dev, s, flags, meta)
+    }
+
+    fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        Exfat::flush(self, dev)
+    }
+
+    /// Surface the on-disk timestamps. The trait default fills mtime/atime/
+    /// ctime with zeros (a `DirEntry` carries none); exFAT stores them in the
+    /// file entry set, so decode them here.
+    fn getattr(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &crate::path::Path,
+    ) -> Result<crate::fs::FileAttrs> {
+        use crate::fs::{EntryKind, FileAttrs};
+        if path == crate::path::Path::new("/") || path.as_os_str().is_empty() {
+            return Ok(FileAttrs::defaults_for(EntryKind::Dir, 0, 0));
+        }
+        let p = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        let (set, _cluster) = self.resolve_entry(dev, p)?;
+        let kind = if set.is_directory {
+            EntryKind::Dir
+        } else {
+            EntryKind::Regular
+        };
+        let mut attrs = FileAttrs::defaults_for(kind, set.data_length, set.first_cluster);
+        // exFAT has no Unix mode — only a READ-ONLY bit in FileAttributes.
+        // Derive a sensible mode from it: read-only entries drop the write
+        // bits, everything else gets the usual file/dir defaults.
+        let read_only = set.file_attributes & dir::ATTR_READ_ONLY != 0;
+        attrs.mode = match (set.is_directory, read_only) {
+            (true, true) => 0o555,
+            (true, false) => 0o755,
+            (false, true) => 0o444,
+            (false, false) => 0o644,
+        };
+        attrs.mtime = exfat_timestamp_to_unix(set.last_modified_timestamp);
+        attrs.atime = exfat_timestamp_to_unix(set.last_accessed_timestamp);
+        attrs.ctime = exfat_timestamp_to_unix(set.create_timestamp);
+        Ok(attrs)
+    }
+
+    /// Apply attribute changes. exFAT only models a READ-ONLY bit, so the
+    /// requested mode's owner-write bit drives it; `mtime` updates the
+    /// LastModified timestamp. uid/gid/atime/ctime have no on-disk home
+    /// here and are ignored.
+    fn set_attrs(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &crate::path::Path,
+        attrs: crate::fs::SetAttrs,
+    ) -> Result<()> {
+        if attrs.mode.is_none() && attrs.mtime.is_none() {
+            return Ok(());
+        }
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        let mtime = attrs.mtime.map(unix_to_exfat_timestamp);
+        Exfat::set_attrs(self, dev, s, attrs.mode, mtime)
+    }
+}
+
+/// Convert a Unix epoch seconds value into the exFAT timestamp word
+/// (date in the upper 16 bits, time in the lower 16). Values before
+/// 1980-01-01 00:00:00 UTC are clamped to zero (exFAT can't represent
+/// them).
+///
+/// Layout (per Microsoft's exFAT spec, identical to FAT's timestamp):
+/// ```text
+///   bits  0..=4   2-second increments (0..=29)
+///   bits  5..=10  minutes             (0..=59)
+///   bits 11..=15  hours               (0..=23)
+///   bits 16..=20  day                 (1..=31)
+///   bits 21..=24  month               (1..=12)
+///   bits 25..=31  years since 1980    (0..=127)
+/// ```
+fn unix_to_exfat_timestamp(unix_secs: u32) -> u32 {
+    // 1980-01-01 00:00:00 UTC is 315_532_800 seconds after the Unix epoch.
+    const EXFAT_EPOCH: u32 = 315_532_800;
+    if unix_secs < EXFAT_EPOCH {
+        return 0;
+    }
+    let secs = unix_secs - EXFAT_EPOCH;
+    let (h, m, s) = {
+        let day_secs = secs % 86_400;
+        (day_secs / 3600, (day_secs / 60) % 60, day_secs % 60)
+    };
+    // Day of the year using a civil calendar walk; cheap because we cap
+    // at 127 years (exFAT only encodes through 2107).
+    let mut days = (secs / 86_400) as i64;
+    let mut year: u32 = 1980;
+    loop {
+        let days_in_year = if is_leap(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+        if year > 2107 {
+            return 0; // out of range — give up
+        }
+    }
+    const MONTH_DAYS: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month: u32 = 1;
+    for (i, m_days) in MONTH_DAYS.iter().enumerate() {
+        let dim = if i == 1 && is_leap(year) { 29 } else { *m_days };
+        if days < dim {
+            break;
+        }
+        days -= dim;
+        month += 1;
+    }
+    let day: u32 = days as u32 + 1;
+    let year_off = year - 1980;
+
+    let time = (h << 11) | (m << 5) | (s / 2);
+    let date = (year_off << 9) | (month << 5) | day;
+    (date << 16) | time
+}
+
+/// Inverse of [`unix_to_exfat_timestamp`]: decode a packed exFAT
+/// date/time word into Unix epoch seconds. Returns `0` for a zero word
+/// (no timestamp) or a structurally invalid date (month/day out of range).
+fn exfat_timestamp_to_unix(ts: u32) -> u32 {
+    if ts == 0 {
+        return 0;
+    }
+    const EXFAT_EPOCH: u64 = 315_532_800; // 1980-01-01 in Unix seconds
+    let time = ts & 0xFFFF;
+    let date = ts >> 16;
+    let sec = (time & 0x1F) * 2;
+    let min = (time >> 5) & 0x3F;
+    let hour = (time >> 11) & 0x1F;
+    let day = date & 0x1F;
+    let month = (date >> 5) & 0x0F;
+    let year = ((date >> 9) & 0x7F) + 1980;
+    if !(1..=12).contains(&month) || day < 1 {
+        return 0;
+    }
+    let mut days: u64 = 0;
+    for y in 1980..year {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
+    const MONTH_DAYS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    for m in 1..month {
+        days += if m == 2 && is_leap(year) {
+            29
+        } else {
+            MONTH_DAYS[(m - 1) as usize]
+        };
+    }
+    days += u64::from(day - 1);
+    let secs =
+        EXFAT_EPOCH + days * 86_400 + u64::from(hour) * 3600 + u64::from(min) * 60 + u64::from(sec);
+    secs.min(u64::from(u32::MAX)) as u32
+}
+
+/// True if `year` is a Gregorian leap year. exFAT only spans 1980..=2107
+/// (none of which are century-boundary edge cases, but we keep the full
+/// rule for clarity).
+fn is_leap(year: u32) -> bool {
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+}
+
+/// Longest name an exFAT entry set can carry: 255 UTF-16 code units (the
+/// StreamExtension's NameLength is a byte, and 17 FileName entries of 15
+/// units hold 255).
+pub const MAX_NAME_UNITS: usize = 255;
+
+/// Reject a name that cannot be stored in an entry set: empty, carrying
+/// a path separator, or longer than [`MAX_NAME_UNITS`].
+fn validate_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return Err(crate::Error::InvalidArgument(format!(
+            "exfat: invalid name {name:?}"
+        )));
+    }
+    let units = name.encode_utf16().count();
+    if units > MAX_NAME_UNITS {
+        return Err(crate::Error::InvalidArgument(format!(
+            "exfat: name {name:?} is {units} UTF-16 units; the limit is {MAX_NAME_UNITS}"
+        )));
+    }
+    Ok(())
+}
+
+/// Set or clear bit `cluster - 2` in the allocation bitmap. No-op if the
+/// cluster index is outside the bitmap.
+fn set_bitmap_bit(bitmap: &mut [u8], cluster: u32, used: bool) {
+    if cluster < 2 {
+        return;
+    }
+    let bit = (cluster - 2) as usize;
+    let byte = bit / 8;
+    let mask = 1u8 << (bit % 8);
+    if byte >= bitmap.len() {
+        return;
+    }
+    if used {
+        bitmap[byte] |= mask;
+    } else {
+        bitmap[byte] &= !mask;
+    }
+}
+
+/// Walk `bytes` slot-by-slot and assemble every file entry set found.
+/// Sets that fail checksum validation are propagated as
+/// [`crate::Error::InvalidImage`].
+fn iter_file_sets(bytes: &[u8]) -> Result<Vec<FileEntrySet>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + ENTRY_SIZE <= bytes.len() {
+        let slot: &[u8; ENTRY_SIZE] = (&bytes[i..i + ENTRY_SIZE]).try_into().unwrap();
+        match dir::classify_slot(slot) {
+            RawSlot::EndOfDirectory => break,
+            RawSlot::Unused => {
+                i += ENTRY_SIZE;
+            }
+            RawSlot::File {
+                secondary_count, ..
+            } => {
+                let total = (1 + secondary_count as usize) * ENTRY_SIZE;
+                if i + total > bytes.len() {
+                    return Err(crate::Error::InvalidImage(
+                        "exfat: file entry set runs past directory end".into(),
+                    ));
+                }
+                let set = dir::parse_file_set(&bytes[i..i + total])?;
+                out.push(set);
+                i += total;
+            }
+            _ => {
+                // Skip metadata entries (AllocationBitmap, UpcaseTable,
+                // VolumeLabel) and anything unrecognised.
+                i += ENTRY_SIZE;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Split an absolute or relative path into its non-empty components.
+/// `/`, `""`, and `.` all yield an empty vec (= "the root").
+fn split_path(path: &str) -> Vec<&str> {
+    path.split(['/', '\\'])
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect()
+}
+
+/// Streaming reader for an exFAT file. Walks the file's cluster vector
+/// on demand; the file is never buffered beyond the destination of one
+/// `read` call.
+pub struct ExfatFileReader<'a> {
+    dev: &'a mut dyn BlockDevice,
+    chain: Vec<u32>,
+    cluster_heap_offset: u64,
+    cluster_bytes: u64,
+    /// Bytes of the file still to be returned (down from DataLength).
+    remaining: u64,
+    /// ValidDataLength: bytes at or past this offset read as zero.
+    valid: u64,
+    /// Current byte offset within the file.
+    pos: u64,
+    cluster_idx: usize,
+    cluster_off: u64,
+}
+
+impl<'a> crate::io::Read for ExfatFileReader<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> crate::io::Result<usize> {
+        if self.remaining == 0 || buf.is_empty() || self.cluster_idx >= self.chain.len() {
+            return Ok(0);
+        }
+        let avail_in_cluster = self.cluster_bytes - self.cluster_off;
+        let mut want = (buf.len() as u64).min(avail_in_cluster).min(self.remaining);
+        if self.pos < self.valid {
+            // Stop at ValidDataLength so the next call zero-fills from
+            // there.
+            want = want.min(self.valid - self.pos);
+            let cluster = self.chain[self.cluster_idx];
+            let cluster_start =
+                self.cluster_heap_offset + (cluster as u64 - 2) * self.cluster_bytes;
+            let off = cluster_start + self.cluster_off;
+            self.dev
+                .read_at(off, &mut buf[..want as usize])
+                .map_err(crate::io::Error::other)?;
+        } else {
+            buf[..want as usize].fill(0);
+        }
+        let want = want as usize;
+        self.pos += want as u64;
+        self.cluster_off += want as u64;
+        self.remaining -= want as u64;
+        if self.cluster_off == self.cluster_bytes {
+            self.cluster_idx += 1;
+            self.cluster_off = 0;
+        }
+        Ok(want)
+    }
+}
+
+/// Probe for the exFAT boot-sector signature: `"EXFAT   "` at offset 3
+/// of LBA 0 (after the 3-byte jump instruction).
+pub fn probe(dev: &mut dyn BlockDevice) -> Result<bool> {
+    if dev.total_size() < 512 {
+        return Ok(false);
+    }
+    let mut head = [0u8; 16];
+    dev.read_at(0, &mut head)?;
+    Ok(&head[3..11] == b"EXFAT   ")
+}
+
+#[cfg(test)]
+mod tests {
+    //! End-to-end test on a synthetic in-memory exFAT image we build
+    //! ourselves. The image has:
+    //!
+    //! - 512-byte sectors, 8 sectors/cluster (4 KiB clusters)
+    //! - 1 FAT
+    //! - A single regular file "hello.txt" with "Hello, exFAT!\n"
+    //! - A subdirectory "sub" containing "x.bin" (12 bytes)
+    //! - An ASCII-only up-case table
+    //! - Volume label "MYVOL"
+    //!
+    //! The image is just big enough to fit metadata + a few clusters of
+    //! data; total ≈ 1 MiB.
+    use super::*;
+    use crate::block::{BlockDevice, MemoryBackend};
+
+    const BPS_SHIFT: u8 = 9; // 512 bytes/sector
+    const SPC_SHIFT: u8 = 3; // 8 sectors/cluster = 4 KiB clusters
+    const BPS: u32 = 1 << BPS_SHIFT;
+    const BPC: u32 = BPS << SPC_SHIFT;
+
+    /// Cluster layout, all picked to keep things simple:
+    ///   2 = AllocationBitmap (we just zero it; it isn't checked on read)
+    ///   3 = UpcaseTable     (ASCII, identity 0..0x80)
+    ///   4 = root directory  (a single cluster of entries)
+    ///   5 = "hello.txt"     (one cluster of data, 14 bytes used)
+    ///   6 = "sub" directory (one cluster)
+    ///   7 = "x.bin"         (one cluster, 12 bytes used)
+    const CL_BITMAP: u32 = 2;
+    const CL_UPCASE: u32 = 3;
+    const CL_ROOT: u32 = 4;
+    const CL_HELLO: u32 = 5;
+    const CL_SUB: u32 = 6;
+    const CL_XBIN: u32 = 7;
+
+    /// Build a minimal exFAT image in memory and return the backend.
+    fn build_test_image() -> MemoryBackend {
+        // Volume geometry — keep tiny.
+        const FAT_OFFSET_SECTORS: u32 = 64; // 32 KiB in
+        const FAT_LENGTH_SECTORS: u32 = 8; // 8 sectors = 4 KiB → 1024 entries
+        const CLUSTER_HEAP_OFFSET_SECTORS: u32 = 128; // 64 KiB in
+        const CLUSTER_COUNT: u32 = 32;
+        const VOLUME_LENGTH_SECTORS: u64 =
+            CLUSTER_HEAP_OFFSET_SECTORS as u64 + (CLUSTER_COUNT as u64 * (1u64 << SPC_SHIFT));
+        let total_bytes = VOLUME_LENGTH_SECTORS * BPS as u64;
+        let mut dev = MemoryBackend::new(total_bytes);
+
+        // Boot sector.
+        let mut bs = [0u8; 512];
+        bs[0..3].copy_from_slice(&[0xEB, 0x76, 0x90]);
+        bs[3..11].copy_from_slice(b"EXFAT   ");
+        // 11..64 MustBeZero
+        bs[64..72].copy_from_slice(&0u64.to_le_bytes());
+        bs[72..80].copy_from_slice(&VOLUME_LENGTH_SECTORS.to_le_bytes());
+        bs[80..84].copy_from_slice(&FAT_OFFSET_SECTORS.to_le_bytes());
+        bs[84..88].copy_from_slice(&FAT_LENGTH_SECTORS.to_le_bytes());
+        bs[88..92].copy_from_slice(&CLUSTER_HEAP_OFFSET_SECTORS.to_le_bytes());
+        bs[92..96].copy_from_slice(&CLUSTER_COUNT.to_le_bytes());
+        bs[96..100].copy_from_slice(&CL_ROOT.to_le_bytes());
+        bs[100..104].copy_from_slice(&0xCAFE_F00Du32.to_le_bytes());
+        bs[104..106].copy_from_slice(&0x0100u16.to_le_bytes());
+        bs[106..108].copy_from_slice(&0u16.to_le_bytes());
+        bs[108] = BPS_SHIFT;
+        bs[109] = SPC_SHIFT;
+        bs[110] = 1; // NumberOfFats
+        bs[111] = 0x80;
+        bs[112] = 0;
+        bs[510] = 0x55;
+        bs[511] = 0xAA;
+        dev.write_at(0, &bs).unwrap();
+
+        // FAT — initialise reserved entries + chains.
+        let fat_bytes_len = FAT_LENGTH_SECTORS as usize * BPS as usize;
+        let mut fat = vec![0u8; fat_bytes_len];
+        let write_entry = |fat: &mut [u8], cluster: u32, value: u32| {
+            let off = cluster as usize * 4;
+            fat[off..off + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        write_entry(&mut fat, 0, 0xFFFFFFF8);
+        write_entry(&mut fat, 1, 0xFFFFFFFF);
+        // Each used cluster is a one-cluster chain (EOC).
+        for c in [CL_BITMAP, CL_UPCASE, CL_ROOT, CL_HELLO, CL_SUB, CL_XBIN] {
+            write_entry(&mut fat, c, 0xFFFFFFFF);
+        }
+        let fat_off = FAT_OFFSET_SECTORS as u64 * BPS as u64;
+        dev.write_at(fat_off, &fat).unwrap();
+
+        // Helper: byte offset of cluster N.
+        let cluster_off = |c: u32| -> u64 {
+            CLUSTER_HEAP_OFFSET_SECTORS as u64 * BPS as u64 + (c as u64 - 2) * BPC as u64
+        };
+
+        // Up-case table (ASCII identity 0..0x80, with a..z → A..Z).
+        let mut upcase = Vec::new();
+        for i in 0..0x80u16 {
+            let c = i as u8;
+            let v = if c.is_ascii_lowercase() {
+                (c - b'a' + b'A') as u16
+            } else {
+                i
+            };
+            upcase.extend_from_slice(&v.to_le_bytes());
+        }
+        let upcase_len = upcase.len() as u64;
+        let upcase_checksum = super::upcase::table_checksum(&upcase);
+        let mut upcase_cluster = vec![0u8; BPC as usize];
+        upcase_cluster[..upcase.len()].copy_from_slice(&upcase);
+        dev.write_at(cluster_off(CL_UPCASE), &upcase_cluster)
+            .unwrap();
+
+        // File: "hello.txt" contents.
+        let hello_text = b"Hello, exFAT!\n";
+        let mut hello_cluster = vec![0u8; BPC as usize];
+        hello_cluster[..hello_text.len()].copy_from_slice(hello_text);
+        dev.write_at(cluster_off(CL_HELLO), &hello_cluster).unwrap();
+
+        // File: "x.bin" contents.
+        let xbin_data: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        let mut xbin_cluster = vec![0u8; BPC as usize];
+        xbin_cluster[..xbin_data.len()].copy_from_slice(&xbin_data);
+        dev.write_at(cluster_off(CL_XBIN), &xbin_cluster).unwrap();
+
+        // Sub directory: holds entry-set for "x.bin".
+        let sub_entries = build_dir_entries(&[("x.bin", false, CL_XBIN, xbin_data.len() as u64)]);
+        let mut sub_cluster = vec![0u8; BPC as usize];
+        sub_cluster[..sub_entries.len()].copy_from_slice(&sub_entries);
+        dev.write_at(cluster_off(CL_SUB), &sub_cluster).unwrap();
+
+        // Root directory: volume label + bitmap + upcase + file +
+        // directory entry sets.
+        let mut root = Vec::new();
+
+        // VolumeLabel "MYVOL"
+        {
+            let label_units: Vec<u16> = "MYVOL".encode_utf16().collect();
+            let mut e = [0u8; ENTRY_SIZE];
+            e[0] = dir::ENTRY_VOLUME_LABEL;
+            e[1] = label_units.len() as u8;
+            for (i, &u) in label_units.iter().enumerate() {
+                let off = 2 + i * 2;
+                e[off..off + 2].copy_from_slice(&u.to_le_bytes());
+            }
+            root.extend_from_slice(&e);
+        }
+
+        // AllocationBitmap — minimum-viable: flags=0, first_cluster=2, data_length=ceil(cluster_count/8)
+        {
+            let bitmap_bytes = (CLUSTER_COUNT as u64).div_ceil(8);
+            let mut e = [0u8; ENTRY_SIZE];
+            e[0] = dir::ENTRY_ALLOCATION_BITMAP;
+            e[1] = 0; // bitmap flags
+            e[20..24].copy_from_slice(&CL_BITMAP.to_le_bytes());
+            e[24..32].copy_from_slice(&bitmap_bytes.to_le_bytes());
+            root.extend_from_slice(&e);
+        }
+
+        // UpcaseTable
+        {
+            let mut e = [0u8; ENTRY_SIZE];
+            e[0] = dir::ENTRY_UPCASE_TABLE;
+            e[4..8].copy_from_slice(&upcase_checksum.to_le_bytes());
+            e[20..24].copy_from_slice(&CL_UPCASE.to_le_bytes());
+            e[24..32].copy_from_slice(&upcase_len.to_le_bytes());
+            root.extend_from_slice(&e);
+        }
+
+        // File "hello.txt" (regular file, 14 bytes).
+        root.extend_from_slice(&build_dir_entries(&[("hello.txt", false, CL_HELLO, 14)]));
+
+        // Directory "sub" (size = one cluster — the spec records data_length
+        // as the directory's total byte length).
+        root.extend_from_slice(&build_dir_entries(&[("sub", true, CL_SUB, BPC as u64)]));
+
+        let mut root_cluster = vec![0u8; BPC as usize];
+        root_cluster[..root.len()].copy_from_slice(&root);
+        dev.write_at(cluster_off(CL_ROOT), &root_cluster).unwrap();
+
+        dev
+    }
+
+    /// Build a sequence of file entry sets, one per `(name, is_dir,
+    /// first_cluster, data_length)`. Each set uses the NoFatChain flag
+    /// off (we provide proper FAT chains).
+    fn build_dir_entries(items: &[(&str, bool, u32, u64)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (name, is_dir, first_cluster, data_length) in items {
+            let name_units: Vec<u16> = name.encode_utf16().collect();
+            let n_name_entries = name_units.len().div_ceil(15).max(1);
+            let secondary_count = (1 + n_name_entries) as u8;
+            let attr = if *is_dir { dir::ATTR_DIRECTORY } else { 0 };
+
+            // Primary.
+            let mut primary = [0u8; ENTRY_SIZE];
+            primary[0] = dir::ENTRY_FILE;
+            primary[1] = secondary_count;
+            // checksum filled below
+            primary[4..6].copy_from_slice(&attr.to_le_bytes());
+
+            // StreamExtension.
+            let mut stream = [0u8; ENTRY_SIZE];
+            stream[0] = dir::ENTRY_STREAM_EXTENSION;
+            stream[1] = dir::SECFLAG_ALLOC_POSSIBLE; // FAT chain present
+            stream[3] = name_units.len() as u8;
+            // name_hash skipped; we don't enforce it on read.
+            stream[8..16].copy_from_slice(&data_length.to_le_bytes()); // ValidDataLength
+            stream[20..24].copy_from_slice(&first_cluster.to_le_bytes());
+            stream[24..32].copy_from_slice(&data_length.to_le_bytes());
+
+            // FileName slots.
+            let mut names: Vec<[u8; ENTRY_SIZE]> = Vec::new();
+            for chunk in name_units.chunks(15) {
+                let mut e = [0u8; ENTRY_SIZE];
+                e[0] = dir::ENTRY_FILE_NAME;
+                for (i, &u) in chunk.iter().enumerate() {
+                    let off = 2 + i * 2;
+                    e[off..off + 2].copy_from_slice(&u.to_le_bytes());
+                }
+                names.push(e);
+            }
+
+            // Assemble in a buffer to compute the checksum.
+            let mut set = Vec::new();
+            set.extend_from_slice(&primary);
+            set.extend_from_slice(&stream);
+            for n in &names {
+                set.extend_from_slice(n);
+            }
+            let csum = dir::set_checksum(&set);
+            // Write checksum back into primary, then concat.
+            set[2..4].copy_from_slice(&csum.to_le_bytes());
+            out.extend_from_slice(&set);
+        }
+        out
+    }
+
+    /// Byte offset of cluster `c` in the synthetic image (heap at sector 128).
+    fn test_cluster_off(c: u32) -> u64 {
+        128 * BPS as u64 + (c as u64 - 2) * BPC as u64
+    }
+
+    /// First two clusters after the metadata in the synthetic image that a
+    /// NoFatChain file occupies.
+    const CL_NOFAT: u32 = 8;
+
+    /// The synthetic image plus a two-cluster file `nofat.bin` stored as a
+    /// contiguous NoFatChain run at clusters 8..=9: its FAT entries stay
+    /// zero (exactly as the spec allows) and only the allocation bitmap
+    /// records the clusters as used. The bitmap bits for the six
+    /// metadata / data clusters of the base image are set too. Returns
+    /// the image and the file's payload.
+    fn image_with_nofat_file() -> (MemoryBackend, Vec<u8>) {
+        let mut dev = build_test_image();
+        // Bitmap byte 0 covers clusters 2..=9: all of them are in use.
+        dev.write_at(test_cluster_off(CL_BITMAP), &[0xFF]).unwrap();
+        let payload: Vec<u8> = (0..2 * BPC).map(|i| (i % 253) as u8).collect();
+        dev.write_at(test_cluster_off(CL_NOFAT), &payload).unwrap();
+        let mut set = build_dir_entries(&[("nofat.bin", false, CL_NOFAT, payload.len() as u64)]);
+        set[ENTRY_SIZE + 1] = dir::SECFLAG_ALLOC_POSSIBLE | dir::SECFLAG_NO_FAT_CHAIN;
+        let csum = dir::set_checksum(&set);
+        set[2..4].copy_from_slice(&csum.to_le_bytes());
+        // Root holds 3 metadata slots + two 3-slot sets; append after them.
+        dev.write_at(test_cluster_off(CL_ROOT) + 9 * ENTRY_SIZE as u64, &set)
+            .unwrap();
+        (dev, payload)
+    }
+
+    #[test]
+    fn alloc_skips_clusters_owned_by_nofatchain_files() {
+        let (mut dev, payload) = image_with_nofat_file();
+        let mut fs = Exfat::open(&mut dev).unwrap();
+        // Sanity: the FAT says clusters 8 and 9 are free, the bitmap says
+        // they are not.
+        assert_eq!(fs.fat.raw(CL_NOFAT), Some(fat::FREE));
+        assert_eq!(fs.bitmap_bit(CL_NOFAT), Some(true));
+
+        let fresh: Vec<u8> = vec![0xEE; 2 * BPC as usize];
+        let mut reader: &[u8] = &fresh;
+        let first = fs
+            .create_file(&mut dev, "/new.bin", &mut reader, fresh.len() as u64, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+        assert!(
+            first >= CL_NOFAT + 2,
+            "new file must not land on the NoFatChain run (got cluster {first})"
+        );
+
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        use crate::io::Read;
+        let mut got = Vec::new();
+        fs2.open_file_reader(&mut dev, "/nofat.bin")
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
+        assert_eq!(got, payload, "NoFatChain file data was overwritten");
+        let mut got2 = Vec::new();
+        fs2.open_file_reader(&mut dev, "/new.bin")
+            .unwrap()
+            .read_to_end(&mut got2)
+            .unwrap();
+        assert_eq!(got2, fresh);
+    }
+
+    #[test]
+    fn remove_frees_every_cluster_of_a_nofatchain_file() {
+        let (mut dev, _payload) = image_with_nofat_file();
+        let mut fs = Exfat::open(&mut dev).unwrap();
+        assert_eq!(fs.bitmap_bit(CL_NOFAT), Some(true));
+        assert_eq!(fs.bitmap_bit(CL_NOFAT + 1), Some(true));
+        fs.remove(&mut dev, "/nofat.bin").unwrap();
+        assert_eq!(fs.bitmap_bit(CL_NOFAT), Some(false));
+        assert_eq!(
+            fs.bitmap_bit(CL_NOFAT + 1),
+            Some(false),
+            "second cluster of the contiguous run leaked"
+        );
+        fs.flush(&mut dev).unwrap();
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        assert_eq!(fs2.bitmap_bit(CL_NOFAT), Some(false));
+        assert_eq!(fs2.bitmap_bit(CL_NOFAT + 1), Some(false));
+        assert!(fs2.open_file_reader(&mut dev, "/nofat.bin").is_err());
+    }
+
+    #[test]
+    fn alloc_refuses_without_allocation_bitmap() {
+        let mut dev = build_test_image();
+        // Mark the AllocationBitmap slot (second root slot) as not in use.
+        dev.write_at(test_cluster_off(CL_ROOT) + ENTRY_SIZE as u64, &[0x01])
+            .unwrap();
+        let mut fs = Exfat::open(&mut dev).unwrap();
+        assert!(fs.bitmap.is_empty());
+        let mut reader: &[u8] = b"x";
+        match fs.create_file(&mut dev, "/x.txt", &mut reader, 1, 0) {
+            Err(crate::Error::InvalidImage(_)) => {}
+            other => panic!("expected InvalidImage, got {other:?}"),
+        }
+        // A read-write handle is refused too: it could grow the file (no
+        // way to find free clusters) or shrink it (no way to record the
+        // release), so there is nothing safe for it to do.
+        match fs.open_rw(
+            &mut dev,
+            "/hello.txt",
+            crate::fs::OpenFlags::default(),
+            None,
+        ) {
+            Err(crate::Error::InvalidImage(_)) => {}
+            other => panic!("expected InvalidImage from open_rw, got {:?}", other.err()),
+        }
+    }
+
+    /// The synthetic image with `hello.txt` re-described as ValidDataLength
+    /// 5 / DataLength 14: only "Hello" counts as written, the rest of the
+    /// cluster (", exFAT!\n") is stale pre-allocation that must read as
+    /// zero.
+    fn image_with_vdl_gap() -> MemoryBackend {
+        let mut dev = build_test_image();
+        // Root: label, bitmap, upcase, then hello.txt's 3-slot set at 96.
+        let set_off = test_cluster_off(CL_ROOT) + 3 * ENTRY_SIZE as u64;
+        let mut set = vec![0u8; 3 * ENTRY_SIZE];
+        dev.read_at(set_off, &mut set).unwrap();
+        assert_eq!(set[0], dir::ENTRY_FILE);
+        set[ENTRY_SIZE + 8..ENTRY_SIZE + 16].copy_from_slice(&5u64.to_le_bytes());
+        let csum = dir::set_checksum(&set);
+        set[2..4].copy_from_slice(&csum.to_le_bytes());
+        dev.write_at(set_off, &set).unwrap();
+        dev
+    }
+
+    #[test]
+    fn reads_report_data_length_and_zero_fill_past_valid_data_length() {
+        use crate::io::{Read, Seek, SeekFrom};
+        let mut dev = image_with_vdl_gap();
+        let mut fs = Exfat::open(&mut dev).unwrap();
+        let expect = {
+            let mut v = b"Hello".to_vec();
+            v.resize(14, 0);
+            v
+        };
+        let listed = fs.list_path(&mut dev, "/").unwrap();
+        let hello = listed.iter().find(|e| e.name == "hello.txt").unwrap();
+        assert_eq!(hello.size, 14);
+        assert_eq!(read_file_contents(&mut fs, &mut dev, "/hello.txt"), expect);
+
+        let attrs =
+            Filesystem::getattr(&mut fs, &mut dev, crate::path::Path::new("/hello.txt")).unwrap();
+        assert_eq!(attrs.size, 14);
+
+        let mut h = fs
+            .open_file_ro(&mut dev, crate::path::Path::new("/hello.txt"))
+            .unwrap();
+        assert_eq!(h.len(), 14);
+        h.seek(SeekFrom::Start(3)).unwrap();
+        let mut four = [0xAAu8; 4];
+        h.read_exact(&mut four).unwrap();
+        assert_eq!(&four, b"lo\0\0");
+    }
+
+    #[test]
+    fn rw_handle_zeroes_the_valid_data_length_gap_before_writing() {
+        use crate::io::{Read, Seek, SeekFrom, Write};
+        let mut dev = image_with_vdl_gap();
+        let mut fs = Exfat::open(&mut dev).unwrap();
+        {
+            let mut h = fs
+                .open_file_rw(
+                    &mut dev,
+                    crate::path::Path::new("/hello.txt"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(h.len(), 14);
+            h.seek(SeekFrom::Start(12)).unwrap();
+            h.write_all(b"XY").unwrap();
+            h.seek(SeekFrom::Start(0)).unwrap();
+            let mut all = Vec::new();
+            h.read_to_end(&mut all).unwrap();
+            let mut expect = b"Hello".to_vec();
+            expect.resize(12, 0);
+            expect.extend_from_slice(b"XY");
+            assert_eq!(all, expect);
+            h.sync().unwrap();
+        }
+        // The stale bytes really were zeroed on disk, and the entry now
+        // has ValidDataLength == DataLength.
+        let mut on_disk = [0u8; 14];
+        dev.read_at(test_cluster_off(CL_HELLO), &mut on_disk)
+            .unwrap();
+        assert_eq!(&on_disk[5..12], &[0u8; 7]);
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        let (set, _) = fs2.resolve_entry(&mut dev, "/hello.txt").unwrap();
+        assert_eq!(set.data_length, 14);
+        assert_eq!(set.valid_data_length, 14);
+    }
+
+    #[test]
+    fn open_decodes_boot_and_metadata() {
+        let mut dev = build_test_image();
+        let fs = Exfat::open(&mut dev).unwrap();
+        assert_eq!(fs.cluster_size(), BPC);
+        assert_eq!(fs.sectors_per_cluster(), 8);
+        assert_eq!(fs.root_directory_cluster(), CL_ROOT);
+        assert_eq!(fs.volume_label(), "MYVOL");
+        assert!(fs.total_bytes() > 0);
+    }
+
+    #[test]
+    fn open_rejects_oversized_fat_length() {
+        // A malicious FatLength must not size a multi-gigabyte allocation;
+        // `open` should reject it as InvalidImage before allocating.
+        let mut dev = build_test_image();
+        let mut bs = [0u8; 512];
+        dev.read_at(0, &mut bs).unwrap();
+        bs[84..88].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // FatLength
+        dev.write_at(0, &bs).unwrap();
+        match Exfat::open(&mut dev) {
+            Err(crate::Error::InvalidImage(_)) => {}
+            Err(e) => panic!("expected InvalidImage, got {e:?}"),
+            Ok(_) => panic!("expected InvalidImage, got Ok"),
+        }
+    }
+
+    #[test]
+    fn list_root_returns_files_and_dirs() {
+        let mut dev = build_test_image();
+        let fs = Exfat::open(&mut dev).unwrap();
+        let entries = fs.list_path(&mut dev, "/").unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"hello.txt"));
+        assert!(names.contains(&"sub"));
+        let sub = entries.iter().find(|e| e.name == "sub").unwrap();
+        assert_eq!(sub.kind, crate::fs::EntryKind::Dir);
+        let hello = entries.iter().find(|e| e.name == "hello.txt").unwrap();
+        assert_eq!(hello.kind, crate::fs::EntryKind::Regular);
+    }
+
+    #[test]
+    fn list_subdirectory() {
+        let mut dev = build_test_image();
+        let fs = Exfat::open(&mut dev).unwrap();
+        let entries = fs.list_path(&mut dev, "/sub").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "x.bin");
+    }
+
+    #[test]
+    fn case_insensitive_lookup() {
+        let mut dev = build_test_image();
+        let fs = Exfat::open(&mut dev).unwrap();
+        // The on-disk name is "hello.txt"; query in mixed case must match.
+        let entries = fs.list_path(&mut dev, "/SUB").unwrap();
+        assert_eq!(entries[0].name, "x.bin");
+    }
+
+    #[test]
+    fn read_file_returns_contents() {
+        use crate::io::Read;
+        let mut dev = build_test_image();
+        let fs = Exfat::open(&mut dev).unwrap();
+        let mut r = fs.open_file_reader(&mut dev, "/hello.txt").unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"Hello, exFAT!\n");
+    }
+
+    #[test]
+    fn read_nested_file() {
+        use crate::io::Read;
+        let mut dev = build_test_image();
+        let fs = Exfat::open(&mut dev).unwrap();
+        let mut r = fs.open_file_reader(&mut dev, "/sub/x.bin").unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, &[0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    }
+
+    #[test]
+    fn probe_recognises_image() {
+        let mut dev = build_test_image();
+        assert!(probe(&mut dev).unwrap());
+    }
+
+    #[test]
+    fn probe_rejects_non_exfat() {
+        let mut dev = MemoryBackend::new(4096);
+        assert!(!probe(&mut dev).unwrap());
+    }
+
+    // ===================================================================
+    // Writer tests — format a fresh volume, create files / dirs, remove
+    // them, re-open and inspect.
+    // ===================================================================
+
+    use crate::fs::exfat::format::FormatOpts;
+
+    fn fresh_volume(label: &str) -> (MemoryBackend, Exfat) {
+        // 4 MiB volume: 512 B sectors, 4 KiB clusters → ~1000 clusters.
+        let mut dev = MemoryBackend::new(4 * 1024 * 1024);
+        let opts = FormatOpts {
+            bytes_per_sector_shift: 9,
+            sectors_per_cluster_shift: 3,
+            volume_serial_number: 0xCAFE_BABE,
+            volume_label: label.to_string(),
+        };
+        let fs = Exfat::format(&mut dev, &opts).unwrap();
+        (dev, fs)
+    }
+
+    #[test]
+    fn format_produces_openable_volume() {
+        let (mut dev, _fs) = fresh_volume("WRTEST");
+        assert!(probe(&mut dev).unwrap());
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        assert_eq!(fs2.volume_label(), "WRTEST");
+        assert!(fs2.cluster_size() >= 512);
+        let root = fs2.list_path(&mut dev, "/").unwrap();
+        assert!(root.is_empty(), "fresh root should be empty, got {root:?}");
+    }
+
+    #[test]
+    fn format_no_label_omits_volume_entry() {
+        let (mut dev, _fs) = fresh_volume("");
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        assert_eq!(fs2.volume_label(), "");
+    }
+
+    /// Format a volume whose allocation bitmap needs more than one cluster
+    /// and verify the bitmap neither clobbers the up-case table / root
+    /// directory nor gets truncated on re-open.
+    fn check_multi_cluster_bitmap(total_bytes: u64, spc_shift: u8) {
+        use crate::io::Read;
+        let mut dev = MemoryBackend::new(total_bytes);
+        let opts = FormatOpts {
+            bytes_per_sector_shift: 9,
+            sectors_per_cluster_shift: spc_shift,
+            volume_serial_number: 1,
+            volume_label: "BIGBM".to_string(),
+        };
+        let mut fs = Exfat::format(&mut dev, &opts).unwrap();
+        let cb = fs.cluster_size() as u64;
+        let bm_bytes = (fs.boot.cluster_count as u64).div_ceil(8);
+        let bm_clusters = bm_bytes.div_ceil(cb) as u32;
+        assert!(
+            bm_clusters > 1,
+            "test needs a multi-cluster bitmap (got {bm_clusters})"
+        );
+        let cl_upcase = 2 + bm_clusters;
+        let cl_root = cl_upcase + 1;
+        assert_eq!(fs.root_directory_cluster(), cl_root);
+        assert_eq!(fs.bitmap.len() as u64, bm_bytes);
+        assert_eq!(fs.dir_chain(2).unwrap().len(), bm_clusters as usize);
+
+        let n = 5u32;
+        for i in 0..n {
+            let body = format!("body-{i}");
+            let mut reader: &[u8] = body.as_bytes();
+            let first = fs
+                .create_file(
+                    &mut dev,
+                    &format!("/f{i}.txt"),
+                    &mut reader,
+                    body.len() as u64,
+                    0,
+                )
+                .unwrap();
+            assert!(first > cl_root, "file landed on metadata cluster {first}");
+        }
+        fs.flush(&mut dev).unwrap();
+
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        assert_eq!(fs2.volume_label(), "BIGBM");
+        assert_eq!(fs2.root_directory_cluster(), cl_root);
+        assert_eq!(fs2.bitmap.len() as u64, bm_bytes);
+        assert_eq!(fs2.bitmap, fs.bitmap);
+        for c in 2..=cl_root {
+            assert_eq!(fs2.bitmap_bit(c), Some(true), "metadata cluster {c}");
+        }
+        // The up-case table on disk is still the one the formatter wrote.
+        let (upcase_bytes, _) = format::make_ascii_upcase_table();
+        let mut on_disk = vec![0u8; upcase_bytes.len()];
+        dev.read_at(fs2.boot.cluster_byte_offset(cl_upcase), &mut on_disk)
+            .unwrap();
+        assert_eq!(on_disk, upcase_bytes, "up-case table was overwritten");
+
+        let listed = fs2.list_path(&mut dev, "/").unwrap();
+        assert_eq!(listed.len(), n as usize);
+        for i in 0..n {
+            let mut got = Vec::new();
+            fs2.open_file_reader(&mut dev, &format!("/f{i}.txt"))
+                .unwrap()
+                .read_to_end(&mut got)
+                .unwrap();
+            assert_eq!(got, format!("body-{i}").into_bytes());
+        }
+    }
+
+    #[test]
+    fn format_multi_cluster_bitmap_with_small_clusters() {
+        // 4 MiB with 512 B clusters: ~8000 clusters → ~1000-byte bitmap →
+        // two clusters.
+        check_multi_cluster_bitmap(4 * 1024 * 1024, 0);
+    }
+
+    #[test]
+    fn format_512mib_volume_has_four_cluster_bitmap() {
+        // 512 MiB with 4 KiB clusters: ~131k clusters → 16 KiB bitmap →
+        // four clusters. The backing Vec is zero-allocated, so only the
+        // touched pages cost anything.
+        check_multi_cluster_bitmap(512 * 1024 * 1024, 3);
+    }
+
+    /// `set_attrs` used to read the entry set as one contiguous disk range
+    /// from the primary slot's offset. When the set straddles two root
+    /// clusters that are not adjacent on disk, that pulled in whatever
+    /// followed the first cluster (here: a file's data) and wrote back a
+    /// checksum computed over garbage.
+    #[test]
+    fn set_attrs_on_entry_set_straddling_non_adjacent_clusters() {
+        let (mut dev, mut fs) = fresh_volume("STRADDLE");
+        let cb = fs.cluster_size() as u64;
+        let root = fs.root_directory_cluster();
+        // Take the cluster right after the root for file data, so the
+        // root's growth cluster is not adjacent to it.
+        let mut reader: &[u8] = b"0123456789";
+        let data_cluster = fs
+            .create_file(&mut dev, "/data.bin", &mut reader, 10, 0)
+            .unwrap();
+        assert_eq!(data_cluster, root + 1);
+        // Root holds 3 metadata slots + data.bin's 3-slot set; 122 slots
+        // remain in the first cluster — 40 whole 3-slot sets plus two
+        // slots, so the 41st set straddles into the growth cluster.
+        let slots_per_cluster = cb as usize / ENTRY_SIZE;
+        let used = 3 + 3;
+        let whole = (slots_per_cluster - used) / 3;
+        assert_eq!((slots_per_cluster - used) % 3, 2, "layout assumption");
+        let n = whole + 1;
+        for i in 0..n {
+            fs.create_file(
+                &mut dev,
+                &format!("/s{i:02}"),
+                &mut crate::io::empty(),
+                0,
+                0,
+            )
+            .unwrap();
+        }
+        fs.flush(&mut dev).unwrap();
+        let chain = fs.dir_chain(root).unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_ne!(chain[1], root + 1, "growth cluster must not be adjacent");
+
+        let last = format!("/s{:02}", n - 1);
+        fs.set_attrs(&mut dev, &last, Some(0o444), None).unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        // Every entry set in the root still checksums, and the change took.
+        let mut fs2 = Exfat::open(&mut dev).unwrap();
+        let listed = fs2.list_path(&mut dev, "/").unwrap();
+        assert_eq!(listed.len(), n + 1);
+        let attrs = Filesystem::getattr(&mut fs2, &mut dev, crate::path::Path::new(&last)).unwrap();
+        assert_eq!(attrs.mode, 0o444);
+        assert_eq!(
+            read_file_contents(&mut fs2, &mut dev, "/data.bin"),
+            b"0123456789"
+        );
+    }
+
+    /// A directory's entry set records the byte length of its cluster
+    /// chain. Growing the chain (many children) used to leave the
+    /// parent's DataLength at the original one cluster.
+    #[test]
+    fn growing_a_directory_updates_its_data_length_in_the_parent() {
+        let (mut dev, mut fs) = fresh_volume("DIRLEN");
+        let cb = fs.cluster_size() as u64;
+        fs.create_dir(&mut dev, "/d", 0).unwrap();
+        // 200 three-slot sets: 600 slots, five 128-slot clusters.
+        for i in 0..200 {
+            fs.create_file(
+                &mut dev,
+                &format!("/d/f{i:03}"),
+                &mut crate::io::empty(),
+                0,
+                0,
+            )
+            .unwrap();
+        }
+        fs.flush(&mut dev).unwrap();
+
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        let (set, _) = fs2.resolve_entry(&mut dev, "/d").unwrap();
+        let chain = fs2.dir_chain(set.first_cluster).unwrap();
+        assert!(chain.len() >= 5, "{}", chain.len());
+        assert_eq!(set.data_length, chain.len() as u64 * cb);
+        assert_eq!(set.valid_data_length, set.data_length);
+        assert_eq!(fs2.list_path(&mut dev, "/d").unwrap().len(), 200);
+
+        // A nested directory grown through the cluster-addressed API on a
+        // fresh instance that never resolved its parent: found by search.
+        let mut fs3 = Exfat::open(&mut dev).unwrap();
+        fs3.create_dir(&mut dev, "/d/e", 0).unwrap();
+        fs3.flush(&mut dev).unwrap();
+        let mut fs4 = Exfat::open(&mut dev).unwrap();
+        let (e_set, _) = fs4.resolve_entry(&mut dev, "/d/e").unwrap();
+        assert!(fs4.dir_parents.is_empty());
+        for i in 0..100 {
+            fs4.create_file_in(
+                &mut dev,
+                e_set.first_cluster,
+                &format!("g{i}"),
+                &mut crate::io::empty(),
+                0,
+                0,
+            )
+            .unwrap();
+        }
+        fs4.flush(&mut dev).unwrap();
+        let fs5 = Exfat::open(&mut dev).unwrap();
+        let (e_set, _) = fs5.resolve_entry(&mut dev, "/d/e").unwrap();
+        let chain = fs5.dir_chain(e_set.first_cluster).unwrap();
+        assert!(chain.len() >= 3, "{}", chain.len());
+        assert_eq!(e_set.data_length, chain.len() as u64 * cb);
+        assert_eq!(fs5.list_path(&mut dev, "/d/e").unwrap().len(), 100);
+        // /d itself did not grow again (200 sets left slack) — still right.
+        let (d_set, _) = fs5.resolve_entry(&mut dev, "/d").unwrap();
+        let d_chain = fs5.dir_chain(d_set.first_cluster).unwrap();
+        assert_eq!(d_set.data_length, d_chain.len() as u64 * cb);
+    }
+
+    #[test]
+    fn names_longer_than_255_units_are_rejected() {
+        let (mut dev, mut fs) = fresh_volume("LONG");
+        let ok = "n".repeat(255);
+        let too_long = "n".repeat(256);
+        fs.create_file(&mut dev, &format!("/{ok}"), &mut crate::io::empty(), 0, 0)
+            .unwrap();
+        for r in [
+            fs.create_file(
+                &mut dev,
+                &format!("/{too_long}"),
+                &mut crate::io::empty(),
+                0,
+                0,
+            ),
+            fs.create_dir(&mut dev, &format!("/{too_long}"), 0),
+        ] {
+            match r {
+                Err(crate::Error::InvalidArgument(msg)) => assert!(msg.contains("limit"), "{msg}"),
+                other => panic!("expected InvalidArgument, got {other:?}"),
+            }
+        }
+        fs.flush(&mut dev).unwrap();
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        let listed = fs2.list_path(&mut dev, "/").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, ok);
+    }
+
+    #[test]
+    fn create_rejects_duplicate_names() {
+        let (mut dev, mut fs) = fresh_volume("DUP");
+        let mut reader: &[u8] = b"one";
+        fs.create_file(&mut dev, "/Dup.txt", &mut reader, 3, 0)
+            .unwrap();
+        let dup = |r: Result<u32>| match r {
+            Err(crate::Error::InvalidArgument(msg)) => {
+                assert!(msg.contains("already exists"), "{msg}")
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        };
+        // Still staged in the batch: exact and case-insensitive.
+        let mut reader: &[u8] = b"two";
+        dup(fs.create_file(&mut dev, "/Dup.txt", &mut reader, 3, 0));
+        let mut reader: &[u8] = b"two";
+        dup(fs.create_file(&mut dev, "/DUP.TXT", &mut reader, 3, 0));
+        dup(fs.create_dir(&mut dev, "/dup.txt", 0));
+        // On disk after a flush, too.
+        fs.flush(&mut dev).unwrap();
+        let mut reader: &[u8] = b"two";
+        dup(fs.create_file(&mut dev, "/dup.txt", &mut reader, 3, 0));
+        fs.create_dir(&mut dev, "/d", 0).unwrap();
+        dup(fs.create_dir(&mut dev, "/D", 0));
+        let mut reader: &[u8] = b"x";
+        dup(fs.create_file(&mut dev, "/d", &mut reader, 1, 0));
+        fs.flush(&mut dev).unwrap();
+
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        let listed = fs2.list_path(&mut dev, "/").unwrap();
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        let used: u32 = fs2.bitmap.iter().map(|b| b.count_ones()).sum();
+        // bitmap + upcase + root + Dup.txt's cluster + d's cluster: the
+        // rejected creates allocated nothing.
+        assert_eq!(used, 5);
+    }
+
+    #[test]
+    fn create_file_then_list() {
+        let (mut dev, mut fs) = fresh_volume("CRT");
+        let payload = b"hello, exfat writer!\n";
+        let mut reader: &[u8] = payload;
+        fs.create_file(&mut dev, "/hello.txt", &mut reader, payload.len() as u64, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+        // Re-open and verify listing + content.
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        let entries = fs2.list_path(&mut dev, "/").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "hello.txt");
+        assert_eq!(entries[0].kind, crate::fs::EntryKind::Regular);
+        use crate::io::Read;
+        let mut r = fs2.open_file_reader(&mut dev, "/hello.txt").unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, payload);
+    }
+
+    /// chmod round-trip: create a file, mark it read-only via set_attrs,
+    /// reopen and confirm getattr reports 0o444, then clear it back to
+    /// 0o644. The mtime set at create time must survive both writes.
+    #[test]
+    fn set_attrs_read_only_round_trip() {
+        use crate::fs::{Filesystem, SetAttrs};
+        use crate::path::Path;
+
+        let (mut dev, mut fs) = fresh_volume("CHMOD");
+        let payload: &[u8] = b"chmod me";
+        // 1_600_000_000 → 2020-09-13, well within exFAT's range.
+        let mtime = 1_600_000_000u32;
+        let mut reader: &[u8] = payload;
+        fs.create_file(
+            &mut dev,
+            "/f.txt",
+            &mut reader,
+            payload.len() as u64,
+            unix_to_exfat_timestamp(mtime),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        // Baseline: a freshly-created regular file is 0o644.
+        let exp_mtime = exfat_timestamp_to_unix(unix_to_exfat_timestamp(mtime));
+        {
+            let mut fs2 = Exfat::open(&mut dev).unwrap();
+            let a = fs2.getattr(&mut dev, Path::new("/f.txt")).unwrap();
+            assert_eq!(a.mode, 0o644);
+            assert_eq!(a.mtime, exp_mtime);
+        }
+
+        // chmod 0o444 → READ-ONLY set.
+        {
+            let mut fs2 = Exfat::open(&mut dev).unwrap();
+            Filesystem::set_attrs(
+                &mut fs2,
+                &mut dev,
+                Path::new("/f.txt"),
+                SetAttrs {
+                    mode: Some(0o444),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            fs2.flush(&mut dev).unwrap();
+        }
+        {
+            let mut fs2 = Exfat::open(&mut dev).unwrap();
+            let a = fs2.getattr(&mut dev, Path::new("/f.txt")).unwrap();
+            assert_eq!(a.mode, 0o444, "read-only file should read back as 0o444");
+            assert_eq!(a.mtime, exp_mtime, "mtime must be preserved across chmod");
+        }
+
+        // chmod 0o644 → READ-ONLY cleared.
+        {
+            let mut fs2 = Exfat::open(&mut dev).unwrap();
+            Filesystem::set_attrs(
+                &mut fs2,
+                &mut dev,
+                Path::new("/f.txt"),
+                SetAttrs {
+                    mode: Some(0o644),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            fs2.flush(&mut dev).unwrap();
+        }
+        {
+            let mut fs2 = Exfat::open(&mut dev).unwrap();
+            let a = fs2.getattr(&mut dev, Path::new("/f.txt")).unwrap();
+            assert_eq!(a.mode, 0o644, "writable file should read back as 0o644");
+            assert_eq!(a.mtime, exp_mtime);
+            // Content must be intact — we only rewrote the primary entry.
+            let mut r = fs2.open_file_reader(&mut dev, "/f.txt").unwrap();
+            use crate::io::Read;
+            let mut buf = Vec::new();
+            r.read_to_end(&mut buf).unwrap();
+            assert_eq!(buf, payload);
+        }
+    }
+
+    #[test]
+    fn create_empty_file() {
+        let (mut dev, mut fs) = fresh_volume("EMPTY");
+        let mut empty: &[u8] = &[];
+        fs.create_file(&mut dev, "/zero.bin", &mut empty, 0, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        let entries = fs2.list_path(&mut dev, "/").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "zero.bin");
+    }
+
+    #[test]
+    fn create_directory_and_nested_file() {
+        let (mut dev, mut fs) = fresh_volume("DIRS");
+        fs.create_dir(&mut dev, "/sub", 0).unwrap();
+        let payload = b"nested";
+        let mut reader: &[u8] = payload;
+        fs.create_file(&mut dev, "/sub/x.bin", &mut reader, payload.len() as u64, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        let root = fs2.list_path(&mut dev, "/").unwrap();
+        assert_eq!(root.len(), 1);
+        assert_eq!(root[0].name, "sub");
+        assert_eq!(root[0].kind, crate::fs::EntryKind::Dir);
+        let sub = fs2.list_path(&mut dev, "/sub").unwrap();
+        assert_eq!(sub.len(), 1);
+        assert_eq!(sub[0].name, "x.bin");
+
+        use crate::io::Read;
+        let mut r = fs2.open_file_reader(&mut dev, "/sub/x.bin").unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, payload);
+    }
+
+    /// Batched directory writes: create many files in one directory in a
+    /// single session (accumulated in the dir batch, serialized once at
+    /// flush), reopen, and confirm every file lists and reads back.
+    #[test]
+    fn batched_many_files_one_dir_round_trip() {
+        let (mut dev, mut fs) = fresh_volume("BAT");
+        fs.create_dir(&mut dev, "/d", 0).unwrap();
+        let n = 40usize;
+        for i in 0..n {
+            let body = format!("exfat-body-{i:03}");
+            let mut reader: &[u8] = body.as_bytes();
+            fs.create_file(
+                &mut dev,
+                &format!("/d/f{i:03}.txt"),
+                &mut reader,
+                body.len() as u64,
+                0,
+            )
+            .unwrap();
+        }
+        fs.flush(&mut dev).unwrap();
+
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        let listed: alloc::collections::BTreeSet<String> = fs2
+            .list_path(&mut dev, "/d")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(listed.len(), n, "expected {n} files, got {listed:?}");
+        let mut fs2 = fs2;
+        for i in 0..n {
+            let name = format!("f{i:03}.txt");
+            assert!(listed.contains(&name), "missing {name}");
+            let got = read_file_contents(&mut fs2, &mut dev, &format!("/d/{name}"));
+            assert_eq!(got, format!("exfat-body-{i:03}").into_bytes());
+        }
+    }
+
+    #[test]
+    fn multi_cluster_file_streams_correctly() {
+        // 4 KiB clusters; write a 20 KiB file → 5 clusters.
+        let (mut dev, mut fs) = fresh_volume("BIG");
+        let mut payload = Vec::with_capacity(20 * 1024);
+        for i in 0..(20 * 1024) {
+            payload.push((i % 251) as u8);
+        }
+        let mut reader: &[u8] = &payload;
+        fs.create_file(&mut dev, "/big.bin", &mut reader, payload.len() as u64, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        use crate::io::Read;
+        let mut r = fs2.open_file_reader(&mut dev, "/big.bin").unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf.len(), payload.len());
+        assert_eq!(buf, payload);
+    }
+
+    #[test]
+    fn remove_file_frees_clusters() {
+        let (mut dev, mut fs) = fresh_volume("RM");
+        let payload = b"to be deleted";
+        let mut reader: &[u8] = payload;
+        fs.create_file(
+            &mut dev,
+            "/doomed.txt",
+            &mut reader,
+            payload.len() as u64,
+            0,
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+        // Capture cluster count snapshot via bitmap byte count (sanity).
+        let used_before: u32 = fs.bitmap.iter().map(|b| b.count_ones()).sum();
+
+        fs.remove(&mut dev, "/doomed.txt").unwrap();
+        fs.flush(&mut dev).unwrap();
+        let used_after: u32 = fs.bitmap.iter().map(|b| b.count_ones()).sum();
+        assert!(
+            used_after < used_before,
+            "remove should free at least one cluster (before={used_before}, after={used_after})"
+        );
+
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        let root = fs2.list_path(&mut dev, "/").unwrap();
+        assert!(
+            root.is_empty(),
+            "root must be empty after remove, got {root:?}"
+        );
+    }
+
+    #[test]
+    fn remove_empty_directory_succeeds() {
+        let (mut dev, mut fs) = fresh_volume("RMD");
+        fs.create_dir(&mut dev, "/empty", 0).unwrap();
+        fs.flush(&mut dev).unwrap();
+        fs.remove(&mut dev, "/empty").unwrap();
+        fs.flush(&mut dev).unwrap();
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        assert!(fs2.list_path(&mut dev, "/").unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_non_empty_directory_fails() {
+        let (mut dev, mut fs) = fresh_volume("RMNE");
+        fs.create_dir(&mut dev, "/sub", 0).unwrap();
+        let mut empty: &[u8] = &[];
+        fs.create_file(&mut dev, "/sub/x", &mut empty, 0, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+        let err = fs.remove(&mut dev, "/sub").unwrap_err();
+        match err {
+            crate::Error::InvalidArgument(msg) => assert!(msg.contains("not empty")),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn case_insensitive_lookup_on_writer() {
+        let (mut dev, mut fs) = fresh_volume("CASE");
+        let mut reader: &[u8] = b"x";
+        fs.create_file(&mut dev, "/Hello.TXT", &mut reader, 1, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        // Different case, same file.
+        use crate::io::Read;
+        let mut r = fs2.open_file_reader(&mut dev, "/HELLO.txt").unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"x");
+    }
+
+    #[test]
+    fn many_files_stress_directory_expansion() {
+        // Cluster = 4 KiB → 128 entries; create 60 files of varying name
+        // lengths (each ≥ 3 entries) so the root spills into a second
+        // cluster, exercising `append_to_directory`'s chain-extend path.
+        let (mut dev, mut fs) = fresh_volume("MANY");
+        for i in 0..60u32 {
+            let name = format!("file_{i:04}.bin");
+            let mut reader: &[u8] = b"";
+            fs.create_file(&mut dev, &format!("/{name}"), &mut reader, 0, 0)
+                .unwrap();
+        }
+        fs.flush(&mut dev).unwrap();
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        let entries = fs2.list_path(&mut dev, "/").unwrap();
+        assert_eq!(entries.len(), 60);
+    }
+
+    #[test]
+    fn unix_to_exfat_timestamp_known_values() {
+        // Pre-1980 → zero (Unix epoch is way before exFAT epoch).
+        assert_eq!(unix_to_exfat_timestamp(0), 0);
+        assert_eq!(unix_to_exfat_timestamp(315_532_799), 0);
+        // Exactly 1980-01-01 00:00:00 UTC → date = (0 year, 1 month, 1 day)
+        // in the upper word, time = 0 in the lower.
+        let ts = unix_to_exfat_timestamp(315_532_800);
+        let date = (ts >> 16) as u16;
+        let time = (ts & 0xFFFF) as u16;
+        assert_eq!(time, 0);
+        let year = (date >> 9) & 0x7F;
+        let month = (date >> 5) & 0x0F;
+        let day = date & 0x1F;
+        assert_eq!((year, month, day), (0, 1, 1));
+        // A 2020-01-01 00:00:00 UTC timestamp (=1577836800) round-trips.
+        let ts = unix_to_exfat_timestamp(1_577_836_800);
+        let date = (ts >> 16) as u16;
+        let year = (date >> 9) & 0x7F;
+        let month = (date >> 5) & 0x0F;
+        let day = date & 0x1F;
+        assert_eq!((year, month, day), (40, 1, 1));
+    }
+
+    #[test]
+    fn exfat_timestamp_round_trips_to_unix() {
+        // Even-second Unix times survive a full encode→decode (exFAT has
+        // 2-second resolution, so we use even seconds).
+        for &t in &[
+            315_532_800u32, // 1980-01-01 00:00:00
+            1_577_836_800,  // 2020-01-01 00:00:00
+            1_615_779_296,  // 2021-03-15 12:34:56
+            1_234_567_890,  // 2009-02-13 23:31:30
+        ] {
+            let packed = unix_to_exfat_timestamp(t);
+            assert_eq!(exfat_timestamp_to_unix(packed), t, "round-trip for {t}");
+        }
+        // A zero word decodes to "no timestamp".
+        assert_eq!(exfat_timestamp_to_unix(0), 0);
+        // Odd seconds round down to the even boundary on the way through.
+        assert_eq!(
+            exfat_timestamp_to_unix(unix_to_exfat_timestamp(1_615_779_297)),
+            1_615_779_296
+        );
+    }
+
+    #[test]
+    fn filesystem_trait_create_file_round_trip() {
+        // Exercise the dyn-compatible `Filesystem` trait surface: create
+        // a file via `create_file`, flush, re-open, then list+read via
+        // the same trait methods.
+        use crate::fs::Filesystem;
+        let (mut dev, mut fs) = fresh_volume("TRAIT");
+        let meta = crate::fs::FileMeta::default();
+        let src = crate::fs::FileSource::Reader {
+            reader: Box::new(crate::io::Cursor::new(b"trait-wired!".to_vec())),
+            len: 12,
+        };
+        Filesystem::create_file(
+            &mut fs,
+            &mut dev,
+            crate::path::Path::new("/t.txt"),
+            src,
+            meta,
+        )
+        .unwrap();
+        Filesystem::flush(&mut fs, &mut dev).unwrap();
+
+        let mut fs2 = Exfat::open(&mut dev).unwrap();
+        let entries = Filesystem::list(&mut fs2, &mut dev, crate::path::Path::new("/")).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "t.txt");
+
+        assert!(fs2.supports_mutation());
+        use crate::io::Read;
+        let mut r =
+            Filesystem::read_file(&mut fs2, &mut dev, crate::path::Path::new("/t.txt")).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"trait-wired!");
+    }
+
+    #[test]
+    fn filesystem_trait_symlink_unsupported() {
+        use crate::fs::Filesystem;
+        let (mut dev, mut fs) = fresh_volume("NOSYM");
+        let err = Filesystem::create_symlink(
+            &mut fs,
+            &mut dev,
+            crate::path::Path::new("/link"),
+            crate::path::Path::new("/target"),
+            crate::fs::FileMeta::default(),
+        )
+        .unwrap_err();
+        match err {
+            crate::Error::Unsupported(_) => {}
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flush_persists_fat_and_bitmap() {
+        let (mut dev, mut fs) = fresh_volume("FLUSH");
+        let mut reader: &[u8] = b"persistence test";
+        fs.create_file(&mut dev, "/p.txt", &mut reader, 16, 0)
+            .unwrap();
+        // Without flush, re-open should still see writes for file content
+        // (those go straight to disk), but bitmap/FAT would be stale. We
+        // call flush() to commit.
+        fs.flush(&mut dev).unwrap();
+
+        // Re-open and verify everything is consistent.
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        // Bitmap bits for the file's cluster should be set.
+        let entries = fs2.list_path(&mut dev, "/").unwrap();
+        assert_eq!(entries.len(), 1);
+        let cluster = entries[0].inode;
+        let bit = (cluster - 2) as usize;
+        let byte = bit / 8;
+        let mask = 1u8 << (bit % 8);
+        assert!(
+            fs2.bitmap[byte] & mask != 0,
+            "bitmap bit for cluster {cluster} must be set"
+        );
+    }
+
+    // ===================================================================
+    // open_file_rw tests — exercise the partial-write / set_len / grow /
+    // shrink paths added in P-exfat-rw.
+    // ===================================================================
+
+    use crate::fs::{FileMeta, Filesystem, OpenFlags};
+
+    fn read_file_contents(fs: &mut Exfat, dev: &mut MemoryBackend, path: &str) -> Vec<u8> {
+        use crate::io::Read;
+        let mut r = fs.open_file_reader(dev, path).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn open_file_rw_partial_write_round_trip() {
+        use crate::io::{Seek, SeekFrom, Write};
+        let (mut dev, mut fs) = fresh_volume("RW1");
+        let payload = b"AAAAAAAAAAAAAAAAAAAA"; // 20 bytes
+        let mut reader: &[u8] = payload;
+        fs.create_file(&mut dev, "/x.bin", &mut reader, payload.len() as u64, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                crate::path::Path::new("/x.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(h.len(), 20);
+            h.seek(SeekFrom::Start(5)).unwrap();
+            h.write_all(b"ZZZZZ").unwrap();
+            h.sync().unwrap();
+        }
+
+        // Verify on a fresh open.
+        let mut fs2 = Exfat::open(&mut dev).unwrap();
+        let bytes = read_file_contents(&mut fs2, &mut dev, "/x.bin");
+        assert_eq!(bytes.len(), 20);
+        let mut expected = payload.to_vec();
+        expected[5..10].copy_from_slice(b"ZZZZZ");
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn open_file_rw_extends_file() {
+        use crate::io::{Seek, SeekFrom, Write};
+        let (mut dev, mut fs) = fresh_volume("RW2");
+        let mut reader: &[u8] = b"hello";
+        fs.create_file(&mut dev, "/g.txt", &mut reader, 5, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                crate::path::Path::new("/g.txt"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+            h.seek(SeekFrom::End(0)).unwrap();
+            h.write_all(b", world!").unwrap();
+            h.sync().unwrap();
+            assert_eq!(h.len(), 13);
+        }
+        let mut fs2 = Exfat::open(&mut dev).unwrap();
+        let bytes = read_file_contents(&mut fs2, &mut dev, "/g.txt");
+        assert_eq!(bytes, b"hello, world!");
+    }
+
+    #[test]
+    fn open_file_rw_set_len_grow_and_shrink() {
+        let (mut dev, mut fs) = fresh_volume("RW3");
+        // Start with an 8-byte file.
+        let mut reader: &[u8] = b"ABCDEFGH";
+        fs.create_file(&mut dev, "/s.bin", &mut reader, 8, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                crate::path::Path::new("/s.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+            // Grow to 20 KiB (multi-cluster) — fills with zeros.
+            h.set_len(20 * 1024).unwrap();
+            assert_eq!(h.len(), 20 * 1024);
+            h.sync().unwrap();
+        }
+        {
+            let mut fs2 = Exfat::open(&mut dev).unwrap();
+            let bytes = read_file_contents(&mut fs2, &mut dev, "/s.bin");
+            assert_eq!(bytes.len(), 20 * 1024);
+            assert_eq!(&bytes[..8], b"ABCDEFGH");
+            assert!(bytes[8..].iter().all(|&b| b == 0));
+        }
+
+        // Now shrink back to 4 bytes.
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                crate::path::Path::new("/s.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+            h.set_len(4).unwrap();
+            assert_eq!(h.len(), 4);
+            h.sync().unwrap();
+        }
+        let mut fs3 = Exfat::open(&mut dev).unwrap();
+        let bytes = read_file_contents(&mut fs3, &mut dev, "/s.bin");
+        assert_eq!(bytes, b"ABCD");
+    }
+
+    #[test]
+    fn open_file_rw_append() {
+        use crate::io::Write;
+        let (mut dev, mut fs) = fresh_volume("RW4");
+        let mut reader: &[u8] = b"head ";
+        fs.create_file(&mut dev, "/a.txt", &mut reader, 5, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                crate::path::Path::new("/a.txt"),
+                OpenFlags {
+                    create: false,
+                    truncate: false,
+                    append: true,
+                },
+                None,
+            )
+            .unwrap();
+            h.write_all(b"tail").unwrap();
+            h.sync().unwrap();
+        }
+        let mut fs2 = Exfat::open(&mut dev).unwrap();
+        let bytes = read_file_contents(&mut fs2, &mut dev, "/a.txt");
+        assert_eq!(bytes, b"head tail");
+    }
+
+    #[test]
+    fn open_file_rw_create_new() {
+        use crate::io::Write;
+        let (mut dev, mut fs) = fresh_volume("RW5");
+        // /n.txt does not exist — open with create=true.
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                crate::path::Path::new("/n.txt"),
+                OpenFlags {
+                    create: true,
+                    truncate: false,
+                    append: false,
+                },
+                Some(FileMeta::default()),
+            )
+            .unwrap();
+            assert_eq!(h.len(), 0);
+            h.write_all(b"freshly created").unwrap();
+            h.sync().unwrap();
+        }
+        let mut fs2 = Exfat::open(&mut dev).unwrap();
+        let bytes = read_file_contents(&mut fs2, &mut dev, "/n.txt");
+        assert_eq!(bytes, b"freshly created");
+    }
+
+    #[test]
+    fn open_file_rw_create_existing_with_truncate() {
+        use crate::io::Write;
+        let (mut dev, mut fs) = fresh_volume("RW6");
+        let mut reader: &[u8] = b"old content";
+        fs.create_file(&mut dev, "/c.txt", &mut reader, 11, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                crate::path::Path::new("/c.txt"),
+                OpenFlags {
+                    create: false,
+                    truncate: true,
+                    append: false,
+                },
+                None,
+            )
+            .unwrap();
+            assert_eq!(h.len(), 0);
+            h.write_all(b"new").unwrap();
+            h.sync().unwrap();
+        }
+        let mut fs2 = Exfat::open(&mut dev).unwrap();
+        let bytes = read_file_contents(&mut fs2, &mut dev, "/c.txt");
+        assert_eq!(bytes, b"new");
+    }
+
+    #[test]
+    fn open_file_rw_grow_allocates_clusters() {
+        use crate::io::Write;
+        // Cluster size = 4 KiB. Start with an empty file, write across a
+        // cluster boundary so the bitmap allocator gets exercised.
+        let (mut dev, mut fs) = fresh_volume("RW7");
+        let mut empty: &[u8] = &[];
+        fs.create_file(&mut dev, "/big.bin", &mut empty, 0, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        let used_before: u32 = fs.bitmap.iter().map(|b| b.count_ones()).sum();
+        let mut payload = vec![0u8; 12 * 1024]; // 3 clusters worth
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                crate::path::Path::new("/big.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+            h.write_all(&payload).unwrap();
+            h.sync().unwrap();
+        }
+        let used_after: u32 = fs.bitmap.iter().map(|b| b.count_ones()).sum();
+        assert!(
+            used_after >= used_before + 3,
+            "grow should allocate at least 3 clusters \
+             (before={used_before}, after={used_after})"
+        );
+
+        let mut fs2 = Exfat::open(&mut dev).unwrap();
+        let bytes = read_file_contents(&mut fs2, &mut dev, "/big.bin");
+        assert_eq!(bytes, payload);
+    }
+
+    #[test]
+    fn open_file_rw_truncate_then_grow_reuses_clusters() {
+        use crate::io::Write;
+        // Create a multi-cluster file, truncate it down, then grow back
+        // and verify the previously freed clusters get reused.
+        let (mut dev, mut fs) = fresh_volume("RW8");
+        let payload = vec![0xABu8; 20 * 1024]; // 5 clusters
+        let mut reader: &[u8] = &payload;
+        fs.create_file(&mut dev, "/t.bin", &mut reader, payload.len() as u64, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+        let used_full: u32 = fs.bitmap.iter().map(|b| b.count_ones()).sum();
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                crate::path::Path::new("/t.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+            h.set_len(0).unwrap();
+            h.sync().unwrap();
+        }
+        let used_empty: u32 = fs.bitmap.iter().map(|b| b.count_ones()).sum();
+        assert!(
+            used_empty < used_full,
+            "truncate to zero must free clusters (full={used_full}, empty={used_empty})"
+        );
+
+        // Grow again — bytes from the chunk written should match.
+        let new_payload = vec![0xCDu8; 16 * 1024]; // 4 clusters
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                crate::path::Path::new("/t.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+            h.write_all(&new_payload).unwrap();
+            h.sync().unwrap();
+        }
+        let used_regrown: u32 = fs.bitmap.iter().map(|b| b.count_ones()).sum();
+        // We should never exceed the original peak after a truncate + smaller grow.
+        assert!(used_regrown <= used_full);
+        let mut fs2 = Exfat::open(&mut dev).unwrap();
+        let bytes = read_file_contents(&mut fs2, &mut dev, "/t.bin");
+        assert_eq!(bytes, new_payload);
+    }
+
+    #[test]
+    fn open_file_rw_missing_without_create_errors() {
+        let (mut dev, mut fs) = fresh_volume("RW9");
+        let res = Filesystem::open_file_rw(
+            &mut fs,
+            &mut dev,
+            crate::path::Path::new("/nope.bin"),
+            OpenFlags::default(),
+            None,
+        );
+        let err = match res {
+            Err(e) => e,
+            Ok(_) => panic!("expected error opening a non-existent file"),
+        };
+        match err {
+            crate::Error::InvalidArgument(msg) => assert!(msg.contains("no such")),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_file_ro_random_seek_exfat() {
+        use crate::io::{Read, Seek, SeekFrom};
+        let (mut dev, mut fs) = fresh_volume("RO");
+        // ~10 KiB file — larger than one 4 KiB cluster, so the read path
+        // exercises chain walking.
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i & 0xFF) as u8).collect();
+        let mut reader: &[u8] = &data;
+        fs.create_file(&mut dev, "/ro.bin", &mut reader, data.len() as u64, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        let mut h = Filesystem::open_file_ro(&mut fs, &mut dev, crate::path::Path::new("/ro.bin"))
+            .expect("open_file_ro");
+        assert_eq!(h.len(), data.len() as u64);
+        assert!(!h.is_empty());
+
+        // Seek to a mid-file, non-cluster-aligned offset and read.
+        h.seek(SeekFrom::Start(5000)).unwrap();
+        let mut buf = [0u8; 128];
+        h.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf[..], &data[5000..5128]);
+
+        // Seek backwards.
+        h.seek(SeekFrom::Start(17)).unwrap();
+        let mut buf2 = [0u8; 32];
+        h.read_exact(&mut buf2).unwrap();
+        assert_eq!(&buf2[..], &data[17..49]);
+    }
+}

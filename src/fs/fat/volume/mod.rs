@@ -16,8 +16,10 @@
 //!   sector at a time through a single-sector write-back cache, so mounting
 //!   a 32 GB volume costs one sector of RAM, not the four megabytes its
 //!   table would occupy.
-//! * **Its own device trait.** [`SectorDriver`] is what you implement over
-//!   your SD/eMMC/NOR driver. It carries an associated error type, unlike
+//! * **A driver, not a block device.** [`SectorDriver`] — from
+//!   [`crate::device`], the layer below the filesystems, and shared with
+//!   [`fs::exfat`](crate::fs::exfat) — is what you implement over your
+//!   SD/eMMC peripheral. It carries an associated error type, unlike
 //!   [`crate::block::SectorIo`], whose signatures return a `crate::Error`
 //!   that owns a `String`.
 //!
@@ -33,7 +35,8 @@
 //! Operations on a handle therefore take the volume back:
 //!
 //! ```
-//! # use fstool::fs::fat::{Error, SectorDriver, Volume};
+//! # use fstool::device::SectorDriver;
+//! # use fstool::fs::fat::{Error, Volume};
 //! # struct RamCard([u8; 0]);
 //! # impl SectorDriver for RamCard {
 //! #     type Error = core::convert::Infallible;
@@ -87,40 +90,20 @@ mod boot;
 mod dir;
 mod file;
 
-pub use boot::{Geometry, MAX_SECTOR_SIZE, MIN_SECTOR_SIZE, MbrPartition};
+pub use boot::{Geometry, MAX_SECTOR_SIZE, MIN_SECTOR_SIZE};
 pub use dir::{DirEntry, DirIter};
 pub use file::{File, MAX_FILE_LEN};
 
-/// A sector-addressed storage driver: the one trait an embedded consumer
-/// implements.
+/// The storage this driver is written against.
 ///
-/// The volume checks every request before making it, so an implementation
-/// need not: `buf` is always a non-zero multiple of
-/// [`sector_size`](Self::sector_size) bytes long, and `lba + buf.len() /
-/// sector_size` never exceeds [`sector_count`](Self::sector_count).
-pub trait SectorDriver {
-    /// Whatever your driver fails with. Surfaces as [`Error::Io`].
-    type Error;
+/// It lives in [`crate::device`], which is where a consumer implementing it
+/// should look: the same trait serves [`fs::exfat`](crate::fs::exfat), so one
+/// card driver mounts either filesystem. This re-export is kept because the
+/// trait was published here first — rustc ignores `#[deprecated]` on a
+/// re-export, so there is no warning to be had, only this note.
+pub use crate::device::SectorDriver;
 
-    /// Bytes per sector. Must be a power of two between 512 and 4096;
-    /// 512 for every SD card.
-    fn sector_size(&self) -> u32;
-
-    /// Number of sectors on the medium.
-    fn sector_count(&self) -> u64;
-
-    /// Read `buf.len() / sector_size()` sectors starting at `lba`.
-    fn read_sectors(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Self::Error>;
-
-    /// Write `buf.len() / sector_size()` sectors starting at `lba`.
-    fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), Self::Error>;
-
-    /// Push any write-back cache through to the medium. Default: nothing
-    /// to do.
-    fn flush(&mut self) -> Result<(), Self::Error> {
-        Ok(())
-    }
-}
+use crate::device::{gpt, mbr};
 
 /// Everything that can go wrong, parameterised by the driver's own error.
 ///
@@ -563,11 +546,13 @@ impl<D: SectorDriver, const SECTOR: usize> Volume<D, SECTOR> {
         Self::mount_at(dev, part.start_lba)
     }
 
-    /// Mount whatever looks like a FAT volume: the whole device if sector
-    /// 0 is a boot sector, otherwise the first MBR partition that mounts.
+    /// Mount whatever looks like a FAT volume: the whole device if sector 0
+    /// is a boot sector, otherwise the first partition that mounts — from a
+    /// GPT if the medium has one, from the MBR if not.
     ///
     /// This is what an SD card wants — some are formatted whole, most are
-    /// partitioned.
+    /// partitioned, and a card that has been through a PC may well carry a
+    /// GPT.
     pub fn mount_auto(mut dev: D) -> Result<Self, Error<D::Error>> {
         Self::check_scratch(&dev)?;
         // `SECTOR` is already known to be at least the driver's sector
@@ -581,6 +566,32 @@ impl<D: SectorDriver, const SECTOR: usize> Volume<D, SECTOR> {
         if Geometry::parse::<D::Error>(&first[..ss], 0, device_bytes).is_ok() {
             return Self::mount_at(dev, 0);
         }
+        // GPT before MBR: a GPT disk carries a protective MBR whose one entry
+        // describes the table, not a volume, so walking that first would just
+        // waste a read.
+        if let Some(table) = gpt::Table::read(&mut dev, &mut first[..ss]).map_err(Error::Io)? {
+            // Likely type GUIDs first, then anything else that parses: the
+            // GUID is a hint, never the decision.
+            for pass in 0..2 {
+                for i in 0..table.entries() {
+                    let Some(part) = table
+                        .entry(&mut dev, &mut first[..ss], i)
+                        .map_err(Error::Io)?
+                    else {
+                        continue;
+                    };
+                    if (pass == 0) != part.looks_like_fat_family() {
+                        continue;
+                    }
+                    if Self::probe_at(&mut dev, part.start_lba, &mut first[..ss]).is_ok() {
+                        return Self::mount_at(dev, part.start_lba);
+                    }
+                }
+            }
+            return Err(Error::NotFat);
+        }
+
+        Self::read_raw(&mut dev, 0, &mut first[..ss])?;
         if let Some(table) = boot::parse_mbr(&first[..ss]) {
             // FAT-typed slots first, then anything else that parses: the
             // type byte is a hint, never the decision.
@@ -632,7 +643,7 @@ impl<D: SectorDriver, const SECTOR: usize> Volume<D, SECTOR> {
     }
 
     /// Look up a 1-based MBR partition without mounting it.
-    pub fn partition(dev: &mut D, index: u8) -> Result<MbrPartition, Error<D::Error>> {
+    pub fn partition(dev: &mut D, index: u8) -> Result<mbr::Partition, Error<D::Error>> {
         if index == 0 || index > 4 {
             return Err(Error::NoSuchPartition);
         }
@@ -714,10 +725,37 @@ impl<D: SectorDriver, const SECTOR: usize> Volume<D, SECTOR> {
         // Flush first, so a failure is reported rather than swallowed by
         // the `Drop` below; on that path `self` drops normally.
         self.flush()?;
+
+        // Handing the device back means moving it out of a type that
+        // implements `Drop`, which only `ManuallyDrop` allows — and that
+        // suppresses the drop glue of *every* field, not just the device's.
+        // So anything that owns memory has to leave the volume here, by
+        // hand, or it is leaked.
+        //
+        // The pattern below is what keeps that honest: it is exhaustive (no
+        // `..`) and binds by reference, which a `Drop` type permits. Add a
+        // field and this stops compiling until someone has decided whether
+        // it needs releasing above.
+        #[cfg(feature = "alloc")]
+        drop(core::mem::take(&mut self.fat_cache));
+        let Self {
+            dev: _,
+            geom: _,
+            buf: _,
+            cache_lba: _,
+            cache_dirty: _,
+            free_count: _,
+            next_free: _,
+            #[cfg(feature = "alloc")]
+                fat_cache: _,
+            fsinfo_dirty: _,
+            now: _,
+        } = &self;
+
         let me = core::mem::ManuallyDrop::new(self);
         // SAFETY: `me` is a `ManuallyDrop`, so its destructor never runs
         // and the device is not dropped twice. Nothing reads `me` after
-        // this.
+        // this, and every field that owned memory was released above.
         Ok(unsafe { core::ptr::read(&me.dev) })
     }
 

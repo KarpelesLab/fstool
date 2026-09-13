@@ -68,30 +68,15 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// Bytes per on-disk directory entry.
-pub const ENTRY_SIZE: usize = 32;
-
-/// Entry-type bytes we recognise.
-pub const ENTRY_ALLOCATION_BITMAP: u8 = 0x81;
-pub const ENTRY_UPCASE_TABLE: u8 = 0x82;
-pub const ENTRY_VOLUME_LABEL: u8 = 0x83;
-pub const ENTRY_FILE: u8 = 0x85;
-pub const ENTRY_STREAM_EXTENSION: u8 = 0xC0;
-pub const ENTRY_FILE_NAME: u8 = 0xC1;
-
-/// Mask: an entry is "in use" when its high bit is set.
-pub const ENTRY_INUSE: u8 = 0x80;
-
-/// FileAttributes bits (from the FileDirectoryEntry primary).
-pub const ATTR_READ_ONLY: u16 = 0x0001;
-pub const ATTR_HIDDEN: u16 = 0x0002;
-pub const ATTR_SYSTEM: u16 = 0x0004;
-pub const ATTR_DIRECTORY: u16 = 0x0010;
-pub const ATTR_ARCHIVE: u16 = 0x0020;
-
-/// GeneralSecondaryFlags bits (StreamExtension).
-pub const SECFLAG_ALLOC_POSSIBLE: u8 = 0x01;
-pub const SECFLAG_NO_FAT_CHAIN: u8 = 0x02;
+// The entry vocabulary itself lives in `super::layout`, shared with the
+// allocator-free driver; these re-exports keep the paths this module has
+// always published.
+pub use super::layout::{
+    ATTR_ARCHIVE, ATTR_DIRECTORY, ATTR_HIDDEN, ATTR_READ_ONLY, ATTR_SYSTEM,
+    ENTRY_ALLOCATION_BITMAP, ENTRY_FILE, ENTRY_FILE_NAME, ENTRY_INUSE, ENTRY_SIZE,
+    ENTRY_STREAM_EXTENSION, ENTRY_UPCASE_TABLE, ENTRY_VOLUME_LABEL, SECFLAG_ALLOC_POSSIBLE,
+    SECFLAG_NO_FAT_CHAIN, name_hash, set_checksum,
+};
 
 /// A fully-parsed file/directory entry set.
 #[derive(Debug, Clone)]
@@ -192,32 +177,6 @@ pub fn classify_slot(slot: &[u8; ENTRY_SIZE]) -> RawSlot<'_> {
         },
         other => RawSlot::Other { entry_type: other },
     }
-}
-
-/// Compute the SetChecksum over the bytes of all entries in a set. The
-/// `set` slice must hold exactly `(1 + secondary_count) * ENTRY_SIZE`
-/// bytes, primary first. Bytes 2 and 3 of the primary are skipped (where
-/// the checksum field lives on-disk).
-pub fn set_checksum(set: &[u8]) -> u16 {
-    let mut sum: u16 = 0;
-    for (i, &b) in set.iter().enumerate() {
-        if i == 2 || i == 3 {
-            continue;
-        }
-        sum = sum.rotate_right(1).wrapping_add(b as u16);
-    }
-    sum
-}
-
-/// Compute the NameHash over an up-cased UTF-16 name. Used by exFAT to
-/// short-circuit name comparisons; we mirror the algorithm so we can
-/// build a name's hash if needed but do not currently verify it.
-pub fn name_hash(upcased_le_bytes: &[u8]) -> u16 {
-    let mut hash: u16 = 0;
-    for &b in upcased_le_bytes {
-        hash = hash.rotate_right(1).wrapping_add(b as u16);
-    }
-    hash
 }
 
 /// Parse a single file entry set starting at `set[0]` (a primary 0x85).

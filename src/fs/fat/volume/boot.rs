@@ -266,57 +266,6 @@ impl Geometry {
     }
 }
 
-/// One MBR partition entry worth keeping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MbrPartition {
-    /// 1-based slot in the table.
-    pub index: u8,
-    /// Partition type byte.
-    pub kind: u8,
-    pub start_lba: u64,
-    pub sectors: u64,
-}
-
-impl MbrPartition {
-    /// Whether the type byte is one of the FAT ones. A volume is still
-    /// mounted by reading its boot sector, not by trusting this.
-    pub fn looks_like_fat(&self) -> bool {
-        matches!(
-            self.kind,
-            0x01 | 0x04 | 0x06 | 0x0B | 0x0C | 0x0E | 0x11 | 0x14 | 0x16 | 0x1B | 0x1C | 0x1E
-        )
-    }
-}
-
-/// Read the four primary partition entries out of an MBR, skipping empty
-/// and extended-container slots. Returns `None` when the sector carries no
-/// usable table.
-pub fn parse_mbr(sector: &[u8]) -> Option<[Option<MbrPartition>; 4]> {
-    if sector.len() < MIN_SECTOR_SIZE || sector[510] != 0x55 || sector[511] != 0xAA {
-        return None;
-    }
-    let mut out = [None; 4];
-    let mut any = false;
-    for (i, slot) in out.iter_mut().enumerate() {
-        let at = 446 + i * 16;
-        let kind = sector[at + 4];
-        let start_lba = u32_at(sector, at + 8) as u64;
-        let sectors = u32_at(sector, at + 12) as u64;
-        // Type 0 is an unused slot; 0x05/0x0F/0x85 are extended
-        // containers, whose logical partitions this driver does not walk.
-        if kind == 0 || sectors == 0 || start_lba == 0 {
-            continue;
-        }
-        if matches!(kind, 0x05 | 0x0F | 0x85) {
-            continue;
-        }
-        any = true;
-        *slot = Some(MbrPartition {
-            index: i as u8 + 1,
-            kind,
-            start_lba,
-            sectors,
-        });
-    }
-    if any { Some(out) } else { None }
-}
+// The partition table a volume may sit inside is not FAT's — it is
+// `crate::device::mbr`'s, shared with the exFAT driver.
+pub use crate::device::mbr::parse as parse_mbr;

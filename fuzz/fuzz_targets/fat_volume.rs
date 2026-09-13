@@ -11,7 +11,8 @@
 
 use fstool::block::{BlockDevice, MemoryBackend};
 use fstool::fs::Filesystem;
-use fstool::fs::fat::{Fat32, FatFormatOpts, FatKind, SectorDriver, Volume};
+use fstool::device::SectorDriver;
+use fstool::fs::fat::{Fat32, FatFormatOpts, FatKind, Volume};
 use libfuzzer_sys::fuzz_target;
 
 /// The volume under test, in RAM.
@@ -137,4 +138,10 @@ fuzz_target!(|data: &[u8]| {
     let _ = vol.create_dir("/fuzzdir");
     let _ = vol.remove_file("/sub/a long name.txt");
     let _ = vol.flush();
+
+    // Hand the card back. `unmount` has to move the device out of a type
+    // with a `Drop` impl, which means suppressing the volume's drop glue —
+    // so anything the volume still owned would be leaked. LeakSanitizer,
+    // which every fuzz run carries, is what says otherwise.
+    let _ = vol.unmount();
 });

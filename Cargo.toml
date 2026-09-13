@@ -110,14 +110,16 @@ std = ["alloc", "uuid/std", "uuid/v4"]
 # `#[global_allocator]` at all. `alloc` is additive from there: turning
 # it on adds the hosted layers and the backends that require them, and
 # never takes anything away. A backend that works either way — today
-# `fat` — gives you its allocation-free driver in both configurations,
-# so the heapless build of a FAT reader is spelled
+# `fat` and `littlefs` — gives you its allocation-free driver in both
+# configurations, so the heapless build of an SD-card and flash reader is
+# spelled
 #
 #     fstool = { version = "0.4", default-features = false,
-#                features = ["fat"] }
+#                features = ["fat", "littlefs"] }
 #
-# and reads and writes an SD card through the `SectorDriver` you
-# implement over your card driver. See `fs::fat`.
+# and reads and writes a card through the `SectorDriver` you implement
+# over your card driver, or flash through the `FlashDriver` you implement
+# over your QSPI one. See `fs::fat` and `fs::littlefs`.
 alloc = []
 
 # Everything the library reads and writes, with no command-line surface.
@@ -156,8 +158,8 @@ filesystems = [
     "tar",
     "xfs",
 ]
-# FAT12 / FAT16 / FAT32, in both configurations — the one backend that
-# needs neither `std` nor `alloc`.
+# FAT12 / FAT16 / FAT32, in both configurations — one of the two backends
+# that need neither `std` nor `alloc` (littlefs is the other).
 #
 # On its own it compiles the allocation-free driver in `fs::fat`: a
 # `SectorDriver` you implement, one sector of scratch RAM, and the
@@ -169,11 +171,35 @@ filesystems = [
 # volumes, and an in-memory allocation table that makes the driver above
 # faster through exactly the same API.
 fat = []
-# exFAT. Shares the allocation-table code with the hosted `fat` driver,
-# so unlike `fat` it needs a heap.
-exfat = ["fat", "alloc"]
-# littlefs (the embedded-flash filesystem, `lfs2` disk versions 2.0 + 2.1).
-littlefs = ["alloc"]
+# exFAT, in both configurations — the third backend that needs neither
+# `std` nor `alloc`, and the one an SDXC card arrives formatted with.
+#
+# On its own it compiles the allocation-free driver in `fs::exfat`: the
+# same `SectorDriver` the `fat` driver uses (hence the dependency), one
+# sector of scratch RAM, and the FAT, the allocation bitmap and the
+# up-case table all read from the card rather than held in memory. Mounts
+# whole cards or MBR partitions, reads and writes.
+#
+# `alloc` (so, any default or `std` build) only adds to that module: the
+# hosted `Exfat`, which speaks the crate's `Filesystem` trait and formats
+# volumes, and an in-memory up-case table that makes the driver above
+# faster through exactly the same API.
+exfat = ["fat"]
+# littlefs (the embedded-flash filesystem, `lfs2` disk versions 2.0 + 2.1),
+# in both configurations — the second backend that needs neither `std` nor
+# `alloc`.
+#
+# On its own it compiles the allocation-free driver in `fs::littlefs`: a
+# `FlashDriver` you implement, one block of scratch RAM plus a page-sized
+# staging buffer, and block allocation by traversal into a fixed lookahead
+# window, exactly as the C implementation does. Mounts, formats, reads and
+# writes, including user attributes.
+#
+# `alloc` (so, any default or `std` build) only adds to that module: the
+# hosted `LittleFs`, which speaks the crate's `Filesystem` trait and builds
+# images, and a whole-volume in-use bitmap that makes the driver above
+# faster through exactly the same API.
+littlefs = []
 # ext2 / ext3 / ext4.
 ext = ["std"]
 # XFS.

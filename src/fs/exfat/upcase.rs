@@ -141,16 +141,9 @@ impl Upcase {
     }
 }
 
-/// Rolling 32-bit checksum used by exFAT for the up-case table and the
-/// entry-set checksum (with different skip semantics). Each byte rotates
-/// the accumulator right by one bit and adds the byte.
-pub fn table_checksum(bytes: &[u8]) -> u32 {
-    let mut sum: u32 = 0;
-    for &b in bytes {
-        sum = sum.rotate_right(1).wrapping_add(b as u32);
-    }
-    sum
-}
+/// Rolling 32-bit checksum used for the up-case table — see
+/// `super::layout::table_checksum`.
+pub use super::layout::table_checksum;
 
 #[cfg(test)]
 mod tests {

@@ -763,6 +763,65 @@ fn an_entry_handle_opens_without_a_second_lookup() {
 // The hosted driver exists only when `alloc` does.
 #[cfg(feature = "alloc")]
 mod cross {
+    /// The crate's own GPT writer against the driver's GPT reader: the
+    /// hosted half lays down a real table — protective MBR, CRC-protected
+    /// header, backup pair at the end — formats a FAT32 volume inside the
+    /// partition, and the driver has to find it with nothing but
+    /// `mount_auto`.
+    #[test]
+    fn mount_auto_finds_a_volume_through_a_hosted_gpt() {
+        use crate::part::{Gpt, Partition, PartitionKind, PartitionTable, slice_partition};
+        use uuid::Uuid;
+
+        const SECTORS: u32 = 160 * 1024; // 80 MiB
+        const START: u64 = 2048;
+        let part_sectors = SECTORS as u64 - START - 34;
+
+        let mut dev = MemoryBackend::new(SECTORS as u64 * 512);
+        let table = Gpt::build_with_guids(
+            alloc::vec![Partition {
+                start_lba: START,
+                size_lba: part_sectors,
+                kind: PartitionKind::Fat32,
+                uuid: Some(Uuid::from_u128(0x1234)),
+                name: Some(alloc::string::String::from("DATA")),
+                bootable: false,
+                attributes: 0,
+            }],
+            Uuid::from_u128(0x5678),
+            || Uuid::from_u128(0x9abc),
+        )
+        .expect("build a GPT");
+        table.write(&mut dev).expect("write the GPT");
+        {
+            let mut slice = slice_partition(&table, &mut dev, 0).expect("slice");
+            let opts = FatFormatOpts {
+                kind: HostedKind::Fat32,
+                total_sectors: part_sectors as u32,
+                ..Default::default()
+            };
+            let mut fs = Fat32::format(&mut slice, &opts).expect("format inside the partition");
+            fs.flush(&mut slice).expect("flush");
+        }
+
+        // Sector 0 is the protective MBR, so only the table leads anywhere.
+        let mut vol = Volume::<_, 512>::mount_auto(RamCard::new(dev.into_bytes()))
+            .expect("mount_auto through the GPT");
+        assert_eq!(vol.geometry().part_start, START);
+        assert_eq!(vol.kind(), FatKind::Fat32);
+        let mut f = vol.create_file("/through-gpt.txt").unwrap();
+        f.write_all(&mut vol, b"found by GUID").unwrap();
+        f.flush(&mut vol).unwrap();
+
+        // And again from scratch, which re-reads the table.
+        let card = vol.unmount().unwrap();
+        let mut vol = Volume::<_, 512>::mount_auto(card).unwrap();
+        let mut f = vol.open_file("/through-gpt.txt").unwrap();
+        let mut buf = [0u8; 13];
+        f.read_exact(&mut vol, &mut buf).unwrap();
+        assert_eq!(&buf, b"found by GUID");
+    }
+
     use super::*;
     use crate::block::MemoryBackend;
     use crate::fs::fat::{Fat32, FatFormatOpts, FatKind as HostedKind};

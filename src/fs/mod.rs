@@ -26,13 +26,14 @@ pub mod archive;
 pub mod devnum;
 #[cfg(feature = "alloc")]
 pub(crate) mod dir_batch;
-#[cfg(all(feature = "alloc", feature = "exfat"))]
+// Another backend that works with or without a heap.
+#[cfg(feature = "exfat")]
 pub mod exfat;
 #[cfg(all(feature = "alloc", feature = "ext"))]
 pub mod ext;
 #[cfg(all(feature = "alloc", feature = "f2fs"))]
 pub mod f2fs;
-// The one backend that works with or without a heap.
+// One of the two backends that work with or without a heap.
 #[cfg(feature = "fat")]
 pub mod fat;
 #[cfg(all(feature = "alloc", feature = "grf"))]
@@ -43,7 +44,8 @@ pub mod hfs;
 pub mod hfs_plus;
 #[cfg(all(feature = "alloc", feature = "iso9660"))]
 pub mod iso9660;
-#[cfg(all(feature = "alloc", feature = "littlefs"))]
+// The other backend that works with or without a heap.
+#[cfg(feature = "littlefs")]
 pub mod littlefs;
 #[cfg(all(feature = "alloc", feature = "ntfs"))]
 pub mod ntfs;

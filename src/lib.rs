@@ -1,7 +1,10 @@
 //! fstool — build disk images and filesystems from a directory tree and TOML spec.
 //!
-//! The crate is organised as a stack of three trait-based layers:
+//! The crate is organised as a stack of trait-based layers:
 //!
+//! - [`device`] — `SectorDriver` and `FlashDriver`: the storage a driver
+//!   implements, for the filesystems that run without an allocator. It is
+//!   the only layer that is always compiled.
 //! - [`block`] — `BlockDevice`: raw seekable byte storage. Backends include
 //!   on-disk files, in-memory buffers (for tests), sub-range slices used to
 //!   give each partition an isolated view, and the disk-image *containers*:
@@ -43,10 +46,16 @@ extern crate alloc;
 extern crate std;
 
 // An empty crate is never what the caller meant.
-#[cfg(not(any(feature = "alloc", feature = "fat")))]
+#[cfg(not(any(
+    feature = "alloc",
+    feature = "fat",
+    feature = "exfat",
+    feature = "littlefs"
+)))]
 compile_error!(
     "fstool: enable at least one feature — `std` for the full library, or a \
-     backend such as `fat` (which needs no allocator) for a slimmer one"
+     backend such as `fat`, `exfat` or `littlefs` (none of which needs an \
+     allocator) for a slimmer one"
 );
 
 #[cfg(all(
@@ -87,11 +96,17 @@ pub mod compression;
 #[cfg(feature = "ext")]
 pub mod concurrent;
 pub mod crc;
+pub mod device;
 #[cfg(feature = "alloc")]
 pub mod error;
 #[cfg(feature = "alloc")]
 pub mod format_opts;
-#[cfg(any(feature = "alloc", feature = "fat"))]
+#[cfg(any(
+    feature = "alloc",
+    feature = "fat",
+    feature = "exfat",
+    feature = "littlefs"
+))]
 pub mod fs;
 #[cfg(feature = "fuse")]
 pub mod fuse_adapter;

@@ -168,3 +168,161 @@ fn mbr_validates_with_fdisk() {
         "missing swap partition:\n{stdout}"
     );
 }
+
+// ---------------------------------------------------------------------
+// The allocator-free GPT reader, against tables the system tools write.
+//
+// `device::gpt` shares no code with `part::gpt` above: it walks the table on
+// a `SectorDriver` with one sector of scratch, for the filesystems that run
+// without an allocator. So it earns its own check against `sgdisk`.
+// ---------------------------------------------------------------------
+
+#[cfg(feature = "fat")]
+mod noalloc_gpt {
+    use super::*;
+    use fstool::device::{SectorDriver, gpt};
+
+    /// A RAM-backed medium over an image file's bytes.
+    struct Disk(Vec<u8>);
+
+    impl SectorDriver for Disk {
+        type Error = std::convert::Infallible;
+        fn sector_size(&self) -> u32 {
+            512
+        }
+        fn sector_count(&self) -> u64 {
+            self.0.len() as u64 / 512
+        }
+        fn read_sectors(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
+            let at = lba as usize * 512;
+            buf.copy_from_slice(&self.0[at..at + buf.len()]);
+            Ok(())
+        }
+        fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), Self::Error> {
+            let at = lba as usize * 512;
+            self.0[at..at + buf.len()].copy_from_slice(buf);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn reads_a_table_sgdisk_wrote() {
+        let Some(_) = which("sgdisk") else {
+            eprintln!("skipping: sgdisk not installed");
+            return;
+        };
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let f = std::fs::File::create(tmp.path()).unwrap();
+            f.set_len(64 * 1024 * 1024).unwrap();
+        }
+        // Three partitions of three different types, named, so every field
+        // the reader decodes is checked against what the tool wrote.
+        let out = std::process::Command::new("sgdisk")
+            .args([
+                "-n",
+                "1:2048:+16M",
+                "-t",
+                "1:EF00",
+                "-c",
+                "1:ESP",
+                "-n",
+                "2:+0:+16M",
+                "-t",
+                "2:0700",
+                "-c",
+                "2:DATA",
+                "-n",
+                "3:+0:+8M",
+                "-t",
+                "3:8300",
+                "-c",
+                "3:LINUX",
+            ])
+            .arg(tmp.path())
+            .output()
+            .expect("run sgdisk");
+        assert!(
+            out.status.success(),
+            "sgdisk failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let mut dev = Disk(std::fs::read(tmp.path()).unwrap());
+        let mut buf = [0u8; 512];
+        let table = gpt::Table::read(&mut dev, &mut buf)
+            .unwrap()
+            .expect("the reader found no GPT where sgdisk wrote one");
+        assert!(
+            !table.from_backup,
+            "the primary header should have checked out"
+        );
+        assert_eq!(table.header.entry_size, 128);
+        assert_eq!(table.header.first_usable_lba, 34);
+
+        // Slot 1: the EFI system partition, which sgdisk typed EF00.
+        let esp = table.entry(&mut dev, &mut buf, 0).unwrap().expect("slot 1");
+        assert!(esp.is_efi_system(), "{:?}", esp.type_guid);
+        assert!(esp.looks_like_fat_family());
+        assert_eq!(esp.start_lba, 2048);
+        assert_eq!(esp.sectors(), 16 * 1024 * 1024 / 512);
+
+        // Slot 2: Microsoft basic data (0700) — where FAT and exFAT live.
+        let data = table.entry(&mut dev, &mut buf, 1).unwrap().expect("slot 2");
+        assert!(data.is_basic_data(), "{:?}", data.type_guid);
+        assert_eq!(data.start_lba, esp.end_lba + 1);
+
+        // Slot 3: a Linux filesystem (8300), which is not FAT-family.
+        let linux = table.entry(&mut dev, &mut buf, 2).unwrap().expect("slot 3");
+        assert_eq!(linux.type_guid, gpt::LINUX_FS);
+        assert!(!linux.looks_like_fat_family());
+
+        // Slots past the three are unused, and every partition's GUID is its
+        // own.
+        assert!(table.entry(&mut dev, &mut buf, 3).unwrap().is_none());
+        assert_ne!(esp.guid, data.guid);
+        assert!(!esp.guid.is_nil());
+
+        // The names sgdisk set come back through the entry bytes.
+        let (lba, at) = table.header.entry_position(1, 512).unwrap();
+        dev.read_sectors(lba, &mut buf).unwrap();
+        let mut units = [0u16; 36];
+        let n = gpt::Partition::name_from(&buf[at..], &mut units);
+        let name: String = char::decode_utf16(units[..n].iter().copied())
+            .map(|c| c.unwrap_or('?'))
+            .collect();
+        assert_eq!(name, "DATA");
+    }
+
+    #[test]
+    fn falls_back_to_the_backup_sgdisk_wrote() {
+        let Some(_) = which("sgdisk") else {
+            eprintln!("skipping: sgdisk not installed");
+            return;
+        };
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let f = std::fs::File::create(tmp.path()).unwrap();
+            f.set_len(32 * 1024 * 1024).unwrap();
+        }
+        let out = std::process::Command::new("sgdisk")
+            .args(["-n", "1:2048:+8M", "-t", "1:0700"])
+            .arg(tmp.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        let mut bytes = std::fs::read(tmp.path()).unwrap();
+        // Wipe the primary header the way a torn write would.
+        bytes[512..1024].fill(0);
+        let mut dev = Disk(bytes);
+        let mut buf = [0u8; 512];
+        let table = gpt::Table::read(&mut dev, &mut buf)
+            .unwrap()
+            .expect("the backup header sgdisk wrote should have been used");
+        assert!(table.from_backup);
+        let p = table.entry(&mut dev, &mut buf, 0).unwrap().expect("slot 1");
+        assert_eq!(p.start_lba, 2048);
+        assert!(p.is_basic_data());
+    }
+}

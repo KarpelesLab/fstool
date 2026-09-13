@@ -148,11 +148,12 @@ jobs:
             echo "::endgroup::"
           done
 
-      # The embedded core: `#![no_std]` + `alloc`, the block / partition /
-      # filesystem traits with FAT, exFAT and littlefs, compiled for a
-      # Cortex-M4F. The same set is unit-tested on the host in its no_std
-      # configuration, and a `uuid` resolve without `getrandom` proves
-      # nothing pulled in an OS.
+      # The embedded core: `#![no_std]`, the block / partition / filesystem
+      # traits with FAT, exFAT and littlefs, compiled for a Cortex-M4F —
+      # first with `alloc` (the hosted API), then without it (the three
+      # allocator-free drivers). The same sets are unit-tested on the host,
+      # and a `uuid` resolve without `getrandom` proves nothing pulled in
+      # an OS.
       #
       # These are plain `cargo build`s: the library is an rlib, so a
       # `no_std` configuration needs no panic handler and no allocator.
@@ -174,23 +175,29 @@ jobs:
           cargo clippy --lib --no-default-features --features fat,exfat,littlefs \
             --target thumbv7em-none-eabihf -- -D warnings
           cargo test --lib --no-default-features --features fat,exfat,littlefs
-          # The floor below that: `fat` on its own, with no allocator at
-          # all — the configuration `fs::fat`'s driver is built for.
-          cargo build --lib --no-default-features --features fat \
-            --target thumbv7em-none-eabihf
-          cargo build --lib --no-default-features --features fat
-          cargo clippy --lib --no-default-features --features fat \
-            --target thumbv7em-none-eabihf -- -D warnings
-          cargo test --lib --no-default-features --features fat
+          # The floor below that: no allocator at all — the configuration
+          # the `fs::fat`, `fs::exfat` and `fs::littlefs` drivers are built
+          # for. Each on its own, and together.
+          for feats in fat exfat littlefs fat,exfat,littlefs; do
+            echo "::group::no-alloc --features $feats"
+            cargo build --lib --no-default-features --features "$feats" \
+              --target thumbv7em-none-eabihf
+            cargo build --lib --no-default-features --features "$feats"
+            cargo clippy --lib --no-default-features --features "$feats" \
+              --all-targets -- -D warnings
+            cargo test --lib --no-default-features --features "$feats"
+            echo "::endgroup::"
+          done
           if cargo tree -e normal --no-default-features --features fat,exfat,littlefs \
                --target thumbv7em-none-eabihf --prefix none | grep -Ew 'getrandom|libc|std'; then
             echo "::error::an OS dependency leaked into the no_std core"; exit 1
           fi
 
       # And a real firmware image: the standalone example crate links the
-      # FAT core for a Cortex-M4F with its own allocator, panic handler and
-      # linker script. Its size is printed so a regression is visible in
-      # the log (see examples/embedded-cortex-m/README.md for the baseline).
+      # FAT and littlefs cores for a Cortex-M4F with their own panic handler
+      # and linker script. Each size is printed so a regression is visible
+      # in the log (see examples/embedded-cortex-m/README.md for the
+      # baselines).
       - name: no_std example links (Cortex-M4F)
         run: |
           set -euo pipefail
@@ -220,6 +227,17 @@ jobs:
           text=$("$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-size "$heapless" | awk 'NR==2 {print $1}')
           if [ "$text" -lt 8000 ]; then
             echo "::error::the heapless example linked to only $text bytes of .text"; exit 1
+          fi
+          # The same proof for littlefs: `littlefs` without `alloc`, on a
+          # RAM-backed flash, again with no `#[global_allocator]` in sight.
+          (cd examples/embedded-cortex-m && \
+             RUSTFLAGS="-D warnings -C link-arg=-Tlink.x -C link-arg=--nmagic" \
+             cargo build --release --no-default-features --features heapless-littlefs)
+          lfs=examples/embedded-cortex-m/target/thumbv7em-none-eabihf/release/fstool-embedded-littlefs
+          "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-size "$lfs"
+          text=$("$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-size "$lfs" | awk 'NR==2 {print $1}')
+          if [ "$text" -lt 8000 ]; then
+            echo "::error::the littlefs example linked to only $text bytes of .text"; exit 1
           fi
 
   # macOS proves the lib + CLI compile and unit-test cleanly on a

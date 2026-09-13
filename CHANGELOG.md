@@ -7,6 +7,154 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(crc)* `crc::crc32_small` / `crc32_small_append`: the same CRC-32 as
+  `crc32`, computed bit by bit with no lookup tables. The table-driven one
+  folds eight bytes at a time through 8 KiB of tables, which is the right
+  trade for a filesystem's worth of data and the wrong one for the 92 bytes of
+  a GPT header — linking it into the Cortex-M example cost 8.3 KB of flash for
+  that one check.
+- *(device)* `device::gpt`: an allocation-free reader for the EFI GUID
+  Partition Table, which is what anything above 2 TB uses, what every UEFI
+  machine boots from, and what a card that has been through a PC often
+  carries. It verifies the header's CRC-32 and falls back to the backup header
+  at the end of the medium when the primary fails it — the reason the format
+  keeps two — decodes entries one at a time through a sector of the caller's
+  scratch, and needs neither an allocator nor 512-byte sectors (the hosted
+  `part::Gpt` requires those; this reader takes the entry array's position
+  from the header). Type GUIDs for the partitions a FAT-family volume lives
+  in are named, and `Partition::name_from` reads a label into a caller's
+  buffer.
+
+  `fs::fat`'s and `fs::exfat`'s `mount_auto` / `probe` now consult it: a GPT
+  is tried before the MBR, since a GPT medium carries a protective MBR whose
+  one entry describes the table rather than a volume — which `device::mbr`
+  now skips as well. Validated against tables `sgdisk` writes, against the
+  crate's own `part::Gpt` writer, and by a `device_tables` fuzz target that
+  feeds both readers arbitrary bytes (it found an overflow in the sector count
+  of an entry naming the whole 64-bit range within minutes of being written).
+- *(exfat)* an allocation-free exFAT driver, in `fs::exfat` beside the
+  hosted one — the filesystem an SDXC card arrives formatted with, so the
+  one an embedded card reader most needs. It needs no heap at all: the FAT
+  and the allocation bitmap are read and written a sector at a time through
+  a single-sector write-back cache, and the up-case table is consulted on
+  the card rather than held in memory (its ASCII range, which covers almost
+  every comparison, is read once at mount). It is the *same* `SectorDriver`
+  trait `fs::fat`'s driver uses, so one implementation over an SD/eMMC
+  driver mounts either filesystem — and `Volume::probe` says which a card
+  holds without consuming it. Mounts whole cards or MBR partitions, reads,
+  writes, appends, truncates, creates and removes files and directories,
+  lists them, honours `NoFatChain` runs on read and converts one when it
+  grows, and compares UTF-16 names case-insensitively through the volume's
+  own table.
+
+  Validated against exfatprogs both directions: volumes the driver
+  populates pass `fsck.exfat`, and a volume `mkfs.exfat` created — standard
+  compressed up-case table and all — is read, extended and still clean
+  afterwards, including after the hosted half and the driver take turns
+  writing to it. The `examples/embedded-cortex-m` heapless binary links it
+  for a Cortex-M4F with no `#[global_allocator]` at all.
+- *(exfat)* `Volume::upcase_cache_bytes`: with `alloc`, the up-case table is
+  decoded into memory on first need instead of being walked on the card for
+  every non-ASCII comparison. Pure optimisation — the same calls, the same
+  answers, far fewer reads.
+
+### Changed
+
+- **breaking** *(device)* the traits a storage driver implements moved out of
+  the filesystems and into `fstool::device`, which is where they belong: one
+  of them serves two filesystems, and none of them knows or cares which
+  filesystem is above it. `device::SectorDriver` (cards) is what `fs::fat`
+  and `fs::exfat` are written against; `device::FlashDriver` (raw flash) is
+  what `fs::littlefs` is. Those two traits are the whole contract a consumer
+  implements, so nothing else shares the namespace: the partition table a
+  driver *reports* is data, and lives in `device::mbr` as
+  `mbr::Partition` + `mbr::parse`. The module allocates nothing and is
+  compiled in every configuration.
+
+  `fs::fat::SectorDriver` and `fs::fat::MbrPartition` shipped in 0.4.30 and
+  still resolve. `MbrPartition` is a deprecated alias for
+  `device::mbr::Partition`, so a build using it says so; `SectorDriver` is a
+  re-export, and rustc ignores `#[deprecated]` on those, so that one carries
+  the notice in its documentation only. Implementations of either trait need
+  no change — only the import, and only if you want the canonical path.
+  `block` re-exports both traits beside its own `SectorIo`, so a hosted
+  reader still finds the whole storage layer in one place. The exFAT and
+  littlefs drivers, which are new in this release, publish no mirrors at all.
+
+  This also ends `fs::exfat` reaching into `fs::fat`'s private `volume::boot`
+  module for MBR parsing, which is what made the sharing visible in the first
+  place — there is now one MBR decoder in the crate's allocator-free layer
+  instead of a copy behind a filesystem.
+- *(features)* `exfat` no longer implies `alloc`. On its own it is now the
+  allocation-free driver, so `default-features = false, features = ["exfat"]`
+  builds for a target with no heap; with `alloc` (any `std` or default
+  build) it additionally compiles the hosted `Exfat` exactly as before. It
+  still implies `fat`, whose `SectorDriver` it shares. No hosted build
+  changes.
+
+### Fixed
+
+- *(fat)* `Volume::unmount` leaked the in-memory allocation table — up to
+  megabytes on a large card. Handing the device back means moving it out of
+  a type that implements `Drop`, which only `ManuallyDrop` allows, and that
+  suppresses the drop glue of *every* field rather than just the device's.
+  The cache is now released explicitly, and an exhaustive field pattern next
+  to it stops compiling if a future field that owns memory is added without
+  a decision being made about it. `tests/driver_no_leak.rs` — a test binary
+  with its own counting allocator — watches all three drivers for it.
+- *(test)* the exFAT conformance tests took `fsck.exfat`'s exit status as
+  the verdict, but with `-n` it answers "no" to every repair prompt and
+  exits 0 even after printing `ERROR:` — so a volume it complained about
+  passed. They now hold it to its report.
+
+### Added
+
+- *(littlefs)* an allocation-free littlefs driver, in `fs::littlefs`
+  beside the hosted one. It needs no heap at all: one block of scratch RAM
+  holds the metadata pair being worked on, a commit is programmed out
+  through a staging buffer the size of one flash page, and block
+  allocation traverses the filesystem into a fixed 256-block lookahead
+  window, exactly as the C implementation does. `FlashDriver` is the trait
+  you implement over your flash — read, program, erase, sync, mirroring
+  littlefs's own `lfs_config` — and the driver mounts, formats, reads,
+  writes, appends, truncates, creates and removes files and directories,
+  lists them, and reads and writes littlefs user attributes. Metadata
+  pairs are read by walking their tag log rather than replaying it into
+  owned entries, so a log full of overrides and splices — what a stock
+  littlefs writes constantly — is read without materialising anything.
+
+  Validated both directions against the reference C implementation through
+  `littlefs-python`: images the driver writes mount there and agree block
+  for block on which blocks are live, images it wrote read back
+  identically, and a volume written by the driver, then by littlefs, then
+  by the driver again stays consistent. The new
+  `examples/embedded-cortex-m` binary links it for a Cortex-M4F with no
+  `#[global_allocator]` at all — a compile-time proof CI runs on every
+  push — in ~28 KB of flash, with a footprint that does not grow with the
+  size of the flash.
+- *(littlefs)* `Volume` keeps an exact in-use bitmap of the whole volume
+  when `alloc` is on, so allocation stops re-traversing the filesystem
+  every time its lookahead window runs dry.
+  `Volume::alloc_cache_bytes` reports how much is held (always 0 without a
+  heap). Pure optimisation: same calls, same answers, far fewer reads.
+
+### Changed
+
+- *(features)* `littlefs` no longer implies `alloc`. On its own it is now
+  the allocation-free driver, so `default-features = false, features =
+  ["littlefs"]` builds for a target with no heap; with `alloc` (any `std`
+  or default build) it additionally compiles the hosted `LittleFs` exactly
+  as before. No hosted build changes.
+
+### Fixed
+
+- *(littlefs)* mounting no longer trusts a fixed offset in block 0 for the
+  superblock: the driver reads it through the metadata *pair*, so a volume
+  whose live half of `{0, 1}` was scribbled over still mounts from the
+  other half, which is the guarantee a pair exists to make.
+
 ## [0.4.30](https://github.com/KarpelesLab/fstool/compare/v0.4.29...v0.4.30) - 2026-09-12
 
 ### Fixed

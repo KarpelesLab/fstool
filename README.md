@@ -631,8 +631,8 @@ none of the other 130 000 lines.
 | Feature | Backend | Notes |
 |---------|---------|-------|
 | `fat` | FAT12 / FAT16 / FAT32 | needs neither `std` nor `alloc`: on its own it is the heapless driver ([below](#no-allocator-at-all)), and `alloc` adds the hosted one beside it |
-| `exfat` | exFAT | `no_std`-clean; implies `fat` (shared allocation-table code) |
-| `littlefs` | littlefs 2.0 / 2.1 | `no_std`-clean |
+| `exfat` | exFAT | needs neither `std` nor `alloc`: on its own it is the heapless driver ([below](#no-allocator-at-all)), and `alloc` adds the hosted one beside it. Implies `fat`, whose `SectorDriver` it shares |
+| `littlefs` | littlefs 2.0 / 2.1 | needs neither `std` nor `alloc`: on its own it is the heapless flash driver ([below](#no-allocator-at-all)), and `alloc` adds the hosted one beside it |
 | `ext` | ext2 / ext3 / ext4 | |
 | `xfs`, `ntfs`, `f2fs`, `affs`, `iso9660`, `squashfs` | as named | |
 | `hfs`, `hfs-plus` | classic HFS, HFS+ / HFSX | |
@@ -645,7 +645,7 @@ none of the other 130 000 lines.
 | `luks` | LUKS1 / LUKS2 | pulls `purecrypto`; implies `json` (LUKS2 metadata is JSON) |
 
 Every feature in the table except the three `no_std` ones implies
-`std`, and every one except `fat` implies `alloc`. The dispatch layers (`inspect`, `repack`, the TOML spec,
+`std`, and every one except `fat`, `exfat` and `littlefs` implies `alloc`. The dispatch layers (`inspect`, `repack`, the TOML spec,
 `memconv`, the CLI) are gated per backend as well: a format that was
 compiled out is still *recognised* by its magic and refused with an error
 naming the feature to enable, never mistaken for an unknown image. The
@@ -694,6 +694,13 @@ flags. CI asserts the library-only resolve contains neither `clap` nor
 Turn the `std` feature off and fstool is `#![no_std]` (with `alloc`).
 What remains is the core an SD-card or flash reader needs:
 
+- [`device`](src/device/mod.rs) — `SectorDriver` for cards and `FlashDriver`
+  for raw flash: the two traits a driver implements, and the whole contract
+  between your hardware and the filesystems. Beside them,
+  [`device::mbr`](src/device/mbr.rs) decodes the partition table that says
+  where on a card a volume starts. The layer allocates nothing and is
+  compiled in every configuration, which is why the allocator-free
+  filesystems are written against it;
 - the [`BlockDevice`](src/block/mod.rs) trait, with the in-memory
   [`MemoryBackend`](src/block/memory.rs), the partition view
   [`SlicedBackend`](src/block/sliced.rs), and
@@ -703,7 +710,9 @@ What remains is the core an SD-card or flash reader needs:
 - MBR, GPT and APM partition tables ([`part`](src/part/mod.rs));
 - the [`Filesystem`](src/fs/mod.rs) trait and the three formats that
   carry no host dependency: **FAT12/16/32**, **exFAT** and **littlefs**,
-  each with format, create, list, read, in-place edit and remove;
+  each with format, create, list, read, in-place edit and remove — and for
+  each of them, a second driver that needs no heap at all
+  ([below](#no-allocator-at-all));
 - `fstool::io` and `fstool::path`, which are `std::io` / `std::path` on a
   hosted build and small equivalents (same names, same semantics) without
   one, so a driver implements the `Read` / `Write` / `Seek` it already
@@ -766,37 +775,49 @@ of the core run in the `no_std` configuration too
 The core above still wants a heap, because the hosted `Filesystem` API
 hands back `Vec`s and `String`s. Underneath it is a floor with no heap at
 all: `alloc` is itself a (default) feature, and turning it off removes the
-layers that need one. What is left today is the FAT driver, at the same
-path it always had:
+layers that need one. What is left is the three drivers a device with
+storage actually needs — **FAT** and **exFAT** for memory cards, and
+**littlefs** for raw flash — each at the same path it always had:
 
 ```toml
 [dependencies]
-fstool = { version = "0.4", default-features = false, features = ["fat"] }
+fstool = { version = "0.4", default-features = false,
+           features = ["fat", "exfat", "littlefs"] }
 ```
 
-That is the *same* `fat` feature a hosted build uses, and
-`fstool::fs::fat` is the same module — FAT needs no allocator, so it does
-not ask for one. `alloc` is purely additive here: it brings the hosted
-[`Fat32`] (the `Filesystem` implementation that `inspect`, `repack`, the
-spec engine and the CLI dispatch through) and it makes the driver below
-*faster* by keeping the allocation table in memory instead of reading a
-sector per lookup. Not one call or type changes shape. (Every other
-backend still requires `alloc` today and says so in its feature.) With
-`alloc` off nothing that can allocate is compiled, so the crate links on
-a target with no `#[global_allocator]` — a guarantee CI checks by linking
-exactly such a binary on every push. Every buffer is a fixed array
-or comes from the caller; the FAT is read a sector at a time from the
-device, so mounting a 32 GB card costs one sector of RAM rather than the
-four megabytes its table would occupy. It reads *and writes*: create,
-remove, append, extend, truncate, subdirectories, long names, and volumes
-inside MBR partitions.
+Those are the *same* features a hosted build uses, and `fstool::fs::fat` /
+`fstool::fs::exfat` / `fstool::fs::littlefs` are the same modules — none of
+the three formats needs an allocator, so none of them asks for one. `alloc`
+is purely additive here: it brings the hosted [`Fat32`], [`Exfat`] and
+[`LittleFs`] (the `Filesystem` implementations that `inspect`, `repack`,
+the spec engine and the CLI dispatch through) and it makes the drivers
+below *faster* — FAT keeps the allocation table in memory instead of
+reading a sector per lookup, exFAT keeps the up-case table decoded instead
+of walking it on the card, littlefs keeps an exact in-use bitmap of the
+volume instead of re-traversing the filesystem when its lookahead window
+runs dry. Not one call or type changes shape. (Every other backend still
+requires `alloc` today and says so in its feature.) With `alloc` off
+nothing that can allocate is compiled, so the crate links on a target with
+no `#[global_allocator]` — a guarantee CI checks by linking exactly such
+binaries on every push. Every buffer is a fixed array or comes from the
+caller: the FAT and the allocation bitmap are read a sector at a time from
+the card, so mounting a 256 GB exFAT card costs one sector of RAM rather
+than the megabytes its tables occupy, and littlefs works out of one block
+of scratch plus a staging buffer the size of a program page. All three read
+*and write*: create, remove, append, extend, truncate and subdirectories,
+plus long names and MBR partitions on FAT and exFAT, UTF-16 names compared
+through the volume's own up-case table on exFAT, and format, user
+attributes and inline small files on littlefs.
 
-The driver carries its own `SectorDriver` trait (the hosted `SectorIo`
-returns a `crate::Error`, which owns a `String`) and its own error type,
-generic over your driver's:
+The driver is written against [`device::SectorDriver`](src/device/mod.rs) — the
+storage layer below the filesystems, shared with the exFAT driver, so one
+implementation over your card serves both. (The hosted `SectorIo` returns a
+`crate::Error`, which owns a `String`; this one carries your driver's error
+type.) Its own error type is generic over that:
 
 ```rust
-use fstool::fs::fat::{SectorDriver, Volume};
+use fstool::device::SectorDriver;
+use fstool::fs::fat::Volume;
 
 struct SdCard { /* your driver */ }
 
@@ -831,6 +852,89 @@ identical program keeps the allocation table resident instead
 (`Volume::fat_cache_bytes` reports how much), trading RAM for transfers
 without a line of it changing. `examples/embedded-cortex-m` builds the
 same demo against each half.
+
+exFAT is the same driver shape over the same
+[`device::SectorDriver`](src/device/mod.rs) — which is the point, because a card
+reader does not know in advance which of the two it has been handed:
+
+```rust
+use fstool::fs::exfat::{Error, Volume as Exfat};
+use fstool::fs::fat::Volume as Fat;
+
+fn open_a_card(mut card: SdCard) -> Result<(), Error<MyDriverError>> {
+    // SDXC cards arrive formatted exFAT, SDHC ones FAT32. `probe` answers
+    // which — by reading the boot sector, not by trusting a partition type
+    // byte — and hands the card back either way.
+    if let Some(lba) = Exfat::<_, 512>::probe(&mut card)? {
+        let mut vol = Exfat::<_, 512>::mount_at(card, lba)?;
+        let mut photo = vol.open_file("/DCIM/100MSDCF/DSC00001.JPG")?;
+        let mut buf = [0u8; 512];
+        let _ = photo.read(&mut vol, &mut buf)?;
+    } else if let Ok(mut vol) = Fat::<_, 512>::mount_auto(card) {
+        let _ = vol.free_clusters();
+    }
+    Ok(())
+}
+```
+
+`mount_auto` finds the volume wherever it is: the whole card if sector 0 is a
+boot sector, otherwise the first partition that mounts — read out of a GPT if
+the card carries one (the header's CRC checked, the backup at the end used if
+the primary fails it), or out of the MBR if not. Its footprint is the same one
+sector of scratch, whatever the size of the card: the FAT, the allocation bitmap and the up-case table are all read
+from the card as they are needed. A directory lookup compares UTF-16 names
+through the volume's *own* up-case table, so a card formatted by a camera
+behaves the way that camera expects; the ASCII range of that table is read
+once at mount, which covers almost every name, and `alloc` decodes the rest
+into memory when it is there (`Volume::upcase_cache_bytes` reports how
+much). What the driver writes is checked by `fsck.exfat` from exfatprogs in
+CI, in both directions: volumes `mkfs.exfat` created that the driver then
+extends, and volumes the driver populated from scratch.
+
+littlefs has the same shape one layer down, over `device::FlashDriver` — the
+erase/program/read triple raw flash actually offers, rather than a sector
+device:
+
+```rust
+use fstool::device::FlashDriver;
+use fstool::fs::littlefs::Volume;
+
+struct Nor { /* your QSPI driver */ }
+
+impl FlashDriver for Nor {
+    type Error = MyDriverError;
+    fn block_size(&self) -> u32 { 4096 }      // the erase block
+    fn block_count(&self) -> u32 { 512 }      // 2 MiB of flash
+    fn prog_size(&self) -> u32 { 256 }        // the page
+    fn read(&mut self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), MyDriverError> { todo!() }
+    fn prog(&mut self, block: u32, off: u32, data: &[u8]) -> Result<(), MyDriverError> { todo!() }
+    fn erase(&mut self, block: u32) -> Result<(), MyDriverError> { todo!() }
+}
+
+fn log_boot(flash: Nor) -> Result<(), fstool::fs::littlefs::Error<MyDriverError>> {
+    // `format` lays a fresh volume down; `mount` takes an existing one.
+    let mut vol = Volume::<_, 4096, 256>::mount(flash)?;
+
+    let mut log = vol.open_or_create_file("/boot.log")?;
+    log.seek_to_end(&mut vol);
+    log.write_all(&mut vol, b"booted\n")?;
+
+    // littlefs keeps no timestamps, so a program that wants one puts it in
+    // a user attribute — the same ones the hosted half surfaces as
+    // `user.littlefs.<type>` xattrs.
+    vol.set_attr("/boot.log", 1, &0u32.to_le_bytes())
+}
+```
+
+That program links to **~28 KB of flash** and holds one block of scratch
+(4 KiB here) plus a 256-byte staging buffer and a 32-byte allocation
+window — the driver's entire footprint, whatever the size of the flash.
+The const parameters are those two buffers: `Volume::<_, 4096, 256>` is a
+4 KiB erase block with 256-byte pages. Every metadata change is a real
+littlefs commit, and both directions of the round trip are validated
+against the reference C implementation through `littlefs-python` — images
+the driver writes mount there, images it writes read back identically, and
+the two agree block for block on which blocks are live.
 
 ## Compression
 

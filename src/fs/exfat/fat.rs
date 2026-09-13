@@ -20,37 +20,15 @@ use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
 
-/// Free cluster.
-pub const FREE: u32 = 0x0000_0000;
+// The sentinels and the classifier live in `super::layout`, shared with
+// the allocator-free driver.
 /// Bad-cluster marker.
-pub const BAD: u32 = 0xFFFF_FFF7;
+pub use super::layout::FAT_BAD as BAD;
 /// End-of-chain marker.
-pub const EOC: u32 = 0xFFFF_FFFF;
-
-/// Classification of one FAT entry's value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FatEntry {
-    Free,
-    Bad,
-    Eoc,
-    /// The next cluster in this chain.
-    Next(u32),
-}
-
-/// Classify a raw 32-bit FAT entry value.
-pub fn classify(value: u32) -> FatEntry {
-    match value {
-        FREE => FatEntry::Free,
-        BAD => FatEntry::Bad,
-        EOC => FatEntry::Eoc,
-        // Anything in 0xFFFFFFF8..=0xFFFFFFFE is reserved per the spec but
-        // commonly treated as "end of chain" by implementations. Per the
-        // Microsoft spec only 0xFFFFFFFF is EOC; we honour that strictly
-        // and treat the reserved values as Next() to surface broken
-        // images rather than silently following them.
-        n => FatEntry::Next(n),
-    }
-}
+pub use super::layout::FAT_EOC as EOC;
+/// Free cluster.
+pub use super::layout::FAT_FREE as FREE;
+pub use super::layout::{FatEntry, classify};
 
 /// An in-memory copy of (the part of) the FAT we need to walk chains.
 ///

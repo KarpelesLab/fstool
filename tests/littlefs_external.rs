@@ -567,3 +567,334 @@ fn we_can_keep_writing_to_reference_images() {
         "{out}"
     );
 }
+
+// ---------------------------------------------------------------------
+// The allocator-free driver, against the same reference implementation.
+//
+// `fs::littlefs::Volume` shares no code with the hosted half above, so it
+// earns its own round trips: images it writes have to mount in the C
+// implementation, images the C implementation writes have to read back
+// identically, and littlefs has to be able to keep writing to what it
+// produced.
+// ---------------------------------------------------------------------
+
+use std::os::unix::fs::FileExt;
+
+use fstool::device::FlashDriver;
+use fstool::fs::littlefs::Volume;
+
+/// A [`FlashDriver`] over an image file: the erase / program / read triple
+/// an embedded consumer implements against its flash, backed by a file so
+/// the reference implementation can be pointed at the result.
+struct FileFlash {
+    file: std::fs::File,
+    block_size: u32,
+    prog_size: u32,
+    blocks: u32,
+}
+
+impl FileFlash {
+    fn create(path: &Path, blocks: u32, block_size: u32, prog_size: u32) -> Self {
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .unwrap();
+        file.set_len((blocks as u64) * block_size as u64).unwrap();
+        // Flash reads as 0xff before anything is written to it.
+        let erased = vec![0xffu8; block_size as usize];
+        for b in 0..blocks {
+            file.write_all_at(&erased, b as u64 * block_size as u64)
+                .unwrap();
+        }
+        Self {
+            file,
+            block_size,
+            prog_size,
+            blocks,
+        }
+    }
+
+    /// Open an existing image, taking its geometry from its own superblock.
+    fn open(path: &Path, prog_size: u32) -> Self {
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let mut head = [0u8; 32];
+        file.read_exact_at(&mut head, 0).unwrap();
+        assert_eq!(&head[8..16], b"littlefs", "not a littlefs image");
+        let block_size = u32::from_le_bytes(head[24..28].try_into().unwrap());
+        let blocks = u32::from_le_bytes(head[28..32].try_into().unwrap());
+        Self {
+            file,
+            block_size,
+            prog_size,
+            blocks,
+        }
+    }
+}
+
+impl FlashDriver for FileFlash {
+    type Error = std::io::Error;
+
+    fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    fn block_count(&self) -> u32 {
+        self.blocks
+    }
+
+    fn prog_size(&self) -> u32 {
+        self.prog_size
+    }
+
+    fn read(&mut self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), Self::Error> {
+        self.file
+            .read_exact_at(buf, block as u64 * self.block_size as u64 + off as u64)
+    }
+
+    fn prog(&mut self, block: u32, off: u32, data: &[u8]) -> Result<(), Self::Error> {
+        self.file
+            .write_all_at(data, block as u64 * self.block_size as u64 + off as u64)
+    }
+
+    fn erase(&mut self, block: u32) -> Result<(), Self::Error> {
+        let erased = vec![0xffu8; self.block_size as usize];
+        self.file
+            .write_all_at(&erased, block as u64 * self.block_size as u64)
+    }
+}
+
+/// Read a whole file through the driver.
+fn driver_slurp<const B: usize, const P: usize>(
+    vol: &mut Volume<FileFlash, B, P>,
+    path: &str,
+) -> Vec<u8> {
+    let mut f = vol.open_file(path).unwrap();
+    let mut out = vec![0u8; f.len() as usize];
+    f.read_exact(vol, &mut out).unwrap();
+    out
+}
+
+/// The driver's view of a volume, in the helper script's manifest format.
+fn driver_manifest<const B: usize, const P: usize>(
+    vol: &mut Volume<FileFlash, B, P>,
+) -> Vec<String> {
+    fn walk<const B: usize, const P: usize>(
+        vol: &mut Volume<FileFlash, B, P>,
+        dir: &str,
+        out: &mut Vec<String>,
+    ) {
+        let handle = vol
+            .open_dir(if dir.is_empty() { "/" } else { dir })
+            .unwrap();
+        // The listing has to be collected before recursing: entries borrow
+        // the volume's scratch buffer.
+        let mut kids: Vec<(String, bool)> = Vec::new();
+        let mut it = vol.iter_dir(handle);
+        while let Some(e) = it.next().unwrap() {
+            kids.push((
+                String::from_utf8(e.name().to_vec()).expect("name is not UTF-8"),
+                e.is_dir(),
+            ));
+        }
+        kids.sort();
+        for (name, is_dir) in kids {
+            let child = format!("{dir}/{name}");
+            if is_dir {
+                out.push(format!("d {child}"));
+                walk(vol, &child, out);
+            } else {
+                let body = driver_slurp(vol, &child);
+                out.push(format!("f {child} {} {}", body.len(), fnv(&body)));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(vol, "", &mut out);
+    out.sort();
+    out
+}
+
+/// The same tree [`build_reference_tree`] builds, written through the
+/// allocator-free driver instead.
+fn build_driver_tree<const B: usize, const P: usize>(vol: &mut Volume<FileFlash, B, P>) {
+    let put = |vol: &mut Volume<FileFlash, B, P>, path: &str, body: &[u8]| {
+        let mut f = vol.create_file(path).unwrap();
+        f.write_all(vol, body).unwrap();
+    };
+    put(vol, "/README", b"written by fstool\n");
+    vol.create_dir("/etc").unwrap();
+    put(vol, "/etc/motd", b"stay curious\n");
+    vol.create_dir("/etc/deep").unwrap();
+    vol.create_dir("/etc/deep/nested").unwrap();
+    put(vol, "/etc/deep/nested/leaf", &pattern(3));
+    // Well past the inline limit: a multi-block CTZ skip-list.
+    put(vol, "/big.bin", &pattern(40_000));
+    // Enough entries to split the directory across metadata pairs.
+    vol.create_dir("/many").unwrap();
+    for i in 0..80 {
+        put(
+            vol,
+            &format!("/many/file{i:03}"),
+            format!("entry number {i}").as_bytes(),
+        );
+    }
+    vol.set_attr("/README", 7, b"attrvalue").unwrap();
+    vol.sync().unwrap();
+}
+
+#[test]
+fn driver_images_mount_in_the_reference_implementation() {
+    let Some(h) = Harness::new() else {
+        eprintln!("skipping: no python with littlefs-python installed");
+        return;
+    };
+    let img = h.image("written-by-the-driver.img");
+    let mut vol = Volume::<_, 4096, 256>::format(FileFlash::create(&img, 1024, 4096, 256)).unwrap();
+    build_driver_tree(&mut vol);
+    let ours = driver_manifest(&mut vol);
+    let our_blocks = vol.used_blocks().unwrap();
+    drop(vol);
+
+    let out = h.run("check", &img);
+    let mut lines = out.lines();
+    let their_blocks: u32 = lines
+        .next()
+        .and_then(|l| l.strip_prefix("used "))
+        .and_then(|n| n.parse().ok())
+        .expect("check prints the block count first");
+    let theirs: Vec<String> = lines.map(|s| s.to_string()).collect();
+    assert_eq!(
+        theirs, ours,
+        "the reference implementation and the no-alloc driver disagree"
+    );
+    // Both sides traverse the volume to decide which blocks are live; if
+    // they disagree, one of them is leaking or about to reuse a live block.
+    assert_eq!(
+        their_blocks, our_blocks,
+        "block accounting differs between the implementations"
+    );
+    assert!(theirs.iter().any(|l| l.starts_with("f /big.bin 40000 ")));
+    assert!(theirs.contains(&"d /etc/deep/nested".to_string()));
+    assert_eq!(
+        theirs.iter().filter(|l| l.starts_with("f /many/")).count(),
+        80
+    );
+}
+
+#[test]
+fn driver_images_at_every_geometry_mount_in_the_reference_implementation() {
+    let Some(h) = Harness::new() else {
+        eprintln!("skipping: no python with littlefs-python installed");
+        return;
+    };
+    // 512-byte blocks split metadata pairs after a handful of entries;
+    // 4 KiB ones with a one-byte program size exercise the padding rules
+    // from the other end.
+    for (blocks, block_size, prog) in [(256u32, 512u32, 128u32), (64, 4096, 1)] {
+        let img = h.image(&format!("driver-{block_size}-{prog}.img"));
+        let mut vol =
+            Volume::<_, 4096, 256>::format(FileFlash::create(&img, blocks, block_size, prog))
+                .unwrap();
+        let mut f = vol.create_file("/payload.bin").unwrap();
+        f.write_all(&mut vol, &pattern(20_000)).unwrap();
+        vol.create_dir("/d").unwrap();
+        for i in 0..24 {
+            let mut f = vol.create_file(&format!("/d/f{i:02}")).unwrap();
+            f.write_all(&mut vol, format!("entry {i}").as_bytes())
+                .unwrap();
+        }
+        let ours = driver_manifest(&mut vol);
+        drop(vol);
+
+        let theirs: Vec<String> = h
+            .run("check", &img)
+            .lines()
+            .skip(1)
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            theirs, ours,
+            "{block_size}-byte blocks with a {prog}-byte program size"
+        );
+    }
+}
+
+#[test]
+fn the_driver_reads_reference_images() {
+    let Some(h) = Harness::new() else {
+        eprintln!("skipping: no python with littlefs-python installed");
+        return;
+    };
+    let img = h.image("driver-reads-littlefs.img");
+    h.run("create", &img);
+    let theirs: Vec<String> = h
+        .run("manifest", &img)
+        .lines()
+        .map(|s| s.to_string())
+        .collect();
+
+    let mut vol = Volume::<_, 4096, 256>::mount(FileFlash::open(&img, 256)).unwrap();
+    assert_eq!(vol.geometry().version_parts(), (2, 1));
+    assert_eq!(driver_manifest(&mut vol), theirs);
+    assert_eq!(
+        driver_slurp(&mut vol, "/greeting.txt"),
+        b"written by littlefs\n"
+    );
+    assert_eq!(driver_slurp(&mut vol, "/data/blob.bin"), pattern(9000));
+    // And the attribute the reference set.
+    let mut buf = [0u8; 16];
+    let n = vol.attr("/greeting.txt", 7, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"attrvalue");
+}
+
+#[test]
+fn the_reference_implementation_can_keep_writing_to_driver_images() {
+    let Some(h) = Harness::new() else {
+        eprintln!("skipping: no python with littlefs-python installed");
+        return;
+    };
+    let img = h.image("driver-handed-over.img");
+    let mut vol = Volume::<_, 4096, 256>::format(FileFlash::create(&img, 1024, 4096, 256)).unwrap();
+    build_driver_tree(&mut vol);
+    drop(vol);
+
+    // littlefs adds, removes and creates a directory in the driver's image.
+    h.run("mutate", &img);
+
+    let mut vol = Volume::<_, 4096, 256>::mount(FileFlash::open(&img, 256)).unwrap();
+    assert_eq!(
+        driver_slurp(&mut vol, "/added-by-lfs.txt"),
+        b"appended by the reference implementation\n"
+    );
+    let payload = driver_slurp(&mut vol, "/lfsdir/payload.bin");
+    assert_eq!(payload.len(), 256 * 40);
+    assert_eq!(&payload[..4], &[0, 1, 2, 3]);
+    assert!(
+        !vol.exists("/README").unwrap(),
+        "its removal is not visible"
+    );
+    assert_eq!(driver_slurp(&mut vol, "/big.bin"), pattern(40_000));
+
+    // And the driver can keep writing after that hand-back — including into
+    // the pairs littlefs appended to, which is what the erased-state rules
+    // decide.
+    let mut f = vol.create_file("/back-to-the-driver.txt").unwrap();
+    f.write_all(&mut vol, b"third writer on this volume\n")
+        .unwrap();
+    let ours = driver_manifest(&mut vol);
+    drop(vol);
+    let theirs: Vec<String> = h
+        .run("check", &img)
+        .lines()
+        .skip(1)
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(theirs, ours, "the volume diverged after three writers");
+}

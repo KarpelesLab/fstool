@@ -4,7 +4,7 @@ name = "fstool-embedded-cortex-m"
 version = "0.0.0"
 edition = "2024"
 publish = false
-description = "Bare-metal smoke test + size probe for fstool's no_std FAT core on a Cortex-M4F"
+description = "Bare-metal smoke test + size probe for fstool's no_std FAT and littlefs cores on a Cortex-M4F"
 
 [dependencies]
 # Which driver is linked is chosen by the features below, so the two
@@ -15,11 +15,16 @@ fstool = { path = "../..", default-features = false }
 default = ["alloc-demo"]
 # The allocator-backed FAT driver (src/main.rs): `fat` plus a heap.
 alloc-demo = ["fstool/fat", "fstool/alloc"]
-# The allocator-free one (src/heapless.rs). Deliberately does NOT enable
+# The allocator-free ones (src/heapless.rs). Deliberately does NOT enable
 # `alloc`: the point of that binary is that nothing in the graph pulls in
 # the `alloc` crate, so the absence of a `#[global_allocator]` is a link
-# error if anything regresses.
-heapless = ["fstool/fat"]
+# error if anything regresses. `exfat` rides along because a card reader has
+# to identify what it is holding — and because linking its driver proves it
+# allocates nothing either.
+heapless = ["fstool/fat", "fstool/exfat"]
+# The same proof for littlefs (src/heapless_littlefs.rs), on flash rather
+# than a card: `littlefs` without `alloc`.
+heapless-littlefs = ["fstool/littlefs"]
 
 [[bin]]
 name = "fstool-embedded-cortex-m"
@@ -30,6 +35,11 @@ required-features = ["alloc-demo"]
 name = "fstool-embedded-heapless"
 path = "src/heapless.rs"
 required-features = ["heapless"]
+
+[[bin]]
+name = "fstool-embedded-littlefs"
+path = "src/heapless_littlefs.rs"
+required-features = ["heapless-littlefs"]
 
 # Size-optimised, the way an MCU firmware is built. `panic = "abort"` is
 # required: there is no unwinder without std.

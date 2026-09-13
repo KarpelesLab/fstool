@@ -1,30 +1,8 @@
 //! CTZ skip-lists — how littlefs stores files too large to inline.
 //!
-//! A file's blocks form a reversed skip-list: block *n* starts with
-//! `ctz(n)+1` pointers, the *x*-th of which points at block *n*-2ˣ, and the
-//! rest of the block is file data. Only the *last* block (the "head") and
-//! the file size are recorded in the metadata, which is enough to reach any
-//! offset in O(log n) reads and — crucially for a copy-on-write filesystem —
-//! means rewriting the file from some offset onward leaves every earlier
-//! block untouched and still correctly pointed at.
-//!
-//! The first eight blocks of a file, with the pointers each one stores:
-//!
-//! ```text
-//!   index   pointers stored at the start of the block
-//!   ----------------------------------------------------
-//!     0     (none — the whole block is data)
-//!     1     → 0
-//!     2     → 1, 0
-//!     3     → 2
-//!     4     → 3, 2, 0
-//!     5     → 4
-//!     6     → 5, 4
-//!     7     → 6
-//! ```
-//!
-//! Reaching index 0 from index 7 is then three hops (7 → 6 → 4 → 0)
-//! rather than seven.
+//! The arithmetic lives in [`super::index`]; this module is the device
+//! I/O built on it: walking a skip-list, traversing one for the allocator,
+//! and writing a file's blocks out.
 
 use crate::io::Read;
 use alloc::format;
@@ -37,40 +15,17 @@ use super::alloc::Alloc;
 use super::mdir::Geom;
 
 /// Number of skip pointers stored at the start of block `index`.
-pub fn pointers(index: u32) -> u32 {
-    if index == 0 {
-        0
-    } else {
-        index.trailing_zeros() + 1
-    }
-}
+pub use super::index::pointers;
 
 /// Bytes of file data block `index` can hold.
 pub fn payload(geom: &Geom, index: u32) -> u32 {
-    geom.block_size - 4 * pointers(index)
+    super::index::payload(geom.block_size, index)
 }
 
-/// `ceil(log2(a))`, littlefs's `lfs_npw2`.
-fn npw2(a: u32) -> u32 {
-    32 - a.wrapping_sub(1).leading_zeros()
-}
-
-/// Map a file offset to `(block index, offset within that block)`. The
-/// in-block offset includes the skip pointers, so it is the byte position to
-/// read from directly.
-///
-/// This is `lfs_ctz_index`: the pointer overhead of the preceding blocks is
-/// a population count, because block *n* carries `ctz(n)+1` pointers and
-/// `Σ ctz(k) = n - popcount(n)`.
+/// Map a file offset to `(block index, offset within that block)` — see
+/// [`super::index::index_of`].
 pub fn index_of(geom: &Geom, off: u32) -> (u32, u32) {
-    let b = geom.block_size - 2 * 4;
-    let i = off / b;
-    if i == 0 {
-        return (0, off);
-    }
-    let i = off.saturating_sub(4 * ((i - 1).count_ones() + 2)) / b;
-    let o = off - b * i - 4 * i.count_ones();
-    (i, o)
+    super::index::index_of(geom.block_size, off)
 }
 
 /// Read one skip pointer out of a block.
@@ -107,11 +62,9 @@ pub fn find(
     // walk costs O(log n) reads rather than O(n). `current` strictly
     // decreases, so a corrupt pointer can't spin here.
     while current > target {
-        let skip = npw2(current - target + 1)
-            .saturating_sub(1)
-            .min(current.trailing_zeros());
+        let (skip, step) = super::index::hop(current, target);
         head = read_pointer(dev, geom, head, skip)?;
-        current -= 1 << skip;
+        current -= step;
     }
     Ok((head, off))
 }
@@ -151,16 +104,10 @@ pub fn traverse(
     }
 }
 
-/// File offset the data in block `index` starts at.
-///
-/// The inverse of [`index_of`]: every earlier block contributes a full
-/// block minus its own skip pointers, and `Σ ctz(k) = n - popcount(n)`
-/// collapses that sum into a population count.
+/// File offset the data in block `index` starts at — see
+/// [`super::index::block_start`].
 pub fn block_start(geom: &Geom, index: u32) -> u32 {
-    if index == 0 {
-        return 0;
-    }
-    index * (geom.block_size - 8) + 8 + 4 * (index - 1).count_ones()
+    super::index::block_start(geom.block_size, index)
 }
 
 /// Where the bytes written into a CTZ block come from.
@@ -242,78 +189,4 @@ pub fn write_blocks(
     }
 
     Ok(prev)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn geom(block_size: u32) -> Geom {
-        Geom {
-            block_size,
-            block_count: 1024,
-            prog_size: 16,
-            fcrc: true,
-        }
-    }
-
-    #[test]
-    fn index_math_agrees_with_block_capacities() {
-        // Walking the file offset by offset must land on exactly the block
-        // sequence the capacities imply — this is the invariant that keeps
-        // reads and writes pointing at the same bytes.
-        let g = geom(256);
-        let mut off = 0u32;
-        for index in 0..40u32 {
-            let cap = payload(&g, index);
-            for within in 0..cap {
-                let (i, o) = index_of(&g, off);
-                assert_eq!(i, index, "offset {off} should be in block {index}");
-                assert_eq!(o, 4 * pointers(index) + within);
-                off += 1;
-            }
-        }
-    }
-
-    #[test]
-    fn first_block_holds_a_whole_block() {
-        let g = geom(4096);
-        assert_eq!(payload(&g, 0), 4096);
-        assert_eq!(index_of(&g, 0), (0, 0));
-        assert_eq!(index_of(&g, 4095), (0, 4095));
-        // Block 1 carries one pointer, so its data starts at byte 4.
-        assert_eq!(index_of(&g, 4096), (1, 4));
-    }
-
-    #[test]
-    fn block_start_inverts_index_of() {
-        let g = geom(512);
-        for index in 0..64u32 {
-            let start = block_start(&g, index);
-            assert_eq!(index_of(&g, start), (index, 4 * pointers(index)));
-            if index > 0 {
-                // The byte before is the last of the previous block.
-                assert_eq!(index_of(&g, start - 1).0, index - 1);
-            }
-        }
-    }
-
-    #[test]
-    fn pointer_counts_follow_ctz() {
-        assert_eq!(pointers(0), 0);
-        assert_eq!(pointers(1), 1);
-        assert_eq!(pointers(2), 2);
-        assert_eq!(pointers(3), 1);
-        assert_eq!(pointers(4), 3);
-        assert_eq!(pointers(8), 4);
-    }
-
-    #[test]
-    fn npw2_matches_ceil_log2() {
-        assert_eq!(npw2(1), 0);
-        assert_eq!(npw2(2), 1);
-        assert_eq!(npw2(3), 2);
-        assert_eq!(npw2(4), 2);
-        assert_eq!(npw2(5), 3);
-    }
 }

@@ -12,13 +12,21 @@
 //! is right here, since the no-alloc driver reads and writes volumes but
 //! does not create them), then mounts it, writes a file, lists the root
 //! and reads the file back.
+//!
+//! It also asks the exFAT driver whether the same card holds an exFAT
+//! volume — which it does not — because that is what a card reader does
+//! with a card it has just been handed, and because linking that driver is
+//! the same compile-time proof for `exfat` as the rest of this program is
+//! for `fat`. Both speak the one `SectorDriver` implemented below.
 
 #![no_std]
 #![no_main]
 
 use core::ptr;
 
-use fstool::fs::fat::{FatKind, SectorDriver, Volume};
+use fstool::fs::exfat::Volume as ExfatVolume;
+use fstool::device::SectorDriver;
+use fstool::fs::fat::{FatKind, Volume};
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -129,6 +137,15 @@ pub extern "C" fn reset() -> ! {
     // SAFETY: single-threaded, and the reference is dropped before the
     // driver starts using the buffer.
     format_fat12(unsafe { &mut *ptr::addr_of_mut!(CARD) });
+
+    // Which filesystem is on the card? exFAT first, as a reader would:
+    // an SDXC card arrives formatted exFAT, an SDHC one FAT32. This card
+    // is FAT12, so the exFAT probe declines it — the point is that the
+    // driver linked at all, with no allocator in the program.
+    sink(match ExfatVolume::<_, 512>::mount_auto(RamCard) {
+        Ok(_) => 1,
+        Err(_) => 0,
+    });
 
     let mut vol = match Volume::<_, 512>::mount(RamCard) {
         Ok(v) => v,

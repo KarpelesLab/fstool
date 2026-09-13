@@ -1,9 +1,17 @@
-//! Block-device abstraction — the bottom layer of the fstool stack.
+//! Block-device abstraction — the bottom layer of the hosted fstool stack.
 //!
 //! A [`BlockDevice`] is a seekable byte-addressable store. Every higher layer
 //! (partition table, filesystem) reads and writes through this trait, which
 //! makes it trivial to substitute an on-disk file with an in-memory buffer in
 //! tests or with a sub-range view when carving partitions.
+//!
+//! Underneath it is [`crate::device`], whose [`SectorDriver`] and
+//! [`FlashDriver`] are what a *driver* implements — they allocate nothing, so
+//! the allocator-free filesystems are written against them, and they are
+//! re-exported here. Implement [`SectorIo`] when you want a byte-addressed
+//! device for the hosted filesystems; implement [`SectorDriver`] or
+//! [`FlashDriver`] when you want `fs::fat`, `fs::exfat` or `fs::littlefs`
+//! with no heap.
 //!
 //! ## Invariants
 //!
@@ -62,6 +70,15 @@ pub use memory::MemoryBackend;
 pub use qcow2::Qcow2Backend;
 pub use sector::{SectorDevice, SectorIo};
 pub use sliced::SlicedBackend;
+
+// The traits a *driver* implements live one layer down, in `crate::device`,
+// because the allocator-free filesystems are written against them and this
+// module needs a heap. They are re-exported here so that both halves of the
+// storage layer are visible in one place: implement [`SectorIo`] to get a
+// byte-addressed [`BlockDevice`] for the hosted filesystems, or
+// [`SectorDriver`] / [`FlashDriver`] to drive `fs::fat`, `fs::exfat` and
+// `fs::littlefs` with no allocator at all.
+pub use crate::device::{FlashDriver, SectorDriver};
 
 /// The host-side entry points: opening and creating images by path.
 /// Everything here needs a filesystem to open files on, so the whole

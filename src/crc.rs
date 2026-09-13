@@ -131,6 +131,34 @@ pub fn crc32_append(crc: u32, data: &[u8]) -> u32 {
     !fold(&IEEE, !crc, data)
 }
 
+/// [`crc32`], computed without the tables — bit by bit, from nothing but the
+/// polynomial.
+///
+/// The value is identical; what differs is what it costs to have. [`crc32`]
+/// folds eight bytes at a time through an 8 KiB table, which is the right
+/// trade for a filesystem's worth of data and the wrong one for the 92 bytes
+/// of a GPT header on a microcontroller with 128 KiB of flash to its name.
+/// So the allocator-free partition readers use this, and nothing that touches
+/// bulk data should.
+pub fn crc32_small(data: &[u8]) -> u32 {
+    crc32_small_append(0, data)
+}
+
+/// Continue a [`crc32_small`] from the value a previous call returned, so
+/// `crc32_small_append(crc32_small(a), b) == crc32_small(a ++ b)` — and both
+/// agree with [`crc32`] over the same bytes.
+pub fn crc32_small_append(crc: u32, data: &[u8]) -> u32 {
+    let mut s = !crc;
+    for &b in data {
+        s ^= b as u32;
+        for _ in 0..8 {
+            // The reflected IEEE polynomial, one bit at a time.
+            s = (s >> 1) ^ (0xEDB8_8320 & (!(s & 1)).wrapping_add(1));
+        }
+    }
+    !s
+}
+
 /// Raw reflected-IEEE CRC-32: no seeding and no final XOR, so the
 /// returned value *is* the internal state and feeds straight back in.
 ///
@@ -145,6 +173,30 @@ pub fn crc32_ieee_raw(state: u32, data: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_table_free_crc32_agrees_with_the_table_driven_one() {
+        // Same value, different cost: one folds eight bytes at a time through
+        // 8 KiB of tables, the other carries no data at all.
+        for len in [0usize, 1, 2, 7, 8, 9, 63, 64, 92, 128, 512, 4096] {
+            let data: alloc::vec::Vec<u8> = (0..len).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+            assert_eq!(
+                super::crc32(&data),
+                super::crc32_small(&data),
+                "length {len}"
+            );
+        }
+        // And appending agrees with both.
+        let a = b"EFI PART";
+        let b = b"the rest of a header";
+        let mut both = alloc::vec::Vec::new();
+        both.extend_from_slice(a);
+        both.extend_from_slice(b);
+        assert_eq!(
+            super::crc32_small_append(super::crc32_small(a), b),
+            super::crc32(&both)
+        );
+    }
+
     use super::*;
     use alloc::vec::Vec;
 

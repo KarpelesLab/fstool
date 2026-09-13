@@ -30,8 +30,16 @@ mod volume;
 // ambiguity inside this module.
 pub use volume::{
     Attributes, Dir, DirEntry, DirIter, Error, FatKind, File, Geometry, MAX_FILE_LEN,
-    MAX_SECTOR_SIZE, MIN_SECTOR_SIZE, MbrPartition, Metadata, SectorDriver, Timestamp, Volume,
+    MAX_SECTOR_SIZE, MIN_SECTOR_SIZE, Metadata, SectorDriver, Timestamp, Volume,
 };
+
+/// Where a volume sits on a partitioned card.
+///
+/// **Deprecated:** the partition table is not FAT's, and this is now
+/// [`device::mbr::Partition`](crate::device::mbr::Partition) — shared with
+/// the exFAT driver, which reads the same table.
+#[deprecated(since = "0.4.31", note = "moved to `fstool::device::mbr::Partition`")]
+pub type MbrPartition = crate::device::mbr::Partition;
 
 // ---------------------------------------------------------------------
 // The hosted half. Everything below needs a heap.

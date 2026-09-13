@@ -40,12 +40,9 @@ use alloc::format;
 /// care about lives in the first 120 bytes).
 pub const BOOT_SECTOR_PARSE_SIZE: usize = 512;
 
-/// Largest legal `ClusterCount` (2^32 - 11), per the exFAT specification.
-/// The eleven excluded values leave room for the two reserved FAT entries
-/// and the end-of-chain / bad-cluster markers, and guarantee that
-/// `cluster_count + 2` — the exclusive end of the data-cluster range —
-/// fits in a `u32`.
-pub const MAX_CLUSTER_COUNT: u32 = u32::MAX - 10;
+/// Largest legal `ClusterCount` (2^32 - 11), per the exFAT specification —
+/// see `super::layout::MAX_CLUSTER_COUNT`.
+pub use super::layout::MAX_CLUSTER_COUNT;
 
 /// Parsed exFAT boot sector. Field names follow the Microsoft spec.
 #[derive(Debug, Clone)]
@@ -105,69 +102,30 @@ impl BootSector {
     }
 
     /// Decode from the first 512 bytes of LBA 0.
+    ///
+    /// The fields and their range checks live in
+    /// `super::layout::Boot`, shared with the allocator-free driver;
+    /// this wraps them in the crate's error type.
     pub fn decode(b: &[u8; BOOT_SECTOR_PARSE_SIZE]) -> crate::Result<Self> {
-        if &b[3..11] != b"EXFAT   " {
-            return Err(crate::Error::InvalidImage(
-                "exfat: missing \"EXFAT   \" signature at offset 3".into(),
-            ));
-        }
-        // MustBeZero (offset 11..64) must be all zeros.
-        if b[11..64].iter().any(|&x| x != 0) {
-            return Err(crate::Error::InvalidImage(
-                "exfat: MustBeZero region is non-zero".into(),
-            ));
-        }
-        if b[510] != 0x55 || b[511] != 0xAA {
-            return Err(crate::Error::InvalidImage(
-                "exfat: missing 0x55AA boot-sector signature".into(),
-            ));
-        }
-        let bytes_per_sector_shift = b[108];
-        let sectors_per_cluster_shift = b[109];
-        if !(9..=12).contains(&bytes_per_sector_shift) {
-            return Err(crate::Error::InvalidImage(format!(
-                "exfat: invalid BytesPerSectorShift {bytes_per_sector_shift} (must be 9..=12)"
-            )));
-        }
-        if (bytes_per_sector_shift as u32 + sectors_per_cluster_shift as u32) > 25 {
-            return Err(crate::Error::InvalidImage(format!(
-                "exfat: BytesPerSectorShift + SectorsPerClusterShift = {} exceeds 25",
-                bytes_per_sector_shift as u32 + sectors_per_cluster_shift as u32
-            )));
-        }
-        let number_of_fats = b[110];
-        if number_of_fats != 1 && number_of_fats != 2 {
-            return Err(crate::Error::InvalidImage(format!(
-                "exfat: NumberOfFats {number_of_fats} (must be 1 or 2)"
-            )));
-        }
-        // ClusterCount is capped at 2^32 - 11 by the spec. Enforcing it
-        // here means `cluster_count + 2` — the exclusive end of the data
-        // range, computed all over this module — can never overflow.
-        let cluster_count = u32::from_le_bytes(b[92..96].try_into().unwrap());
-        if cluster_count > MAX_CLUSTER_COUNT {
-            return Err(crate::Error::InvalidImage(format!(
-                "exfat: ClusterCount {cluster_count} exceeds the maximum {MAX_CLUSTER_COUNT}"
-            )));
-        }
-        let fs_revision = u16::from_le_bytes(b[104..106].try_into().unwrap());
+        let raw = super::layout::Boot::decode(b)
+            .map_err(|e| crate::Error::InvalidImage(format!("exfat: {e}")))?;
         Ok(Self {
-            partition_offset: u64::from_le_bytes(b[64..72].try_into().unwrap()),
-            volume_length: u64::from_le_bytes(b[72..80].try_into().unwrap()),
-            fat_offset: u32::from_le_bytes(b[80..84].try_into().unwrap()),
-            fat_length: u32::from_le_bytes(b[84..88].try_into().unwrap()),
-            cluster_heap_offset: u32::from_le_bytes(b[88..92].try_into().unwrap()),
-            cluster_count,
-            first_cluster_of_root_directory: u32::from_le_bytes(b[96..100].try_into().unwrap()),
-            volume_serial_number: u32::from_le_bytes(b[100..104].try_into().unwrap()),
-            fs_revision_major: (fs_revision >> 8) as u8,
-            fs_revision_minor: (fs_revision & 0xff) as u8,
-            volume_flags: u16::from_le_bytes(b[106..108].try_into().unwrap()),
-            bytes_per_sector_shift,
-            sectors_per_cluster_shift,
-            number_of_fats,
-            drive_select: b[111],
-            percent_in_use: b[112],
+            partition_offset: raw.partition_offset,
+            volume_length: raw.volume_length,
+            fat_offset: raw.fat_offset,
+            fat_length: raw.fat_length,
+            cluster_heap_offset: raw.cluster_heap_offset,
+            cluster_count: raw.cluster_count,
+            first_cluster_of_root_directory: raw.first_cluster_of_root_directory,
+            volume_serial_number: raw.volume_serial_number,
+            fs_revision_major: raw.fs_revision_major,
+            fs_revision_minor: raw.fs_revision_minor,
+            volume_flags: raw.volume_flags,
+            bytes_per_sector_shift: raw.bytes_per_sector_shift,
+            sectors_per_cluster_shift: raw.sectors_per_cluster_shift,
+            number_of_fats: raw.number_of_fats,
+            drive_select: raw.drive_select,
+            percent_in_use: raw.percent_in_use,
         })
     }
 }
