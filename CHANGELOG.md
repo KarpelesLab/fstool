@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.5.0](https://github.com/KarpelesLab/fstool/compare/v0.4.30...v0.5.0) - 2026-09-13
+## [0.4.31](https://github.com/KarpelesLab/fstool/compare/v0.4.30...v0.4.31) - 2026-09-13
 
 ### Added
 
