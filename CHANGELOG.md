@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.32](https://github.com/KarpelesLab/fstool/compare/v0.4.31...v0.4.32) - 2026-09-15
+
+### Added
+
+- *(fs)* one no-alloc interface, a generic mount, formatters and partition writers
+
 ### Added
 
 - *(fat)* `Volume::format` / `format_at`: the allocator-free driver formats.
