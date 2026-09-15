@@ -23,6 +23,8 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use super::StatFs;
+
 #[cfg(feature = "std")]
 pub use super::rootdevs::{DeviceEntry, RootDevs};
 
@@ -340,36 +342,6 @@ pub struct SetAttrs {
     pub atime: Option<u32>,
     pub mtime: Option<u32>,
     pub ctime: Option<u32>,
-}
-
-/// Filesystem-level capacity stats returned by [`Filesystem::statfs`].
-/// All `u64` so backends with huge counts don't overflow. `name_max`
-/// is the longest filename the FS will accept.
-#[derive(Debug, Clone, Copy)]
-pub struct StatFs {
-    pub block_size: u32,
-    pub blocks: u64,
-    pub blocks_free: u64,
-    pub blocks_avail: u64,
-    pub inodes: u64,
-    pub inodes_free: u64,
-    pub name_max: u32,
-}
-
-impl Default for StatFs {
-    fn default() -> Self {
-        // 4 KiB block, no quota, generous name budget — the same
-        // numbers the kernel hands out for tmpfs in a fresh mount.
-        Self {
-            block_size: 4096,
-            blocks: 0,
-            blocks_free: 0,
-            blocks_avail: 0,
-            inodes: 0,
-            inodes_free: 0,
-            name_max: 255,
-        }
-    }
 }
 
 /// A single extended attribute, returned by [`Filesystem::list_xattrs`].

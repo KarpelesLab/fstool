@@ -341,6 +341,31 @@ pub trait Volume: Sized {
     /// structures to find out.
     fn free_bytes(&mut self) -> Result<u64, Self::Error>;
 
+    /// Capacity figures in `statfs` shape — the allocation unit, how many
+    /// there are and how many are free, the longest name — the same struct
+    /// the hosted [`Filesystem::statfs`](crate::fs::Filesystem) answers
+    /// with. Costs what [`free_bytes`](Self::free_bytes) costs.
+    ///
+    /// The FAT, exFAT and littlefs drivers answer in their own allocation
+    /// units. The default, for an implementation that predates this method,
+    /// derives the figures from [`total_bytes`](Self::total_bytes) and
+    /// [`free_bytes`](Self::free_bytes) in 512-byte units with a 255-byte
+    /// `name_max`.
+    fn statfs(&mut self) -> Result<crate::fs::StatFs, Self::Error> {
+        const UNIT: u64 = 512;
+        let blocks = self.total_bytes() / UNIT;
+        let free = self.free_bytes()? / UNIT;
+        Ok(crate::fs::StatFs {
+            block_size: UNIT as u32,
+            blocks,
+            blocks_free: free,
+            blocks_avail: free,
+            inodes: 0,
+            inodes_free: 0,
+            name_max: 255,
+        })
+    }
+
     /// Flush and hand the device back.
     fn unmount(self) -> Result<Self::Device, Self::Error>;
 }

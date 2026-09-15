@@ -981,6 +981,11 @@ fn on_insert(card: SdCard) -> Result<SdCard, fstool::fs::volume::AnyError<MyDriv
 }
 ```
 
+`statfs()` answers capacity the same way on every one of them — the
+`fs::StatFs` struct the hosted `Filesystem::statfs` returns, compiled without
+a heap: allocation unit, units in all and free, longest name, plus
+`total_bytes()` / `free_bytes()` helpers.
+
 Errors keep their driver's detail — `AnyError::Fat(fat::Error::NoSpace)` —
 and every one of them also answers `kind()` with a shared `ErrorKind`, so
 generic code can tell `NotFound` from `Io` without knowing whose error it

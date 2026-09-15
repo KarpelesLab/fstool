@@ -94,6 +94,9 @@ impl<D: FlashDriver, const B: usize, const P: usize> Volume for LittleFs<D, B, P
         let bs = self.geometry().block_size as u64;
         Ok(LittleFs::free_blocks(self)? as u64 * bs)
     }
+    fn statfs(&mut self) -> Result<crate::fs::StatFs, Self::Error> {
+        LittleFs::statfs(self)
+    }
     fn unmount(self) -> Result<D, Self::Error> {
         LittleFs::unmount(self)
     }

@@ -89,6 +89,9 @@ impl<D: SectorDriver, const S: usize> Volume for Fat<D, S> {
     fn free_bytes(&mut self) -> Result<u64, Self::Error> {
         Fat::free_bytes(self)
     }
+    fn statfs(&mut self) -> Result<crate::fs::StatFs, Self::Error> {
+        Fat::statfs(self)
+    }
     fn unmount(self) -> Result<D, Self::Error> {
         Fat::unmount(self)
     }

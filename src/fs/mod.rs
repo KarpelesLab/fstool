@@ -21,6 +21,11 @@ mod api;
 #[cfg(feature = "alloc")]
 pub use api::*;
 
+// Capacity figures, answered by both halves: plain data, so compiled in every
+// configuration.
+mod statfs;
+pub use statfs::StatFs;
+
 #[cfg(all(feature = "alloc", feature = "affs"))]
 pub mod affs;
 #[cfg(all(feature = "alloc", feature = "apfs"))]

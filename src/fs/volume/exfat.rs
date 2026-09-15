@@ -87,6 +87,9 @@ impl<D: SectorDriver, const S: usize> Volume for Exfat<D, S> {
     fn free_bytes(&mut self) -> Result<u64, Self::Error> {
         Exfat::free_bytes(self)
     }
+    fn statfs(&mut self) -> Result<crate::fs::StatFs, Self::Error> {
+        Exfat::statfs(self)
+    }
     fn unmount(self) -> Result<D, Self::Error> {
         Exfat::unmount(self)
     }

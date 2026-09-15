@@ -222,6 +222,7 @@ fn fat_volumes_the_driver_formats_pass_fsck_vfat_before_and_after_use() {
         }
         drop(vol.unmount().unwrap());
         fsck_fat(&img, &format!("a used volume ({what})"));
+        statfs_agrees_with_fsck_vfat(&img, ss, &what);
         if bytes >= 64 * MIB && ss == 512 {
             hosted_reads_fat(&img);
         }
@@ -263,6 +264,39 @@ fn a_fat32_volume_formatted_inside_an_mbr_partition_passes_fsck_vfat() {
     extract(&img, 2048, part.sectors as u64, 512, &vol_img);
     fsck_fat(&vol_img, "a FAT32 volume formatted in an MBR partition");
     hosted_reads_fat(&vol_img);
+}
+
+/// `statfs` through the generic interface, against the cluster counts
+/// `fsck.vfat` works out by walking the FAT itself.
+fn statfs_agrees_with_fsck_vfat(image: &Path, ss: u32, what: &str) {
+    use fstool::fs::volume::Volume as _;
+    let out = Command::new("fsck.vfat")
+        .arg("-n")
+        .arg(image)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // "<image>: N files, used/total clusters"
+    let summary = stdout
+        .lines()
+        .find(|l| l.contains(" files, "))
+        .expect("fsck summary");
+    let counts = summary
+        .rsplit(", ")
+        .next()
+        .unwrap()
+        .trim_end_matches(" clusters");
+    let (used, total) = counts.split_once('/').unwrap();
+    let (used, total): (u64, u64) = (used.parse().unwrap(), total.parse().unwrap());
+
+    let mut vol = fstool::fs::mount::<_, 4096, 4096>(FileCard::open(image, ss)).unwrap();
+    let st = vol.statfs().unwrap();
+    assert_eq!(
+        (st.blocks, st.blocks - st.blocks_free),
+        (total, used),
+        "{what}: {st:?} vs {summary}"
+    );
+    assert_eq!(st.total_bytes(), vol.total_bytes(), "{what}");
 }
 
 // -- exFAT ------------------------------------------------------------------
@@ -321,6 +355,37 @@ fn hosted_reads_exfat(image: &Path) {
     assert!(root.contains(&"big.bin".to_string()), "{root:?}");
 }
 
+/// `statfs` through the generic interface, against what `dump.exfat` reads
+/// out of the volume.
+fn statfs_agrees_with_dump_exfat(image: &Path, ss: u32, what: &str) {
+    use fstool::fs::volume::Volume as _;
+    if !which("dump.exfat") {
+        return;
+    }
+    let out = Command::new("dump.exfat").arg(image).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let field = |name: &str| -> u64 {
+        text.lines()
+            .find_map(|l| l.strip_prefix(name))
+            .unwrap_or_else(|| panic!("no {name} in dump.exfat output:\n{text}"))
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let (total, free, cluster) = (
+        field("Total Clusters:"),
+        field("Free Clusters:"),
+        field("Cluster size:"),
+    );
+    let mut vol = fstool::fs::mount::<_, 4096, 4096>(FileCard::open(image, ss)).unwrap();
+    let st = vol.statfs().unwrap();
+    assert_eq!(
+        (st.blocks, st.blocks_free, st.block_size as u64),
+        (total, free, cluster),
+        "{what}: {st:?}"
+    );
+}
+
 #[test]
 fn exfat_volumes_the_driver_formats_pass_fsck_exfat_before_and_after_use() {
     if !which("fsck.exfat") {
@@ -351,6 +416,7 @@ fn exfat_volumes_the_driver_formats_pass_fsck_exfat_before_and_after_use() {
         fill_exfat(&mut vol);
         drop(vol.unmount().unwrap());
         fsck_exfat(&img, &format!("a used volume ({what})"));
+        statfs_agrees_with_dump_exfat(&img, ss, &what);
         if ss == 512 {
             hosted_reads_exfat(&img);
         }

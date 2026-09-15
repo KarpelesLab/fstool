@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(fs)* `Volume::statfs` on the allocator-free FAT, exFAT and littlefs
+  drivers, and on the `fs::volume::Volume` trait (so on `AnyVolume` too):
+  capacity in `statfs` shape — the allocation unit (cluster or erase block),
+  how many there are and how many are free, and the longest name. It
+  answers with the same `fs::StatFs` the hosted `Filesystem::statfs` does,
+  which is now compiled in every configuration, not only with `alloc`, and
+  gains `total_bytes` / `free_bytes` / `avail_bytes`. The counts agree with
+  what `fsck.vfat` and `dump.exfat` work out from the volume, and with
+  littlefs's own traversal through `littlefs-python`. The trait method is
+  provided — derived from `total_bytes` / `free_bytes` in 512-byte units —
+  so an implementation written against 0.4.32 still compiles.
+
+### Changed
+
+- *(fs)* `StatFs` derives `PartialEq` and `Eq`.
+
 ## [0.4.32](https://github.com/KarpelesLab/fstool/compare/v0.4.31...v0.4.32) - 2026-09-15
 
 ### Added

@@ -129,6 +129,16 @@ where
     let total = vol.total_bytes();
     let free = vol.free_bytes().unwrap();
     assert!(total > 0 && free <= total, "{free} free of {total}");
+    // statfs says the same thing in allocation units.
+    let st = vol.statfs().unwrap();
+    assert!(
+        st.block_size.is_power_of_two() && st.block_size >= 512,
+        "{st:?}"
+    );
+    assert_eq!((st.total_bytes(), st.free_bytes()), (total, free), "{st:?}");
+    assert_eq!(st.blocks_avail, st.blocks_free);
+    assert_eq!((st.inodes, st.inodes_free), (0, 0));
+    assert_eq!(st.name_max, 255);
 
     vol.create_dir("/logs").unwrap();
     let mut f = vol.create_file("/logs/boot.txt").unwrap();
@@ -212,6 +222,16 @@ where
     drop(it);
     vol.flush().unwrap();
     assert!(vol.free_bytes().unwrap() < free);
+    // The data just written is gone from statfs's free count too, by at
+    // least the allocation units it needed.
+    let after = vol.statfs().unwrap();
+    assert_eq!(after.blocks, st.blocks);
+    let needed = 20_000u64.div_ceil(st.block_size as u64);
+    assert!(
+        st.blocks_free - after.blocks_free >= needed,
+        "{st:?} -> {after:?}"
+    );
+    assert_eq!(after.free_bytes(), vol.free_bytes().unwrap());
 }
 
 fn kept() -> Vec<u8> {

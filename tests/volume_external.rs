@@ -396,6 +396,14 @@ if cmd == 'create':
             with fs.open('/n%02d' % i, 'w') as f:
                 f.write('back %d' % i)
     open(path, 'wb').write(bytes(fs.context.buffer))
+elif cmd == 'used':
+    data = bytearray(open(path, 'rb').read())
+    ctx = UserContext(len(data))
+    ctx.buffer = data
+    fs = LittleFS(context=ctx, block_size=bs, block_count=bc,
+                  read_size=bs, prog_size=bs, cache_size=bs, mount=False)
+    fs.mount()
+    print(fs.used_block_count)
 elif cmd == 'manifest':
     data = bytearray(open(path, 'rb').read())
     ctx = UserContext(len(data))
@@ -471,6 +479,7 @@ fn a_littlefs_volume_the_c_implementation_wrote_is_found_on_a_card_and_stays_rea
         edit(&mut vol);
         let mut seen = manifest(&mut vol);
         seen.sort();
+        let st = vol.statfs().unwrap();
         vol.unmount().unwrap();
 
         // And what we wrote is what the C implementation reads back.
@@ -480,6 +489,16 @@ fn a_littlefs_volume_the_c_implementation_wrote_is_found_on_a_card_and_stays_rea
             seen.join("\n"),
             after.trim_end(),
             "after the edit, at {block_size}-byte blocks"
+        );
+        // statfs agrees with littlefs's own traversal about what is in use.
+        let used: u64 = run_python(&py, &["used", vol_img.to_str().unwrap(), &bs, &bc])
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            (st.block_size as u64, st.blocks, st.blocks - st.blocks_free),
+            (block_size, blocks, used),
+            "statfs at {block_size}-byte blocks"
         );
     }
 }

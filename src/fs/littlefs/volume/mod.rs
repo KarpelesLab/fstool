@@ -1528,6 +1528,23 @@ impl<D: FlashDriver, const BLOCK: usize, const PROG: usize> Volume<D, BLOCK, PRO
         Ok(total)
     }
 
+    /// Capacity figures in `statfs` shape: erase blocks as the allocation
+    /// unit, free blocks from [`Self::free_blocks`] (so a traversal, or the
+    /// in-use bitmap with `alloc`), no inodes, and the superblock's
+    /// `name_max`.
+    pub fn statfs(&mut self) -> Result<crate::fs::StatFs, Error<D::Error>> {
+        let free = self.free_blocks()? as u64;
+        Ok(crate::fs::StatFs {
+            block_size: self.geom.block_size,
+            blocks: self.geom.block_count as u64,
+            blocks_free: free,
+            blocks_avail: free,
+            inodes: 0,
+            inodes_free: 0,
+            name_max: self.geom.name_max,
+        })
+    }
+
     /// Blocks the filesystem has left.
     pub fn free_blocks(&mut self) -> Result<u32, Error<D::Error>> {
         let used = self.used_blocks()?;

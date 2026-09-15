@@ -1308,6 +1308,23 @@ impl<D: SectorDriver, const SECTOR: usize> Volume<D, SECTOR> {
         Ok(self.geom.cluster_count - self.used_clusters()?)
     }
 
+    /// Capacity figures in `statfs` shape: clusters as the allocation unit,
+    /// free clusters counted from the allocation bitmap (so the same cost as
+    /// [`Self::free_clusters`]), no inodes, and [`MAX_NAME_LEN`] as
+    /// `name_max`.
+    pub fn statfs(&mut self) -> Result<crate::fs::StatFs, Error<D::Error>> {
+        let free = self.free_clusters()? as u64;
+        Ok(crate::fs::StatFs {
+            block_size: self.geom.cluster_bytes(),
+            blocks: self.geom.cluster_count as u64,
+            blocks_free: free,
+            blocks_avail: free,
+            inodes: 0,
+            inodes_free: 0,
+            name_max: MAX_NAME_LEN as u32,
+        })
+    }
+
     /// Free space in bytes.
     pub fn free_bytes(&mut self) -> Result<u64, Error<D::Error>> {
         Ok(self.free_clusters()? as u64 * self.geom.cluster_bytes() as u64)

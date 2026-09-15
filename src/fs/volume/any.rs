@@ -625,6 +625,10 @@ impl<D: SectorDriver, const SECTOR: usize, const BLOCK: usize> Volume
         each!(self, |v| Volume::free_bytes(v))
     }
 
+    fn statfs(&mut self) -> Result<crate::fs::StatFs, Self::Error> {
+        each!(self, |v| Volume::statfs(v))
+    }
+
     fn unmount(self) -> Result<D, Self::Error> {
         match self {
             #[cfg(feature = "fat")]
