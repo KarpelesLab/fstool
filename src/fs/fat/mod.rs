@@ -24,12 +24,17 @@
 
 mod volume;
 
+// The driver's test fixtures, for the generic layer's tests to lay volumes
+// out with.
+#[cfg(test)]
+pub(crate) use volume::tests as volume_tests;
+
 // `Error` here is the driver's own — generic over your `SectorDriver`'s
 // failure, and allocating nothing. The hosted half returns the crate's
 // `Error` instead, and exports no type of that name, so there is no
 // ambiguity inside this module.
 pub use volume::{
-    Attributes, Dir, DirEntry, DirIter, Error, FatKind, File, Geometry, MAX_FILE_LEN,
+    Attributes, Dir, DirEntry, DirIter, Error, FatKind, File, FormatOpts, Geometry, MAX_FILE_LEN,
     MAX_SECTOR_SIZE, MIN_SECTOR_SIZE, Metadata, SectorDriver, Timestamp, Volume,
 };
 

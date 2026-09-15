@@ -63,7 +63,7 @@ impl SectorDriver for RamCard {
 
 /// Lay out a FAT volume of `total_sectors` 512-byte sectors with
 /// `spc` sectors per cluster, at `offset` sectors into `image`.
-fn format(image: &mut [u8], offset: usize, total_sectors: u32, spc: u32, want: FatKind) {
+pub(crate) fn format(image: &mut [u8], offset: usize, total_sectors: u32, spc: u32, want: FatKind) {
     const BPS: u32 = 512;
     let reserved = if want == FatKind::Fat32 { 32 } else { 1 };
     let num_fats = 2u32;
@@ -1250,5 +1250,324 @@ fn the_in_memory_fat_only_changes_how_much_is_read() {
         // trade the configuration makes.
         assert_eq!(vol.fat_cache_bytes(), 0);
         assert!(reads >= 40);
+    }
+}
+
+// -- formatting ---------------------------------------------------------------
+
+mod formatting {
+    use super::*;
+    use crate::fs::fat::volume::format::plan;
+    use alloc::collections::BTreeMap;
+
+    /// A card whose sectors exist only once written, so a many-gigabyte
+    /// format can be tested without the gigabytes. Unwritten sectors read
+    /// as a pattern, not zeros, so a format that relies on the medium being
+    /// blank is caught.
+    #[derive(Debug)]
+    struct Sparse {
+        sectors: u64,
+        ss: u32,
+        data: BTreeMap<u64, Vec<u8>>,
+        writes: u64,
+    }
+
+    impl Sparse {
+        fn new(sectors: u64, ss: u32) -> Self {
+            Self {
+                sectors,
+                ss,
+                data: BTreeMap::new(),
+                writes: 0,
+            }
+        }
+    }
+
+    impl SectorDriver for Sparse {
+        type Error = core::convert::Infallible;
+        fn sector_size(&self) -> u32 {
+            self.ss
+        }
+        fn sector_count(&self) -> u64 {
+            self.sectors
+        }
+        fn read_sectors(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
+            let ss = self.ss as usize;
+            assert!(
+                lba + (buf.len() / ss) as u64 <= self.sectors,
+                "read past the card"
+            );
+            for (i, chunk) in buf.chunks_mut(ss).enumerate() {
+                match self.data.get(&(lba + i as u64)) {
+                    Some(s) => chunk.copy_from_slice(s),
+                    None => chunk.fill(0xE5),
+                }
+            }
+            Ok(())
+        }
+        fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), Self::Error> {
+            let ss = self.ss as usize;
+            assert!(
+                lba + (buf.len() / ss) as u64 <= self.sectors,
+                "write past the card"
+            );
+            for (i, chunk) in buf.chunks(ss).enumerate() {
+                self.data.insert(lba + i as u64, chunk.to_vec());
+                self.writes += 1;
+            }
+            Ok(())
+        }
+    }
+
+    const MIB: u64 = 1 << 20;
+
+    #[test]
+    fn the_flavour_and_cluster_size_follow_the_volume_size() {
+        let opts = FormatOpts::default();
+        // (bytes, flavour, cluster bytes) — FAT32 by Microsoft's table.
+        for (bytes, kind, cluster) in [
+            (1440 * 1024, FatKind::Fat12, 512),
+            (8 * MIB, FatKind::Fat12, 2048),
+            (64 * MIB, FatKind::Fat16, 1024),
+            (256 * MIB, FatKind::Fat16, 4096),
+            (512 * MIB, FatKind::Fat32, 4096),
+            (4 * 1024 * MIB, FatKind::Fat32, 4096),
+            (16 * 1024 * MIB, FatKind::Fat32, 8192),
+            (32 * 1024 * MIB, FatKind::Fat32, 16384),
+            (128 * 1024 * MIB, FatKind::Fat32, 32768),
+        ] {
+            let p = plan((bytes / 512) as u32, 512, &opts).unwrap();
+            assert_eq!((p.kind, p.spc * 512), (kind, cluster), "at {bytes} bytes");
+            assert!(p.clusters >= kind.min_clusters() && p.clusters <= kind.max_clusters());
+            if kind == FatKind::Fat32 {
+                assert_eq!(
+                    (p.reserved + 2 * p.fat_sectors) % p.spc,
+                    0,
+                    "data region aligned"
+                );
+            }
+        }
+        // 4 KiB sectors: the same flavours, and never a cluster below a sector.
+        let p = plan((64 * MIB / 4096) as u32, 4096, &opts).unwrap();
+        assert_eq!((p.kind, p.spc), (FatKind::Fat16, 1));
+    }
+
+    #[test]
+    fn a_flavour_that_cannot_fit_is_refused() {
+        let fat32 = FormatOpts {
+            kind: Some(FatKind::Fat32),
+            ..Default::default()
+        };
+        assert!(plan((16 * MIB / 512) as u32, 512, &fat32).is_err());
+        let fat12 = FormatOpts {
+            kind: Some(FatKind::Fat12),
+            ..Default::default()
+        };
+        assert!(plan((4 * 1024 * MIB / 512) as u32, 512, &fat12).is_err());
+        let odd = FormatOpts {
+            cluster_size: Some(3000),
+            ..Default::default()
+        };
+        assert!(plan(100_000, 512, &odd).is_err());
+        let card = Sparse::new(16 * MIB / 512, 512);
+        assert!(matches!(
+            Volume::<_, 512>::format(card, &fat32),
+            Err(Error::Unsupported(_))
+        ));
+        let card = Sparse::new(1000, 512);
+        assert!(matches!(
+            Volume::<_, 512>::format_at(card, 500, 600, &FormatOpts::default()),
+            Err(Error::VolumeExceedsDevice)
+        ));
+    }
+
+    /// Format, fill a little, remount, and check what a fresh mount sees.
+    fn round_trip(card: Sparse, start: u64, sectors: u64, opts: &FormatOpts, want: FatKind) {
+        let mut vol = Volume::<_, 4096>::format_at(card, start, sectors, opts).unwrap();
+        assert_eq!(vol.kind(), want);
+        let clusters = vol.geometry().cluster_count;
+        let reserved_by_root = u32::from(want == FatKind::Fat32);
+        assert_eq!(vol.free_clusters().unwrap(), clusters - reserved_by_root);
+        let root = vol.root();
+        assert!(
+            vol.iter_dir(root).next().unwrap().is_none(),
+            "a fresh root is empty"
+        );
+
+        vol.create_dir("/DCIM").unwrap();
+        let body: Vec<u8> = (0..100_000u32).map(|i| (i % 253) as u8).collect();
+        let mut f = vol.create_file("/DCIM/a long file name.bin").unwrap();
+        f.write_all(&mut vol, &body).unwrap();
+        f.flush(&mut vol).unwrap();
+        let card = vol.unmount().unwrap();
+
+        let mut vol = Volume::<_, 4096>::mount_at(card, start).unwrap();
+        let mut f = vol.open_file("/DCIM/a long file name.bin").unwrap();
+        let mut back = vec![0u8; body.len()];
+        f.read_exact(&mut vol, &mut back).unwrap();
+        assert_eq!(back, body);
+        let used = clusters - reserved_by_root - vol.free_clusters().unwrap();
+        assert!(used as usize >= body.len().div_ceil(vol.cluster_bytes() as usize));
+    }
+
+    #[test]
+    fn each_flavour_formats_mounts_and_takes_files() {
+        round_trip(
+            Sparse::new(2880, 512),
+            0,
+            2880,
+            &FormatOpts::default(),
+            FatKind::Fat12,
+        );
+        round_trip(
+            Sparse::new(64 * MIB / 512, 512),
+            0,
+            64 * MIB / 512,
+            &FormatOpts::default(),
+            FatKind::Fat16,
+        );
+        let fat32 = FormatOpts {
+            kind: Some(FatKind::Fat32),
+            ..Default::default()
+        };
+        round_trip(
+            Sparse::new(64 * MIB / 512, 512),
+            0,
+            64 * MIB / 512,
+            &fat32,
+            FatKind::Fat32,
+        );
+        // A 32 GiB card: FAT32, 16 KiB clusters, and only its metadata written.
+        let sectors = 32 * 1024 * MIB / 512;
+        round_trip(
+            Sparse::new(sectors, 512),
+            0,
+            sectors,
+            &FormatOpts::default(),
+            FatKind::Fat32,
+        );
+        // 4 KiB sectors.
+        round_trip(
+            Sparse::new(1024 * MIB / 4096, 4096),
+            0,
+            1024 * MIB / 4096,
+            &FormatOpts::default(),
+            FatKind::Fat32,
+        );
+    }
+
+    #[test]
+    fn a_format_writes_only_metadata() {
+        let sectors = 32 * 1024 * MIB / 512;
+        let vol =
+            Volume::<_, 512>::format(Sparse::new(sectors, 512), &FormatOpts::default()).unwrap();
+        let g = *vol.geometry();
+        let card = vol.unmount().unwrap();
+        let expected = g.first_data_sector as u64 + g.sectors_per_cluster as u64;
+        assert!(
+            card.writes <= expected + 2,
+            "{} writes, metadata is {expected} sectors",
+            card.writes
+        );
+        assert!(card.data.keys().all(|&lba| lba < expected));
+    }
+
+    #[test]
+    fn a_label_lands_in_the_boot_sector_and_the_root() {
+        let opts = FormatOpts {
+            label: *b"CAMERA     ",
+            volume_id: 0xCAFE_F00D,
+            ..Default::default()
+        };
+        let vol = Volume::<_, 512>::format(Sparse::new(64 * MIB / 512, 512), &opts).unwrap();
+        let root_sector = vol.geometry().reserved_sectors + 2 * vol.geometry().fat_sectors;
+        let mut vol = vol;
+        let root = vol.root();
+        // The label is not a directory entry anyone lists…
+        assert!(vol.iter_dir(root).next().unwrap().is_none());
+        let card = vol.unmount().unwrap();
+        // …but it is there, and in the BPB.
+        let boot = &card.data[&0];
+        assert_eq!(&boot[43..54], b"CAMERA     ");
+        assert_eq!(&boot[39..43], &0xCAFE_F00Du32.to_le_bytes());
+        let root = &card.data[&(root_sector as u64)];
+        assert_eq!((&root[0..11], root[11]), (&b"CAMERA     "[..], 0x08));
+    }
+
+    #[test]
+    fn a_partition_is_formatted_in_place() {
+        use crate::device::mbr;
+        let mut card = Sparse::new(128 * MIB / 512, 512);
+        let mut scratch = [0u8; 512];
+        let part = mbr::Entry::new(mbr::FAT16_LBA, mbr::FIRST_LBA, (64 * MIB / 512) as u32);
+        mbr::write(
+            &mut card,
+            &mut scratch,
+            &[Some(part), None, None, None],
+            0x1111,
+        )
+        .unwrap();
+        let vol = Volume::<_, 512>::format_at(
+            card,
+            part.start_lba as u64,
+            part.sectors as u64,
+            &FormatOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(vol.geometry().part_start, 2048);
+        let card = vol.unmount().unwrap();
+        // The table survived, the hidden-sectors field points back at it, and
+        // mount_auto finds the volume through it.
+        assert_eq!(&card.data[&2048][28..32], &2048u32.to_le_bytes());
+        let vol = Volume::<_, 512>::mount_auto(card).unwrap();
+        assert_eq!(vol.kind(), FatKind::Fat16);
+    }
+
+    #[test]
+    fn every_size_plans_a_consistent_layout_or_is_refused() {
+        let opts = FormatOpts::default();
+        let mut sizes = Vec::new();
+        for shift in 0..32u32 {
+            let base = 1u64 << shift;
+            for d in [0i64, -1, 1, 7, -333, 4099] {
+                let v = base as i64 + d;
+                if v > 0 && v <= u32::MAX as i64 {
+                    sizes.push(v as u32);
+                }
+            }
+        }
+        sizes.push(u32::MAX);
+        for ss in [512u32, 4096] {
+            for &total in &sizes {
+                for kind in [
+                    None,
+                    Some(FatKind::Fat12),
+                    Some(FatKind::Fat16),
+                    Some(FatKind::Fat32),
+                ] {
+                    let Ok(p) = plan(total, ss, &FormatOpts { kind, ..opts }) else {
+                        continue;
+                    };
+                    let meta = p.reserved as u64 + 2 * p.fat_sectors as u64 + p.root_sectors as u64;
+                    assert!(
+                        meta + p.clusters as u64 * p.spc as u64 <= total as u64,
+                        "{total}/{ss}: {p:?}"
+                    );
+                    assert!(
+                        p.kind.fat_bytes(p.clusters as u64 + 2) <= p.fat_sectors as u64 * ss as u64
+                    );
+                    assert_eq!(
+                        FatKind::from_cluster_count(p.clusters),
+                        p.kind,
+                        "{total}/{ss}: {p:?}"
+                    );
+                    assert!(p.spc.is_power_of_two() && p.spc * ss <= 32 * 1024);
+                    assert!(p.reserved <= u16::MAX as u32 && p.root_entries <= u16::MAX as u32);
+                    if let Some(k) = kind {
+                        assert_eq!(p.kind, k);
+                    }
+                }
+            }
+        }
     }
 }

@@ -18,9 +18,11 @@ reachable behind the `fat`, `exfat` or `littlefs` features ever started
 allocating, they would stop linking. That is a compile-time guarantee, not a
 runtime check, and CI builds both on every push.
 
-The heapless binary asks the exFAT driver about the card before it mounts it
-as FAT, which is what a card reader does — and which means that driver is
-linked into the same allocator-free program.
+The heapless binary works the card twice: once through the FAT driver's own
+API, then the way a card reader has to — `fstool::fs::mount` probes the card,
+hands back whichever volume it found, and a function written once against the
+`fs::volume` traits appends to a log on it. That links the exFAT driver into
+the same allocator-free program too.
 
 ```sh
 rustup target add thumbv7em-none-eabihf
@@ -50,10 +52,13 @@ no symbols from the allocation-free driver at all.)
 `.bss` is the 64 KiB allocator arena plus a few words; the driver itself
 keeps the allocation table and one cluster resident.
 
-The heapless binary, measured the same way on 2026-09-13, is **~23.6 KB** of
-`.text` — the FAT driver, the exFAT driver's mount path (which brings the MBR
-and GPT readers with it), and the FAT12 layout code this example writes by
-hand — and its `.bss` is just the 512 KiB RAM card. Each driver's own state is
+The heapless binary, measured the same way on 2026-09-15, is **~39.6 KB** of
+`.text` — the FAT driver with its formatter, the MBR and GPT readers, the
+probe, and, because the generic append can land on either filesystem, the
+exFAT driver's write path as well as its mount — and its `.bss` is just the
+512 KiB RAM card. The FAT formatter is about 2.7 KB of that. (Mounting through
+the exFAT driver alone, before `fs::mount` existed, was ~23.6 KB: reading a
+card costs far less than being able to format and write to both kinds.) Each driver's own state is
 one sector of scratch plus the handles you hold, so on real hardware reading
 an SD card either costs well under 1 KiB of RAM regardless of how large the
 card is.
@@ -68,9 +73,9 @@ The littlefs binary, measured the same way on 2026-09-13, is **~28 KB** of
 remount — and its `.bss` is the 128 KiB RAM "flash" plus the driver's own
 state: one block of scratch (4 KiB here, the erase block), a 256-byte
 staging buffer for the commit being programmed, and a 32-byte allocation
-window. That footprint does not grow with the size of the flash. It needs
-no formatter of its own, unlike the FAT binaries: a littlefs format is one
-metadata commit, so `Volume::format` is right there in the driver.
+window. That footprint does not grow with the size of the flash. Like the
+heapless card binary, it formats with the driver itself: `Volume::format` is
+right there, whichever filesystem it is.
 
 There is no board support here: `reset` is the entry point named in
 `link.x`, the vector table is left to you, and the allocator is the

@@ -8,25 +8,26 @@
 //! failure mode is the point of this program: it is a compile-time proof,
 //! not a runtime demo.
 //!
-//! It formats a small FAT12 volume in a static RAM buffer (the formatter
-//! is right here, since the no-alloc driver reads and writes volumes but
-//! does not create them), then mounts it, writes a file, lists the root
-//! and reads the file back.
+//! It formats a small FAT12 volume in a static RAM buffer with the driver's
+//! own formatter, then mounts it, writes a file, lists the root and reads
+//! the file back.
 //!
-//! It also asks the exFAT driver whether the same card holds an exFAT
-//! volume — which it does not — because that is what a card reader does
-//! with a card it has just been handed, and because linking that driver is
-//! the same compile-time proof for `exfat` as the rest of this program is
-//! for `fat`. Both speak the one `SectorDriver` implemented below.
+//! Then it does it again the way a card reader has to, not knowing what the
+//! card holds: `fstool::fs::mount` probes it — exFAT or FAT, whole card or
+//! partition — and hands back whichever volume it found, and a function
+//! written once against the `fs::volume` traits appends to a log on it.
+//! That links the exFAT driver too, so this binary is the same compile-time
+//! proof for `exfat` as for `fat`. Both speak the one `SectorDriver`
+//! implemented below.
 
 #![no_std]
 #![no_main]
 
 use core::ptr;
 
-use fstool::fs::exfat::Volume as ExfatVolume;
 use fstool::device::SectorDriver;
-use fstool::fs::fat::{FatKind, Volume};
+use fstool::fs::fat::{FatKind, FormatOpts, Volume};
+use fstool::fs::volume::{Volume as _, VolumeDirIter, VolumeFile};
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -79,73 +80,19 @@ impl SectorDriver for RamCard {
     }
 }
 
-/// Lay out a FAT12 volume in the card buffer.
-///
-/// The driver mounts volumes rather than creating them, so a program that
-/// must start from a blank medium brings its own layout — about fifty
-/// lines, and only for the flavour it needs.
-fn format_fat12(card: &mut [u8]) {
-    const RESERVED: u32 = 1;
-    const NUM_FATS: u32 = 2;
-    const ROOT_ENTRIES: u32 = 512;
-    const SPC: u32 = 1;
-    let total = SECTORS as u32;
-    let root_sectors = (ROOT_ENTRIES * 32).div_ceil(SECTOR as u32);
-
-    // Size the FAT so it can map every cluster left over once it is
-    // accounted for.
-    let mut fat_sectors = 1u32;
-    loop {
-        let data = total - RESERVED - NUM_FATS * fat_sectors - root_sectors;
-        let clusters = data / SPC;
-        let need = (((clusters + 2).div_ceil(2) * 3) as u32).div_ceil(SECTOR as u32);
-        if need <= fat_sectors {
-            break;
-        }
-        fat_sectors = need;
-    }
-
-    card.fill(0);
-    let boot = &mut card[..SECTOR];
-    boot[0..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
-    boot[3..11].copy_from_slice(b"FSTOOL  ");
-    boot[11..13].copy_from_slice(&(SECTOR as u16).to_le_bytes());
-    boot[13] = SPC as u8;
-    boot[14..16].copy_from_slice(&(RESERVED as u16).to_le_bytes());
-    boot[16] = NUM_FATS as u8;
-    boot[17..19].copy_from_slice(&(ROOT_ENTRIES as u16).to_le_bytes());
-    boot[19..21].copy_from_slice(&(total as u16).to_le_bytes());
-    boot[21] = 0xF8;
-    boot[22..24].copy_from_slice(&(fat_sectors as u16).to_le_bytes());
-    boot[510] = 0x55;
-    boot[511] = 0xAA;
-
-    // FAT[0] carries the media byte, FAT[1] ends a chain.
-    for copy in 0..NUM_FATS {
-        let at = (RESERVED + copy * fat_sectors) as usize * SECTOR;
-        card[at] = 0xF8;
-        card[at + 1] = 0xFF;
-        card[at + 2] = 0xFF;
-    }
-}
-
 // Pinned into its own section so the linker script can KEEP it: under
 // `--gc-sections` an entry point nothing references is otherwise fair game.
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.reset")]
 pub extern "C" fn reset() -> ! {
-    // SAFETY: single-threaded, and the reference is dropped before the
-    // driver starts using the buffer.
-    format_fat12(unsafe { &mut *ptr::addr_of_mut!(CARD) });
-
-    // Which filesystem is on the card? exFAT first, as a reader would:
-    // an SDXC card arrives formatted exFAT, an SDHC one FAT32. This card
-    // is FAT12, so the exFAT probe declines it — the point is that the
-    // driver linked at all, with no allocator in the program.
-    sink(match ExfatVolume::<_, 512>::mount_auto(RamCard) {
-        Ok(_) => 1,
-        Err(_) => 0,
-    });
+    // A blank card gets a filesystem — no heap needed for that either.
+    let opts = FormatOpts {
+        label: *b"HEAPLESS   ",
+        ..FormatOpts::default()
+    };
+    if Volume::<_, 512>::format(RamCard, &opts).and_then(Volume::unmount).is_err() {
+        loop {}
+    }
 
     let mut vol = match Volume::<_, 512>::mount(RamCard) {
         Ok(v) => v,
@@ -182,6 +129,37 @@ pub extern "C" fn reset() -> ! {
         count += entry.name().len() as u32;
     }
     sink(count);
+    drop(it);
+    if vol.unmount().is_err() {
+        loop {}
+    }
+
+    // The card reader's way: find out what is on the card, and use it
+    // through the generic interface. `BLOCK` only matters with littlefs
+    // compiled in, which this binary does not.
+    let mut any = match fstool::fs::mount::<_, 512, 512>(RamCard) {
+        Ok(v) => v,
+        Err(_) => loop {},
+    };
+    sink(any.fs_type() as u32);
+    sink(append_log(&mut any).unwrap_or(0));
 
     loop {}
+}
+
+/// Append a line to `/boot.log` and count the root's entries — on any
+/// filesystem, written once.
+fn append_log<V: fstool::fs::volume::Volume>(vol: &mut V) -> Result<u32, V::Error> {
+    let mut log = vol.open_or_create_file("/boot.log")?;
+    log.seek_to_end(vol)?;
+    log.write_all(vol, b"booted\n")?;
+    log.flush(vol)?;
+
+    let root = vol.root();
+    let mut it = vol.iter_dir(root);
+    let mut entries = 0;
+    while it.next()?.is_some() {
+        entries += 1;
+    }
+    Ok(entries)
 }

@@ -697,8 +697,10 @@ What remains is the core an SD-card or flash reader needs:
 - [`device`](src/device/mod.rs) — `SectorDriver` for cards and `FlashDriver`
   for raw flash: the two traits a driver implements, and the whole contract
   between your hardware and the filesystems. Beside them,
-  [`device::mbr`](src/device/mbr.rs) decodes the partition table that says
-  where on a card a volume starts. The layer allocates nothing and is
+  [`device::mbr`](src/device/mbr.rs) and [`device::gpt`](src/device/gpt.rs)
+  read and write the partition tables that say where on a card a volume
+  starts, and
+  [`device::SectorFlash`](src/device/sector_flash.rs) puts flash on a card. The layer allocates nothing and is
   compiled in every configuration, which is why the allocator-free
   filesystems are written against it;
 - the [`BlockDevice`](src/block/mod.rs) trait, with the in-memory
@@ -712,7 +714,8 @@ What remains is the core an SD-card or flash reader needs:
   carry no host dependency: **FAT12/16/32**, **exFAT** and **littlefs**,
   each with format, create, list, read, in-place edit and remove — and for
   each of them, a second driver that needs no heap at all
-  ([below](#no-allocator-at-all));
+  ([below](#no-allocator-at-all)), behind one interface and one `fs::mount`
+  ([below](#one-interface-over-all-of-them-and-a-mount-that-finds-the-volume));
 - `fstool::io` and `fstool::path`, which are `std::io` / `std::path` on a
   hosted build and small equivalents (same names, same semantics) without
   one, so a driver implements the `Read` / `Write` / `Seek` it already
@@ -935,6 +938,125 @@ littlefs commit, and both directions of the round trip are validated
 against the reference C implementation through `littlefs-python` — images
 the driver writes mount there, images it writes read back identically, and
 the two agree block for block on which blocks are live.
+
+### One interface over all of them, and a mount that finds the volume
+
+The three drivers are shaped alike but typed apart — sizes are `u32` on FAT
+and littlefs and `u64` on exFAT, names are `&str` on the FAT family and bytes
+on littlefs, each has its own error. [`fs::volume`](src/fs/volume/mod.rs) is
+the common ground, and it needs no allocator either: every driver implements
+its `Volume`, `VolumeFile` and `VolumeDirIter` traits, so code written once
+runs on any of them. The traits are generic, not `dyn`, so a call through them
+is the driver's own method.
+
+`fs::mount` is the card reader's half. It probes a `SectorDriver` — the whole
+card first, then every GPT or MBR partition in order — recognises what is
+there by its own signature (the exFAT boot sector, a FAT BPB that validates,
+a littlefs superblock), and hands back an `AnyVolume`, which implements the
+same traits:
+
+```rust
+use fstool::fs::volume::{Volume, VolumeDirIter, VolumeFile};
+
+/// On whatever filesystem the card holds.
+fn log_boot<V: Volume>(vol: &mut V) -> Result<(), V::Error> {
+    let mut log = vol.open_or_create_file("/boot.log")?;
+    log.seek_to_end(vol)?;
+    log.write_all(vol, b"booted\n")?;
+    log.flush(vol)?;
+
+    let root = vol.root();
+    let mut it = vol.iter_dir(root);
+    while let Some(entry) = it.next()? {
+        let _ = (entry.name_str(), entry.len(), entry.is_dir());
+    }
+    Ok(())
+}
+
+fn on_insert(card: SdCard) -> Result<SdCard, fstool::fs::volume::AnyError<MyDriverError>> {
+    // `SECTOR` scratch for the card drivers; `BLOCK` bounds a littlefs block.
+    let mut vol = fstool::fs::mount::<_, 512, 4096>(card)?;
+    log_boot(&mut vol)?;
+    vol.unmount()
+}
+```
+
+Errors keep their driver's detail — `AnyError::Fat(fat::Error::NoSpace)` —
+and every one of them also answers `kind()` with a shared `ErrorKind`, so
+generic code can tell `NotFound` from `Io` without knowing whose error it
+holds. `fs::volume::probe` answers the same question without taking the card,
+for a program that wants to format it when nothing is found.
+
+littlefs is on that list because it is a sound choice on a card, too: it
+never overwrites live metadata, which is what a card pulled mid-write needs.
+[`device::SectorFlash`](src/device/sector_flash.rs) presents sectors as erase
+blocks, and is how `mount` puts littlefs on a card — or how you format one
+there yourself. On raw flash there is nothing to probe: `littlefs::Volume`
+implements `Volume` directly.
+
+### Partitioning and formatting a blank card
+
+A device that is handed a blank card — or asked to wipe one — needs no heap
+for that either. [`device::mbr`](src/device/mbr.rs) and
+[`device::gpt`](src/device/gpt.rs) write tables as well as read them: `write`
+lays a whole table down, `set_entry` adds, resizes or removes one partition of
+the table already there (a GPT's two copies both rewritten, which repairs one
+that was damaged), and `gpt::erase` clears a GPT before the card takes an MBR.
+Every layout is checked — inside the medium, no overlaps, within the format's
+limits — before a byte is written, and a GPT's GUIDs come from the caller
+(`Guid::random_v4` over sixteen bytes of whatever entropy the board has), since
+a random source is the one thing a driver cannot assume.
+
+Each driver formats: `fat::Volume::format_at(card, start, sectors, &opts)`
+picks FAT12, FAT16 or FAT32 and a cluster size from the volume's size the way
+`mkfs.fat` and Windows do; `exfat::Volume::format_at` takes Microsoft's
+cluster-size defaults and writes the specification's full up-case table, so
+non-ASCII names fold exactly as on a card formatted anywhere else; littlefs
+formatted already. `fs::volume::format` does any of them by name, and
+`FormatAs::sd_card` picks what the SD specification requires — FAT up to
+32 GiB, exFAT above:
+
+```rust
+use fstool::device::mbr;
+use fstool::fs::volume::{self, FormatAs};
+
+fn prepare(mut card: SdCard) -> Result<(), fstool::fs::volume::AnyError<MyDriverError>> {
+    let sectors = card.sector_count() - mbr::FIRST_LBA as u64;
+    let how = FormatAs::sd_card(sectors, card.sector_size());
+    let kind = if matches!(how, FormatAs::Exfat(_)) { mbr::EXFAT } else { mbr::FAT32_LBA };
+    let mut scratch = [0u8; 512];
+    mbr::write(&mut card, &mut scratch,
+               &[Some(mbr::Entry::new(kind, mbr::FIRST_LBA, sectors as u32)), None, None, None],
+               0x5DCA_4D00)
+        .map_err(|_| volume::AnyError::NotRecognised)?;
+    let mut vol = volume::format::<_, 512, 4096>(card, mbr::FIRST_LBA as u64, sectors, how)?;
+    // …and it is mounted, ready for files.
+    let _ = &mut vol;
+    Ok(())
+}
+```
+
+A format writes only metadata — the boot region, the FATs or the FAT and
+bitmap, the root directory — a sector at a time through one sector of stack,
+and puts the boot sector down last, so a format cut short does not leave a
+boot sector describing structures that were never written. It is checked by
+the tools that own each format: `fsck.vfat` passes FAT12, FAT16 and FAT32
+volumes the driver formatted at 512- and 4096-byte sectors, fresh and after
+being filled; `fsck.exfat` — which verifies the boot checksum and the up-case
+table's — passes exFAT volumes from 8 MiB to 4 GiB at both sector sizes and a
+1 MiB cluster size; both pass volumes formatted inside a partition the writers
+laid down, and the crate's hosted implementations read every one. `sgdisk -v`
+passes the GPTs, `sgdisk -i` reads back every field, `sfdisk` reads back the
+MBRs, and changes are made to tables those tools wrote. The partition-table
+fuzz target runs `set_entry` over arbitrary media too.
+
+`fs::mount` is checked against the tools that made the volumes: a FAT32
+volume `mkfs.fat` wrote inside an `sgdisk` GPT partition and an exFAT volume
+`mkfs.exfat` wrote, on a whole card and in an MBR slot, are each found,
+edited through the traits and passed by `fsck.vfat` / `fsck.exfat`; littlefs
+images the C implementation wrote and churned are found at 512-, 1024- and
+4096-byte blocks, read identically, and read back identically by it after the
+edit. A fuzz target feeds `probe` and `mount_found` arbitrary media.
 
 ## Compression
 

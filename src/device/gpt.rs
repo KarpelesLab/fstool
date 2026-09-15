@@ -21,6 +21,16 @@
 //! allocates, and the caller's [`SectorDriver`] is the only way it touches
 //! the medium.
 //!
+//! Writing is the same shape. [`write`](fn@write) lays down a whole table — protective
+//! MBR, both headers, both entry arrays — from a list of [`NewPartition`]s;
+//! [`set_entry`] adds, changes or removes one entry of the table already
+//! there, rewriting both copies so a damaged one is repaired on the way;
+//! [`erase`] removes a GPT so the medium can take an MBR. A sector of scratch
+//! is all any of them uses: the entry array is written, and its CRC-32
+//! computed, one sector at a time. The format wants GUIDs, and a random
+//! source is the one thing a driver cannot assume, so they are the caller's
+//! — [`Guid::random_v4`] turns sixteen random bytes into a well-formed one.
+//!
 //! [`part::Gpt`](crate::part::Gpt) is the hosted counterpart: it owns a
 //! table, builds and writes one, and speaks
 //! [`BlockDevice`](crate::block::BlockDevice). Unlike that one, the reader
@@ -78,6 +88,17 @@ impl Guid {
     /// Whether this is the all-zero GUID.
     pub fn is_nil(&self) -> bool {
         self.0 == [0u8; 16]
+    }
+
+    /// A version-4 (random) GUID made from `bytes`, which should come from
+    /// whatever random source the platform has: the version and variant
+    /// bits are set, everything else is taken as given.
+    pub const fn random_v4(mut bytes: [u8; 16]) -> Guid {
+        // Byte 7 holds the version nibble (the third group is stored
+        // little-endian), byte 8 the variant bits.
+        bytes[7] = (bytes[7] & 0x0F) | 0x40;
+        bytes[8] = (bytes[8] & 0x3F) | 0x80;
+        Guid(bytes)
     }
 }
 
@@ -367,6 +388,487 @@ impl Table {
     }
 }
 
+/// Entries [`write`](fn@write) puts in the array: the specification's minimum
+/// reservation, and what every partitioning tool uses.
+pub const ENTRY_COUNT: u32 = 128;
+
+/// Size of each entry [`write`](fn@write) lays down.
+pub const ENTRY_SIZE: u32 = 128;
+
+/// Longest partition name, in UTF-16 code units.
+pub const MAX_NAME_UNITS: usize = 36;
+
+/// A partition to write into a table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewPartition<'a> {
+    /// What it holds — [`BASIC_DATA`] for FAT and exFAT, [`LINUX_FS`], ….
+    pub type_guid: Guid,
+    /// The partition's own GUID. Must not be nil.
+    pub guid: Guid,
+    /// First sector.
+    pub start_lba: u64,
+    /// Last sector, inclusive.
+    pub end_lba: u64,
+    /// Attribute flags — bit 0 "required", bit 60 read-only, ….
+    pub attributes: u64,
+    /// Name, up to [`MAX_NAME_UNITS`] UTF-16 code units.
+    pub name: &'a str,
+}
+
+impl<'a> NewPartition<'a> {
+    /// A partition of `type_guid` covering `sectors` sectors from
+    /// `start_lba`, unnamed and with no attributes.
+    pub fn new(type_guid: Guid, guid: Guid, start_lba: u64, sectors: u64) -> Self {
+        Self {
+            type_guid,
+            guid,
+            start_lba,
+            end_lba: start_lba.saturating_add(sectors).saturating_sub(1),
+            attributes: 0,
+            name: "",
+        }
+    }
+
+    /// The 128-byte entry for this partition, validated.
+    fn encode(&self, out: &mut [u8]) -> Result<(), Invalid> {
+        if self.type_guid.is_nil() || self.guid.is_nil() || self.end_lba < self.start_lba {
+            return Err(Invalid::Entry);
+        }
+        out[..ENTRY_SIZE as usize].fill(0);
+        out[0..16].copy_from_slice(&self.type_guid.0);
+        out[16..32].copy_from_slice(&self.guid.0);
+        out[32..40].copy_from_slice(&self.start_lba.to_le_bytes());
+        out[40..48].copy_from_slice(&self.end_lba.to_le_bytes());
+        out[48..56].copy_from_slice(&self.attributes.to_le_bytes());
+        for (n, unit) in self.name.encode_utf16().enumerate() {
+            if n == MAX_NAME_UNITS {
+                return Err(Invalid::Name);
+            }
+            out[56 + n * 2..58 + n * 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        Ok(())
+    }
+}
+
+/// Where a table on a medium of a given size puts things.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layout {
+    /// Sectors each copy of the entry array takes.
+    pub array_sectors: u64,
+    /// First sector a partition may use: after the protective MBR, the
+    /// primary header and its array.
+    pub first_usable_lba: u64,
+    /// Last sector a partition may use: before the backup array and header.
+    pub last_usable_lba: u64,
+    /// First sector of the backup array.
+    pub backup_array_lba: u64,
+    /// The backup header: the medium's last sector.
+    pub backup_lba: u64,
+}
+
+impl Layout {
+    /// The layout of a [`ENTRY_COUNT`]-entry table on `sector_count` sectors
+    /// of `sector_size` bytes, or `None` when that leaves no room for a
+    /// partition.
+    pub fn new(sector_count: u64, sector_size: u32) -> Option<Layout> {
+        if sector_size < 512 {
+            return None;
+        }
+        let array_sectors = ((ENTRY_COUNT * ENTRY_SIZE) as u64).div_ceil(sector_size as u64);
+        let first_usable_lba = 2 + array_sectors;
+        let backup_lba = sector_count.checked_sub(1)?;
+        let backup_array_lba = backup_lba.checked_sub(array_sectors)?;
+        let last_usable_lba = backup_array_lba.checked_sub(1)?;
+        (last_usable_lba >= first_usable_lba).then_some(Layout {
+            array_sectors,
+            first_usable_lba,
+            last_usable_lba,
+            backup_array_lba,
+            backup_lba,
+        })
+    }
+
+    /// The first usable sector on a 1 MiB boundary — where partitioning
+    /// tools start the first partition, aligned with flash erase blocks and
+    /// Advanced Format sectors alike.
+    pub fn first_aligned_lba(&self, sector_size: u32) -> u64 {
+        let align = ((1u64 << 20) / sector_size.max(1) as u64).max(1);
+        self.first_usable_lba.div_ceil(align) * align
+    }
+}
+
+/// Why a table could not be written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteError<E> {
+    /// The device failed.
+    Io(E),
+    /// The scratch buffer is shorter than a sector, or sectors are smaller
+    /// than 512 bytes.
+    ScratchTooSmall,
+    /// The medium is too small for a table and a partition.
+    MediumTooSmall,
+    /// More partitions than the array holds, or an index past it.
+    NoSuchSlot,
+    /// The entry at this index has a nil type or partition GUID, or ends
+    /// before it starts.
+    InvalidEntry(u32),
+    /// The entry at this index has a name longer than [`MAX_NAME_UNITS`].
+    NameTooLong(u32),
+    /// The entry at this index lies outside the usable sectors.
+    OutsideUsable(u32),
+    /// The entries at these indices share sectors.
+    Overlap(u32, u32),
+    /// [`set_entry`] found no valid table to change.
+    NoTable,
+    /// [`set_entry`] found a table laid out in a way it does not rewrite:
+    /// more than [`MAX_ENTRIES`] entries, entries that are not a whole
+    /// fraction of a sector, or an array overlapping the usable sectors.
+    UnsupportedLayout,
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for WriteError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            WriteError::Io(e) => write!(f, "device error: {e}"),
+            WriteError::ScratchTooSmall => f.write_str("scratch buffer smaller than a sector"),
+            WriteError::MediumTooSmall => f.write_str("medium too small for a GPT"),
+            WriteError::NoSuchSlot => f.write_str("no such GPT entry"),
+            WriteError::InvalidEntry(i) => write!(f, "GPT entry {i} is invalid"),
+            WriteError::NameTooLong(i) => write!(f, "GPT entry {i} has a name over 36 units"),
+            WriteError::OutsideUsable(i) => {
+                write!(f, "GPT entry {i} lies outside the usable sectors")
+            }
+            WriteError::Overlap(a, b) => write!(f, "GPT entries {a} and {b} overlap"),
+            WriteError::NoTable => f.write_str("no GPT to change"),
+            WriteError::UnsupportedLayout => f.write_str("GPT layout not supported for rewriting"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<E: core::fmt::Debug + core::fmt::Display> std::error::Error for WriteError<E> {}
+
+/// What was wrong with a [`NewPartition`], before its index is known.
+enum Invalid {
+    Entry,
+    Name,
+}
+
+impl Invalid {
+    fn at<E>(self, index: u32) -> WriteError<E> {
+        match self {
+            Invalid::Entry => WriteError::InvalidEntry(index),
+            Invalid::Name => WriteError::NameTooLong(index),
+        }
+    }
+}
+
+/// Everything a header records that is not derived from the layout.
+struct Shape {
+    disk_guid: Guid,
+    first_usable_lba: u64,
+    last_usable_lba: u64,
+    primary_array_lba: u64,
+    backup_array_lba: u64,
+    backup_lba: u64,
+    entry_count: u32,
+    entry_size: u32,
+}
+
+/// Write a GPT holding `parts` — entry `i` of the array is `parts[i]` —
+/// over whatever the medium had: a protective MBR, both headers and both
+/// arrays.
+///
+/// The partitions are checked first (inside the usable sectors, no overlaps,
+/// GUIDs set, names short enough) and nothing is written unless all of them
+/// pass. The backup copy is written before the primary, so a write torn
+/// part-way leaves one complete table or the old one.
+pub fn write<D: SectorDriver>(
+    dev: &mut D,
+    scratch: &mut [u8],
+    disk_guid: Guid,
+    parts: &[NewPartition<'_>],
+) -> Result<(), WriteError<D::Error>> {
+    let ss = check_scratch(dev, scratch)?;
+    let layout = Layout::new(dev.sector_count(), ss).ok_or(WriteError::MediumTooSmall)?;
+    if parts.len() > ENTRY_COUNT as usize {
+        return Err(WriteError::NoSuchSlot);
+    }
+    let mut entry = [0u8; ENTRY_SIZE as usize];
+    for (i, p) in parts.iter().enumerate() {
+        let i = i as u32;
+        p.encode(&mut entry).map_err(|e| e.at(i))?;
+        if p.start_lba < layout.first_usable_lba || p.end_lba > layout.last_usable_lba {
+            return Err(WriteError::OutsideUsable(i));
+        }
+        for (j, q) in parts.iter().enumerate().skip(i as usize + 1) {
+            if p.start_lba <= q.end_lba && q.start_lba <= p.end_lba {
+                return Err(WriteError::Overlap(i, j as u32));
+            }
+        }
+    }
+    let shape = Shape {
+        disk_guid,
+        first_usable_lba: layout.first_usable_lba,
+        last_usable_lba: layout.last_usable_lba,
+        primary_array_lba: 2,
+        backup_array_lba: layout.backup_array_lba,
+        backup_lba: layout.backup_lba,
+        entry_count: ENTRY_COUNT,
+        entry_size: ENTRY_SIZE,
+    };
+    commit(dev, scratch, &shape, |_, first, sector| {
+        for (k, out) in sector
+            .as_chunks_mut::<{ ENTRY_SIZE as usize }>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
+            match parts.get(first as usize + k) {
+                // Already validated above.
+                Some(p) => {
+                    let _ = p.encode(out);
+                }
+                None => out.fill(0),
+            }
+        }
+        Ok(())
+    })?;
+    protective_mbr(dev, scratch, ss)
+}
+
+/// Add, change or remove (with `None`) entry `index` of the GPT already on
+/// `dev`, and rewrite both copies of the table.
+///
+/// The table is read from the primary header, or the backup when the
+/// primary is damaged; either way both are written back whole, so this also
+/// repairs a table with one bad copy. The new entry is checked against the
+/// usable sectors and against every other entry before anything is written.
+pub fn set_entry<D: SectorDriver>(
+    dev: &mut D,
+    scratch: &mut [u8],
+    index: u32,
+    part: Option<NewPartition<'_>>,
+) -> Result<(), WriteError<D::Error>> {
+    let ss = check_scratch(dev, scratch)?;
+    let table = Table::read(dev, scratch)
+        .map_err(WriteError::Io)?
+        .ok_or(WriteError::NoTable)?;
+    let h = table.header;
+    let count = dev.sector_count();
+    if h.entry_count > MAX_ENTRIES
+        || !h.entry_size.is_power_of_two()
+        || h.entry_size > ss
+        || count < 2
+    {
+        return Err(WriteError::UnsupportedLayout);
+    }
+    if index >= h.entry_count {
+        return Err(WriteError::NoSuchSlot);
+    }
+    let array_sectors = (h.entry_count as u64 * h.entry_size as u64).div_ceil(ss as u64);
+    let backup_lba = count - 1;
+    let backup_array_lba = backup_lba
+        .checked_sub(array_sectors)
+        .ok_or(WriteError::UnsupportedLayout)?;
+    if h.first_usable_lba < 2 + array_sectors || h.last_usable_lba >= backup_array_lba {
+        return Err(WriteError::UnsupportedLayout);
+    }
+
+    // Validate against every other live entry before touching the medium.
+    let mut entry = [0u8; ENTRY_SIZE as usize];
+    if let Some(p) = &part {
+        p.encode(&mut entry).map_err(|e| e.at(index))?;
+        if p.start_lba < h.first_usable_lba || p.end_lba > h.last_usable_lba {
+            return Err(WriteError::OutsideUsable(index));
+        }
+        for j in 0..h.entry_count {
+            if j == index {
+                continue;
+            }
+            if let Some(q) = table.entry(dev, scratch, j).map_err(WriteError::Io)?
+                && p.start_lba <= q.end_lba
+                && q.start_lba <= p.end_lba
+            {
+                return Err(WriteError::Overlap(index, j));
+            }
+        }
+    }
+
+    let source = h.entries_lba;
+    // The array the header points at has to be on the medium to be read
+    // back — a header off untrusted media can point anywhere.
+    if source
+        .checked_add(array_sectors)
+        .is_none_or(|end| end > count)
+    {
+        return Err(WriteError::UnsupportedLayout);
+    }
+    // Regenerating a copy over itself is safe sector by sector; over a range
+    // that only partly overlaps its source (a backup array on a medium that
+    // has since grown by less than the array) it is not.
+    let partly_overlaps = |dest: u64| {
+        dest != source && dest < source + array_sectors && source < dest + array_sectors
+    };
+    if partly_overlaps(2) || partly_overlaps(backup_array_lba) {
+        return Err(WriteError::UnsupportedLayout);
+    }
+    let per_sector = ss / h.entry_size;
+    let entry_size = h.entry_size as usize;
+    let shape = Shape {
+        disk_guid: h.disk_guid,
+        first_usable_lba: h.first_usable_lba,
+        last_usable_lba: h.last_usable_lba,
+        primary_array_lba: 2,
+        backup_array_lba,
+        backup_lba,
+        entry_count: h.entry_count,
+        entry_size: h.entry_size,
+    };
+    // The array is regenerated from the copy the header was read from, a
+    // sector at a time, with the one entry patched in on the way. Each
+    // source sector is read before its destination is written, so
+    // rewriting a copy over itself is safe, and patching a sector that
+    // already carries the change is harmless.
+    commit(dev, scratch, &shape, |dev, first, sector| {
+        let lba = source + (first / per_sector) as u64;
+        if lba < count {
+            dev.read_sectors(lba, sector)?;
+        } else {
+            sector.fill(0);
+        }
+        if (first..first + per_sector).contains(&index) {
+            let at = (index - first) as usize * entry_size;
+            let slot = &mut sector[at..at + entry_size];
+            match &part {
+                // Already validated above.
+                Some(p) => {
+                    let _ = p.encode(slot);
+                }
+                None => slot.fill(0),
+            }
+        }
+        Ok(())
+    })?;
+    // A table whose protective MBR is already there (or is a hybrid one a
+    // tool put there on purpose) keeps it.
+    Ok(())
+}
+
+/// Remove the GPT from `dev` by zeroing both headers, so the medium can be
+/// given an MBR (or nothing) without a GPT reader finding the old table's
+/// backup. Partition data is not touched.
+pub fn erase<D: SectorDriver>(dev: &mut D, scratch: &mut [u8]) -> Result<(), WriteError<D::Error>> {
+    let ss = check_scratch(dev, scratch)? as usize;
+    let count = dev.sector_count();
+    if count < 2 {
+        return Ok(());
+    }
+    let buf = &mut scratch[..ss];
+    buf.fill(0);
+    dev.write_sectors(1, buf).map_err(WriteError::Io)?;
+    dev.write_sectors(count - 1, buf).map_err(WriteError::Io)?;
+    dev.flush().map_err(WriteError::Io)
+}
+
+/// The sector size, once the scratch is known to hold a sector.
+fn check_scratch<D: SectorDriver>(dev: &D, scratch: &[u8]) -> Result<u32, WriteError<D::Error>> {
+    let ss = dev.sector_size();
+    if ss < 512 || !ss.is_power_of_two() || scratch.len() < ss as usize {
+        return Err(WriteError::ScratchTooSmall);
+    }
+    Ok(ss)
+}
+
+/// Write both copies of the table: the backup array, the backup header, the
+/// primary array, the primary header — in that order, so a write torn at
+/// any point leaves at least one copy whose header and array agree.
+///
+/// `fill(dev, first, sector)` produces the array sector whose first entry is
+/// index `first`. It is called once per sector per copy, and must produce
+/// the same bytes both times.
+fn commit<D: SectorDriver>(
+    dev: &mut D,
+    scratch: &mut [u8],
+    shape: &Shape,
+    mut fill: impl FnMut(&mut D, u32, &mut [u8]) -> Result<(), D::Error>,
+) -> Result<(), WriteError<D::Error>> {
+    let ss = dev.sector_size() as usize;
+    let buf = &mut scratch[..ss];
+    let per_sector = ss as u32 / shape.entry_size;
+    let array_bytes = shape.entry_count as u64 * shape.entry_size as u64;
+    let sectors = array_bytes.div_ceil(ss as u64);
+
+    let mut crc = 0;
+    for (copy, (array_lba, my_lba, alternate_lba)) in [
+        (shape.backup_array_lba, shape.backup_lba, 1),
+        (shape.primary_array_lba, 1, shape.backup_lba),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut running = 0;
+        for k in 0..sectors {
+            fill(dev, k as u32 * per_sector, buf).map_err(WriteError::Io)?;
+            // Past the last entry the sector is padding, and not part of the
+            // array the CRC covers.
+            let used = (array_bytes - k * ss as u64).min(ss as u64) as usize;
+            buf[used..].fill(0);
+            running = crate::crc::crc32_small_append(running, &buf[..used]);
+            dev.write_sectors(array_lba + k, buf)
+                .map_err(WriteError::Io)?;
+        }
+        if copy == 0 {
+            crc = running;
+        }
+        header(buf, shape, my_lba, alternate_lba, array_lba, crc);
+        dev.write_sectors(my_lba, buf).map_err(WriteError::Io)?;
+    }
+    dev.flush().map_err(WriteError::Io)
+}
+
+/// Encode a header into `sector`.
+fn header(sector: &mut [u8], shape: &Shape, my: u64, alternate: u64, array: u64, crc: u32) {
+    sector.fill(0);
+    sector[0..8].copy_from_slice(SIGNATURE);
+    sector[8..12].copy_from_slice(&REVISION.to_le_bytes());
+    sector[12..16].copy_from_slice(&MIN_HEADER_SIZE.to_le_bytes());
+    sector[24..32].copy_from_slice(&my.to_le_bytes());
+    sector[32..40].copy_from_slice(&alternate.to_le_bytes());
+    sector[40..48].copy_from_slice(&shape.first_usable_lba.to_le_bytes());
+    sector[48..56].copy_from_slice(&shape.last_usable_lba.to_le_bytes());
+    sector[56..72].copy_from_slice(&shape.disk_guid.0);
+    sector[72..80].copy_from_slice(&array.to_le_bytes());
+    sector[80..84].copy_from_slice(&shape.entry_count.to_le_bytes());
+    sector[84..88].copy_from_slice(&shape.entry_size.to_le_bytes());
+    sector[88..92].copy_from_slice(&crc.to_le_bytes());
+    let own = crate::crc::crc32_small(&sector[..MIN_HEADER_SIZE as usize]);
+    sector[16..20].copy_from_slice(&own.to_le_bytes());
+}
+
+/// Write the protective MBR a GPT medium carries in sector 0: one partition
+/// of type `0xEE` covering the medium (capped at what 32 bits can say),
+/// keeping any boot code already there.
+fn protective_mbr<D: SectorDriver>(
+    dev: &mut D,
+    scratch: &mut [u8],
+    ss: u32,
+) -> Result<(), WriteError<D::Error>> {
+    let buf = &mut scratch[..ss as usize];
+    dev.read_sectors(0, buf).map_err(WriteError::Io)?;
+    buf[440..].fill(0);
+    let sectors = (dev.sector_count() - 1).min(u32::MAX as u64) as u32;
+    let slot = &mut buf[446..462];
+    slot[1..4].copy_from_slice(&[0x00, 0x02, 0x00]); // CHS of LBA 1
+    slot[4] = super::mbr::GPT_PROTECTIVE;
+    slot[5..8].copy_from_slice(&[0xFF, 0xFF, 0xFF]);
+    slot[8..12].copy_from_slice(&1u32.to_le_bytes());
+    slot[12..16].copy_from_slice(&sectors.to_le_bytes());
+    buf[510] = 0x55;
+    buf[511] = 0xAA;
+    dev.write_sectors(0, buf).map_err(WriteError::Io)?;
+    dev.flush().map_err(WriteError::Io)
+}
 fn le16(b: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([b[off], b[off + 1]])
 }
@@ -615,5 +1117,261 @@ mod tests {
         // An empty name reads as nothing rather than 36 zeros.
         let e = entry(BASIC_DATA, 2048, 4095, "");
         assert_eq!(Partition::name_from(&e, &mut units), 0);
+    }
+
+    /// A blank medium of `sectors` sectors of `ss` bytes.
+    struct Blank {
+        data: alloc::vec::Vec<u8>,
+        ss: u32,
+    }
+
+    impl SectorDriver for Blank {
+        type Error = core::convert::Infallible;
+        fn sector_size(&self) -> u32 {
+            self.ss
+        }
+        fn sector_count(&self) -> u64 {
+            self.data.len() as u64 / self.ss as u64
+        }
+        fn read_sectors(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
+            assert_eq!(buf.len() % self.ss as usize, 0);
+            let at = lba as usize * self.ss as usize;
+            buf.copy_from_slice(&self.data[at..at + buf.len()]);
+            Ok(())
+        }
+        fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), Self::Error> {
+            assert_eq!(buf.len() % self.ss as usize, 0);
+            let at = lba as usize * self.ss as usize;
+            self.data[at..at + buf.len()].copy_from_slice(buf);
+            Ok(())
+        }
+    }
+
+    fn blank(sectors: usize, ss: u32) -> Blank {
+        Blank {
+            data: alloc::vec![0u8; sectors * ss as usize],
+            ss,
+        }
+    }
+
+    fn guid(n: u8) -> Guid {
+        Guid::random_v4([n; 16])
+    }
+
+    /// Verify the array CRC a header records against the array itself.
+    fn array_crc_matches(dev: &mut Blank, h: &Header) -> bool {
+        let ss = dev.ss as usize;
+        let bytes = (h.entry_count * h.entry_size) as usize;
+        let at = h.entries_lba as usize * ss;
+        crate::crc::crc32(&dev.data[at..at + bytes]) == h.entries_crc32
+    }
+
+    #[test]
+    fn a_written_table_reads_back_from_either_copy() {
+        for ss in [512u32, 4096] {
+            let sectors = (64 * 1024 * 1024 / ss) as usize;
+            let mut dev = blank(sectors, ss);
+            let layout = Layout::new(sectors as u64, ss).unwrap();
+            let start = layout.first_aligned_lba(ss);
+            assert_eq!(start * ss as u64, 1 << 20);
+            let parts = [
+                NewPartition {
+                    name: "EFI system",
+                    ..NewPartition::new(EFI_SYSTEM, guid(1), start, 8192 * 512 / ss as u64)
+                },
+                NewPartition {
+                    attributes: 1 << 60,
+                    ..NewPartition::new(BASIC_DATA, guid(2), start + 8192 * 512 / ss as u64, 1000)
+                },
+            ];
+            let mut scratch = [0u8; 4096];
+            write(&mut dev, &mut scratch, guid(9), &parts).unwrap();
+
+            // Protective MBR.
+            let mbr = super::super::mbr::parse(&dev.data[..512]);
+            assert!(
+                mbr.is_none(),
+                "the protective entry is not offered as a partition"
+            );
+            assert_eq!(dev.data[446 + 4], 0xEE);
+
+            for damage_primary in [false, true] {
+                if damage_primary {
+                    let at = ss as usize;
+                    dev.data[at..at + 92].fill(0x5A);
+                }
+                let table = Table::read(&mut dev, &mut scratch).unwrap().expect("table");
+                assert_eq!(table.from_backup, damage_primary);
+                assert_eq!(table.header.disk_guid, guid(9));
+                assert_eq!(table.header.first_usable_lba, layout.first_usable_lba);
+                assert_eq!(table.header.last_usable_lba, layout.last_usable_lba);
+                assert!(
+                    array_crc_matches(&mut dev, &table.header),
+                    "array CRC at {ss}"
+                );
+                let a = table.entry(&mut dev, &mut scratch, 0).unwrap().unwrap();
+                assert!(a.is_efi_system());
+                assert_eq!((a.start_lba, a.guid), (start, guid(1)));
+                let (lba, at) = table.header.entry_position(0, ss).unwrap();
+                let sector = &dev.data[lba as usize * ss as usize..][..ss as usize];
+                let mut name = [0u16; MAX_NAME_UNITS];
+                let n = Partition::name_from(&sector[at..], &mut name);
+                assert!(name[..n].iter().copied().eq("EFI system".encode_utf16()));
+                let b = table.entry(&mut dev, &mut scratch, 1).unwrap().unwrap();
+                assert!(b.is_read_only() && b.is_basic_data());
+                assert!(table.entry(&mut dev, &mut scratch, 2).unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn an_invalid_table_writes_nothing() {
+        let mut dev = blank(100_000, 512);
+        let mut scratch = [0u8; 512];
+        let l = Layout::new(100_000, 512).unwrap();
+        let p = |start, n| NewPartition::new(BASIC_DATA, guid(1), start, n);
+        let cases: [(&[NewPartition<'_>], WriteError<core::convert::Infallible>); 5] = [
+            (&[p(2048, 100), p(2100, 10)], WriteError::Overlap(0, 1)),
+            (&[p(10, 100)], WriteError::OutsideUsable(0)),
+            (&[p(2048, l.last_usable_lba)], WriteError::OutsideUsable(0)),
+            (
+                &[NewPartition {
+                    guid: Guid::NIL,
+                    ..p(2048, 10)
+                }],
+                WriteError::InvalidEntry(0),
+            ),
+            (
+                &[
+                    p(2048, 10),
+                    NewPartition {
+                        name: "a name that is far too long to fit in GPT",
+                        ..p(4096, 10)
+                    },
+                ],
+                WriteError::NameTooLong(1),
+            ),
+        ];
+        for (parts, want) in cases {
+            assert_eq!(write(&mut dev, &mut scratch, guid(9), parts), Err(want));
+        }
+        assert!(dev.data.iter().all(|&b| b == 0), "nothing was written");
+        assert_eq!(
+            write(&mut blank(60, 512), &mut scratch, guid(9), &[]),
+            Err(WriteError::MediumTooSmall)
+        );
+    }
+
+    #[test]
+    fn entries_change_one_at_a_time_and_a_damaged_copy_is_repaired() {
+        let mut dev = blank(200_000, 512);
+        let mut scratch = [0u8; 512];
+        write(
+            &mut dev,
+            &mut scratch,
+            guid(9),
+            &[NewPartition::new(BASIC_DATA, guid(1), 2048, 4096)],
+        )
+        .unwrap();
+
+        // Add a second partition in slot 5, leaving a gap.
+        set_entry(
+            &mut dev,
+            &mut scratch,
+            5,
+            Some(NewPartition::new(LINUX_FS, guid(2), 8192, 4096)),
+        )
+        .unwrap();
+        // One that overlaps the first is refused.
+        assert_eq!(
+            set_entry(
+                &mut dev,
+                &mut scratch,
+                6,
+                Some(NewPartition::new(LINUX_FS, guid(3), 3000, 10))
+            ),
+            Err(WriteError::Overlap(6, 0))
+        );
+        assert_eq!(
+            set_entry(&mut dev, &mut scratch, 128, None),
+            Err(WriteError::NoSuchSlot)
+        );
+        // Resizing an entry in place is not an overlap with itself.
+        set_entry(
+            &mut dev,
+            &mut scratch,
+            0,
+            Some(NewPartition::new(BASIC_DATA, guid(1), 2048, 6000)),
+        )
+        .unwrap();
+
+        // Damage the primary; the next change reads the backup and rewrites
+        // both.
+        dev.data[512..604].fill(0x5A);
+        set_entry(&mut dev, &mut scratch, 0, None).unwrap();
+        let table = Table::read(&mut dev, &mut scratch).unwrap().unwrap();
+        assert!(!table.from_backup, "the primary was repaired");
+        assert!(array_crc_matches(&mut dev, &table.header));
+        assert!(table.entry(&mut dev, &mut scratch, 0).unwrap().is_none());
+        let p = table.entry(&mut dev, &mut scratch, 5).unwrap().unwrap();
+        assert_eq!((p.start_lba, p.guid), (8192, guid(2)));
+        // And the backup agrees.
+        let last = dev.data.len() - 512;
+        let backup = Header::decode(&dev.data[last..]).unwrap();
+        assert_eq!(backup.entries_crc32, table.header.entries_crc32);
+        assert!(array_crc_matches(&mut dev, &backup));
+
+        // A medium with no GPT has nothing to change.
+        assert_eq!(
+            set_entry(&mut blank(200_000, 512), &mut scratch, 0, None),
+            Err(WriteError::NoTable)
+        );
+    }
+
+    #[test]
+    fn an_erased_table_is_gone_from_both_ends() {
+        let mut dev = blank(100_000, 512);
+        let mut scratch = [0u8; 512];
+        write(
+            &mut dev,
+            &mut scratch,
+            guid(9),
+            &[NewPartition::new(BASIC_DATA, guid(1), 2048, 4096)],
+        )
+        .unwrap();
+        erase(&mut dev, &mut scratch).unwrap();
+        assert!(Table::read(&mut dev, &mut scratch).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_random_guid_carries_version_4_and_the_rfc_variant() {
+        let g = Guid::random_v4([0xFF; 16]);
+        assert_eq!(g.0[7] >> 4, 4);
+        assert_eq!(g.0[8] >> 6, 0b10);
+        assert_eq!(Guid::random_v4([0; 16]).0[7], 0x40);
+    }
+
+    #[test]
+    fn a_header_pointing_its_array_off_the_medium_is_not_rewritten() {
+        let mut dev = blank(100_000, 512);
+        let mut scratch = [0u8; 512];
+        write(
+            &mut dev,
+            &mut scratch,
+            guid(9),
+            &[NewPartition::new(BASIC_DATA, guid(1), 2048, 4096)],
+        )
+        .unwrap();
+        // Re-sign the primary header with its array at the top of the
+        // address space.
+        let h = &mut dev.data[512..1024];
+        h[72..80].copy_from_slice(&u64::MAX.to_le_bytes());
+        h[16..20].fill(0);
+        let crc = crate::crc::crc32(&h[..92]);
+        h[16..20].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            set_entry(&mut dev, &mut scratch, 1, None),
+            Err(WriteError::UnsupportedLayout)
+        );
     }
 }

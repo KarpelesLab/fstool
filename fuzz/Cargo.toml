@@ -61,3 +61,10 @@ path = "fuzz_targets/fat_volume.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "volume_mount"
+path = "fuzz_targets/volume_mount.rs"
+test = false
+doc = false
+bench = false

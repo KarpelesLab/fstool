@@ -1085,6 +1085,7 @@ impl<D: SectorDriver, const S: usize> Volume<D, S> {
             units: [0u16; MAX_NAME_UNITS],
             name: [0u8; MAX_NAME_BYTES],
             name_len: 0,
+            skip_dots: false,
         }
     }
 
@@ -1142,10 +1143,10 @@ pub struct DirEntry<'a> {
     meta: Metadata,
 }
 
-impl DirEntry<'_> {
+impl<'a> DirEntry<'a> {
     /// The entry's name: the long name when it has one, otherwise its 8.3
     /// name.
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> &'a str {
         self.name
     }
 
@@ -1211,6 +1212,9 @@ pub struct DirIter<'v, D: SectorDriver, const S: usize> {
     units: [u16; MAX_NAME_UNITS],
     name: [u8; MAX_NAME_BYTES],
     name_len: usize,
+    /// Leave `.` and `..` out, as the generic interface does — every other
+    /// filesystem behind it has no such entries to report.
+    pub(crate) skip_dots: bool,
 }
 
 impl<D: SectorDriver, const S: usize> DirIter<'_, D, S> {
@@ -1284,6 +1288,9 @@ impl<D: SectorDriver, const S: usize> DirIter<'_, D, S> {
                 short_name(&raw, &mut self.name)
             };
             self.run.reset();
+            if self.skip_dots && matches!(&self.name[..self.name_len], [b'.'] | [b'.', b'.']) {
+                continue;
+            }
 
             let meta = decode_short(&raw, self.vol.geom.kind, loc);
             let name = core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("");

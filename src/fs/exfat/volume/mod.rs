@@ -80,9 +80,9 @@
 //!   you have 4 KiB-sector media.
 //! * The volume's declared sector size must equal the driver's; a mismatch
 //!   is [`Error::SectorSizeMismatch`] rather than a bounce-buffer layer.
-//! * Volumes are mounted, not created: `mkfs` needs the boot region's
-//!   checksums, a fresh up-case table and a bitmap laid out together, which
-//!   is the hosted half's job (or `fstool create -t exfat`).
+//! * [`Volume::format`] / [`Volume::format_at`] create volumes, with the
+//!   specification's recommended up-case table, one FAT, and no volume GUID
+//!   entry; TexFAT's second FAT and bitmap are never laid down.
 //! * Every write path needs the allocation bitmap, since it is the only
 //!   record of which clusters a `NoFatChain` file owns; a volume without a
 //!   readable one is read-only ([`Error::NoAllocationBitmap`]).
@@ -106,11 +106,13 @@
 mod dir;
 mod entry;
 mod file;
+mod format;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use dir::{Dir, DirEntry, DirIter, Metadata};
 pub use file::File;
+pub use format::VolumeFormatOpts;
 
 use super::layout::{self, Boot, FatEntry};
 

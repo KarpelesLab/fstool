@@ -7,6 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(fat)* `Volume::format` / `format_at`: the allocator-free driver formats.
+  FAT12, FAT16 or FAT32 and the cluster size are chosen from the volume's
+  size the way `mkfs.fat` and Windows choose them (FAT32 from 512 MiB, with
+  Microsoft's cluster table and the data region on a cluster boundary), or
+  set through `FormatOpts`. Only metadata is written, a sector at a time
+  through one sector of stack, boot sector last. `fsck.vfat` passes every
+  flavour at 512- and 4096-byte sectors, fresh and after use, and inside an
+  MBR partition; the hosted `Fat32` reads them.
+- *(exfat)* `Volume::format` / `format_at`, likewise: Microsoft's default
+  cluster sizes (or `VolumeFormatOpts::cluster_size`), both boot regions with
+  their checksum, one FAT, the allocation bitmap, a label, and the
+  specification's recommended up-case table — the same 5836 bytes
+  `mkfs.exfat` writes, so non-ASCII names fold as they do on any other card.
+  The boot regions are written last. `fsck.exfat`, which checks the boot and
+  up-case checksums, passes volumes from 8 MiB to 4 GiB at both sector sizes
+  and inside a GPT partition; the hosted `Exfat` reads them. (The hosted
+  `Exfat::format` still writes an ASCII-only table.)
+- *(device)* `device::mbr::write` / `set_entry`: write a partition table, or
+  change one slot of the one there, through a `SectorDriver` and a sector of
+  scratch — boot code kept, CHS fields filled, the layout validated (inside
+  the medium, no overlaps) before anything is written. Type-byte constants
+  (`FAT32_LBA`, `EXFAT`, `LINUX`, …) and `FIRST_LBA` come with it. `sfdisk`
+  reads back what they write, including changes to tables it wrote.
+- *(device)* `device::gpt::write` / `set_entry` / `erase`: lay a GPT down
+  (protective MBR, both headers and arrays, CRCs computed a sector at a time),
+  change one entry of an existing table — rewriting both copies, which
+  repairs a damaged one — or remove a table. Backup copy first, primary
+  last, so a torn write leaves one whole table. `Layout` says where usable
+  sectors start and end and where the 1 MiB-aligned first partition goes;
+  `Guid::random_v4` makes a well-formed GUID from the caller's random bytes.
+  `sgdisk -v` passes the tables and `sgdisk -i` reads back every field; the
+  `device_tables` fuzz target now runs `set_entry` over arbitrary media (it
+  found an overflow on a header pointing its array off the medium, fixed).
+- *(fs)* `fs::volume::format` and `FormatAs`: format any compiled-in
+  filesystem through the generic layer — littlefs on a card through
+  `SectorFlash` — and get an `AnyVolume` back. `FormatAs::sd_card` picks what
+  the SD specification requires for a card's size: FAT up to 32 GiB, exFAT
+  above.
+- *(fs)* `fs::volume`: one interface over every allocator-free driver.
+  `fs::fat::Volume`, `fs::exfat::Volume` and `fs::littlefs::Volume` all
+  implement its `Volume`, `VolumeFile` and `VolumeDirIter` traits, so code
+  written once — open, read, write, seek, truncate, list, create and remove
+  — runs on any of them. Sizes are `u64` and names bytes (with `name_str`)
+  whatever the driver stores; a listing never reports FAT's `.` and `..`;
+  every driver error answers `kind()` with a shared `ErrorKind`, so generic
+  code can tell `NotFound` from `Io` without knowing whose error it holds.
+  The traits are generic rather than `dyn`, need no allocator, and cost
+  nothing over calling the driver directly. The drivers' own APIs are
+  unchanged.
+- *(fs)* `fs::mount` / `fs::volume::probe`: find out what a card holds and
+  mount it. The whole medium is tried, then each GPT or MBR partition in
+  order, and at each start the compiled-in filesystems are recognised by
+  their own signatures — exFAT boot sector, a FAT BPB that validates, a
+  littlefs superblock log — never by a partition type. The result is an
+  `AnyVolume`, which implements the same traits, and whose `AnyError` keeps
+  the driver's error whole. `probe` answers without taking the card. Checked
+  against volumes `mkfs.fat` (inside an `sgdisk` GPT), `mkfs.exfat` (whole
+  card and MBR slot) and littlefs's C implementation (512-, 1024- and
+  4096-byte blocks, after enough churn to compact the superblock) wrote: each
+  is found, edited through the traits, and passed by its own tool afterwards.
+  A new `volume_mount` fuzz target feeds `probe` and `mount_found` arbitrary
+  media.
+- *(device)* `device::SectorFlash`: a `SectorDriver` presented as a
+  `FlashDriver`, one erase block per run of sectors — littlefs on an SD card
+  or eMMC part, where never overwriting live metadata is exactly what a card
+  pulled mid-write needs. `fs::mount` uses it to mount littlefs found on a
+  card. Erase really writes `0xff`, as the flash contract promises the
+  driver.
+
+### Changed
+
+- *(fat)* `DirEntry::name` returns `&'a str`, borrowed from the iterator
+  rather than from the entry, like exFAT's and littlefs's already did. Code
+  that compiled before still does.
+
 ## [0.4.31](https://github.com/KarpelesLab/fstool/compare/v0.4.30...v0.4.31) - 2026-09-13
 
 ### Added

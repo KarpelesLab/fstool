@@ -19,15 +19,15 @@ use crate::device::gpt;
 /// A RAM-backed card that holds the driver to its contract: reads and
 /// writes are whole sectors, inside the medium.
 #[derive(Debug)]
-struct RamCard {
-    data: Vec<u8>,
+pub(crate) struct RamCard {
+    pub(crate) data: Vec<u8>,
     sector_size: u32,
     reads: u32,
     writes: u32,
 }
 
 impl RamCard {
-    fn new(sectors: u32) -> Self {
+    pub(crate) fn new(sectors: u32) -> Self {
         Self {
             data: vec![0u8; sectors as usize * 512],
             sector_size: 512,
@@ -88,7 +88,7 @@ const BOOT_REGION: u32 = 24;
 /// This is the driver's own fixture, not a `mkfs`: it writes what a mount
 /// reads, and leaves the boot region's backup and checksum sectors alone
 /// (the conformance suite formats with the real tools instead).
-fn format(card: &mut RamCard, offset: u32, sectors: u32, sectors_per_cluster: u32) {
+pub(crate) fn format(card: &mut RamCard, offset: u32, sectors: u32, sectors_per_cluster: u32) {
     const BPS: u32 = 512;
     let spc_shift = sectors_per_cluster.trailing_zeros() as u8;
     let fat_offset = BOOT_REGION;
@@ -1144,4 +1144,253 @@ fn write_gpt(card: &mut RamCard, start: u32, sectors: u32, type_guid: gpt::Guid)
         1,
         backup_array_lba,
     ));
+}
+
+// -- formatting ---------------------------------------------------------------
+
+mod formatting {
+    use super::super::format::plan;
+    use super::*;
+    use alloc::collections::BTreeMap;
+
+    /// A card whose sectors exist only once written, so a many-gigabyte
+    /// format is testable. Unwritten sectors read as a pattern, not zeros,
+    /// so a format that leans on a blank card is caught.
+    #[derive(Debug)]
+    struct Sparse {
+        sectors: u64,
+        ss: u32,
+        data: BTreeMap<u64, Vec<u8>>,
+    }
+
+    impl Sparse {
+        fn new(bytes: u64, ss: u32) -> Self {
+            Self {
+                sectors: bytes / ss as u64,
+                ss,
+                data: BTreeMap::new(),
+            }
+        }
+    }
+
+    impl SectorDriver for Sparse {
+        type Error = core::convert::Infallible;
+        fn sector_size(&self) -> u32 {
+            self.ss
+        }
+        fn sector_count(&self) -> u64 {
+            self.sectors
+        }
+        fn read_sectors(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
+            let ss = self.ss as usize;
+            assert!(buf.len().is_multiple_of(ss) && lba + (buf.len() / ss) as u64 <= self.sectors);
+            for (i, chunk) in buf.chunks_mut(ss).enumerate() {
+                match self.data.get(&(lba + i as u64)) {
+                    Some(s) => chunk.copy_from_slice(s),
+                    None => chunk.fill(0xE5),
+                }
+            }
+            Ok(())
+        }
+        fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), Self::Error> {
+            let ss = self.ss as usize;
+            assert!(buf.len().is_multiple_of(ss) && lba + (buf.len() / ss) as u64 <= self.sectors);
+            for (i, chunk) in buf.chunks(ss).enumerate() {
+                self.data.insert(lba + i as u64, chunk.to_vec());
+            }
+            Ok(())
+        }
+    }
+
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn the_cluster_size_follows_microsofts_defaults() {
+        for (bytes, cluster) in [
+            (8 * MIB, 4096),
+            (256 * MIB, 4096),
+            (2 * GIB, 32 << 10),
+            (32 * GIB, 32 << 10),
+            (64 * GIB, 128 << 10),
+            (2048 * GIB, 128 << 10),
+        ] {
+            let p = plan(bytes / 512, 512, None).unwrap();
+            assert_eq!(p.spc * 512, cluster, "at {bytes} bytes");
+            assert!(p.fat_length as u64 * 512 >= (p.clusters as u64 + 2) * 4);
+            assert_eq!(p.heap_offset % p.spc, 0, "heap on a cluster boundary");
+            let heap_end = p.heap_offset as u64 + p.clusters as u64 * p.spc as u64;
+            assert!(heap_end <= bytes / 512 && bytes / 512 - heap_end < p.spc as u64);
+        }
+        assert!(plan(1024, 512, None).is_err(), "below 1 MiB");
+        assert!(plan(64 * MIB / 512, 512, Some(1000)).is_err());
+        // 4 KiB sectors never get a cluster below a sector.
+        assert_eq!(
+            plan(64 * MIB / 4096, 4096, Some(512)).map(|p| p.spc),
+            Err("cluster size must be a power of two from a sector to 32 MiB")
+        );
+    }
+
+    fn fill_and_check(vol: Volume<Sparse, 4096>) -> Volume<Sparse, 4096> {
+        let mut vol = vol;
+        let cb = vol.cluster_bytes() as usize;
+        let body: Vec<u8> = (0..cb * 3 + 17).map(|i| (i % 251) as u8).collect();
+        vol.create_dir("/DCIM").unwrap();
+        let mut f = vol.create_file("/DCIM/Über.bin").unwrap();
+        f.write_all(&mut vol, &body).unwrap();
+        f.flush(&mut vol).unwrap();
+        let card = vol.unmount().unwrap();
+        let mut vol = Volume::<_, 4096>::mount_auto(card).unwrap();
+        let mut f = vol.open_file("/dcim/über.BIN").unwrap();
+        let mut back = vec![0u8; body.len()];
+        f.read_exact(&mut vol, &mut back).unwrap();
+        assert_eq!(back, body);
+        vol
+    }
+
+    #[test]
+    fn a_formatted_card_mounts_empty_and_takes_files() {
+        for (bytes, ss) in [
+            (8 * MIB, 512),
+            (512 * MIB, 512),
+            (64 * GIB, 512),
+            (256 * MIB, 4096),
+        ] {
+            let card = Sparse::new(bytes, ss);
+            let opts = VolumeFormatOpts {
+                label: "Kamera",
+                volume_serial: 0xABCD_0123,
+                ..Default::default()
+            };
+            let mut vol =
+                Volume::<_, 4096>::format(card, &opts).unwrap_or_else(|e| panic!("{bytes}: {e:?}"));
+            let p = plan(bytes / ss as u64, ss, None).unwrap();
+            assert_eq!(vol.geometry().cluster_count, p.clusters);
+            assert_eq!(vol.geometry().serial, 0xABCD_0123);
+            assert_eq!(
+                vol.used_clusters().unwrap(),
+                p.bitmap_clusters + p.upcase_clusters + 1
+            );
+            assert!(vol.is_writable());
+            let root = vol.root();
+            assert!(
+                vol.iter_dir(root).next().unwrap().is_none(),
+                "a fresh root lists nothing"
+            );
+            fill_and_check(vol);
+        }
+    }
+
+    #[test]
+    fn the_full_up_case_table_folds_names_beyond_ascii() {
+        let mut vol =
+            Volume::<_, 512>::format(Sparse::new(16 * MIB, 512), &VolumeFormatOpts::default())
+                .unwrap();
+        vol.create_file("/Ωmega-ÆØÅ-Straße.txt").unwrap();
+        assert!(vol.exists("/ωMEGA-æøå-STRAßE.TXT").unwrap());
+        // Creating the other spelling is the same name.
+        assert!(matches!(
+            vol.create_file("/ωmega-æøå-straße.txt"),
+            Err(Error::AlreadyExists)
+        ));
+    }
+
+    #[test]
+    fn only_metadata_is_written() {
+        let bytes = 64 * GIB;
+        let vol = Volume::<_, 512>::format(Sparse::new(bytes, 512), &VolumeFormatOpts::default())
+            .unwrap();
+        let p = plan(bytes / 512, 512, None).unwrap();
+        let card = vol.unmount().unwrap();
+        let meta_end = p.heap_offset as u64 + p.used_for_tests() as u64 * p.spc as u64;
+        assert!(
+            card.data.keys().all(|&lba| lba < meta_end),
+            "a data cluster was written"
+        );
+        assert!(card.data.len() as u64 <= meta_end);
+    }
+
+    #[test]
+    fn a_bad_request_writes_nothing() {
+        let card = Sparse::new(16 * MIB, 512);
+        let opts = VolumeFormatOpts {
+            label: "far too long a label",
+            ..Default::default()
+        };
+        assert!(matches!(
+            Volume::<_, 512>::format(card, &opts),
+            Err(Error::Unsupported(_))
+        ));
+        let card = Sparse::new(16 * MIB, 512);
+        assert!(matches!(
+            Volume::<_, 512>::format_at(card, 30_000, 10_000, &VolumeFormatOpts::default()),
+            Err(Error::VolumeExceedsDevice)
+        ));
+        let card = Sparse::new(512 * 1024, 512);
+        assert!(matches!(
+            Volume::<_, 512>::format(card, &VolumeFormatOpts::default()),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn a_gpt_partition_is_formatted_and_found_again() {
+        use crate::device::gpt;
+        let mut card = Sparse::new(4 * GIB, 512);
+        let mut scratch = [0u8; 512];
+        let layout = gpt::Layout::new(card.sector_count(), 512).unwrap();
+        let start = layout.first_aligned_lba(512);
+        let sectors = layout.last_usable_lba + 1 - start;
+        let part = gpt::NewPartition::new(
+            gpt::BASIC_DATA,
+            gpt::Guid::random_v4([5; 16]),
+            start,
+            sectors,
+        );
+        gpt::write(
+            &mut card,
+            &mut scratch,
+            gpt::Guid::random_v4([6; 16]),
+            &[part],
+        )
+        .unwrap();
+        let vol = Volume::<_, 4096>::format_at(card, start, sectors, &VolumeFormatOpts::default())
+            .unwrap();
+        assert_eq!(vol.geometry().part_start, start);
+        let card = vol.unmount().unwrap();
+        // PartitionOffset records where the volume is.
+        assert_eq!(&card.data[&start][64..72], &start.to_le_bytes());
+        let vol = fill_and_check(Volume::<_, 4096>::mount_auto(card).unwrap());
+        assert_eq!(vol.geometry().part_start, start);
+    }
+
+    #[test]
+    fn every_size_plans_a_consistent_layout_or_is_refused() {
+        for ss in [512u32, 4096] {
+            for shift in 0..45u32 {
+                for d in [0i64, -1, 1, 13, -4097, 65_537] {
+                    let v = (1i64 << shift) + d;
+                    if v <= 0 {
+                        continue;
+                    }
+                    let sectors = v as u64;
+                    for cluster in [None, Some(ss), Some(1 << 17), Some(32 << 20)] {
+                        let Ok(p) = plan(sectors, ss, cluster) else {
+                            continue;
+                        };
+                        let heap_end = p.heap_offset as u64 + p.clusters as u64 * p.spc as u64;
+                        assert!(heap_end <= sectors, "{sectors}/{ss}: {p:?}");
+                        assert!(p.fat_offset >= 24 && p.fat_offset + p.fat_length <= p.heap_offset);
+                        assert!(p.fat_length as u64 * ss as u64 >= (p.clusters as u64 + 2) * 4);
+                        assert!(p.clusters <= layout::MAX_CLUSTER_COUNT);
+                        assert!(p.root_cluster() < p.clusters + 2);
+                        assert!(
+                            p.bitmap_clusters as u64 * p.spc as u64 * ss as u64
+                                >= (p.clusters as u64).div_ceil(8)
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

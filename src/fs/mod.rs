@@ -4,11 +4,16 @@
 //! implement it are the hosted surface: they hand back owned collections
 //! and so need `alloc`, which every build that has `std` does.
 //!
-//! [`fat`] is the exception, and the shape the rest is headed for: its
-//! driver needs no allocator at all, and `alloc` only *adds* to it —
-//! the hosted [`Filesystem`] implementation, and an in-memory allocation
-//! table that makes the same API faster. Enabling a feature never changes
-//! the shape of what you call.
+//! [`fat`], [`exfat`] and [`littlefs`] are the exception, and the shape the
+//! rest is headed for: each has a driver that needs no allocator at all,
+//! and `alloc` only *adds* to it — the hosted `Filesystem` implementation,
+//! and caches that make the same API faster. Enabling a feature never
+//! changes the shape of what you call.
+//!
+//! Those drivers share [`volume`]: one set of traits every allocator-free
+//! driver implements, so code written once runs on any of them, and
+//! [`mount`], which works out which filesystem a card holds and mounts it.
+//! Both need no allocator, like the drivers.
 
 // The hosted trait surface: `Filesystem`, `FileMeta`, `DirEntry`, … .
 #[cfg(feature = "alloc")]
@@ -57,6 +62,13 @@ pub mod rootdevs;
 pub mod squashfs;
 #[cfg(all(feature = "alloc", feature = "tar"))]
 pub mod tar;
+// The interface every allocator-free driver implements, and the mount that
+// picks one. Compiled whenever one of those drivers is (`exfat` implies
+// `fat`), with or without a heap, like the drivers themselves.
+#[cfg(any(feature = "fat", feature = "littlefs"))]
+pub mod volume;
+#[cfg(any(feature = "fat", feature = "littlefs"))]
+pub use volume::mount;
 #[cfg(feature = "alloc")]
 pub mod xattr;
 #[cfg(all(feature = "alloc", feature = "xfs"))]

@@ -325,4 +325,328 @@ mod noalloc_gpt {
         assert_eq!(p.start_lba, 2048);
         assert!(p.is_basic_data());
     }
+
+    // -- The writers, checked by the same tools ----------------------------
+
+    use fstool::device::mbr;
+
+    /// A GUID in the canonical spelling `sgdisk` prints.
+    fn spelled(g: gpt::Guid) -> String {
+        let b = g.0;
+        format!(
+            "{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{}",
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            u16::from_le_bytes([b[4], b[5]]),
+            u16::from_le_bytes([b[6], b[7]]),
+            b[8],
+            b[9],
+            b[10..16]
+                .iter()
+                .map(|x| format!("{x:02X}"))
+                .collect::<String>()
+        )
+    }
+
+    fn sgdisk(args: &[&str], image: &std::path::Path) -> String {
+        let out = std::process::Command::new("sgdisk")
+            .args(args)
+            .arg(image)
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "sgdisk {args:?} failed:\n{text}");
+        text
+    }
+
+    /// `sgdisk -v`, held to its report: it exits 0 after loading a backup
+    /// over a corrupt primary, so the words matter, not the status.
+    fn sgdisk_verifies(image: &std::path::Path, what: &str) {
+        let text = sgdisk(&["-v"], image);
+        let complained = [
+            "Warning",
+            "Caution",
+            "ERROR",
+            "Invalid",
+            "Problem:",
+            "problems found",
+        ]
+        .iter()
+        .any(|w| text.contains(w) && !text.contains("No problems found"))
+            || ["Warning", "Caution", "ERROR"]
+                .iter()
+                .any(|w| text.contains(w));
+        assert!(
+            text.contains("No problems found") && !complained,
+            "sgdisk -v on {what}:\n{text}"
+        );
+    }
+
+    fn image(sectors: u64) -> (tempfile::NamedTempFile, Disk) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        (tmp, Disk(vec![0u8; sectors as usize * 512]))
+    }
+
+    #[test]
+    fn a_gpt_the_writer_lays_down_passes_sgdisk_verification() {
+        let Some(_) = which("sgdisk") else {
+            eprintln!("skipping: sgdisk not installed");
+            return;
+        };
+        let (tmp, mut dev) = image(128 * 1024);
+        let layout = gpt::Layout::new(128 * 1024, 512).unwrap();
+        let start = layout.first_aligned_lba(512);
+        let parts = [
+            gpt::NewPartition {
+                name: "EFI system",
+                ..gpt::NewPartition::new(
+                    gpt::EFI_SYSTEM,
+                    gpt::Guid::random_v4([1; 16]),
+                    start,
+                    32_768,
+                )
+            },
+            gpt::NewPartition {
+                name: "données",
+                attributes: 1 << 60,
+                ..gpt::NewPartition::new(
+                    gpt::BASIC_DATA,
+                    gpt::Guid::random_v4([2; 16]),
+                    start + 32_768,
+                    51_200,
+                )
+            },
+            gpt::NewPartition::new(
+                gpt::LINUX_FS,
+                gpt::Guid::random_v4([3; 16]),
+                start + 90_112,
+                // Up to the last 1 MiB boundary before the backup table.
+                (layout.last_usable_lba + 1) / 2048 * 2048 - (start + 90_112),
+            ),
+        ];
+        let mut scratch = [0u8; 512];
+        gpt::write(
+            &mut dev,
+            &mut scratch,
+            gpt::Guid::random_v4([9; 16]),
+            &parts,
+        )
+        .unwrap();
+        std::fs::write(tmp.path(), &dev.0).unwrap();
+
+        sgdisk_verifies(tmp.path(), "a table gpt::write laid down");
+        let printed = sgdisk(&["-p"], tmp.path());
+        assert!(
+            printed.contains(&spelled(gpt::Guid::random_v4([9; 16]))),
+            "{printed}"
+        );
+        for (i, p) in parts.iter().enumerate() {
+            let info = sgdisk(&["-i", &(i + 1).to_string()], tmp.path());
+            assert!(
+                info.contains(&format!("First sector: {} ", p.start_lba)),
+                "{info}"
+            );
+            assert!(
+                info.contains(&format!("Last sector: {} ", p.end_lba)),
+                "{info}"
+            );
+            assert!(info.contains(&spelled(p.type_guid)), "{info}");
+            assert!(info.contains(&spelled(p.guid)), "{info}");
+            assert!(
+                info.contains(&format!("Partition name: '{}'", p.name)),
+                "{info}"
+            );
+            assert!(
+                info.contains(&format!("Attribute flags: {:016X}", p.attributes)),
+                "{info}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_entry_changes_a_table_sgdisk_wrote_and_repairs_it() {
+        let Some(_) = which("sgdisk") else {
+            eprintln!("skipping: sgdisk not installed");
+            return;
+        };
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::File::create(tmp.path())
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        sgdisk(
+            &[
+                "-n",
+                "1:2048:+8M",
+                "-t",
+                "1:0700",
+                "-n",
+                "2:+0:+8M",
+                "-t",
+                "2:8300",
+            ],
+            tmp.path(),
+        );
+
+        let mut dev = Disk(std::fs::read(tmp.path()).unwrap());
+        // The primary header is torn; the change goes through the backup and
+        // rewrites both.
+        dev.0[512..604].fill(0);
+        let mut scratch = [0u8; 512];
+        let added = gpt::NewPartition {
+            name: "added",
+            ..gpt::NewPartition::new(
+                gpt::BASIC_DATA,
+                gpt::Guid::random_v4([7; 16]),
+                40_960,
+                20_480,
+            )
+        };
+        gpt::set_entry(&mut dev, &mut scratch, 2, Some(added)).unwrap();
+        gpt::set_entry(&mut dev, &mut scratch, 0, None).unwrap();
+        // Overlapping what sgdisk put in slot 2 is refused.
+        assert!(matches!(
+            gpt::set_entry(
+                &mut dev,
+                &mut scratch,
+                3,
+                Some(gpt::NewPartition::new(
+                    gpt::LINUX_FS,
+                    gpt::Guid::random_v4([8; 16]),
+                    20_000,
+                    10
+                )),
+            ),
+            Err(gpt::WriteError::Overlap(3, 1))
+        ));
+        std::fs::write(tmp.path(), &dev.0).unwrap();
+
+        sgdisk_verifies(tmp.path(), "a table set_entry changed and repaired");
+        let printed = sgdisk(&["-p"], tmp.path());
+        assert!(
+            !printed.contains("\n   1 "),
+            "slot 1 was removed:\n{printed}"
+        );
+        let info = sgdisk(&["-i", "3"], tmp.path());
+        assert!(info.contains("First sector: 40960 "), "{info}");
+        assert!(info.contains("Partition name: 'added'"), "{info}");
+        let info = sgdisk(&["-i", "2"], tmp.path());
+        assert!(
+            info.contains("0FC63DAF-8483-4772-8E79-3D69D8477DE4"),
+            "sgdisk's own slot 2 kept:\n{info}"
+        );
+    }
+
+    /// `sfdisk -d`, parsed just enough: the table's label id, and each
+    /// partition's start, size, type and bootable flag.
+    fn sfdisk_dump(image: &std::path::Path) -> (String, Vec<(u64, u64, String, bool)>) {
+        let out = std::process::Command::new("sfdisk")
+            .arg("-d")
+            .arg(image)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "sfdisk -d: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("label: dos"), "{text}");
+        let mut id = String::new();
+        let mut parts = Vec::new();
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("label-id: ") {
+                id = v.trim().to_string();
+            }
+            let Some((_, fields)) = line.split_once(" : ") else {
+                continue;
+            };
+            let mut p = (0u64, 0u64, String::new(), false);
+            for f in fields.split(',').map(str::trim) {
+                match f.split_once('=') {
+                    Some(("start", v)) => p.0 = v.trim().parse().unwrap(),
+                    Some(("size", v)) => p.1 = v.trim().parse().unwrap(),
+                    Some(("type", v)) => p.2 = v.trim().to_string(),
+                    None if f == "bootable" => p.3 = true,
+                    _ => {}
+                }
+            }
+            parts.push(p);
+        }
+        (id, parts)
+    }
+
+    #[test]
+    fn an_mbr_the_writer_lays_down_reads_back_through_sfdisk() {
+        if !cfg!(target_os = "linux") || which("sfdisk").is_none() {
+            eprintln!("skipping: needs util-linux sfdisk");
+            return;
+        }
+        let (tmp, mut dev) = image(128 * 1024);
+        let mut scratch = [0u8; 512];
+        let entries = [
+            Some(mbr::Entry {
+                bootable: true,
+                ..mbr::Entry::new(mbr::FAT32_LBA, mbr::FIRST_LBA, 65_536)
+            }),
+            Some(mbr::Entry::new(mbr::EXFAT, 70_000, 30_000)),
+            None,
+            Some(mbr::Entry::new(mbr::LINUX, 100_000, 30_000)),
+        ];
+        mbr::write(&mut dev, &mut scratch, &entries, 0xDEAD_BEEF).unwrap();
+        std::fs::write(tmp.path(), &dev.0).unwrap();
+
+        let (id, parts) = sfdisk_dump(tmp.path());
+        assert_eq!(id, "0xdeadbeef");
+        assert_eq!(
+            parts,
+            vec![
+                (2048, 65_536, "c".into(), true),
+                (70_000, 30_000, "7".into(), false),
+                (100_000, 30_000, "83".into(), false),
+            ]
+        );
+
+        // Change a table sfdisk wrote: resize its slot 1, add slot 2.
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "printf 'label: dos\\nstart=2048, size=10000, type=83\\n' | sfdisk {}",
+                tmp.path().display()
+            ))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut dev = Disk(std::fs::read(tmp.path()).unwrap());
+        mbr::set_entry(
+            &mut dev,
+            &mut scratch,
+            1,
+            Some(mbr::Entry::new(mbr::LINUX, 2048, 20_000)),
+        )
+        .unwrap();
+        mbr::set_entry(
+            &mut dev,
+            &mut scratch,
+            2,
+            Some(mbr::Entry::new(mbr::FAT32_LBA, 30_000, 5_000)),
+        )
+        .unwrap();
+        std::fs::write(tmp.path(), &dev.0).unwrap();
+        let (_, parts) = sfdisk_dump(tmp.path());
+        assert_eq!(
+            parts,
+            vec![
+                (2048, 20_000, "83".into(), false),
+                (30_000, 5_000, "c".into(), false)
+            ]
+        );
+    }
 }

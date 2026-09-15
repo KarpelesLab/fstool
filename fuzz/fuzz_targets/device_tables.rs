@@ -102,6 +102,28 @@ fuzz_target!(|data: &[u8]| {
 
     let mut dev = Disk(image);
     let mut scratch = [0u8; 512];
+
+    // The writers that start from what is on the medium parse it first, and
+    // must refuse — never panic, never write outside it — whatever it says.
+    // They run on a copy, so the reader below still sees the fuzzer's bytes.
+    {
+        let mut copy = Disk(dev.0.clone());
+        let n = data[1] as u32;
+        let part = gpt::NewPartition::new(
+            gpt::BASIC_DATA,
+            gpt::Guid::random_v4([data[2]; 16]),
+            u32::from_le_bytes([data[3], data[4], data[5], 0]) as u64,
+            (data[6] as u64) << (data[7] % 40),
+        );
+        let _ = gpt::set_entry(&mut copy, &mut scratch, n, Some(part));
+        let _ = gpt::set_entry(&mut copy, &mut scratch, n, None);
+        let entry = mbr::Entry::new(data[2], u32::from_le_bytes([data[3], data[4], 0, 0]), data[6] as u32);
+        let _ = mbr::set_entry(&mut copy, &mut scratch, data[1] % 6, Some(entry));
+        // Anything they did write must still be a table the readers take.
+        let _ = gpt::Table::read(&mut copy, &mut scratch);
+        let _ = mbr::parse(&copy.0[..512]);
+    }
+
     let Ok(Some(table)) = gpt::Table::read(&mut dev, &mut scratch) else {
         return;
     };

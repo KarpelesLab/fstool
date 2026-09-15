@@ -89,10 +89,12 @@
 mod boot;
 mod dir;
 mod file;
+mod format;
 
 pub use boot::{Geometry, MAX_SECTOR_SIZE, MIN_SECTOR_SIZE};
 pub use dir::{DirEntry, DirIter};
 pub use file::{File, MAX_FILE_LEN};
+pub use format::FormatOpts;
 
 /// The storage this driver is written against.
 ///
@@ -1293,4 +1295,4 @@ impl<D: SectorDriver, const SECTOR: usize> Drop for Volume<D, SECTOR> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

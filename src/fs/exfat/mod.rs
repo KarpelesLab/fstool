@@ -64,8 +64,14 @@ pub(crate) mod layout;
 
 mod volume;
 
+// The driver's test fixtures, for the generic layer's tests to lay volumes
+// out with.
+#[cfg(test)]
+pub(crate) use volume::tests as volume_tests;
+
 pub use volume::{
     Dir, DirEntry, DirIter, Error, File, Geometry, MAX_NAME_LEN, Metadata, Timestamp, Volume,
+    VolumeFormatOpts,
 };
 
 // ---------------------------------------------------------------------

@@ -15,7 +15,8 @@
 //! * [`FlashDriver`] — media that must be erased before it is programmed,
 //!   and only a whole block at a time: raw NOR and NAND. This is what
 //!   [`fs::littlefs`](crate::fs::littlefs)'s driver is written against, and
-//!   it mirrors littlefs's own `lfs_config`.
+//!   it mirrors littlefs's own `lfs_config`. [`SectorFlash`] presents a
+//!   [`SectorDriver`] as one, which is how littlefs lives on a card.
 //!
 //! Those two traits are the whole contract: what a consumer *implements*.
 //! Everything a driver hands back about the medium is data, and lives beside
@@ -37,6 +38,9 @@
 
 pub mod gpt;
 pub mod mbr;
+mod sector_flash;
+
+pub use sector_flash::SectorFlash;
 
 /// A driver for sector-addressed storage: the one trait an embedded consumer
 /// implements for a card.
