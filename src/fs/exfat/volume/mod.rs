@@ -89,6 +89,9 @@
 //! * A file this driver creates is a FAT chain, never a `NoFatChain` run —
 //!   the bit is honoured on read, and a contiguous file that grows is
 //!   converted by writing the chain its run implies.
+//! * A [`File`] caches where its entry set lives and how many clusters
+//!   its stream holds, so two handles on one path — or removing a path
+//!   while a handle to it is open — is a bug the driver cannot detect.
 //! * Names are compared through the volume's own up-case table, so
 //!   behaviour matches whatever formatted the card. A name outside the
 //!   Basic Multilingual Plane (a surrogate pair) is compared code unit by

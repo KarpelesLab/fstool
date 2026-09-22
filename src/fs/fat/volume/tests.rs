@@ -1571,3 +1571,83 @@ mod formatting {
         }
     }
 }
+
+/// Reading four bytes at a time must not re-read the sector each call:
+/// the one-sector cache is what makes a byte-oriented caller affordable
+/// on a card, where a transfer costs milliseconds.
+#[test]
+fn tiny_reads_do_not_re_read_the_sector() {
+    let mut vol = mount(fat16());
+    let bps = vol.geometry().bytes_per_sector as usize;
+    let cb = vol.cluster_bytes() as usize;
+    let len = cb * 3;
+    let body: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    let mut f = vol.create_file("/tiny.bin").unwrap();
+    f.write_all(&mut vol, &body).unwrap();
+    f.flush(&mut vol).unwrap();
+    let mut vol = remount(vol);
+
+    let mut f = vol.open_file("/tiny.bin").unwrap();
+    vol.driver_mut().reads = 0;
+    let mut got = Vec::with_capacity(len);
+    let mut quad = [0u8; 4];
+    while got.len() < len {
+        let n = f.read(&mut vol, &mut quad).unwrap();
+        assert!(n > 0, "short read at {}", got.len());
+        got.extend_from_slice(&quad[..n]);
+    }
+    assert_eq!(got, body, "four-byte reads must reassemble the file");
+
+    let reads = vol.driver().reads;
+    let data_sectors = (len / bps) as u32;
+    // One transfer per data sector, plus the FAT lookups at the two
+    // cluster boundaries. Anything near `len / 4` means the cache is
+    // being evicted between calls.
+    assert!(
+        reads <= data_sectors + 8,
+        "{reads} sector reads for {} four-byte reads over {data_sectors} sectors",
+        len / 4
+    );
+    std::eprintln!(
+        "fat: {} four-byte reads over {data_sectors} sectors => {reads} sector transfers",
+        len / 4
+    );
+}
+
+/// The same for writes, which on flash are the expensive direction: four
+/// bytes at a time must accumulate in the cached sector and leave as one
+/// transfer per sector, not one per call.
+#[test]
+fn tiny_writes_batch_into_one_transfer_per_sector() {
+    let mut vol = mount(fat16());
+    let bps = vol.geometry().bytes_per_sector as usize;
+    let len = bps * 8;
+    let body: Vec<u8> = (0..len).map(|i| (i % 241) as u8).collect();
+
+    let mut f = vol.create_file("/tiny-w.bin").unwrap();
+    vol.driver_mut().writes = 0;
+    for chunk in body.chunks(4) {
+        f.write_all(&mut vol, chunk).unwrap();
+    }
+    f.flush(&mut vol).unwrap();
+    let writes = vol.driver().writes;
+
+    let data_sectors = (len / bps) as u32;
+    // Data sectors, the cluster zeroing that precedes them, the FAT and
+    // the directory entry — but nothing per call.
+    assert!(
+        writes <= data_sectors * 3 + 16,
+        "{writes} sector writes for {} four-byte writes over {data_sectors} sectors",
+        len / 4
+    );
+    std::eprintln!(
+        "fat: {} four-byte writes over {data_sectors} sectors => {writes} sector writes",
+        len / 4
+    );
+
+    let mut vol = remount(vol);
+    let mut f = vol.open_file("/tiny-w.bin").unwrap();
+    let mut back = vec![0u8; len];
+    f.read_exact(&mut vol, &mut back).unwrap();
+    assert_eq!(back, body);
+}

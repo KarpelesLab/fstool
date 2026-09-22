@@ -44,6 +44,12 @@ pub struct File {
     flags: u8,
     /// The read/write cursor.
     pos: u64,
+    /// Clusters known to be allocated to the stream.
+    ///
+    /// A lower bound, never an upper one: `0` means "ask the chain". It
+    /// exists so an append does not re-walk the FAT on every call — and a
+    /// four-byte `write` is a call.
+    capacity: u64,
     /// Whether the entry set needs rewriting.
     dirty: bool,
 }
@@ -60,6 +66,7 @@ impl File {
             contiguous: set.flags & layout::SECFLAG_NO_FAT_CHAIN != 0,
             flags: set.flags,
             pos: 0,
+            capacity: 0,
             dirty: false,
         }
     }
@@ -289,6 +296,7 @@ impl File {
             self.first_cluster = 0;
             self.contiguous = false;
             self.flags = 0;
+            self.capacity = 0;
         } else if keep < have {
             if self.contiguous {
                 // The run's tail is simply given back; the surviving part
@@ -308,6 +316,7 @@ impl File {
         self.len = new_len;
         self.valid = self.valid.min(new_len);
         self.pos = self.pos.min(new_len);
+        self.capacity = self.capacity.min(keep);
         self.dirty = true;
         self.flush(vol)
     }
@@ -361,18 +370,31 @@ impl File {
         if need == 0 {
             return Ok(());
         }
+        // The bytes already stored occupy this many clusters, so that is
+        // a free lower bound on what is allocated.
+        self.capacity = self.capacity.max(self.len.div_ceil(cb));
+        if need <= self.capacity {
+            return Ok(());
+        }
         if self.first_cluster < 2 {
             let (first, count) = vol.alloc_run(None, need)?;
             self.first_cluster = first;
             self.contiguous = false;
             self.flags = layout::SECFLAG_ALLOC_POSSIBLE;
             self.dirty = true;
+            self.capacity = count;
             if count >= need {
                 return Ok(());
             }
         }
-        let mut have = vol.chain_len(&self.stream())?;
+        // Only now is the chain worth walking, and only when the handle
+        // has not already learnt how long it is.
+        let mut have = self.capacity.max(1);
+        if need > have {
+            have = vol.chain_len(&self.stream())?;
+        }
         if need <= have {
+            self.capacity = have;
             return Ok(());
         }
         if self.contiguous {
@@ -389,6 +411,7 @@ impl File {
             have += count;
             last = first + (count - 1) as u32;
         }
+        self.capacity = have;
         self.dirty = true;
         Ok(())
     }
@@ -494,6 +517,7 @@ impl<D: SectorDriver, const SECTOR: usize> Volume<D, SECTOR> {
             contiguous: false,
             flags: 0,
             pos: 0,
+            capacity: 0,
             dirty: false,
         })
     }

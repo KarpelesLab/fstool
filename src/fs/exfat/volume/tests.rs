@@ -1394,3 +1394,72 @@ mod formatting {
         }
     }
 }
+
+/// Reading four bytes at a time must not re-read the sector each call.
+/// A byte-oriented caller is the normal case on a microcontroller, and a
+/// transfer costs milliseconds on a card, so the one-sector cache has to
+/// absorb them.
+#[test]
+fn tiny_reads_do_not_re_read_the_sector() {
+    let mut vol = fresh();
+    let bps = vol.geometry().bytes_per_sector as usize;
+    let cb = vol.cluster_bytes() as usize;
+    let len = cb * 3;
+    let body: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    write_file(&mut vol, "/tiny.bin", &body);
+    let mut vol = remount(vol);
+
+    let mut f = vol.open_file("/tiny.bin").expect("open");
+    vol.driver_mut().reads = 0;
+    let mut got = Vec::with_capacity(len);
+    let mut quad = [0u8; 4];
+    while got.len() < len {
+        let n = f.read(&mut vol, &mut quad).expect("read");
+        assert!(n > 0, "short read at {}", got.len());
+        got.extend_from_slice(&quad[..n]);
+    }
+    assert_eq!(got, body, "four-byte reads must reassemble the file");
+
+    let reads = vol.driver().reads;
+    let data_sectors = (len / bps) as u32;
+    assert!(
+        reads <= data_sectors + 8,
+        "{reads} sector reads for {} four-byte reads over {data_sectors} sectors",
+        len / 4
+    );
+    std::eprintln!(
+        "exfat: {} four-byte reads over {data_sectors} sectors => {reads} sector transfers",
+        len / 4
+    );
+}
+
+/// The same for writes, which on flash are the expensive direction.
+#[test]
+fn tiny_writes_batch_into_one_transfer_per_sector() {
+    let mut vol = fresh();
+    let bps = vol.geometry().bytes_per_sector as usize;
+    let len = bps * 8;
+    let body: Vec<u8> = (0..len).map(|i| (i % 241) as u8).collect();
+
+    let mut f = vol.create_file("/tiny-w.bin").expect("create");
+    vol.driver_mut().writes = 0;
+    for chunk in body.chunks(4) {
+        f.write_all(&mut vol, chunk).expect("write");
+    }
+    f.flush(&mut vol).expect("flush");
+    let writes = vol.driver().writes;
+
+    let data_sectors = (len / bps) as u32;
+    assert!(
+        writes <= data_sectors * 3 + 16,
+        "{writes} sector writes for {} four-byte writes over {data_sectors} sectors",
+        len / 4
+    );
+    std::eprintln!(
+        "exfat: {} four-byte writes over {data_sectors} sectors => {writes} sector writes",
+        len / 4
+    );
+
+    let mut vol = remount(vol);
+    assert_eq!(read_all(&mut vol, "/tiny-w.bin"), body);
+}
