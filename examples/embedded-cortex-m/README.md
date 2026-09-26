@@ -77,6 +77,12 @@ window. That footprint does not grow with the size of the flash. Like the
 heapless card binary, it formats with the driver itself: `Volume::format` is
 right there, whichever filesystem it is.
 
+Its `.rodata` is under 500 bytes because littlefs's commit CRC goes through
+`crc::crc32_ieee_raw_small`, a 16-entry (64-byte) nibble table, the same trade
+the C `lfs_crc` makes. Until 2026-09-26 it used the slice-by-8 table the
+hosted filesystems use, which put 8 KiB of `.rodata` in this binary (8588
+bytes, against 460 now) just to checksum metadata commits of a few hundred bytes.
+
 There is no board support here: `reset` is the entry point named in
 `link.x`, the vector table is left to you, and the allocator is the
 simplest thing that works. Replace the `MemoryBackend` with a

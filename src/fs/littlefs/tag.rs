@@ -156,12 +156,14 @@ impl Tag {
 /// `0xffffffff`, and — unlike the usual zlib flavour — **no final XOR**, so
 /// the running state can be fed straight back in for the next chunk.
 ///
-/// [`crate::crc::crc32_ieee_raw`] is that variant exactly — it is why the
-/// module carries a raw flavour alongside the finalised one. The
+/// [`crate::crc::crc32_ieee_raw_small`] is that variant exactly, through a
+/// 16-entry table as the C implementation's `lfs_crc` does it: littlefs
+/// only checksums metadata commits, so the 8 KiB slice-by-8 table of
+/// [`crate::crc::crc32_ieee_raw`] would buy nothing but flash. The
 /// `crc_matches_reference` test pins this against a commit CRC taken from
 /// an image written by the C implementation.
 pub fn crc(state: u32, data: &[u8]) -> u32 {
-    crate::crc::crc32_ieee_raw(state, data)
+    crate::crc::crc32_ieee_raw_small(state, data)
 }
 
 /// Read a big-endian tag word.

@@ -171,6 +171,39 @@ pub fn crc32_ieee_raw(state: u32, data: &[u8]) -> u32 {
     fold(&IEEE, state, data)
 }
 
+/// [`crc32_ieee_raw`], computed through a 16-entry table — four bits per
+/// lookup instead of eight bytes.
+///
+/// The value is identical; the cost is 64 bytes of table where
+/// [`crc32_ieee_raw`] carries 8 KiB. That is the trade the C littlefs makes
+/// in its own `lfs_crc`, and for the same reason: littlefs only ever
+/// checksums metadata commits, a few hundred bytes at a time, on parts
+/// whose flash is measured in kilobytes. So `fs::littlefs` uses this, in
+/// both its allocation-free and its hosted form.
+pub fn crc32_ieee_raw_small(mut s: u32, data: &[u8]) -> u32 {
+    /// Row 0 of the byte-at-a-time table, for a nibble instead of a byte.
+    const NIBBLE: [u32; 16] = {
+        let mut t = [0u32; 16];
+        let mut i = 0;
+        while i < 16 {
+            let mut c = i as u32;
+            let mut k = 0;
+            while k < 4 {
+                c = (c >> 1) ^ ((c & 1).wrapping_neg() & 0xEDB8_8320);
+                k += 1;
+            }
+            t[i] = c;
+            i += 1;
+        }
+        t
+    };
+    for &b in data {
+        s = (s >> 4) ^ NIBBLE[((s ^ b as u32) & 0xF) as usize];
+        s = (s >> 4) ^ NIBBLE[((s ^ (b as u32 >> 4)) & 0xF) as usize];
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -258,6 +291,23 @@ mod tests {
                 "raw ieee split at {cut}"
             );
         }
+    }
+
+    /// The nibble-table raw CRC is the slice-by-8 one, byte for byte, from
+    /// any starting state — littlefs threads its state through both.
+    #[test]
+    fn the_nibble_table_raw_crc_agrees_with_the_table_driven_one() {
+        let data: Vec<u8> = (0..4096usize).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+        for len in [0usize, 1, 2, 7, 8, 9, 63, 64, 92, 128, 512, 4096] {
+            for seed in [!0u32, 0, 0xF2F5_2010] {
+                assert_eq!(
+                    crc32_ieee_raw_small(seed, &data[..len]),
+                    crc32_ieee_raw(seed, &data[..len]),
+                    "length {len}, seed {seed:#x}"
+                );
+            }
+        }
+        assert_eq!(!crc32_ieee_raw_small(!0, b"123456789"), 0xCBF4_3926);
     }
 
     /// The two polynomials must not accidentally be the same table.
