@@ -4458,7 +4458,9 @@ impl Ext {
         }
         n_off -= ptrs * ptrs;
         // Triple-indirect.
-        if n_off < ptrs * ptrs * ptrs {
+        // `ptrs³` exceeds u32 with 64 KiB blocks; logical block numbers
+        // are u32, so saturating is exact.
+        if n_off < ptrs.saturating_mul(ptrs).saturating_mul(ptrs) {
             let tind = ino.block[constants::IDX_TRIPLE_INDIRECT];
             if tind == 0 {
                 return Ok(0);

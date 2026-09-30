@@ -810,7 +810,9 @@ impl<'a> Ext2FileHandle<'a> {
         }
 
         let n_off = n_off - ptrs * ptrs;
-        if n_off < ptrs * ptrs * ptrs {
+        // `ptrs³` exceeds u32 with 64 KiB blocks; logical block numbers
+        // are u32, so saturating is exact.
+        if n_off < ptrs.saturating_mul(ptrs).saturating_mul(ptrs) {
             // Triple-indirect.
             let mut tind = self.staged_inode().block[IDX_TRIPLE_INDIRECT];
             if tind == 0 {
@@ -892,7 +894,9 @@ impl<'a> Ext2FileHandle<'a> {
             return Ok(read_u32_le(&inner, (n_off % ptrs) as usize * 4));
         }
         let n_off = n_off - ptrs * ptrs;
-        if n_off < ptrs * ptrs * ptrs {
+        // `ptrs³` exceeds u32 with 64 KiB blocks; logical block numbers
+        // are u32, so saturating is exact.
+        if n_off < ptrs.saturating_mul(ptrs).saturating_mul(ptrs) {
             let tind = inode.block[IDX_TRIPLE_INDIRECT];
             if tind == 0 {
                 return Ok(0);
@@ -1020,7 +1024,9 @@ impl<'a> Ext2FileHandle<'a> {
         }
 
         // 4. Triple-indirect.
-        let triple_end = double_end + ptrs * ptrs * ptrs;
+        // `ptrs³` exceeds u32 with 64 KiB blocks; logical block numbers
+        // are u32, so saturating is exact.
+        let triple_end = double_end.saturating_add(ptrs.saturating_mul(ptrs).saturating_mul(ptrs));
         if from < triple_end {
             let tind = self.staged_inode().block[IDX_TRIPLE_INDIRECT];
             if tind != 0 {
@@ -1032,8 +1038,8 @@ impl<'a> Ext2FileHandle<'a> {
                     if dind == 0 {
                         continue;
                     }
-                    let dind_start = base + (i as u32) * ptrs * ptrs;
-                    let dind_end = dind_start + ptrs * ptrs;
+                    let dind_start = base.saturating_add((i as u32).saturating_mul(ptrs * ptrs));
+                    let dind_end = dind_start.saturating_add(ptrs * ptrs);
                     if from >= dind_end {
                         any_l1 = true;
                         continue;
