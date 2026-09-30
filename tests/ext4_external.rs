@@ -2238,3 +2238,144 @@ fn ext_metadata_csum_seed_requires_ext4() {
         );
     }
 }
+
+fn mke2fs(img: &std::path::Path, args: &[&str], size: &str) {
+    let out = Command::new("mke2fs")
+        .args(["-F", "-q", "-E", "nodiscard"])
+        .args(args)
+        .arg(img)
+        .arg(size)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "mke2fs {args:?} failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn debugfs_cat(img: &std::path::Path, path: &str) -> Vec<u8> {
+    Command::new("debugfs")
+        .arg("-R")
+        .arg(format!("cat {path}"))
+        .arg(img)
+        .output()
+        .unwrap()
+        .stdout
+}
+
+/// Small files written into an inline_data volume that mke2fs (not
+/// fstool) made must read back through debugfs — through every trait
+/// entry point that creates a file.
+#[test]
+fn small_files_on_a_mke2fs_inline_data_volume_read_back_in_debugfs() {
+    use fstool::fs::Filesystem;
+    use std::path::Path;
+    for tool in ["mke2fs", "e2fsck", "debugfs"] {
+        if which(tool).is_none() {
+            eprintln!("skipping: {tool} not installed");
+            return;
+        }
+    }
+    let tmp = NamedTempFile::new().unwrap();
+    mke2fs(
+        tmp.path(),
+        &["-t", "ext4", "-I", "256", "-O", "inline_data"],
+        "64M",
+    );
+    let mut src = NamedTempFile::new().unwrap();
+    src.as_file_mut().write_all(b"hi\n").unwrap();
+    {
+        let mut dev = FileBackend::open(tmp.path()).unwrap();
+        let mut ext = Ext::open(&mut dev).unwrap();
+        let host = || FileSource::HostPath(src.path().to_path_buf());
+        ext.create_file(
+            &mut dev,
+            Path::new("/a"),
+            host(),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+        let mut body: &[u8] = b"streamed body\n";
+        ext.create_file_streaming(
+            &mut dev,
+            Path::new("/b"),
+            &mut body,
+            14,
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+        ext.create_dir(&mut dev, Path::new("/d"), FileMeta::with_mode(0o755))
+            .unwrap();
+        ext.create_file(
+            &mut dev,
+            Path::new("/d/x"),
+            host(),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+        ext.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+    let out = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "e2fsck:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(debugfs_cat(tmp.path(), "/a"), b"hi\n");
+    assert_eq!(debugfs_cat(tmp.path(), "/b"), b"streamed body\n");
+    assert_eq!(debugfs_cat(tmp.path(), "/d/x"), b"hi\n");
+}
+
+/// A volume with a feature the writer does not maintain opens and reads,
+/// but every modification is refused up front, naming the feature — and
+/// the image is left exactly as e2fsck found it.
+#[test]
+fn unmaintained_features_make_the_volume_read_only() {
+    use fstool::fs::Filesystem;
+    use std::path::Path;
+    for tool in ["mke2fs", "e2fsck"] {
+        if which(tool).is_none() {
+            eprintln!("skipping: {tool} not installed");
+            return;
+        }
+    }
+    for (feature, args) in [
+        (
+            "bigalloc",
+            &["-t", "ext4", "-O", "bigalloc", "-C", "16384"][..],
+        ),
+        ("quota", &["-t", "ext4", "-O", "quota"][..]),
+    ] {
+        let tmp = NamedTempFile::new().unwrap();
+        mke2fs(tmp.path(), args, "64M");
+        let before = std::fs::read(tmp.path()).unwrap();
+        let mut dev = FileBackend::open(tmp.path()).unwrap();
+        match Ext::open(&mut dev) {
+            Ok(mut ext) => {
+                ext.list(&mut dev, Path::new("/")).unwrap();
+                let err = ext
+                    .create_dir(&mut dev, Path::new("/new"), FileMeta::with_mode(0o755))
+                    .unwrap_err();
+                assert!(
+                    matches!(&err, fstool::Error::Unsupported(m) if m.contains(feature)),
+                    "{feature}: {err:?}"
+                );
+            }
+            // Reading bigalloc's cluster-based layout is not implemented
+            // either; refusing to open is fine, writing is not.
+            Err(e) if feature == "bigalloc" => eprintln!("bigalloc does not open: {e}"),
+            Err(e) => panic!("{feature}: open failed: {e}"),
+        }
+        drop(dev);
+        assert!(
+            std::fs::read(tmp.path()).unwrap() == before,
+            "{feature}: the image changed"
+        );
+    }
+}

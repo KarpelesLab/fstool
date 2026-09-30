@@ -112,6 +112,12 @@ pub mod feature {
     /// `s_checksum_seed` superblock field instead of being derived from
     /// the UUID (so the UUID can change without rewriting every checksum).
     pub const INCOMPAT_CSUM_SEED: u32 = 0x2000;
+    pub const INCOMPAT_MMP: u32 = 0x0100;
+    pub const INCOMPAT_EA_INODE: u32 = 0x0400;
+    pub const INCOMPAT_DIRDATA: u32 = 0x1000;
+    pub const INCOMPAT_LARGEDIR: u32 = 0x4000;
+    pub const INCOMPAT_ENCRYPT: u32 = 0x1_0000;
+    pub const INCOMPAT_CASEFOLD: u32 = 0x2_0000;
 
     // ro_compat
     pub const RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
@@ -122,6 +128,80 @@ pub mod feature {
     pub const RO_COMPAT_DIR_NLINK: u32 = 0x0020;
     pub const RO_COMPAT_EXTRA_ISIZE: u32 = 0x0040;
     pub const RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
+    pub const RO_COMPAT_QUOTA: u32 = 0x0100;
+    pub const RO_COMPAT_BIGALLOC: u32 = 0x0200;
+    pub const RO_COMPAT_REPLICA: u32 = 0x0800;
+    pub const RO_COMPAT_READONLY: u32 = 0x1000;
+    pub const RO_COMPAT_PROJECT: u32 = 0x2000;
+    pub const RO_COMPAT_SHARED_BLOCKS: u32 = 0x4000;
+    pub const RO_COMPAT_VERITY: u32 = 0x8000;
+    pub const RO_COMPAT_ORPHAN_PRESENT: u32 = 0x1_0000;
+
+    /// The incompat features whose on-disk structures the writer keeps
+    /// consistent. A volume with any other incompat bit is still read,
+    /// but never modified — see `Ext::check_writable`.
+    pub const WRITABLE_INCOMPAT: u32 = INCOMPAT_FILETYPE
+        | INCOMPAT_RECOVER
+        | INCOMPAT_META_BG
+        | INCOMPAT_EXTENTS
+        | INCOMPAT_64BIT
+        | INCOMPAT_FLEX_BG
+        | INCOMPAT_INLINE_DATA
+        | INCOMPAT_EA_INODE
+        | INCOMPAT_LARGEDIR
+        | INCOMPAT_CSUM_SEED;
+
+    /// The ro_compat features the writer keeps consistent; as for
+    /// [`WRITABLE_INCOMPAT`], any other bit makes the volume read-only
+    /// here, which is what ro_compat asks of an implementation that does
+    /// not know it.
+    pub const WRITABLE_RO_COMPAT: u32 = RO_COMPAT_SPARSE_SUPER
+        | RO_COMPAT_LARGE_FILE
+        | RO_COMPAT_BTREE_DIR
+        | RO_COMPAT_HUGE_FILE
+        | RO_COMPAT_GDT_CSUM
+        | RO_COMPAT_DIR_NLINK
+        | RO_COMPAT_EXTRA_ISIZE
+        | RO_COMPAT_METADATA_CSUM;
+
+    /// Name of an incompat (`ro == false`) or ro_compat feature bit, as
+    /// e2fsprogs spells it.
+    pub fn name(bit: u32, ro: bool) -> Option<&'static str> {
+        Some(match (ro, bit) {
+            (false, INCOMPAT_COMPRESSION) => "compression",
+            (false, INCOMPAT_FILETYPE) => "filetype",
+            (false, INCOMPAT_RECOVER) => "needs_recovery",
+            (false, INCOMPAT_JOURNAL_DEV) => "journal_dev",
+            (false, INCOMPAT_META_BG) => "meta_bg",
+            (false, INCOMPAT_EXTENTS) => "extent",
+            (false, INCOMPAT_64BIT) => "64bit",
+            (false, INCOMPAT_MMP) => "mmp",
+            (false, INCOMPAT_FLEX_BG) => "flex_bg",
+            (false, INCOMPAT_EA_INODE) => "ea_inode",
+            (false, INCOMPAT_DIRDATA) => "dirdata",
+            (false, INCOMPAT_CSUM_SEED) => "metadata_csum_seed",
+            (false, INCOMPAT_LARGEDIR) => "large_dir",
+            (false, INCOMPAT_INLINE_DATA) => "inline_data",
+            (false, INCOMPAT_ENCRYPT) => "encrypt",
+            (false, INCOMPAT_CASEFOLD) => "casefold",
+            (true, RO_COMPAT_SPARSE_SUPER) => "sparse_super",
+            (true, RO_COMPAT_LARGE_FILE) => "large_file",
+            (true, RO_COMPAT_HUGE_FILE) => "huge_file",
+            (true, RO_COMPAT_GDT_CSUM) => "uninit_bg",
+            (true, RO_COMPAT_DIR_NLINK) => "dir_nlink",
+            (true, RO_COMPAT_EXTRA_ISIZE) => "extra_isize",
+            (true, RO_COMPAT_QUOTA) => "quota",
+            (true, RO_COMPAT_BIGALLOC) => "bigalloc",
+            (true, RO_COMPAT_METADATA_CSUM) => "metadata_csum",
+            (true, RO_COMPAT_REPLICA) => "replica",
+            (true, RO_COMPAT_READONLY) => "read-only",
+            (true, RO_COMPAT_PROJECT) => "project",
+            (true, RO_COMPAT_SHARED_BLOCKS) => "shared_blocks",
+            (true, RO_COMPAT_VERITY) => "verity",
+            (true, RO_COMPAT_ORPHAN_PRESENT) => "orphan_present",
+            _ => return None,
+        })
+    }
 }
 
 /// Inode flag `EXT4_EXTENTS_FL` — set on inodes whose `i_block` array

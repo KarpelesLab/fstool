@@ -843,6 +843,49 @@ impl Ext {
         self.has_metadata_csum()
     }
 
+    /// Refuse to modify a volume that carries a feature the writer does
+    /// not maintain, naming the features.
+    ///
+    /// Reading such a volume is fine, and is left alone. Writing one is
+    /// not: allocating blocks without `bigalloc`'s cluster bitmaps, or
+    /// files without charging `quota`, or entries in a `casefold` or
+    /// `encrypt` directory with the plain name hash, leaves a volume the
+    /// kernel and e2fsck find inconsistent. An unknown ro_compat bit
+    /// means read-only by definition, and an unknown incompat bit means
+    /// the layout itself is not understood. Every mutating entry point of
+    /// the [`crate::fs::Filesystem`] implementation checks this first.
+    pub fn check_writable(&self) -> Result<()> {
+        use constants::feature;
+        let incompat = self.sb.feature_incompat & !feature::WRITABLE_INCOMPAT;
+        let ro_compat = self.sb.feature_ro_compat & !feature::WRITABLE_RO_COMPAT;
+        if incompat == 0 && ro_compat == 0 {
+            return Ok(());
+        }
+        let names: Vec<String> = [(incompat, false), (ro_compat, true)]
+            .into_iter()
+            .flat_map(|(bits, ro)| {
+                (0..32)
+                    .map(|i| 1u32 << i)
+                    .filter(move |b| bits & b != 0)
+                    .map(move |b| match feature::name(b, ro) {
+                        Some(n) => n.to_string(),
+                        None if ro => format!("unknown ro_compat {b:#x}"),
+                        None => format!("unknown incompat {b:#x}"),
+                    })
+            })
+            .collect();
+        Err(crate::Error::Unsupported(format!(
+            "ext: not modifying a volume with {}: fstool can read it but does not \
+             maintain {}",
+            names.join(", "),
+            if names.len() == 1 {
+                "that feature"
+            } else {
+                "those features"
+            }
+        )))
+    }
+
     /// Whether directory entries carry a `file_type` byte (`INCOMPAT_FILETYPE`).
     fn has_filetype(&self) -> bool {
         self.sb.feature_incompat & constants::feature::INCOMPAT_FILETYPE != 0
@@ -5332,6 +5375,7 @@ impl crate::fs::Filesystem for Ext {
         src: FileSource,
         meta: FileMeta,
     ) -> Result<()> {
+        self.check_writable()?;
         let (parent, name) = split_path(path)?;
         let parent_str = parent
             .to_str()
@@ -5349,6 +5393,7 @@ impl crate::fs::Filesystem for Ext {
         len: u64,
         meta: FileMeta,
     ) -> Result<()> {
+        self.check_writable()?;
         let (parent, name) = split_path(path)?;
         let parent_str = parent
             .to_str()
@@ -5364,6 +5409,7 @@ impl crate::fs::Filesystem for Ext {
         path: &std::path::Path,
         meta: FileMeta,
     ) -> Result<()> {
+        self.check_writable()?;
         let (parent, name) = split_path(path)?;
         let parent_str = parent.to_str().unwrap();
         let parent_ino = self.path_to_inode(dev, parent_str)?;
@@ -5378,6 +5424,7 @@ impl crate::fs::Filesystem for Ext {
         target: &std::path::Path,
         meta: FileMeta,
     ) -> Result<()> {
+        self.check_writable()?;
         let (parent, name) = split_path(path)?;
         let parent_str = parent.to_str().unwrap();
         let parent_ino = self.path_to_inode(dev, parent_str)?;
@@ -5398,6 +5445,7 @@ impl crate::fs::Filesystem for Ext {
         minor: u32,
         meta: FileMeta,
     ) -> Result<()> {
+        self.check_writable()?;
         let (parent, name) = split_path(path)?;
         let parent_str = parent.to_str().unwrap();
         let parent_ino = self.path_to_inode(dev, parent_str)?;
@@ -5406,6 +5454,7 @@ impl crate::fs::Filesystem for Ext {
     }
 
     fn remove(&mut self, dev: &mut dyn BlockDevice, path: &std::path::Path) -> Result<()> {
+        self.check_writable()?;
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 path".into()))?;
@@ -5457,6 +5506,7 @@ impl crate::fs::Filesystem for Ext {
         flags: crate::fs::OpenFlags,
         meta: Option<FileMeta>,
     ) -> Result<Box<dyn crate::fs::FileHandle + 'a>> {
+        self.check_writable()?;
         rw::open_file_rw_ext(self, dev, path, flags, meta)
     }
 
@@ -5530,6 +5580,7 @@ impl crate::fs::Filesystem for Ext {
         path: &std::path::Path,
         attrs: crate::fs::SetAttrs,
     ) -> Result<()> {
+        self.check_writable()?;
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 path".into()))?;
@@ -5555,6 +5606,7 @@ impl crate::fs::Filesystem for Ext {
         path: &std::path::Path,
         new_size: u64,
     ) -> Result<()> {
+        self.check_writable()?;
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 path".into()))?;
@@ -5568,6 +5620,7 @@ impl crate::fs::Filesystem for Ext {
         old_path: &std::path::Path,
         new_path: &std::path::Path,
     ) -> Result<()> {
+        self.check_writable()?;
         let (op, on) = split_path(old_path)?;
         let (np, nn) = split_path(new_path)?;
         let op_s = op
@@ -5587,6 +5640,7 @@ impl crate::fs::Filesystem for Ext {
         target_path: &std::path::Path,
         new_path: &std::path::Path,
     ) -> Result<()> {
+        self.check_writable()?;
         let target_s = target_path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 target path".into()))?;
@@ -5624,6 +5678,7 @@ impl crate::fs::Filesystem for Ext {
         path: &std::path::Path,
         xattrs: &[crate::fs::XattrPair],
     ) -> Result<()> {
+        self.check_writable()?;
         if xattrs.is_empty() {
             return Ok(());
         }
