@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/KarpelesLab/fstool/compare/v0.4.35...v0.5.0) - 2026-09-30
+
+### Added
+
+- *(tar)* write hard links as link members
+- *(repack)* carry on past unreadable source entries
+- *(ext)* read and write meta_bg volumes
+
+### Fixed
+
+- *(ext)* allocate on small flex_bg volumes that mke2fs made
+- *(ext)* refuse to modify volumes with features the writer ignores
+- *(ext)* no u32 overflow in the triple-indirect range on 64 KiB blocks
+- *(ext)* list a directory past a damaged entry
+- *(ext)* walk htree block 0 in full and decode 64 KiB rec_len
+- *(ext)* kernel device-number layout and 32-bit uid/gid
+- *(tar)* keep the directory of entries that carry PAX records
+
+### Other
+
+- *(ext)* read inline files back the way libext2fs returns them
+- *(ext)* keep the debugfs-made device within mknod's 16-bit minor
+- *(repack)* give the salvage-reader test its own module
+- *(ext)* create the debugfs device nodes by bare name
+
 ## [0.4.35](https://github.com/KarpelesLab/fstool/compare/v0.4.34...v0.4.35) - 2026-09-26
 
 ### Other
