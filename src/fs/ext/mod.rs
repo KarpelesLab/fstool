@@ -4598,15 +4598,7 @@ impl Ext {
                 continue;
             }
             self.read_block(dev, blk, &mut block_buf)?;
-            if indexed && n == 0 {
-                self.decode_directory_entries(&block_buf[..24], with_filetype, dev, &mut out)?;
-                continue;
-            }
-            let data = if metadata_csum {
-                &block_buf[..block_buf.len() - dir::CSUM_TAIL_LEN]
-            } else {
-                &block_buf
-            };
+            let data = dirent_area(&block_buf, indexed && n == 0, metadata_csum);
             self.decode_directory_entries(data, with_filetype, dev, &mut out)?;
         }
         Ok(out)
@@ -4719,15 +4711,7 @@ impl Ext {
                 continue;
             }
             self.read_block(dev, blk, &mut block_buf)?;
-            // An indexed dir's block 0 is a dx_root: only the fake
-            // `.` / `..` façade in its first 24 bytes is a dirent list.
-            let data = if indexed && n == 0 {
-                &block_buf[..24]
-            } else if metadata_csum {
-                &block_buf[..block_buf.len() - dir::CSUM_TAIL_LEN]
-            } else {
-                &block_buf[..]
-            };
+            let data = dirent_area(&block_buf, indexed && n == 0, metadata_csum);
             if let Some(ino) = self.find_name_in_dir_block(data, with_filetype, name)? {
                 return Ok(Some(ino));
             }
@@ -5085,6 +5069,30 @@ impl<'a> crate::fs::FileReadHandle for FileReader<'a> {
 /// bitmap we later flush is authoritative. Groups lacking
 /// `BG_INODE_ZEROED` record where their never-zeroed inode-table tail
 /// starts so the flush can zero it before landing inodes there.
+/// The part of directory block `buf` to walk as a dirent list.
+///
+/// Every block is read linearly, the way the kernel falls back to when
+/// an htree is unusable, including an indexed directory's block 0 (its
+/// dx_root). A sound dx_root is a `.` entry and a `..` entry whose
+/// `rec_len` spans the rest of the block, so the walk sees exactly those
+/// two; the index data hides inside `..`. Reading only that 24-byte
+/// façade instead, as this once did, lost every entry that an
+/// htree-unaware writer — the old ext2 driver, which ignores
+/// `EXT2_INDEX_FL` — had placed in block 0 by splitting `..`. Interior
+/// dx nodes are a single free entry spanning the block and are skipped
+/// as such.
+///
+/// With `metadata_csum` a leaf block ends in a 12-byte checksum tail,
+/// which is cut off; a dx_root keeps its own tail inside `..`, so it is
+/// walked whole.
+fn dirent_area(buf: &[u8], dx_root: bool, metadata_csum: bool) -> &[u8] {
+    if metadata_csum && !dx_root {
+        &buf[..buf.len() - dir::CSUM_TAIL_LEN]
+    } else {
+        buf
+    }
+}
+
 /// Read the whole group descriptor table, `gdt_blocks` blocks, each from
 /// its primary location ([`layout::Layout::gdt_block_locations`]) — one
 /// run after the superblock classically, one block per meta group with

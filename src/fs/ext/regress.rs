@@ -848,17 +848,22 @@ fn writing_into_an_unwritten_extent_initialises_it() {
 /// `use_64bit` used to also advertise `INCOMPAT_META_BG`, which tells
 /// the kernel the group descriptors are scattered across meta block
 /// groups. Ours are in one contiguous table after the superblock, so
-/// the flag made the image unreadable. And since the reader assumes
-/// the contiguous layout, an image that really does carry meta_bg must
-/// be refused instead of parsed against the wrong blocks.
+/// the flag made the image unreadable.
+///
+/// An image that really does carry meta_bg is read through its own
+/// layout now (see `meta_bg_image_reads_and_writes` in the e2fsprogs
+/// tests for a two-meta-group volume). With a single group the meta_bg
+/// location of GDT block 0 — just past group 0's superblock — is the
+/// classic one, so flipping the bit on must leave the image readable.
 #[test]
-fn meta_bg_is_never_emitted_and_is_refused_on_open() {
+fn meta_bg_is_never_emitted_and_is_read_when_present() {
     let mut dev = MemoryBackend::new(64 * 1024 * 1024);
     let opts = FormatOpts {
         use_64bit: true,
         ..ext4_opts()
     };
     let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    add_file(&mut ext, &mut dev, INO_ROOT_DIR, b"f", b"meta");
     ext.flush(&mut dev).unwrap();
     assert_eq!(
         ext.sb.feature_incompat & constants::feature::INCOMPAT_META_BG,
@@ -866,8 +871,8 @@ fn meta_bg_is_never_emitted_and_is_refused_on_open() {
     );
     Ext::open(&mut dev).expect("a 64bit image without meta_bg reopens");
 
-    // Now force the bit on in the on-disk superblock and re-stamp its
-    // checksum the way the kernel would; open must refuse.
+    // Force the bit on (s_first_meta_bg stays 0: every GDT block is in
+    // a meta group) and re-stamp the checksum the way the kernel would.
     let mut sb_buf = [0u8; constants::SUPERBLOCK_SIZE];
     dev.read_at(constants::SUPERBLOCK_OFFSET, &mut sb_buf)
         .unwrap();
@@ -877,8 +882,73 @@ fn meta_bg_is_never_emitted_and_is_refused_on_open() {
     let csum = super::csum::superblock(&sb_buf);
     sb_buf[1020..1024].copy_from_slice(&csum.to_le_bytes());
     dev.write_at(constants::SUPERBLOCK_OFFSET, &sb_buf).unwrap();
-    let err = Ext::open(&mut dev).unwrap_err();
-    assert!(matches!(err, crate::Error::Unsupported(_)), "{err:?}");
+    let re = Ext::open(&mut dev).expect("meta_bg image opens");
+    assert_eq!(re.layout.first_meta_bg, Some(0));
+    assert_eq!(re.layout.gdt_block_locations(0), vec![1]);
+    assert_eq!(read_path(&re, &mut dev, "/f"), b"meta");
+}
+
+// ─────────── directory blocks the kernel's ext2 driver writes ───────────
+
+/// The old ext2 driver knows nothing of htree: it ignores
+/// `EXT2_INDEX_FL` and, looking for room in an indexed directory's
+/// block 0, finds the `..` entry of the dx_root spanning the block and
+/// splits it, writing a real entry over the index. The reader used to
+/// walk only the 24-byte `.` / `..` façade of block 0 and so never saw
+/// such an entry. Reproduce that split by hand and look the name up.
+#[test]
+fn entries_an_ext2_driver_put_in_a_dx_root_block_are_listed() {
+    let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+    // `add_dir_indexed` builds htrees on ext4 only; the reader does not
+    // care which kind wrote the block.
+    let mut ext = Ext::format_with(&mut dev, &ext4_opts()).unwrap();
+    let names: Vec<String> = (0..64).map(|i| format!("name_{i:04}")).collect();
+    let refs: Vec<&[u8]> = names.iter().map(|n| n.as_bytes()).collect();
+    let dir = ext
+        .add_dir_indexed(
+            &mut dev,
+            INO_ROOT_DIR,
+            b"idx",
+            FileMeta::with_mode(0o755),
+            &refs,
+        )
+        .unwrap();
+    for n in &names {
+        add_file(&mut ext, &mut dev, dir, n.as_bytes(), n.as_bytes());
+    }
+    let target = add_file(&mut ext, &mut dev, INO_ROOT_DIR, b"t", b"linked");
+    ext.flush(&mut dev).unwrap();
+
+    let dir_inode = ext.read_inode(&mut dev, dir).unwrap();
+    assert_ne!(
+        dir_inode.flags & constants::EXT4_INDEX_FL,
+        0,
+        "idx must be indexed"
+    );
+    let bs = ext.layout.block_size as u64;
+    let blk0 = ext.file_block(&mut dev, &dir_inode, 0).unwrap() as u64;
+    let mut block = vec![0u8; bs as usize];
+    dev.read_at(blk0 * bs, &mut block).unwrap();
+    // `..` at offset 12: shrink it to its own 12 bytes and put an entry
+    // for `t` named "ext2_added" in the space it gave up.
+    block[16..18].copy_from_slice(&12u16.to_le_bytes());
+    let name = b"ext2_added";
+    block[24..28].copy_from_slice(&target.to_le_bytes());
+    block[28..30].copy_from_slice(&((bs - 24) as u16).to_le_bytes());
+    block[30] = name.len() as u8;
+    block[31] = constants::DENT_REG;
+    block[32..32 + name.len()].copy_from_slice(name);
+    dev.write_at(blk0 * bs, &block).unwrap();
+
+    let re = Ext::open(&mut dev).unwrap();
+    let listed: Vec<String> = re
+        .list_inode(&mut dev, dir)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert!(listed.contains(&"ext2_added".to_string()), "{listed:?}");
+    assert_eq!(read_path(&re, &mut dev, "/idx/ext2_added"), b"linked");
 }
 
 // ─────────── finding 6: HTree hash seed, signedness, version ───────────

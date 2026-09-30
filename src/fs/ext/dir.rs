@@ -84,7 +84,14 @@ pub fn decode_entry(b: &[u8], with_filetype: bool) -> Option<DecodedEntry<'_>> {
         return None;
     }
     let inode = u32::from_le_bytes(b[0..4].try_into().unwrap());
-    let rec_len = u16::from_le_bytes(b[4..6].try_into().unwrap()) as usize;
+    // `ext4_rec_len_from_disk`: with 64 KiB blocks a record spanning the
+    // whole block cannot be spelled in 16 bits and is stored as 65535 (or
+    // 0). With smaller blocks either value exceeds `b` and is rejected
+    // below, as before.
+    let rec_len = match u16::from_le_bytes(b[4..6].try_into().unwrap()) {
+        0 | u16::MAX => 1 << 16,
+        n => n as usize,
+    };
     let (name_len, file_type) = if with_filetype {
         (b[6] as usize, b[7])
     } else {
@@ -262,6 +269,25 @@ mod tests {
         let first = decode_entry(&buf, true).unwrap();
         let second = decode_entry(&buf[first.rec_len..], true).unwrap();
         assert_eq!(first.rec_len + second.rec_len, 1024 - CSUM_TAIL_LEN);
+    }
+
+    /// A 64 KiB block's lone free entry spans the whole block, which a
+    /// 16-bit `rec_len` cannot hold: the kernel stores 65535 (or 0) and
+    /// reads either back as the block size.
+    #[test]
+    fn a_rec_len_spanning_a_64k_block_decodes() {
+        for raw in [u16::MAX, 0] {
+            let mut buf = vec![0u8; 1 << 16];
+            buf[0..4].copy_from_slice(&11u32.to_le_bytes());
+            buf[4..6].copy_from_slice(&raw.to_le_bytes());
+            buf[6] = 1;
+            buf[7] = DENT_REG;
+            buf[8] = b'x';
+            let e = decode_entry(&buf, true).unwrap();
+            assert_eq!((e.inode, e.name, e.rec_len), (11, &b"x"[..], 1 << 16));
+            // In a smaller block the same bytes overrun it and are refused.
+            assert!(decode_entry(&buf[..4096], true).is_none());
+        }
     }
 
     #[test]
