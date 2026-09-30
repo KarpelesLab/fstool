@@ -929,7 +929,7 @@ impl<'a> TarWriter<'a> {
             None,
             (0, 0),
             &meta,
-            !records.is_empty(),
+            pax::carries_path(&records),
         )?;
         self.write_block(&h.encode()?)?;
         // Stream the file content, padding to a 512-byte boundary.
@@ -963,7 +963,7 @@ impl<'a> TarWriter<'a> {
             None,
             (0, 0),
             &meta,
-            !records.is_empty(),
+            pax::carries_path(&records),
         )?;
         self.write_block(&h.encode()?)?;
         Ok(())
@@ -987,7 +987,7 @@ impl<'a> TarWriter<'a> {
             Some(target),
             (0, 0),
             &meta,
-            !records.is_empty(),
+            pax::carries_path(&records),
         )?;
         self.write_block(&h.encode()?)?;
         Ok(())
@@ -1024,7 +1024,7 @@ impl<'a> TarWriter<'a> {
             None,
             (major, minor),
             &meta,
-            !records.is_empty(),
+            pax::carries_path(&records),
         )?;
         self.write_block(&h.encode()?)?;
         Ok(())

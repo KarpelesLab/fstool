@@ -160,6 +160,17 @@ pub fn records_for_entry(
     out
 }
 
+/// True when `records` carry the entry's `path`, so the ustar header
+/// may hold a placeholder name instead of the real one.
+///
+/// It is the `path` record and nothing else that decides this: an entry
+/// with xattrs or an oversized `size` carries PAX records too, but its
+/// path still travels in the ustar `name` / `prefix` fields, and a header
+/// that dropped them would put the entry at the archive root.
+pub fn carries_path(records: &[Record]) -> bool {
+    records.iter().any(|r| r.key == KEY_PATH)
+}
+
 /// True when `path` fits in `name` (≤ 100 bytes) or splits cleanly into
 /// `prefix` (≤ 155) + `name` (≤ 100) at a `/` boundary. False → must
 /// emit a PAX `path` record.

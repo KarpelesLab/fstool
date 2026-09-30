@@ -116,7 +116,7 @@ impl<W: Write> TarStreamWriter<W> {
             None,
             (0, 0),
             &meta,
-            !records.is_empty(),
+            pax::carries_path(&records),
         )?;
         self.write_all_block(&h.encode()?)?;
         // Stream the file content, then pad to a 512-byte boundary.
@@ -147,7 +147,7 @@ impl<W: Write> TarStreamWriter<W> {
             None,
             (0, 0),
             &meta,
-            !records.is_empty(),
+            pax::carries_path(&records),
         )?;
         self.write_all_block(&h.encode()?)
     }
@@ -170,7 +170,7 @@ impl<W: Write> TarStreamWriter<W> {
             Some(target),
             (0, 0),
             &meta,
-            !records.is_empty(),
+            pax::carries_path(&records),
         )?;
         self.write_all_block(&h.encode()?)
     }
@@ -204,7 +204,7 @@ impl<W: Write> TarStreamWriter<W> {
             None,
             (major, minor),
             &meta,
-            !records.is_empty(),
+            pax::carries_path(&records),
         )?;
         self.write_all_block(&h.encode()?)
     }
@@ -1020,6 +1020,32 @@ mod tests {
         assert_eq!(ent.entry.xattrs[0].value, b"bar");
         assert_eq!(ent.entry.xattrs[1].name, "user.bin");
         assert_eq!(ent.entry.xattrs[1].value, b"\x00\x01\x02");
+    }
+
+    /// An entry whose PAX records are only xattrs keeps its directory.
+    /// The ustar header used to fall back to the bare leaf name whenever
+    /// *any* PAX record was written, but only a long path emits a `path`
+    /// record, so every file with an xattr landed at the archive root.
+    #[test]
+    fn stream_xattrs_keep_the_directory_in_the_path() {
+        let x = [Xattr::new("user.tag", b"v".to_vec())];
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut w = TarStreamWriter::new(&mut sink);
+            let mut r: &[u8] = b"x";
+            w.add_file("/w/d0/file", &mut r, 1, meta(), &x).unwrap();
+            w.add_dir("/w/d2", meta(), &x).unwrap();
+            w.add_symlink("/w/d2/lnk", "file", meta(), &x).unwrap();
+            w.add_device("/w/d2/fifo", DeviceKind::Fifo, 0, 0, meta(), &x)
+                .unwrap();
+            w.finish().unwrap();
+        }
+        let mut reader = TarStreamReader::new(&sink[..]);
+        for want in ["/w/d0/file", "/w/d2", "/w/d2/lnk", "/w/d2/fifo"] {
+            let ent = reader.next_entry().unwrap().unwrap();
+            assert_eq!(ent.entry.path.trim_end_matches('/'), want);
+            assert_eq!(ent.entry.xattrs.len(), 1, "{want}");
+        }
     }
 
     // Build a small tar archive with the three "interesting" entry
