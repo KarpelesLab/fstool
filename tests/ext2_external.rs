@@ -1394,10 +1394,11 @@ fn device_numbers_and_high_ids_match_debugfs() {
         assert!(stat.contains(want), "{name}: want {want:?} in:\n{stat}");
     }
 
-    // debugfs writes; fstool reads.
+    // debugfs writes; fstool reads. (`mknod` links its name verbatim
+    // into the current directory, so no leading slash.)
     debugfs_write(
         tmp.path(),
-        "mknod /k c 301 70001\nmknod /s b 3 5\nsif /sda1 uid 123456\nsif /sda1 gid 654321\n",
+        "mknod k c 301 70001\nmknod s b 3 5\nsif /sda1 uid 123456\nsif /sda1 gid 654321\n",
     );
     let mut dev = FileBackend::open(tmp.path()).unwrap();
     let mut ext = Ext::open(&mut dev).unwrap();
