@@ -1201,8 +1201,9 @@ fn used_dirs_count_is_charged_per_block_group() {
     );
 }
 
-/// Run `debugfs -w` over `img` with one command per line.
-fn debugfs_write(img: &Path, cmds: &str) {
+/// Run `debugfs -w` over `img` with one command per line, returning
+/// what it printed (it exits 0 even when a command fails).
+fn debugfs_write(img: &Path, cmds: &str) -> String {
     let mut f = NamedTempFile::new().unwrap();
     f.as_file_mut().write_all(cmds.as_bytes()).unwrap();
     let out = Command::new("debugfs")
@@ -1217,6 +1218,11 @@ fn debugfs_write(img: &Path, cmds: &str) {
         "debugfs -w failed:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
 }
 
 /// `debugfs -R cmd img`'s stdout, whitespace-normalised so a test can
@@ -1396,10 +1402,21 @@ fn device_numbers_and_high_ids_match_debugfs() {
 
     // debugfs writes; fstool reads. (`mknod` links its name verbatim
     // into the current directory, so no leading slash.)
-    debugfs_write(
+    let log = debugfs_write(
         tmp.path(),
         "mknod k c 301 70001\nmknod s b 3 5\nsif /sda1 uid 123456\nsif /sda1 gid 654321\n",
     );
+    for (name, want) in [
+        ("/k", "Device major/minor number: 301:70001"),
+        ("/s", "Device major/minor number: 03:05"),
+        ("/sda1", "User: 123456 Group: 654321"),
+    ] {
+        let stat = debugfs_read(tmp.path(), &format!("stat {name}"));
+        assert!(
+            stat.contains(want),
+            "debugfs did not make {name} ({want:?}):\n{stat}\ndebugfs -w said:\n{log}"
+        );
+    }
     let mut dev = FileBackend::open(tmp.path()).unwrap();
     let mut ext = Ext::open(&mut dev).unwrap();
     let rdev = |ext: &mut Ext, dev: &mut FileBackend, p: &str| {

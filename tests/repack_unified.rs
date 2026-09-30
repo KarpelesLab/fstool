@@ -578,11 +578,12 @@ fn f2fs_source_preserves_mode_into_tar() {
     );
 }
 
-/// Hard links from an ext source materialise into a tar (tar can't
-/// represent links across the walk), and both names carry the content.
+/// Hard links from an ext source stay hard links in a tar (typeflag `1`
+/// naming the first member), so extracting it gives one file under both
+/// names instead of two copies.
 #[test]
 #[cfg(all(unix, feature = "ext", feature = "tar"))]
-fn ext_hardlinks_materialise_into_tar() {
+fn ext_hardlinks_stay_links_in_tar() {
     if !which("mke2fs") || !which("tar") {
         eprintln!("skipping: mke2fs/tar not installed");
         return;
@@ -610,15 +611,34 @@ fn ext_hardlinks_materialise_into_tar() {
     let (ok, err) = run(&["repack", img.to_str().unwrap(), tar.to_str().unwrap()]);
     assert!(ok, "ext → tar repack failed: {err}");
 
+    let out = work.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let x = Command::new("tar")
+        .arg("xf")
+        .arg(&tar)
+        .arg("-C")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        x.status.success(),
+        "tar xf: {}",
+        String::from_utf8_lossy(&x.stderr)
+    );
     for name in ["a", "b"] {
-        let body = Command::new("tar")
-            .arg("xOf")
-            .arg(&tar)
-            .arg(name)
-            .output()
-            .unwrap();
-        assert_eq!(body.stdout, b"shared\n", "hardlink {name} content wrong");
+        assert_eq!(
+            std::fs::read(out.join(name)).unwrap(),
+            b"shared\n",
+            "hardlink {name} content wrong"
+        );
     }
+    use std::os::unix::fs::MetadataExt;
+    let (a, b) = (
+        std::fs::metadata(out.join("a")).unwrap(),
+        std::fs::metadata(out.join("b")).unwrap(),
+    );
+    assert_eq!(a.ino(), b.ino(), "a and b must be one file");
+    assert_eq!(a.nlink(), 2);
 }
 
 /// A sequential archive that names a path twice — `dir/file` before

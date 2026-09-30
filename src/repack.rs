@@ -970,7 +970,7 @@ impl RepackSink for FsSink<'_> {
 }
 
 /// Sink that streams a tar archive (optionally codec-wrapped) to a
-/// `Write`. Hard links are materialised (tar copies the body).
+/// `Write`. Hard links become link members naming the first path.
 #[cfg(feature = "tar")]
 pub struct TarStreamSink {
     writer: TarStreamWriter<Box<dyn Write>>,
@@ -1063,13 +1063,18 @@ impl RepackSink for TarStreamSink {
 
     fn put_hardlink(
         &mut self,
-        _path: &str,
-        _target: &str,
-        _meta: RepackMeta,
-        _xattrs: &[XattrPair],
+        path: &str,
+        target: &str,
+        meta: RepackMeta,
+        xattrs: &[XattrPair],
     ) -> Result<bool> {
-        // Tar materialises hard links: tell the walker to copy the body.
-        Ok(false)
+        self.writer.add_hardlink(
+            tar_name(path),
+            tar_name(target),
+            meta.to_tar_meta(),
+            &xattrs_to_tar(xattrs),
+        )?;
+        Ok(true)
     }
 
     fn finish(&mut self) -> Result<()> {

@@ -175,6 +175,32 @@ impl<W: Write> TarStreamWriter<W> {
         self.write_all_block(&h.encode()?)
     }
 
+    /// A hard link: `path` names the same file as the earlier member
+    /// `target` (typeflag `1`, no body). Extractors link to the member
+    /// already on disk, so `target` must have been added before.
+    pub fn add_hardlink(
+        &mut self,
+        path: &str,
+        target: &str,
+        meta: TarEntryMeta,
+        xattrs: &[Xattr],
+    ) -> Result<()> {
+        let records = pax::records_for_entry(path, Some(target), false, xattrs);
+        if !records.is_empty() {
+            self.write_pax_header(path, &records)?;
+        }
+        let h = build_header(
+            path,
+            header::TYPEFLAG_HARDLINK,
+            0,
+            Some(target),
+            (0, 0),
+            &meta,
+            pax::carries_path(&records),
+        )?;
+        self.write_all_block(&h.encode()?)
+    }
+
     pub fn add_device(
         &mut self,
         path: &str,
@@ -1046,6 +1072,33 @@ mod tests {
             assert_eq!(ent.entry.path.trim_end_matches('/'), want);
             assert_eq!(ent.entry.xattrs.len(), 1, "{want}");
         }
+    }
+
+    /// A hard link round-trips as a link to its target, with no body.
+    #[test]
+    fn stream_round_trip_hardlink() {
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut w = TarStreamWriter::new(&mut sink);
+            let mut r: &[u8] = b"body";
+            w.add_file("d/first", &mut r, 4, meta(), &[]).unwrap();
+            w.add_hardlink("e/second", "d/first", meta(), &[]).unwrap();
+            w.finish().unwrap();
+        }
+        let mut reader = TarStreamReader::new(&sink[..]);
+        let first = reader.next_entry().unwrap().unwrap();
+        assert_eq!(first.entry.path.trim_start_matches('/'), "d/first");
+        let second = reader.next_entry().unwrap().unwrap();
+        assert_eq!(second.entry.path.trim_start_matches('/'), "e/second");
+        assert_eq!(second.entry.size, 0);
+        assert_eq!(
+            second
+                .entry
+                .link_target
+                .as_deref()
+                .map(|t| t.trim_start_matches('/')),
+            Some("d/first")
+        );
     }
 
     // Build a small tar archive with the three "interesting" entry
