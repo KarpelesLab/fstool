@@ -42,6 +42,14 @@ pub struct Layout {
     /// remaining groups in the unit hold only data (and optional SB+GDT
     /// backups per `sparse_super`).
     pub log_groups_per_flex: u8,
+    /// `s_reserved_gdt_blocks`: the `resize_inode` reserve after the GDT
+    /// in every group that carries a superblock copy.
+    pub reserved_gdt_blocks: u32,
+    /// `s_first_meta_bg` when `INCOMPAT_META_BG` is set, else `None`.
+    /// GDT blocks below it sit in the classic table after each
+    /// superblock; each block from it on sits at the start of its own
+    /// meta group (see [`Layout::gdt_block_locations`]).
+    pub first_meta_bg: Option<u32>,
     /// One entry per group, in order.
     pub groups: Vec<GroupLayout>,
 }
@@ -50,6 +58,58 @@ impl Layout {
     /// Total number of groups.
     pub fn num_groups(&self) -> u32 {
         self.groups.len() as u32
+    }
+
+    /// Group descriptors per GDT block — the size of a meta group.
+    pub fn descs_per_block(&self) -> u32 {
+        self.block_size / self.desc_size as u32
+    }
+
+    /// Blocks at the start of group `g` taken by its superblock copy and
+    /// group descriptors — the kernel's `ext4_num_base_meta_clusters`.
+    pub fn base_meta_blocks(&self, g: u32) -> u32 {
+        base_meta_blocks(
+            g,
+            self.groups[g as usize].has_superblock,
+            self.gdt_blocks,
+            self.reserved_gdt_blocks,
+            self.first_meta_bg,
+            self.descs_per_block(),
+        )
+    }
+
+    /// Every block holding a copy of GDT block `i`, primary first.
+    ///
+    /// Classically (and with meta_bg, for `i < s_first_meta_bg`) block `i`
+    /// of the table follows the superblock in every group that has one.
+    /// Under meta_bg, block `i` from `s_first_meta_bg` on describes meta
+    /// group `i` — groups `i * descs_per_block ..` — and lives in that
+    /// meta group's first group, with backups in its second and last, just
+    /// past the superblock copy when the group has one
+    /// (`ext4_descriptor_loc`, `ext2fs_descriptor_block_loc2`).
+    pub fn gdt_block_locations(&self, i: u32) -> Vec<u32> {
+        match self.first_meta_bg {
+            Some(first) if i >= first => {
+                let dpb = self.descs_per_block();
+                let g0 = i * dpb;
+                let mut out = Vec::with_capacity(3);
+                for g in [g0, g0 + 1, g0 + dpb - 1] {
+                    if let Some(gl) = self.groups.get(g as usize) {
+                        let blk = gl.start_block + gl.has_superblock as u32;
+                        if !out.contains(&blk) {
+                            out.push(blk);
+                        }
+                    }
+                }
+                out
+            }
+            _ => self
+                .groups
+                .iter()
+                .filter(|g| g.has_superblock)
+                .map(|g| g.start_block + 1 + i)
+                .collect(),
+        }
     }
 
     /// Number of groups per flex unit, or 1 when flex_bg is disabled.
@@ -86,6 +146,32 @@ pub struct GroupLayout {
     /// Number of metadata blocks occupied in this group (superblock + GDT +
     /// bitmaps + inode table).
     pub meta_blocks: u32,
+}
+
+/// See [`Layout::base_meta_blocks`]; split out so the layout can be
+/// computed before the [`Layout`] exists.
+fn base_meta_blocks(
+    g: u32,
+    has_sb: bool,
+    gdt_blocks: u32,
+    reserved_gdt_blocks: u32,
+    first_meta_bg: Option<u32>,
+    descs_per_block: u32,
+) -> u32 {
+    match first_meta_bg {
+        Some(first) if g as u64 >= first as u64 * descs_per_block as u64 => {
+            // A meta group's first, second and last groups each hold one
+            // copy of its descriptor block.
+            let rel = g % descs_per_block;
+            has_sb as u32 + (rel == 0 || rel == 1 || rel == descs_per_block - 1) as u32
+        }
+        _ if has_sb => {
+            let classic = first_meta_bg.map_or(gdt_blocks, |f| f.min(gdt_blocks));
+            1u32.saturating_add(classic)
+                .saturating_add(reserved_gdt_blocks)
+        }
+        _ => 0,
+    }
 }
 
 /// Whether group `g` (out of `num_groups`) holds a superblock + GDT
@@ -439,6 +525,8 @@ pub fn plan_layout_sized(
         inode_table_blocks,
         gdt_blocks,
         log_groups_per_flex,
+        reserved_gdt_blocks: 0,
+        first_meta_bg: None,
         groups,
     })
 }
@@ -563,9 +651,9 @@ pub fn from_superblock(sb: &super::superblock::Superblock) -> crate::Result<Layo
     // every group that carries a superblock backup; they are metadata,
     // not data. Saturate: the field is untrusted and only bounds
     // `data_start`, which the allocator clamps to the group anyway.
-    let sb_gdt_blocks_total: u32 = 1u32
-        .saturating_add(gdt_blocks)
-        .saturating_add(sb.reserved_gdt_blocks as u32);
+    let reserved_gdt_blocks = sb.reserved_gdt_blocks as u32;
+    let first_meta_bg = sb.first_meta_bg();
+    let descs_per_block = block_size / desc_size as u32;
 
     // `sparse_super2` (compat 0x200) takes precedence over `sparse_super`:
     // it pins backups to the two listed groups regardless. Otherwise fall
@@ -608,7 +696,17 @@ pub fn from_superblock(sb: &super::superblock::Superblock) -> crate::Result<Layo
         // locations; `has_superblock` only controls where we *write* SB+GDT
         // backups on flush.
         let has_sb = sparse_super_mode.group_has_backup(g);
-        let sb_gdt_blocks: u32 = if has_sb { sb_gdt_blocks_total } else { 0 };
+        let base = |g: u32, has_sb: bool| {
+            base_meta_blocks(
+                g,
+                has_sb,
+                gdt_blocks,
+                reserved_gdt_blocks,
+                first_meta_bg,
+                descs_per_block,
+            )
+        };
+        let sb_gdt_blocks: u32 = base(g, has_sb);
         let local_meta_start = start.saturating_add(sb_gdt_blocks);
 
         let (block_bitmap, inode_bitmap, inode_table, data_start, meta_blocks);
@@ -627,8 +725,7 @@ pub fn from_superblock(sb: &super::superblock::Superblock) -> crate::Result<Layo
                 let prev = &groups[flex_first as usize];
                 (prev.start_block, prev.has_superblock)
             };
-            let packed_base =
-                first_start.saturating_add(if first_has_sb { sb_gdt_blocks_total } else { 0 });
+            let packed_base = first_start.saturating_add(base(flex_first, first_has_sb));
             let bbm_base = packed_base;
             let ibm_base = bbm_base.saturating_add(flex_size);
             let table_base = ibm_base.saturating_add(flex_size);
@@ -670,6 +767,8 @@ pub fn from_superblock(sb: &super::superblock::Superblock) -> crate::Result<Layo
         inode_table_blocks,
         gdt_blocks,
         log_groups_per_flex,
+        reserved_gdt_blocks,
+        first_meta_bg,
         groups,
     })
 }

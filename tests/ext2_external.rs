@@ -1200,3 +1200,214 @@ fn used_dirs_count_is_charged_per_block_group() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// Run `debugfs -w` over `img` with one command per line.
+fn debugfs_write(img: &Path, cmds: &str) {
+    let mut f = NamedTempFile::new().unwrap();
+    f.as_file_mut().write_all(cmds.as_bytes()).unwrap();
+    let out = Command::new("debugfs")
+        .arg("-w")
+        .arg("-f")
+        .arg(f.path())
+        .arg(img)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "debugfs -w failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `debugfs -R cmd img`'s stdout, whitespace-normalised so a test can
+/// match on "User: 100000 Group: 200000" regardless of column padding.
+fn debugfs_read(img: &Path, cmd: &str) -> String {
+    let out = Command::new("debugfs")
+        .arg("-R")
+        .arg(cmd)
+        .arg(img)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn assert_e2fsck_clean(img: &Path, what: &str) {
+    let out = Command::new("e2fsck").arg("-fn").arg(img).output().unwrap();
+    assert!(
+        out.status.success(),
+        "e2fsck failed {what}:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A `meta_bg` volume keeps each block of group descriptors inside the
+/// meta group it describes (with backups in the meta group's second and
+/// last groups) rather than in one table after the superblock — what
+/// `resize2fs` leaves behind once the reserved GDT blocks run out. fstool
+/// used to refuse such an image outright. 1 KiB blocks and 1024-block
+/// groups give 64 groups and 32 descriptors per block, so two meta
+/// groups; the file written here is large enough to allocate in the
+/// second, which changes the descriptor block that lives there.
+#[test]
+fn meta_bg_image_reads_and_writes() {
+    use fstool::fs::Filesystem;
+    use std::io::Read;
+    for tool in ["mke2fs", "e2fsck", "debugfs"] {
+        if which(tool).is_none() {
+            eprintln!("skipping: {tool} not installed");
+            return;
+        }
+    }
+    let src_dir = tempfile::tempdir().unwrap();
+    std::fs::write(src_dir.path().join("hello.txt"), b"hello meta_bg\n").unwrap();
+    let tmp = NamedTempFile::new().unwrap();
+    let out = Command::new("mke2fs")
+        .args([
+            "-F", "-q", "-t", "ext2", "-b", "1024", "-g", "1024", "-N", "512",
+        ])
+        .args(["-O", "meta_bg,^resize_inode", "-E", "nodiscard", "-d"])
+        .arg(src_dir.path())
+        .arg(tmp.path())
+        .arg("65536")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "mke2fs failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let mut big = NamedTempFile::new().unwrap();
+    let body: Vec<u8> = (0..40u32 << 20)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    big.as_file_mut().write_all(&body).unwrap();
+
+    {
+        use fstool::block::BlockDevice;
+        let mut dev = FileBackend::open(tmp.path()).unwrap();
+        let mut ext = Ext::open(&mut dev).unwrap();
+        let mut got = Vec::new();
+        ext.read_file(&mut dev, Path::new("/hello.txt"))
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
+        assert_eq!(got, b"hello meta_bg\n");
+        ext.create_file(
+            &mut dev,
+            Path::new("/big.bin"),
+            FileSource::HostPath(big.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+        ext.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+    assert_e2fsck_clean(tmp.path(), "after writing to a meta_bg image");
+
+    // debugfs reads back what fstool wrote…
+    let dump = NamedTempFile::new().unwrap();
+    let out = Command::new("debugfs")
+        .arg("-R")
+        .arg(format!("dump /big.bin {}", dump.path().display()))
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        std::fs::read(dump.path()).unwrap() == body,
+        "debugfs dump of /big.bin differs"
+    );
+
+    // …and so does a fresh open, through the descriptors it just wrote.
+    let mut dev = FileBackend::open(tmp.path()).unwrap();
+    let mut ext = Ext::open(&mut dev).unwrap();
+    let mut got = Vec::new();
+    ext.read_file(&mut dev, Path::new("/big.bin"))
+        .unwrap()
+        .read_to_end(&mut got)
+        .unwrap();
+    assert!(got == body, "reopened /big.bin differs");
+}
+
+/// Device numbers and owners the way the kernel stores them, in both
+/// directions. A device whose major or minor exceeds 255 lives in
+/// `i_block[1]` (new encoding) with `i_block[0]` zero; small ones use the
+/// old encoding in `i_block[0]`. Owners above 65535 split across `i_uid`
+/// and `l_i_uid_high`.
+#[test]
+fn device_numbers_and_high_ids_match_debugfs() {
+    use fstool::fs::Filesystem;
+    for tool in ["e2fsck", "debugfs"] {
+        if which(tool).is_none() {
+            eprintln!("skipping: {tool} not installed");
+            return;
+        }
+    }
+    let tmp = NamedTempFile::new().unwrap();
+    let opts = FormatOpts {
+        inodes_count: 64,
+        ..FormatOpts::default()
+    };
+    // fstool writes; debugfs reads.
+    {
+        use fstool::block::BlockDevice;
+        let size = opts.blocks_count as u64 * opts.block_size as u64;
+        let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+        let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+        for (name, kind, major, minor) in [
+            ("/big", DeviceKind::Char, 300, 70000),
+            ("/wide_minor", DeviceKind::Block, 8, 256),
+            ("/sda1", DeviceKind::Block, 8, 1),
+        ] {
+            ext.create_device(
+                &mut dev,
+                Path::new(name),
+                kind,
+                major,
+                minor,
+                FileMeta::with_mode(0o600),
+            )
+            .unwrap();
+        }
+        let set = fstool::fs::SetAttrs {
+            uid: Some(100_000),
+            gid: Some(200_000),
+            ..Default::default()
+        };
+        ext.set_attrs(&mut dev, Path::new("/big"), set).unwrap();
+        ext.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+    assert_e2fsck_clean(tmp.path(), "after fstool wrote devices / high ids");
+    for (name, want) in [
+        ("/big", "Device major/minor number: 300:70000"),
+        ("/wide_minor", "Device major/minor number: 08:256"),
+        ("/sda1", "Device major/minor number: 08:01"),
+        ("/big", "User: 100000 Group: 200000"),
+    ] {
+        let stat = debugfs_read(tmp.path(), &format!("stat {name}"));
+        assert!(stat.contains(want), "{name}: want {want:?} in:\n{stat}");
+    }
+
+    // debugfs writes; fstool reads.
+    debugfs_write(
+        tmp.path(),
+        "mknod /k c 301 70001\nmknod /s b 3 5\nsif /sda1 uid 123456\nsif /sda1 gid 654321\n",
+    );
+    let mut dev = FileBackend::open(tmp.path()).unwrap();
+    let mut ext = Ext::open(&mut dev).unwrap();
+    let rdev = |ext: &mut Ext, dev: &mut FileBackend, p: &str| {
+        let a = ext.getattr(dev, Path::new(p)).unwrap();
+        fstool::fs::devnum::decode_devnum(a.rdev)
+    };
+    assert_eq!(rdev(&mut ext, &mut dev, "/k"), (301, 70001));
+    assert_eq!(rdev(&mut ext, &mut dev, "/s"), (3, 5));
+    assert_eq!(rdev(&mut ext, &mut dev, "/big"), (300, 70000));
+    let a = ext.getattr(&mut dev, Path::new("/sda1")).unwrap();
+    assert_eq!((a.uid, a.gid), (123_456, 654_321));
+}

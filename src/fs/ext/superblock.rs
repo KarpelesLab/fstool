@@ -112,6 +112,14 @@ pub const FLAGS_UNSIGNED_HASH: u32 = 0x0002;
 impl Superblock {
     /// Effective group-descriptor size in bytes: `desc_size` if non-zero,
     /// otherwise the classic 32.
+    /// `s_first_meta_bg` when `INCOMPAT_META_BG` is set: the first
+    /// group-descriptor block that lives in its meta group rather than in
+    /// the table after the superblock. `None` without meta_bg.
+    pub fn first_meta_bg(&self) -> Option<u32> {
+        (self.feature_incompat & super::constants::feature::INCOMPAT_META_BG != 0)
+            .then(|| read_u32(&self.raw, 0x104))
+    }
+
     pub fn group_desc_size(&self) -> usize {
         if self.desc_size == 0 {
             32

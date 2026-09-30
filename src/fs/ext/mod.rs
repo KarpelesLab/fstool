@@ -2422,23 +2422,14 @@ impl Ext {
             }
         }
 
-        // Bitmaps and GDT copies, per group.
-        for (i, g) in self.layout.groups.iter().enumerate() {
-            if g.has_superblock {
-                // The GDT itself; SB backup is handled by write_superblocks.
-                let gdt_start_block = if i == 0 {
-                    if self.layout.first_data_block == 1 {
-                        2u32
-                    } else {
-                        1u32
-                    }
-                } else {
-                    g.start_block + 1
-                };
-                for (blk_off, chunk) in gdt.chunks(bs as usize).enumerate() {
-                    out.push((gdt_start_block + blk_off as u32, chunk.to_vec()));
-                }
+        // Every copy of each GDT block (the SB backups are handled by
+        // write_superblocks), then the bitmaps, per group.
+        for (i, chunk) in gdt.chunks(bs as usize).enumerate() {
+            for blk in self.layout.gdt_block_locations(i as u32) {
+                out.push((blk, chunk.to_vec()));
             }
+        }
+        for (i, g) in self.layout.groups.iter().enumerate() {
             out.push((g.block_bitmap, self.groups[i].block_bitmap.clone()));
             out.push((g.inode_bitmap, self.groups[i].inode_bitmap.clone()));
         }
@@ -4293,43 +4284,12 @@ impl Ext {
                 )));
             }
         }
-        // `meta_bg` scatters the group descriptors across the filesystem
-        // instead of keeping them in one table right after the
-        // superblock. Everything below (and the writer) assumes the
-        // contiguous layout, so a meta_bg image would be parsed against
-        // the wrong blocks; refuse it rather than corrupt it.
-        if sb.feature_incompat & constants::feature::INCOMPAT_META_BG != 0 {
-            return Err(crate::Error::Unsupported(
-                "ext: INCOMPAT_META_BG (scattered group descriptor table) is not supported".into(),
-            ));
-        }
         let mut layout = layout::from_superblock(&sb)?;
 
-        // GDT location: same logic as the writer.
         let bs = layout.block_size as u64;
-        let gdt_off = if layout.first_data_block == 1 {
-            2 * bs
-        } else {
-            bs
-        };
-        // Cap allocations sized from untrusted superblock geometry against the
-        // actual device size before allocating: a hostile image can claim a
-        // huge group count / GDT, driving an unbounded `vec![]` → OOM.
-        let total = dev.total_size();
-        let gdt_bytes = (layout.gdt_blocks as u64)
-            .checked_mul(bs)
-            .ok_or_else(|| crate::Error::InvalidImage("ext: gdt size overflow".into()))?;
-        let gdt_end = gdt_off
-            .checked_add(gdt_bytes)
-            .ok_or_else(|| crate::Error::InvalidImage("ext: gdt offset overflow".into()))?;
-        if gdt_end > total {
-            return Err(crate::Error::InvalidImage(format!(
-                "ext: group descriptor table ({gdt_bytes} bytes at {gdt_off}) exceeds device size {total}"
-            )));
-        }
         // Each group costs at least two bitmap blocks we read below; reject a
         // group count that can't physically fit on the device.
-        let max_groups = total / bs.max(1);
+        let max_groups = dev.total_size() / bs.max(1);
         if layout.groups.len() as u64 > max_groups {
             return Err(crate::Error::InvalidImage(format!(
                 "ext: num_groups {} exceeds device capacity {} blocks",
@@ -4337,8 +4297,7 @@ impl Ext {
                 max_groups
             )));
         }
-        let mut gdt = vec![0u8; gdt_bytes as usize];
-        dev.read_at(gdt_off, &mut gdt)?;
+        let gdt = read_gdt(dev, &layout)?;
 
         let groups = load_group_states(dev, &mut layout, &sb, &gdt)?;
 
@@ -4395,14 +4354,7 @@ impl Ext {
     /// after applying a transaction so subsequent staged metadata
     /// writes don't shadow the just-replayed values.
     pub(crate) fn reload_groups_from_disk(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
-        let bs = self.layout.block_size as u64;
-        let gdt_off = if self.layout.first_data_block == 1 {
-            2 * bs
-        } else {
-            bs
-        };
-        let mut gdt = vec![0u8; self.layout.gdt_blocks as usize * bs as usize];
-        dev.read_at(gdt_off, &mut gdt)?;
+        let gdt = read_gdt(dev, &self.layout)?;
         // Same path as `open`, so `*_UNINIT` groups are synthesised (and
         // never trusted verbatim) after a replay too.
         self.groups = load_group_states(dev, &mut self.layout, &self.sb, &gdt)?;
@@ -5133,6 +5085,44 @@ impl<'a> crate::fs::FileReadHandle for FileReader<'a> {
 /// bitmap we later flush is authoritative. Groups lacking
 /// `BG_INODE_ZEROED` record where their never-zeroed inode-table tail
 /// starts so the flush can zero it before landing inodes there.
+/// Read the whole group descriptor table, `gdt_blocks` blocks, each from
+/// its primary location ([`layout::Layout::gdt_block_locations`]) — one
+/// run after the superblock classically, one block per meta group with
+/// `meta_bg`.
+fn read_gdt(dev: &mut dyn BlockDevice, layout: &Layout) -> Result<Vec<u8>> {
+    let bs = layout.block_size as u64;
+    let total = dev.total_size();
+    // Cap the allocation, sized from untrusted superblock geometry, against
+    // the device before making it: a hostile image can claim a huge group
+    // count / GDT, driving an unbounded `vec![]` → OOM.
+    let gdt_bytes = (layout.gdt_blocks as u64)
+        .checked_mul(bs)
+        .filter(|&n| n <= total)
+        .ok_or_else(|| {
+            crate::Error::InvalidImage(format!(
+                "ext: group descriptor table ({} blocks) exceeds device size {total}",
+                layout.gdt_blocks
+            ))
+        })?;
+    let mut gdt = vec![0u8; gdt_bytes as usize];
+    for (i, chunk) in gdt.chunks_mut(bs as usize).enumerate() {
+        let blk = *layout
+            .gdt_block_locations(i as u32)
+            .first()
+            .ok_or_else(|| {
+                crate::Error::InvalidImage(format!("ext: GDT block {i} has no location"))
+            })?;
+        let off = blk as u64 * bs;
+        if off + bs > total {
+            return Err(crate::Error::InvalidImage(format!(
+                "ext: GDT block {i} at block {blk} exceeds device size {total}"
+            )));
+        }
+        dev.read_at(off, chunk)?;
+    }
+    Ok(gdt)
+}
+
 fn load_group_states(
     dev: &mut dyn BlockDevice,
     layout: &mut Layout,
@@ -5160,7 +5150,7 @@ fn load_group_states(
         let mut inode_bitmap = vec![0u8; bs as usize];
         let mut zero_itable_from = None;
         if group_csum && desc.flags & group::BG_BLOCK_UNINIT != 0 {
-            block_bitmap = synth_block_bitmap(layout, sb, i, &desc);
+            block_bitmap = synth_block_bitmap(layout, i, &desc);
             desc.flags &= !group::BG_BLOCK_UNINIT;
         } else {
             dev.read_at(desc.block_bitmap as u64 * bs, &mut block_bitmap)?;
@@ -5204,20 +5194,14 @@ fn load_group_states(
 /// block bitmap, inode bitmap and inode table when they lie inside the
 /// group (with flex_bg they may live in the flex leader, whose bitmap
 /// mke2fs always writes), and every bit past the group's last block.
-fn synth_block_bitmap(layout: &Layout, sb: &Superblock, gi: usize, desc: &GroupDesc) -> Vec<u8> {
+fn synth_block_bitmap(layout: &Layout, gi: usize, desc: &GroupDesc) -> Vec<u8> {
     let bs = layout.block_size;
     let g = layout.groups[gi];
     let mut bm = vec![0u8; bs as usize];
     let group_blocks = g.end_block - g.start_block + 1;
     let in_group = |blk: u32| blk >= g.start_block && blk <= g.end_block;
-    if g.has_superblock {
-        let n = 1u32
-            .saturating_add(layout.gdt_blocks)
-            .saturating_add(sb.reserved_gdt_blocks as u32)
-            .min(group_blocks);
-        for bit in 0..n {
-            set_bit(&mut bm, bit);
-        }
+    for bit in 0..layout.base_meta_blocks(gi as u32).min(group_blocks) {
+        set_bit(&mut bm, bit);
     }
     for blk in [desc.block_bitmap, desc.inode_bitmap] {
         if in_group(blk) {
