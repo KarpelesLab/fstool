@@ -1401,13 +1401,14 @@ fn device_numbers_and_high_ids_match_debugfs() {
     }
 
     // debugfs writes; fstool reads. (`mknod` links its name verbatim
-    // into the current directory, so no leading slash.)
+    // into the current directory, so no leading slash, and takes
+    // numbers up to 65535.)
     let log = debugfs_write(
         tmp.path(),
-        "mknod k c 301 70001\nmknod s b 3 5\nsif /sda1 uid 123456\nsif /sda1 gid 654321\n",
+        "mknod k c 301 65001\nmknod s b 3 5\nsif /sda1 uid 123456\nsif /sda1 gid 654321\n",
     );
     for (name, want) in [
-        ("/k", "Device major/minor number: 301:70001"),
+        ("/k", "Device major/minor number: 301:65001"),
         ("/s", "Device major/minor number: 03:05"),
         ("/sda1", "User: 123456 Group: 654321"),
     ] {
@@ -1423,7 +1424,7 @@ fn device_numbers_and_high_ids_match_debugfs() {
         let a = ext.getattr(dev, Path::new(p)).unwrap();
         fstool::fs::devnum::decode_devnum(a.rdev)
     };
-    assert_eq!(rdev(&mut ext, &mut dev, "/k"), (301, 70001));
+    assert_eq!(rdev(&mut ext, &mut dev, "/k"), (301, 65001));
     assert_eq!(rdev(&mut ext, &mut dev, "/s"), (3, 5));
     assert_eq!(rdev(&mut ext, &mut dev, "/big"), (300, 70000));
     let a = ext.getattr(&mut dev, Path::new("/sda1")).unwrap();
