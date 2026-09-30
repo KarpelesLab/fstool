@@ -2461,6 +2461,48 @@ mod ticker_layout_tests {
     }
 }
 
+#[cfg(test)]
+mod salvage_tests {
+    use super::{SalvageReader, take_unreadable};
+    use std::io::Read;
+
+    /// A body that fails mid-way still yields exactly its length — the
+    /// good prefix, then zeros — and the path is reported once; so does
+    /// one that ends short.
+    #[test]
+    fn salvage_reader_zero_fills_past_a_failure() {
+        struct BadBlockAt10(usize);
+        impl Read for BadBlockAt10 {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 >= 10 {
+                    return Err(std::io::Error::other("bad block"));
+                }
+                let n = buf.len().min(10 - self.0);
+                buf[..n].fill(0xAB);
+                self.0 += n;
+                Ok(n)
+            }
+        }
+        let _ = take_unreadable();
+        let mut src = BadBlockAt10(0);
+        let mut out = Vec::new();
+        SalvageReader::new(&mut src, 25, "/f")
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out.len(), 25);
+        assert!(out[..10].iter().all(|&b| b == 0xAB));
+        assert!(out[10..].iter().all(|&b| b == 0));
+
+        let mut short: &[u8] = b"abc";
+        let mut out = Vec::new();
+        SalvageReader::new(&mut short, 5, "/s")
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out, b"abc\0\0");
+        assert_eq!(take_unreadable(), ["/f", "/s"]);
+    }
+}
+
 #[cfg(all(test, feature = "ext"))]
 mod cycle_guard_tests {
     use super::scan_into_build_plan;
@@ -2545,42 +2587,6 @@ mod cycle_guard_tests {
             kind: EntryKind::Dir,
             size: 0,
         }
-    }
-
-    /// A body that fails mid-way still yields exactly its length — the
-    /// good prefix, then zeros — and the path is reported once; so does
-    /// one that ends short.
-    #[test]
-    fn salvage_reader_zero_fills_past_a_failure() {
-        struct BadBlockAt10(usize);
-        impl Read for BadBlockAt10 {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                if self.0 >= 10 {
-                    return Err(std::io::Error::other("bad block"));
-                }
-                let n = buf.len().min(10 - self.0);
-                buf[..n].fill(0xAB);
-                self.0 += n;
-                Ok(n)
-            }
-        }
-        let _ = take_unreadable();
-        let mut src = BadBlockAt10(0);
-        let mut out = Vec::new();
-        SalvageReader::new(&mut src, 25, "/f")
-            .read_to_end(&mut out)
-            .unwrap();
-        assert_eq!(out.len(), 25);
-        assert!(out[..10].iter().all(|&b| b == 0xAB));
-        assert!(out[10..].iter().all(|&b| b == 0));
-
-        let mut short: &[u8] = b"abc";
-        let mut out = Vec::new();
-        SalvageReader::new(&mut short, 5, "/s")
-            .read_to_end(&mut out)
-            .unwrap();
-        assert_eq!(out, b"abc\0\0");
-        assert_eq!(take_unreadable(), ["/f", "/s"]);
     }
 
     /// A directory whose child re-uses an ancestor's inode (a cycle)
