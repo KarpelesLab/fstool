@@ -5208,6 +5208,20 @@ fn load_group_states(
         layout.groups[i].block_bitmap = desc.block_bitmap;
         layout.groups[i].inode_bitmap = desc.inode_bitmap;
         layout.groups[i].inode_table = desc.inode_table;
+        // Likewise the computed start of the data area: it assumes our
+        // own flex_bg packing, which reserves inode tables for a whole
+        // flex unit even past the last group — on a one-group volume
+        // mke2fs made that lands beyond the group's end, and the
+        // allocator found no free block on an empty filesystem. On a
+        // volume that exists, the block bitmap says what is in use (its
+        // bitmaps and tables included), so only the superblock and
+        // descriptor area is taken as given.
+        let base = layout.base_meta_blocks(i as u32);
+        let g = &mut layout.groups[i];
+        g.data_start = g
+            .start_block
+            .saturating_add(base)
+            .min(g.end_block.saturating_add(1));
         let mut block_bitmap = vec![0u8; bs as usize];
         let mut inode_bitmap = vec![0u8; bs as usize];
         let mut zero_itable_from = None;
