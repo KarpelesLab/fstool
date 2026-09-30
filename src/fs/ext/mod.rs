@@ -4628,18 +4628,27 @@ impl Ext {
                 off += entry.rec_len;
                 continue;
             }
-            if entry.inode > self.sb.inodes_count {
-                return Err(crate::Error::InvalidImage(format!(
-                    "ext: directory entry references inode {} beyond inode count {}",
-                    entry.inode, self.sb.inodes_count
-                )));
-            }
-            let child = self.read_inode(dev, entry.inode)?;
-            let kind = kind_from_mode(child.mode);
-            let size = if matches!(kind, crate::fs::EntryKind::Regular) {
-                child.file_size()
+            // A damaged entry — an inode number past the table, or an
+            // inode that cannot be read — is still listed, as `Unknown`,
+            // rather than failing the listing of every sibling with it
+            // (the kernel's readdir returns such names too). Opening it
+            // then reports the actual problem.
+            let child = if entry.inode > self.sb.inodes_count {
+                None
             } else {
-                0
+                self.read_inode(dev, entry.inode).ok()
+            };
+            let (kind, size) = match child {
+                Some(child) => {
+                    let kind = kind_from_mode(child.mode);
+                    let size = if matches!(kind, crate::fs::EntryKind::Regular) {
+                        child.file_size()
+                    } else {
+                        0
+                    };
+                    (kind, size)
+                }
+                None => (crate::fs::EntryKind::Unknown, 0),
             };
             out.push(crate::fs::DirEntry {
                 name: String::from_utf8_lossy(entry.name).into_owned(),
