@@ -2327,9 +2327,36 @@ fn small_files_on_a_mke2fs_inline_data_volume_read_back_in_debugfs() {
         "e2fsck:\n{}",
         String::from_utf8_lossy(&out.stdout)
     );
-    assert_eq!(debugfs_cat(tmp.path(), "/a"), b"hi\n");
-    assert_eq!(debugfs_cat(tmp.path(), "/b"), b"streamed body\n");
-    assert_eq!(debugfs_cat(tmp.path(), "/d/x"), b"hi\n");
+    for (path, want) in [
+        ("/a", &b"hi\n"[..]),
+        ("/b", b"streamed body\n"),
+        ("/d/x", b"hi\n"),
+    ] {
+        // libext2fs reads an inline file as all of i_block plus the
+        // `system.data` value, whatever i_size says, so debugfs prints
+        // a 3-byte file as 60 bytes. Check the size it reports and the
+        // payload, with nothing but zero padding after it.
+        let stat = Command::new("debugfs")
+            .arg("-R")
+            .arg(format!("stat {path}"))
+            .arg(tmp.path())
+            .output()
+            .unwrap()
+            .stdout;
+        let stat = String::from_utf8_lossy(&stat)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            stat.contains(&format!("Size: {}", want.len())),
+            "{path}: {stat}"
+        );
+        let got = debugfs_cat(tmp.path(), path);
+        assert!(
+            got.starts_with(want) && got[want.len()..].iter().all(|&b| b == 0),
+            "{path}: {got:?}"
+        );
+    }
 }
 
 /// A volume with a feature the writer does not maintain opens and reads,
