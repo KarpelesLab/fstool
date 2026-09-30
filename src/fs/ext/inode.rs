@@ -41,17 +41,26 @@ pub fn extra_isize_covers_checksum_hi(slot: &[u8]) -> bool {
     INODE_BASE_SIZE + extra as usize >= CHECKSUM_HI_OFF + 2
 }
 
+/// Offset of `l_i_uid_high` (inside `osd2`) in the 128-byte base.
+const UID_HIGH_OFF: usize = 116 + 4;
+/// Offset of `l_i_gid_high` (inside `osd2`) in the 128-byte base.
+const GID_HIGH_OFF: usize = 116 + 6;
+
 /// Decoded inode.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Inode {
     pub mode: u16,
-    pub uid: u16,
+    /// Owner, all 32 bits: the low half is `i_uid`, the high half
+    /// `osd2.l_i_uid_high`, which [`Self::encode`] and [`Self::decode`]
+    /// split and join.
+    pub uid: u32,
     pub size: u32,
     pub atime: u32,
     pub ctime: u32,
     pub mtime: u32,
     pub dtime: u32,
-    pub gid: u16,
+    /// Group, all 32 bits — `i_gid` plus `osd2.l_i_gid_high`, like `uid`.
+    pub gid: u32,
     pub links_count: u16,
     /// Count of 512-byte sectors used. Note: this is NOT the FS block count.
     pub blocks_512: u32,
@@ -74,13 +83,13 @@ impl Inode {
     pub fn regular(size: u32, mode_perms: u16, uid: u32, gid: u32, mtime: u32) -> Self {
         Self {
             mode: S_IFREG | (mode_perms & 0o7777),
-            uid: (uid & 0xffff) as u16,
+            uid,
             size,
             atime: mtime,
             ctime: mtime,
             mtime,
             dtime: 0,
-            gid: (gid & 0xffff) as u16,
+            gid,
             links_count: 1,
             blocks_512: 0,
             flags: 0,
@@ -100,13 +109,13 @@ impl Inode {
     pub fn directory(size: u32, mode_perms: u16, uid: u32, gid: u32, mtime: u32) -> Self {
         Self {
             mode: S_IFDIR | (mode_perms & 0o7777),
-            uid: (uid & 0xffff) as u16,
+            uid,
             size,
             atime: mtime,
             ctime: mtime,
             mtime,
             dtime: 0,
-            gid: (gid & 0xffff) as u16,
+            gid,
             // Will be patched as subdirs add their ".." links pointing here.
             links_count: 2,
             blocks_512: 0,
@@ -127,13 +136,13 @@ impl Inode {
     pub fn symlink(size: u32, mode_perms: u16, uid: u32, gid: u32, mtime: u32) -> Self {
         Self {
             mode: S_IFLNK | (mode_perms & 0o7777),
-            uid: (uid & 0xffff) as u16,
+            uid,
             size,
             atime: mtime,
             ctime: mtime,
             mtime,
             dtime: 0,
-            gid: (gid & 0xffff) as u16,
+            gid,
             links_count: 1,
             blocks_512: 0,
             flags: 0,
@@ -147,9 +156,9 @@ impl Inode {
         }
     }
 
-    /// Build an inode for a device / fifo / socket. Major/minor are encoded
-    /// into `block[0]` using the Linux convention (newer encoding):
-    /// `(minor & 0xff) | (major << 8) | ((minor & ~0xff) << 12)`.
+    /// Build an inode for a device / fifo / socket. Major/minor go into
+    /// `i_block` the way the kernel lays them out — see
+    /// [`device_to_i_block`].
     pub fn special(
         kind: SpecialKind,
         major: u32,
@@ -167,17 +176,17 @@ impl Inode {
         };
         let mut block = [0u32; N_BLOCKS];
         if matches!(kind, SpecialKind::Char | SpecialKind::Block) {
-            block[0] = encode_devnum(major, minor);
+            [block[0], block[1]] = device_to_i_block(major, minor);
         }
         Self {
             mode: m | (mode_perms & 0o7777),
-            uid: (uid & 0xffff) as u16,
+            uid,
             size: 0,
             atime: mtime,
             ctime: mtime,
             mtime,
             dtime: 0,
-            gid: (gid & 0xffff) as u16,
+            gid,
             links_count: 1,
             blocks_512: 0,
             flags: 0,
@@ -214,13 +223,13 @@ impl Inode {
     pub fn encode(&self) -> [u8; INODE_BASE_SIZE] {
         let mut buf = [0u8; INODE_BASE_SIZE];
         buf[0..2].copy_from_slice(&self.mode.to_le_bytes());
-        buf[2..4].copy_from_slice(&self.uid.to_le_bytes());
+        buf[2..4].copy_from_slice(&(self.uid as u16).to_le_bytes());
         buf[4..8].copy_from_slice(&self.size.to_le_bytes());
         buf[8..12].copy_from_slice(&self.atime.to_le_bytes());
         buf[12..16].copy_from_slice(&self.ctime.to_le_bytes());
         buf[16..20].copy_from_slice(&self.mtime.to_le_bytes());
         buf[20..24].copy_from_slice(&self.dtime.to_le_bytes());
-        buf[24..26].copy_from_slice(&self.gid.to_le_bytes());
+        buf[24..26].copy_from_slice(&(self.gid as u16).to_le_bytes());
         buf[26..28].copy_from_slice(&self.links_count.to_le_bytes());
         buf[28..32].copy_from_slice(&self.blocks_512.to_le_bytes());
         buf[32..36].copy_from_slice(&self.flags.to_le_bytes());
@@ -235,6 +244,12 @@ impl Inode {
         buf[108..112].copy_from_slice(&self.size_hi_or_dir_acl.to_le_bytes());
         buf[112..116].copy_from_slice(&self.faddr.to_le_bytes());
         buf[116..128].copy_from_slice(&self.osd2);
+        // `l_i_uid_high` / `l_i_gid_high` sit inside osd2; the fields
+        // above are the source of truth for them.
+        buf[UID_HIGH_OFF..UID_HIGH_OFF + 2]
+            .copy_from_slice(&((self.uid >> 16) as u16).to_le_bytes());
+        buf[GID_HIGH_OFF..GID_HIGH_OFF + 2]
+            .copy_from_slice(&((self.gid >> 16) as u16).to_le_bytes());
         buf
     }
 
@@ -249,13 +264,19 @@ impl Inode {
         osd2.copy_from_slice(&buf[116..128]);
         Inode {
             mode: u16::from_le_bytes(buf[0..2].try_into().unwrap()),
-            uid: u16::from_le_bytes(buf[2..4].try_into().unwrap()),
+            uid: u16::from_le_bytes(buf[2..4].try_into().unwrap()) as u32
+                | (u16::from_le_bytes(buf[UID_HIGH_OFF..UID_HIGH_OFF + 2].try_into().unwrap())
+                    as u32)
+                    << 16,
             size: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
             atime: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
             ctime: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
             mtime: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
             dtime: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
-            gid: u16::from_le_bytes(buf[24..26].try_into().unwrap()),
+            gid: u16::from_le_bytes(buf[24..26].try_into().unwrap()) as u32
+                | (u16::from_le_bytes(buf[GID_HIGH_OFF..GID_HIGH_OFF + 2].try_into().unwrap())
+                    as u32)
+                    << 16,
             links_count: u16::from_le_bytes(buf[26..28].try_into().unwrap()),
             blocks_512: u32::from_le_bytes(buf[28..32].try_into().unwrap()),
             flags: u32::from_le_bytes(buf[32..36].try_into().unwrap()),
@@ -281,6 +302,33 @@ pub enum SpecialKind {
 
 pub use crate::fs::devnum::{decode_devnum, encode_devnum};
 
+/// A device number as a char/block inode stores it in `i_block[0..2]`.
+///
+/// The kernel (`ext4_write_inode`, and ext2 before it) keeps the old
+/// 16-bit layout in `i_block[0]` whenever major and minor both fit in a
+/// byte, and otherwise zeroes `i_block[0]` and stores the new layout
+/// ([`encode_devnum`]) in `i_block[1]`. The reader tells them apart by
+/// `i_block[0]` being non-zero, so the new layout can never go there: a
+/// number with a minor above 255 in `i_block[0]` reads back as a
+/// different device.
+pub fn device_to_i_block(major: u32, minor: u32) -> [u32; 2] {
+    if major < 256 && minor < 256 {
+        [(major << 8) | minor, 0]
+    } else {
+        [0, encode_devnum(major, minor)]
+    }
+}
+
+/// Inverse of [`device_to_i_block`]: `(major, minor)` from a char/block
+/// inode's `i_block`, as `ext4_iget` reads it.
+pub fn device_from_i_block(block: &[u32; N_BLOCKS]) -> (u32, u32) {
+    if block[0] != 0 {
+        ((block[0] >> 8) & 0xff, block[0] & 0xff)
+    } else {
+        decode_devnum(block[1])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +352,38 @@ mod tests {
         let ino = Inode::directory(1024, 0o755, 0, 0, 0);
         assert_eq!(ino.links_count, 2);
         assert_eq!(ino.mode & 0o170000, S_IFDIR);
+    }
+
+    /// Small numbers use the old layout in `i_block[0]`; anything wider
+    /// moves to `i_block[1]`, as `ext4_write_inode` does. `/dev/sda1`
+    /// (8, 1) is 0x0801 in word 0; (300, 70000) is word 1 only.
+    #[test]
+    fn device_numbers_use_the_kernels_two_word_layout() {
+        assert_eq!(device_to_i_block(8, 1), [0x0801, 0]);
+        assert_eq!(device_to_i_block(4, 64), [0x0440, 0]);
+        assert_eq!(
+            device_to_i_block(300, 70000),
+            [0, encode_devnum(300, 70000)]
+        );
+        assert_eq!(device_to_i_block(8, 256), [0, encode_devnum(8, 256)]);
+        for (maj, min) in [
+            (0, 0),
+            (1, 3),
+            (8, 1),
+            (255, 255),
+            (256, 0),
+            (8, 256),
+            (300, 70000),
+            (0xfff, 0xfffff),
+        ] {
+            let mut block = [0u32; N_BLOCKS];
+            [block[0], block[1]] = device_to_i_block(maj, min);
+            assert_eq!(device_from_i_block(&block), (maj, min));
+        }
+        // What the kernel wrote for mknod(…, makedev(300, 70000)).
+        let mut block = [0u32; N_BLOCKS];
+        block[1] = (70000 & 0xff) | (300 << 8) | ((70000 & !0xff) << 12);
+        assert_eq!(device_from_i_block(&block), (300, 70000));
     }
 
     #[test]

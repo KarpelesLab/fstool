@@ -3461,13 +3461,12 @@ impl Ext {
     }
 
     /// Change the ownership (uid/gid) of an existing inode. POSIX
-    /// `chown`. Values are truncated to 16 bits — the high halves
-    /// would live in `osd2.l_i_uid_high` / `osd2.l_i_gid_high` but
-    /// the v1 inode encoder doesn't surface them yet.
+    /// `chown`. All 32 bits are kept: the high halves go to
+    /// `osd2.l_i_uid_high` / `osd2.l_i_gid_high`.
     pub fn chown(&mut self, dev: &mut dyn BlockDevice, ino: u32, uid: u32, gid: u32) -> Result<()> {
         self.patch_inode(dev, ino, |i| {
-            i.uid = (uid & 0xffff) as u16;
-            i.gid = (gid & 0xffff) as u16;
+            i.uid = uid;
+            i.gid = gid;
         })
     }
 
@@ -5486,13 +5485,14 @@ impl crate::fs::Filesystem for Ext {
         let ino = self.path_to_inode(dev, s)?;
         let inode = self.read_inode(dev, ino)?;
         let kind = kind_from_mode(inode.mode);
-        // Device numbers live in i_block[0] when the inode is a
-        // char/block device (encoded by `add_device_to`).
+        // A char/block device's number lives in `i_block[0..2]`; `rdev`
+        // is the interchange word every backend shares.
         let rdev = if matches!(
             kind,
             crate::fs::EntryKind::Char | crate::fs::EntryKind::Block
         ) {
-            inode.block[0]
+            let (major, minor) = inode::device_from_i_block(&inode.block);
+            crate::fs::devnum::encode_devnum(major, minor)
         } else {
             0
         };
@@ -5508,8 +5508,8 @@ impl crate::fs::Filesystem for Ext {
         Ok(crate::fs::FileAttrs {
             kind,
             mode: inode.mode & 0o7777,
-            uid: inode.uid as u32,
-            gid: inode.gid as u32,
+            uid: inode.uid,
+            gid: inode.gid,
             size,
             blocks: inode.blocks_512 as u64,
             nlink: inode.links_count as u32,
@@ -5536,8 +5536,8 @@ impl crate::fs::Filesystem for Ext {
         }
         if attrs.uid.is_some() || attrs.gid.is_some() {
             let cur = self.read_inode(dev, ino)?;
-            let new_uid = attrs.uid.unwrap_or(cur.uid as u32);
-            let new_gid = attrs.gid.unwrap_or(cur.gid as u32);
+            let new_uid = attrs.uid.unwrap_or(cur.uid);
+            let new_gid = attrs.gid.unwrap_or(cur.gid);
             self.chown(dev, ino, new_uid, new_gid)?;
         }
         if attrs.atime.is_some() || attrs.mtime.is_some() || attrs.ctime.is_some() {

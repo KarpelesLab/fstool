@@ -1573,8 +1573,8 @@ fn ext4_mutation_api_round_trips_through_e2fsck() {
     // Verify the changes are visible via read_inode.
     let inode = ext.read_inode(&mut dev, ino).unwrap();
     assert_eq!(inode.mode & 0o7777, 0o640);
-    assert_eq!(inode.uid as u32, 1000);
-    assert_eq!(inode.gid as u32, 1000);
+    assert_eq!(inode.uid, 1000);
+    assert_eq!(inode.gid, 1000);
     assert_eq!(inode.atime, 123456);
     assert_eq!(inode.mtime, 654321);
     assert_eq!(inode.ctime, 111111);
