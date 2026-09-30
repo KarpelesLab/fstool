@@ -991,6 +991,19 @@ fn run(cli: Cli) -> fstool::Result<()> {
             if let Some((ctype, level)) = comp {
                 finalize_compress_qcow2(&dst, ctype, level)?;
             }
+            // The walk carries on past source entries it cannot read, as
+            // an archiver does, and reports each as it goes. The output is
+            // finished by now; the exit status still says it is partial.
+            let unreadable = fstool::repack::take_unreadable();
+            if !unreadable.is_empty() {
+                return Err(fstool::Error::InvalidImage(format!(
+                    "{} source entr{} could not be read in full (reported above); \
+                     everything else was repacked into {}",
+                    unreadable.len(),
+                    if unreadable.len() == 1 { "y" } else { "ies" },
+                    dst.display(),
+                )));
+            }
             Ok(())
         }
         Command::Dd {

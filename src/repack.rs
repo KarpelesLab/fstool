@@ -426,6 +426,96 @@ pub fn set_total(files: u64, bytes: u64) {
     });
 }
 
+thread_local! {
+    static UNREADABLE: std::cell::RefCell<std::collections::BTreeSet<String>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+}
+
+/// Report that the source entry at `path` could not be read, and what the
+/// walk does about it. Warns once per path — a sizing pass and the copy
+/// pass walk the same source — and remembers it for [`take_unreadable`].
+fn unreadable(path: &str, why: std::fmt::Arguments<'_>, consequence: &str) {
+    UNREADABLE.with(|set| {
+        if set.borrow_mut().insert(path.to_string()) {
+            eprintln!("repack: {path:?} {why}; {consequence}");
+        }
+    });
+}
+
+/// `res`'s value, or `None` once the failure is reported through
+/// [`unreadable`]. The source walkers go on past an entry they cannot
+/// read — a directory they cannot list, an inode they cannot stat, a
+/// symlink they cannot follow — the way an archiver does, rather than
+/// abandoning everything else on the volume over one damaged entry.
+fn salvage<T>(path: &str, what: &str, consequence: &str, res: Result<T>) -> Option<T> {
+    match res {
+        Ok(v) => Some(v),
+        Err(e) => {
+            unreadable(path, format_args!("could not {what}: {e}"), consequence);
+            None
+        }
+    }
+}
+
+/// Paths of the source entries the walks since the last call could not
+/// read in full — skipped, or for file data zero-filled past the failure —
+/// each reported on stderr as it happened. The output is complete apart
+/// from these; whether that is a failure is the caller's call.
+pub fn take_unreadable() -> Vec<String> {
+    UNREADABLE.with(|set| std::mem::take(&mut *set.borrow_mut()).into_iter().collect())
+}
+
+/// A file body that always delivers exactly `len` bytes, so one bad block
+/// cannot abort the whole repack or leave a sink with a half-written
+/// entry: once the source fails, or ends short, the rest reads as zeros
+/// and the path is reported through [`unreadable`].
+struct SalvageReader<'a> {
+    inner: &'a mut dyn Read,
+    len: u64,
+    remaining: u64,
+    failed: bool,
+    path: &'a str,
+}
+
+impl<'a> SalvageReader<'a> {
+    fn new(inner: &'a mut dyn Read, len: u64, path: &'a str) -> Self {
+        Self {
+            inner,
+            len,
+            remaining: len,
+            failed: false,
+            path,
+        }
+    }
+}
+
+impl Read for SalvageReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let want = (buf.len() as u64).min(self.remaining) as usize;
+        if want == 0 {
+            return Ok(0);
+        }
+        let buf = &mut buf[..want];
+        if !self.failed {
+            let at = self.len - self.remaining;
+            let why = match self.inner.read(buf) {
+                Ok(0) => format!("ends after {at} of {} bytes", self.len),
+                Ok(n) => {
+                    self.remaining -= n as u64;
+                    return Ok(n);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Err(e),
+                Err(e) => format!("could not be read past byte {at}: {e}"),
+            };
+            self.failed = true;
+            unreadable(self.path, format_args!("{why}"), "zero-filling the rest");
+        }
+        buf.fill(0);
+        self.remaining -= want as u64;
+        Ok(want)
+    }
+}
+
 /// Where to draw a filesystem's contents from when building or
 /// populating it. See module docs.
 #[derive(Debug, Clone)]
@@ -1078,8 +1168,11 @@ pub fn walk_anyfs(
     let mut entries_seen: u64 = 0;
     let mut stack: Vec<(String, usize)> = vec![("/".to_string(), 0)];
     while let Some((dir, depth)) = stack.pop() {
-        for e in src_fs.list(src_dev, &dir)? {
-            if e.name == "." || e.name == ".." || e.name == "lost+found" {
+        let Some(entries) = salvage(&dir, "list", "skipping it", src_fs.list(src_dev, &dir)) else {
+            continue;
+        };
+        for e in entries {
+            if e.name == "." || e.name == ".." {
                 continue;
             }
             entries_seen += 1;
@@ -1092,8 +1185,21 @@ pub fn walk_anyfs(
             let child = join_fs_path(&dir, &e.name);
             note(&child);
             let child_path = Path::new(&child);
-            let attrs = src_fs.getattr(src_dev, child_path)?;
-            let xattrs = src_fs.list_xattrs(src_dev, child_path)?;
+            let Some(attrs) = salvage(
+                &child,
+                "stat",
+                "skipping it",
+                src_fs.getattr(src_dev, child_path),
+            ) else {
+                continue;
+            };
+            let xattrs = salvage(
+                &child,
+                "read the xattrs of",
+                "dropping them",
+                src_fs.list_xattrs(src_dev, child_path),
+            )
+            .unwrap_or_default();
             let meta = RepackMeta {
                 mode: attrs.mode,
                 uid: attrs.uid,
@@ -1104,44 +1210,81 @@ pub fn walk_anyfs(
             };
             match attrs.kind {
                 EntryKind::Dir => {
-                    // Refuse to re-enter a directory inode we've already
+                    // Never re-enter a directory inode we've already
                     // descended into (a cycle), and never descend past the
-                    // depth ceiling. Both abort with InvalidImage rather
-                    // than looping / exhausting memory.
+                    // depth ceiling: such a directory is reported and
+                    // skipped rather than looped over.
                     if attrs.inode != 0 && !visited_dirs.insert(attrs.inode) {
-                        return Err(crate::Error::InvalidImage(format!(
-                            "source directory cycle: {child:?} re-enters inode {} — \
-                             refusing to walk a cyclic image",
-                            attrs.inode
-                        )));
+                        unreadable(
+                            &child,
+                            format_args!("re-enters directory inode {} (a cycle)", attrs.inode),
+                            "skipping it",
+                        );
+                        continue;
                     }
                     if depth >= MAX_WALK_DEPTH {
-                        return Err(crate::Error::InvalidImage(format!(
-                            "source directory nesting exceeds depth {MAX_WALK_DEPTH} at \
-                             {child:?} — refusing to walk a possibly cyclic image"
-                        )));
+                        unreadable(
+                            &child,
+                            format_args!("is nested deeper than {MAX_WALK_DEPTH} directories"),
+                            "skipping it",
+                        );
+                        continue;
                     }
-                    sink.put_dir(&child, meta, &xattrs)?;
+                    if dir == "/" && e.name == "lost+found" {
+                        // Every ext volume has one and an ext destination
+                        // makes its own, so an empty one is left out. One
+                        // that holds something — what e2fsck recovered —
+                        // is exactly what a salvage wants, and is merged
+                        // into the destination's own when it has one.
+                        let empty = src_fs
+                            .list(src_dev, &child)
+                            .is_ok_and(|l| l.iter().all(|e| e.name == "." || e.name == ".."));
+                        if empty {
+                            continue;
+                        }
+                        if sink.put_dir(&child, meta, &xattrs).is_err() {
+                            sink.update_dir(&child, meta, &xattrs)?;
+                        }
+                    } else {
+                        sink.put_dir(&child, meta, &xattrs)?;
+                    }
                     stack.push((child, depth + 1));
                 }
                 EntryKind::Regular => {
-                    if attrs.inode != 0 && attrs.nlink > 1 {
-                        let key = (attrs.inode, attrs.nlink);
-                        if let Some(first) = link_map.get(&key) {
-                            if sink.put_hardlink(&child, first, meta, &xattrs)? {
-                                continue;
-                            }
-                            // else: sink can't link — fall through and copy.
-                        } else {
-                            link_map.insert(key, child.clone());
-                        }
+                    let link_key =
+                        (attrs.inode != 0 && attrs.nlink > 1).then_some((attrs.inode, attrs.nlink));
+                    if let Some(first) = link_key.and_then(|k| link_map.get(&k))
+                        && sink.put_hardlink(&child, first, meta, &xattrs)?
+                    {
+                        continue;
                     }
-                    let mut body = src_fs.open_body_reader(src_dev, &child)?;
-                    sink.put_file(&child, &mut *body, attrs.size, meta, &xattrs)?;
+                    // else: first of its links, or the sink can't link —
+                    // copy the body.
+                    let Some(mut body) = salvage(
+                        &child,
+                        "open",
+                        "skipping it",
+                        src_fs.open_body_reader(src_dev, &child),
+                    ) else {
+                        continue;
+                    };
+                    let mut body = SalvageReader::new(&mut *body, attrs.size, &child);
+                    sink.put_file(&child, &mut body, attrs.size, meta, &xattrs)?;
+                    // Only a body that made it out can be linked to.
+                    if let Some(k) = link_key {
+                        link_map.entry(k).or_insert_with(|| child.clone());
+                    }
                     note_bytes(attrs.size);
                 }
                 EntryKind::Symlink => {
-                    let target = src_fs.read_symlink(src_dev, &child)?;
+                    let Some(target) = salvage(
+                        &child,
+                        "read the target of",
+                        "skipping it",
+                        src_fs.read_symlink(src_dev, &child),
+                    ) else {
+                        continue;
+                    };
                     sink.put_symlink(&child, &target, meta, &xattrs)?;
                 }
                 EntryKind::Char | EntryKind::Block | EntryKind::Fifo | EntryKind::Socket => {
@@ -1182,8 +1325,16 @@ pub fn walk_filesystem(
     let mut entries_seen: u64 = 0;
     let mut stack: Vec<(String, usize)> = vec![("/".to_string(), 0)];
     while let Some((dir, depth)) = stack.pop() {
-        for e in src_fs.list(src_dev, Path::new(&dir))? {
-            if e.name == "." || e.name == ".." || e.name == "lost+found" {
+        let Some(entries) = salvage(
+            &dir,
+            "list",
+            "skipping it",
+            src_fs.list(src_dev, Path::new(&dir)),
+        ) else {
+            continue;
+        };
+        for e in entries {
+            if e.name == "." || e.name == ".." {
                 continue;
             }
             entries_seen += 1;
@@ -1196,8 +1347,21 @@ pub fn walk_filesystem(
             let child = join_fs_path(&dir, &e.name);
             note(&child);
             let child_path = Path::new(&child);
-            let attrs = src_fs.getattr(src_dev, child_path)?;
-            let xattrs = src_fs.list_xattrs(src_dev, child_path)?;
+            let Some(attrs) = salvage(
+                &child,
+                "stat",
+                "skipping it",
+                src_fs.getattr(src_dev, child_path),
+            ) else {
+                continue;
+            };
+            let xattrs = salvage(
+                &child,
+                "read the xattrs of",
+                "dropping them",
+                src_fs.list_xattrs(src_dev, child_path),
+            )
+            .unwrap_or_default();
             let meta = RepackMeta {
                 mode: attrs.mode,
                 uid: attrs.uid,
@@ -1209,39 +1373,76 @@ pub fn walk_filesystem(
             match attrs.kind {
                 EntryKind::Dir => {
                     if attrs.inode != 0 && !visited_dirs.insert(attrs.inode) {
-                        return Err(crate::Error::InvalidImage(format!(
-                            "source directory cycle: {child:?} re-enters inode {} — \
-                             refusing to walk a cyclic image",
-                            attrs.inode
-                        )));
+                        unreadable(
+                            &child,
+                            format_args!("re-enters directory inode {} (a cycle)", attrs.inode),
+                            "skipping it",
+                        );
+                        continue;
                     }
                     if depth >= MAX_WALK_DEPTH {
-                        return Err(crate::Error::InvalidImage(format!(
-                            "source directory nesting exceeds depth {MAX_WALK_DEPTH} at \
-                             {child:?} — refusing to walk a possibly cyclic image"
-                        )));
+                        unreadable(
+                            &child,
+                            format_args!("is nested deeper than {MAX_WALK_DEPTH} directories"),
+                            "skipping it",
+                        );
+                        continue;
                     }
-                    sink.put_dir(&child, meta, &xattrs)?;
+                    if dir == "/" && e.name == "lost+found" {
+                        // Every ext volume has one and an ext destination
+                        // makes its own, so an empty one is left out. One
+                        // that holds something — what e2fsck recovered —
+                        // is exactly what a salvage wants, and is merged
+                        // into the destination's own when it has one.
+                        let empty = src_fs
+                            .list(src_dev, Path::new(&child))
+                            .is_ok_and(|l| l.iter().all(|e| e.name == "." || e.name == ".."));
+                        if empty {
+                            continue;
+                        }
+                        if sink.put_dir(&child, meta, &xattrs).is_err() {
+                            sink.update_dir(&child, meta, &xattrs)?;
+                        }
+                    } else {
+                        sink.put_dir(&child, meta, &xattrs)?;
+                    }
                     stack.push((child, depth + 1));
                 }
                 EntryKind::Regular => {
-                    if attrs.inode != 0 && attrs.nlink > 1 {
-                        let key = (attrs.inode, attrs.nlink);
-                        if let Some(first) = link_map.get(&key) {
-                            if sink.put_hardlink(&child, first, meta, &xattrs)? {
-                                continue;
-                            }
-                            // else: sink can't link — fall through and copy.
-                        } else {
-                            link_map.insert(key, child.clone());
-                        }
+                    let link_key =
+                        (attrs.inode != 0 && attrs.nlink > 1).then_some((attrs.inode, attrs.nlink));
+                    if let Some(first) = link_key.and_then(|k| link_map.get(&k))
+                        && sink.put_hardlink(&child, first, meta, &xattrs)?
+                    {
+                        continue;
                     }
-                    let mut body = src_fs.read_file(src_dev, child_path)?;
-                    sink.put_file(&child, &mut *body, attrs.size, meta, &xattrs)?;
+                    // else: first of its links, or the sink can't link —
+                    // copy the body.
+                    let Some(mut body) = salvage(
+                        &child,
+                        "open",
+                        "skipping it",
+                        src_fs.read_file(src_dev, child_path),
+                    ) else {
+                        continue;
+                    };
+                    let mut body = SalvageReader::new(&mut *body, attrs.size, &child);
+                    sink.put_file(&child, &mut body, attrs.size, meta, &xattrs)?;
+                    // Only a body that made it out can be linked to.
+                    if let Some(k) = link_key {
+                        link_map.entry(k).or_insert_with(|| child.clone());
+                    }
                     note_bytes(attrs.size);
                 }
                 EntryKind::Symlink => {
-                    let target = src_fs.read_symlink(src_dev, child_path)?;
+                    let Some(target) = salvage(
+                        &child,
+                        "read the target of",
+                        "skipping it",
+                        src_fs.read_symlink(src_dev, child_path),
+                    ) else {
+                        continue;
+                    };
                     let target = target.to_string_lossy();
                     sink.put_symlink(&child, &target, meta, &xattrs)?;
                 }
@@ -1948,9 +2149,13 @@ pub(crate) fn scan_into_build_plan(
     let mut entries_seen: u64 = 0;
     let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(std::path::PathBuf::from("/"), 0)];
     while let Some((dir, depth)) = stack.pop() {
-        let entries = fs.list(dev, &dir)?;
+        // Same salvage rules as the copy walk, which reports what it
+        // skips: an unlistable directory contributes nothing here either.
+        let Ok(entries) = fs.list(dev, &dir) else {
+            continue;
+        };
         for e in entries {
-            if e.name == "." || e.name == ".." || e.name == "lost+found" {
+            if e.name == "." || e.name == ".." {
                 continue;
             }
             entries_seen += 1;
@@ -1963,18 +2168,8 @@ pub(crate) fn scan_into_build_plan(
             let child = dir.join(&e.name);
             match e.kind {
                 EntryKind::Dir => {
-                    if e.inode != 0 && !visited_dirs.insert(e.inode) {
-                        return Err(crate::Error::InvalidImage(format!(
-                            "source directory cycle: {child:?} re-enters inode {} — \
-                             refusing to walk a cyclic image",
-                            e.inode
-                        )));
-                    }
-                    if depth >= MAX_WALK_DEPTH {
-                        return Err(crate::Error::InvalidImage(format!(
-                            "source directory nesting exceeds depth {MAX_WALK_DEPTH} at \
-                             {child:?} — refusing to walk a possibly cyclic image"
-                        )));
+                    if (e.inode != 0 && !visited_dirs.insert(e.inode)) || depth >= MAX_WALK_DEPTH {
+                        continue;
                     }
                     plan.add_dir();
                     stack.push((child, depth + 1));
@@ -2352,10 +2547,47 @@ mod cycle_guard_tests {
         }
     }
 
-    /// A directory whose child re-uses an ancestor's inode (a cycle)
-    /// must abort with `InvalidImage`, not loop forever.
+    /// A body that fails mid-way still yields exactly its length — the
+    /// good prefix, then zeros — and the path is reported once; so does
+    /// one that ends short.
     #[test]
-    fn scan_rejects_inode_cycle() {
+    fn salvage_reader_zero_fills_past_a_failure() {
+        struct BadBlockAt10(usize);
+        impl Read for BadBlockAt10 {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 >= 10 {
+                    return Err(std::io::Error::other("bad block"));
+                }
+                let n = buf.len().min(10 - self.0);
+                buf[..n].fill(0xAB);
+                self.0 += n;
+                Ok(n)
+            }
+        }
+        let _ = take_unreadable();
+        let mut src = BadBlockAt10(0);
+        let mut out = Vec::new();
+        SalvageReader::new(&mut src, 25, "/f")
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out.len(), 25);
+        assert!(out[..10].iter().all(|&b| b == 0xAB));
+        assert!(out[10..].iter().all(|&b| b == 0));
+
+        let mut short: &[u8] = b"abc";
+        let mut out = Vec::new();
+        SalvageReader::new(&mut short, 5, "/s")
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out, b"abc\0\0");
+        assert_eq!(take_unreadable(), ["/f", "/s"]);
+    }
+
+    /// A directory whose child re-uses an ancestor's inode (a cycle)
+    /// must not be looped over: the scan skips the re-entry and finishes,
+    /// like the copy walk, which reports it.
+    #[test]
+    fn scan_skips_inode_cycle() {
         let mut dev = MemoryBackend::new(1 << 20);
         // Every directory lists a single child "loop" pointing back at
         // the same inode 42 — a self-referential cycle.
@@ -2363,15 +2595,11 @@ mod cycle_guard_tests {
             list_fn: |_path: &Path| vec![dir_entry("loop", 42)],
         };
         let mut plan = BuildPlan::new(4096, FsKind::Ext4);
-        let err = scan_into_build_plan(&mut dev, &mut fs, &mut plan).unwrap_err();
-        assert!(
-            matches!(err, crate::Error::InvalidImage(_)),
-            "expected InvalidImage, got {err:?}"
-        );
+        scan_into_build_plan(&mut dev, &mut fs, &mut plan).unwrap();
     }
 
     /// Backends that report inode 0 (no per-path identity) can't be
-    /// caught by the visited-set — the depth ceiling must still abort an
+    /// caught by the visited-set — the depth ceiling must still end an
     /// unbounded descent.
     #[test]
     fn scan_depth_caps_zero_inode_descent() {
@@ -2382,11 +2610,7 @@ mod cycle_guard_tests {
             list_fn: |_path: &Path| vec![dir_entry("deeper", 0)],
         };
         let mut plan = BuildPlan::new(4096, FsKind::Ext4);
-        let err = scan_into_build_plan(&mut dev, &mut fs, &mut plan).unwrap_err();
-        assert!(
-            matches!(err, crate::Error::InvalidImage(_)),
-            "expected InvalidImage, got {err:?}"
-        );
+        scan_into_build_plan(&mut dev, &mut fs, &mut plan).unwrap();
     }
 
     /// A finite, acyclic tree (distinct inodes, bounded depth) must
