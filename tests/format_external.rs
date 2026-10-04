@@ -1,4 +1,4 @@
-#![cfg(all(unix, feature = "std", feature = "fat", feature = "exfat"))]
+#![cfg(all(unix, feature = "hosted", feature = "fat", feature = "exfat"))]
 //! The allocator-free formatters and partition writers, judged by the tools
 //! that own each format.
 //!

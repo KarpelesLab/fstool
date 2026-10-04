@@ -24,11 +24,11 @@
 //! turning `alloc` on adds the hosted [`fs::Filesystem`] surface and an
 //! in-memory allocation table — never a different shape to call.
 
-#![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(not(feature = "hosted"), no_std)]
 
 // The `alloc` crate is the floor for the hosted API: every layer hands
 // back `Vec`s and `String`s, so a consumer of it brings a global
-// allocator (as it already does for `alloc` itself). With `std` on, this
+// allocator (as it already does for `alloc` itself). With `hosted` on, this
 // is just `std`'s own `alloc` under another name.
 //
 // With the `alloc` feature off, none of that is compiled and the crate
@@ -59,7 +59,7 @@ compile_error!(
 );
 
 #[cfg(all(
-    feature = "std",
+    feature = "hosted",
     not(any(
         feature = "affs",
         feature = "apfs",
@@ -81,17 +81,18 @@ compile_error!(
     ))
 ))]
 compile_error!(
-    "fstool: the `std` build needs at least one filesystem feature \
-     (`fat`, `ext`, … or `filesystems`); `inspect` has nothing to dispatch to otherwise"
+    "fstool: the `hosted` build needs at least one filesystem feature \
+     (`fat`, `ext`, … or `filesystems`, which `std` includes); `inspect` has \
+     nothing to dispatch to otherwise"
 );
 
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 pub mod analyze;
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 pub mod base64;
 #[cfg(feature = "alloc")]
 pub mod block;
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 pub mod compression;
 #[cfg(feature = "ext")]
 pub mod concurrent;
@@ -110,29 +111,29 @@ pub mod format_opts;
 pub mod fs;
 #[cfg(feature = "fuse")]
 pub mod fuse_adapter;
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 pub mod inspect;
 #[cfg(feature = "alloc")]
 pub mod io;
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 pub mod macroman;
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 pub mod memconv;
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 pub mod memedit;
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 pub mod merge;
 #[cfg(feature = "alloc")]
 pub mod part;
 #[cfg(feature = "alloc")]
 pub mod path;
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 pub mod path_style;
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 pub mod repack;
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 pub mod resfork;
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 pub mod spec;
 /// WebAssembly bindings (browser UI). Only compiled for `wasm32` with the
 /// `wasm` feature; see `src/wasm.rs`.

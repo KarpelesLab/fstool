@@ -545,7 +545,7 @@ impl<E: core::fmt::Display> core::fmt::Display for WriteError<E> {
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 impl<E: core::fmt::Debug + core::fmt::Display> std::error::Error for WriteError<E> {}
 
 /// What was wrong with a [`NewPartition`], before its index is known.

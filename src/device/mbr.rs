@@ -192,7 +192,7 @@ impl<E: core::fmt::Display> core::fmt::Display for WriteError<E> {
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 impl<E: core::fmt::Debug + core::fmt::Display> std::error::Error for WriteError<E> {}
 
 /// Write a partition table holding `entries` — slot 1 first, `None` for an

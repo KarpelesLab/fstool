@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 
 use super::StatFs;
 
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 pub use super::rootdevs::{DeviceEntry, RootDevs};
 
 /// Permissions + ownership + timestamps for a new filesystem entry. All
@@ -76,7 +76,7 @@ impl FileMeta {
 pub enum FileSource {
     /// Stream from a path on the host filesystem. Length is taken from
     /// `metadata().len()` at the time the source is constructed.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "hosted")]
     HostPath(PathBuf),
     /// Stream from an arbitrary seekable reader with a known length.
     Reader {
@@ -95,7 +95,7 @@ impl FileSource {
     /// Length the source will produce.
     pub fn len(&self) -> io::Result<u64> {
         match self {
-            #[cfg(feature = "std")]
+            #[cfg(feature = "hosted")]
             FileSource::HostPath(p) => Ok(std::fs::metadata(p)?.len()),
             FileSource::Reader { len, .. } => Ok(*len),
             FileSource::Zero(n) => Ok(*n),
@@ -113,7 +113,7 @@ impl FileSource {
     /// reading to end.
     pub fn open(self) -> io::Result<(Box<dyn ReadSeek + Send>, u64)> {
         match self {
-            #[cfg(feature = "std")]
+            #[cfg(feature = "hosted")]
             FileSource::HostPath(p) => {
                 let f = std::fs::File::open(&p)?;
                 let len = f.metadata()?.len();
@@ -1122,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "std")]
+    #[cfg(feature = "hosted")]
     fn host_path_source_length_matches_file() {
         use tempfile::NamedTempFile;
         let mut f = NamedTempFile::new().unwrap();

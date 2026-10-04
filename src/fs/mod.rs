@@ -61,7 +61,7 @@ pub mod littlefs;
 pub mod ntfs;
 #[cfg(all(feature = "alloc", feature = "ramfs"))]
 pub mod ramfs;
-#[cfg(all(feature = "alloc", feature = "std"))]
+#[cfg(all(feature = "alloc", feature = "hosted"))]
 pub mod rootdevs;
 #[cfg(all(feature = "alloc", feature = "squashfs"))]
 pub mod squashfs;

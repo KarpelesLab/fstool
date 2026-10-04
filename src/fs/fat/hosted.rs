@@ -640,7 +640,7 @@ impl Fat32 {
         self.boot.sectors_per_cluster as u64 * SECTOR as u64
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "hosted")]
     /// Allocate `n` clusters, linking them into one chain, and return the
     /// chain. The last cluster's FAT entry is the end-of-chain marker.
     fn alloc_chain(&mut self, n: u32) -> Result<Vec<u32>> {
@@ -667,7 +667,7 @@ impl Fat32 {
         Ok(chain)
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "hosted")]
     /// Write `data` across the cluster `chain` (the chain must be large
     /// enough). The final cluster's slack is left zero.
     fn write_chain(&self, dev: &mut dyn BlockDevice, chain: &[u32], data: &[u8]) -> Result<()> {
@@ -760,7 +760,7 @@ impl Fat32 {
     /// One-shot: format `dev` to `total_sectors` and copy a host directory
     /// tree into the root. Symlinks and device nodes in the source are
     /// skipped (FAT has no representation for them).
-    #[cfg(feature = "std")]
+    #[cfg(feature = "hosted")]
     pub fn build_from_host_dir(
         dev: &mut dyn BlockDevice,
         total_sectors: u32,
@@ -785,7 +785,7 @@ impl Fat32 {
     /// `src`. The volume label set at format time stays in place;
     /// callers that want to re-set it should re-format. Used by the
     /// repack flow where the destination has been formatted already.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "hosted")]
     pub fn populate_from_host_dir(&mut self, dev: &mut dyn BlockDevice, src: &Path) -> Result<()> {
         let root_cluster = self.boot.root_cluster;
         // Root is its own "parent" placeholder; parent_cluster is unused when
@@ -799,7 +799,7 @@ impl Fat32 {
     ///
     /// `dir_cluster` must already be a one-cluster chain; the directory is
     /// extended if its entries overflow one cluster.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "hosted")]
     fn write_dir_tree(
         &mut self,
         dev: &mut dyn BlockDevice,
@@ -896,7 +896,7 @@ impl Fat32 {
         Ok(())
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "hosted")]
     /// Append a directory entry for `name` to `entries`, emitting LFN
     /// fragments first when the name isn't a plain 8.3 name. `mtime` is
     /// Unix epoch seconds (`0` for none).
@@ -938,7 +938,7 @@ impl Fat32 {
         entries.extend_from_slice(&entry.encode());
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "hosted")]
     /// Write a directory's assembled entry bytes into its cluster chain,
     /// extending the chain if the entries overflow `dir_cluster`'s single
     /// cluster.
@@ -994,7 +994,7 @@ impl Fat32 {
 
     /// Stream a host file's bytes into its cluster chain. The file is read
     /// one cluster at a time — never fully resident in memory.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "hosted")]
     fn stream_file(
         &self,
         dev: &mut dyn BlockDevice,
@@ -1022,7 +1022,7 @@ impl Fat32 {
         Ok(())
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "hosted")]
     /// Return clusters allocated for a zero-length file to the free pool.
     /// Only valid for the most-recently-allocated chain (we just rewind
     /// `next_free`); used right after `alloc_chain` for empty files.
@@ -1398,7 +1398,7 @@ impl<'a> Read for FatFileReader<'a> {
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 /// Build a "." or ".." directory entry (11-byte raw name, directory attr).
 fn dot_entry(name_83: &[u8; 11], cluster: u32) -> [u8; dir::ENTRY_SIZE] {
     dir::DirEntry {

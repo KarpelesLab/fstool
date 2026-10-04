@@ -39,13 +39,13 @@ use alloc::boxed::Box;
 
 use crate::Result;
 
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 pub mod crash_inject;
 #[cfg(feature = "diskcopy")]
 pub mod diskcopy;
 #[cfg(feature = "dmg")]
 pub mod dmg;
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 pub mod file;
 #[cfg(feature = "luks")]
 pub mod luks;
@@ -55,13 +55,13 @@ pub mod qcow2;
 pub mod sector;
 pub mod sliced;
 
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 pub use crash_inject::{CrashInject, FailAfter};
 #[cfg(feature = "diskcopy")]
 pub use diskcopy::DiskCopy42Backend;
 #[cfg(feature = "dmg")]
 pub use dmg::DmgBackend;
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 pub use file::FileBackend;
 #[cfg(feature = "luks")]
 pub use luks::LuksBackend;
@@ -84,7 +84,7 @@ pub use crate::device::{FlashDriver, SectorDriver};
 /// Everything here needs a filesystem to open files on, so the whole
 /// module is `std`-only; the items are re-exported below under their
 /// old names.
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 mod host {
     use super::*;
     use std::path::{Path, PathBuf};
@@ -469,7 +469,7 @@ mod host {
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 pub use host::{
     CreateOpts, EncryptOpts, create_image, is_qcow2_path, open_image, open_image_maybe_compressed,
     open_image_maybe_compressed_read_only, open_image_maybe_compressed_read_only_with_password,

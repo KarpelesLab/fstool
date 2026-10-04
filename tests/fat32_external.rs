@@ -1,4 +1,4 @@
-#![cfg(all(feature = "std", feature = "fat"))]
+#![cfg(all(feature = "hosted", feature = "fat"))]
 //! External validation: produce FAT12 / FAT16 / FAT32 images and check them
 //! with `fsck.vfat` (dosfstools) and `mdir` / `mtype` / `mcopy` (mtools).
 //! Each test skips silently when the required tool isn't on PATH.

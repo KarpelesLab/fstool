@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "std")]
+    #[cfg(feature = "hosted")]
     fn estimated_size_actually_fits_and_reads_back() {
         // End-to-end: size a real tree, format at exactly that size, populate,
         // and read a file back — proving the estimate is sufficient (the build

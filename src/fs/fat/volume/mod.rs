@@ -206,7 +206,7 @@ impl<E: core::fmt::Display> core::fmt::Display for Error<E> {
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 impl<E: core::fmt::Debug + core::fmt::Display> std::error::Error for Error<E> {}
 
 /// FAT entry width, decided by the volume's data-cluster count.

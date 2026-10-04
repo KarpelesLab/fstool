@@ -22,7 +22,7 @@
 
 #![cfg(all(
     unix,
-    feature = "std",
+    feature = "hosted",
     any(
         feature = "ext",
         feature = "fat",

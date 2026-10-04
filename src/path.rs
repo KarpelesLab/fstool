@@ -13,14 +13,14 @@
 //! filesystem code is written once against this module and compiles
 //! unchanged in either configuration.
 
-#[cfg(feature = "std")]
+#[cfg(feature = "hosted")]
 pub use std::path::{Path, PathBuf};
 
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "hosted"))]
 pub use nostd::{Component, Components, Display, OsStr, Path, PathBuf};
 
 /// The `no_std` stand-in for `std::path` (Unix rules).
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "hosted"))]
 mod nostd {
     use alloc::borrow::{Cow, ToOwned};
     use alloc::string::String;
@@ -689,7 +689,7 @@ mod nostd {
     }
 }
 
-#[cfg(all(test, not(feature = "std")))]
+#[cfg(all(test, not(feature = "hosted")))]
 mod tests {
     use super::*;
 

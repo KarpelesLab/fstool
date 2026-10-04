@@ -65,7 +65,7 @@ impl Gpt {
     /// LBA range when `total_lba` is known (callers normally supply this from
     /// `dev.total_size() / dev.block_size()` at write time, so `build` only
     /// checks intra-table consistency).
-    #[cfg(feature = "std")]
+    #[cfg(feature = "hosted")]
     pub fn build(partitions: Vec<Partition>) -> Result<Self> {
         Self::build_with_guids(partitions, Uuid::new_v4(), Uuid::new_v4)
     }
