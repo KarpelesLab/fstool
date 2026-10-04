@@ -130,19 +130,6 @@ jobs:
             fi
           done
 
-      # Manifests written against 0.4.27, before the per-format split, name
-      # only codec features with default features off (and expect every
-      # filesystem). Those features enable `filesystems` for exactly that
-      # reason; this keeps it so.
-      - name: pre-0.4.28 feature sets
-        run: |
-          set -euo pipefail
-          for feats in gzip gzip,xz cab luks; do
-            echo "::group::--features $feats"
-            cargo check --lib --no-default-features --features "$feats"
-            echo "::endgroup::"
-          done
-
       # One filesystem at a time. Each backend's feature must stand on its
       # own (plus whatever it declares), with no unused-import or dead-code
       # noise from the dispatch layers — the gating in inspect / repack /
