@@ -1,6 +1,6 @@
 #![cfg(all(
     unix,
-    feature = "hosted",
+    feature = "std",
     feature = "fat",
     feature = "exfat",
     feature = "littlefs"

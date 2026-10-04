@@ -645,12 +645,7 @@ none of the other 130 000 lines.
 | `luks` | LUKS1 / LUKS2 | pulls `purecrypto`; implies `json` (LUKS2 metadata is JSON) |
 
 Every feature in the table except the three `no_std` ones implies
-`hosted` (the standard library, with no filesystem of its own), and every
-one except `fat`, `exfat` and `littlefs` implies `alloc`. `std` itself is
-`hosted` plus `filesystems`: that is what it meant before the per-format
-split in 0.4.28, and the codec, archive-format and container features that
-existed then (`gzip`, `xz`, `cab`, `rar`, `luks`, …) still imply it, so a
-manifest written against 0.4.27 keeps building. The dispatch layers (`inspect`, `repack`, the TOML spec,
+`std`, and every one except `fat`, `exfat` and `littlefs` implies `alloc`. The dispatch layers (`inspect`, `repack`, the TOML spec,
 `memconv`, the CLI) are gated per backend as well: a format that was
 compiled out is still *recognised* by its magic and refused with an error
 naming the feature to enable, never mistaken for an unknown image. The
@@ -696,7 +691,7 @@ flags. CI asserts the library-only resolve contains neither `clap` nor
 
 ## Embedded targets (`no_std`)
 
-Leave `hosted` (and so `std`) off and fstool is `#![no_std]` (with `alloc`).
+Turn the `std` feature off and fstool is `#![no_std]` (with `alloc`).
 What remains is the core an SD-card or flash reader needs:
 
 - [`device`](src/device/mod.rs) — `SectorDriver` for cards and `FlashDriver`
@@ -773,8 +768,8 @@ dependency in this configuration is `uuid` (no `getrandom`, no OS): GPT
 you through `Gpt::build_with_guids` instead of a random source.
 
 The rest of the crate — every other filesystem, the containers, `inspect`
-/ `repack` / the spec engine, host paths — needs `hosted` and is gated
-on it; enabling any of those features turns `hosted` back on. The unit tests
+/ `repack` / the spec engine, host paths — needs `std` and is gated on
+it; enabling any of those features turns `std` back on. The unit tests
 of the core run in the `no_std` configuration too
 (`cargo test --lib --no-default-features --features fat,exfat,littlefs`).
 

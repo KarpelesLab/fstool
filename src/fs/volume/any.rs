@@ -112,7 +112,7 @@ impl<E: core::fmt::Display> core::fmt::Display for AnyError<E> {
     }
 }
 
-#[cfg(feature = "hosted")]
+#[cfg(feature = "std")]
 impl<E: core::fmt::Debug + core::fmt::Display> std::error::Error for AnyError<E> {}
 
 /// Find the first volume on `dev` that this build can mount, without taking

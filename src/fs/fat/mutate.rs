@@ -8,7 +8,7 @@
 //! its 8.3 entry land in consecutive slots as the spec requires.
 
 use crate::io::Read;
-#[cfg(feature = "hosted")]
+#[cfg(feature = "std")]
 use crate::path::Path;
 use alloc::collections::BTreeSet;
 use alloc::format;
@@ -240,7 +240,7 @@ impl Fat32 {
     /// Add a regular file at `dest_path` populated from a host file. The
     /// parent directory must already exist; an existing entry at the same
     /// destination is an error.
-    #[cfg(feature = "hosted")]
+    #[cfg(feature = "std")]
     pub fn add_file(
         &mut self,
         dev: &mut dyn BlockDevice,
@@ -763,7 +763,7 @@ fn dot_entry(name_83: &[u8; 11], cluster: u32) -> [u8; dir::ENTRY_SIZE] {
 
 /// Host file modification time as Unix epoch seconds, or `0` if unavailable
 /// (or before the epoch). Portable across platforms via `Metadata::modified`.
-#[cfg(feature = "hosted")]
+#[cfg(feature = "std")]
 pub(super) fn host_mtime_secs(md: &std::fs::Metadata) -> u32 {
     md.modified()
         .ok()

@@ -15,18 +15,18 @@
 //!
 //! [`BlockDevice`]: crate::block::BlockDevice
 
-#[cfg(feature = "hosted")]
+#[cfg(feature = "std")]
 pub use std::io::{
     Cursor, Empty, Error, ErrorKind, Read, Result, Seek, SeekFrom, Take, Write, empty,
 };
 
-#[cfg(not(feature = "hosted"))]
+#[cfg(not(feature = "std"))]
 pub use nostd::{
     Cursor, Empty, Error, ErrorKind, Read, Result, Seek, SeekFrom, Take, Write, empty,
 };
 
 /// The `no_std` stand-in for `std::io`. Only the surface fstool uses.
-#[cfg(not(feature = "hosted"))]
+#[cfg(not(feature = "std"))]
 mod nostd {
     use alloc::boxed::Box;
     use alloc::string::String;

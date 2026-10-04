@@ -132,7 +132,7 @@ jobs:
 
       # Manifests written against 0.4.27, before the per-format split, name
       # only codec features with default features off (and expect every
-      # filesystem). Those features imply the full `std` for exactly that
+      # filesystem). Those features enable `filesystems` for exactly that
       # reason; this keeps it so.
       - name: pre-0.4.28 feature sets
         run: |
@@ -151,10 +151,10 @@ jobs:
       - name: single-filesystem builds
         run: |
           set -euo pipefail
-          for feats in hosted,fat hosted,ext hosted,exfat hosted,littlefs hosted,tar hosted,archive \
-                       hosted,hfs hosted,hfs-plus hosted,apfs hosted,xfs hosted,ntfs hosted,f2fs \
-                       hosted,iso9660 hosted,squashfs hosted,grf hosted,affs hosted,ramfs \
-                       hosted,fat,qcow2 hosted,ext,luks hosted,ext,tar,ramfs \
+          for feats in std,fat std,ext std,exfat std,littlefs std,tar std,archive \
+                       std,hfs std,hfs-plus std,apfs std,xfs std,ntfs std,f2fs \
+                       std,iso9660 std,squashfs std,grf std,affs std,ramfs \
+                       std,fat,qcow2 std,ext,luks std,ext,tar,ramfs \
                        cli,readline,fat cli,readline,ext,spec cli,readline,filesystems,containers,codecs; do
             echo "::group::--features $feats"
             cargo clippy --no-default-features --features "$feats" --all-targets -- -D warnings

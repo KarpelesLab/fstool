@@ -1,4 +1,4 @@
-#![cfg(all(unix, feature = "hosted", feature = "exfat"))]
+#![cfg(all(unix, feature = "std", feature = "exfat"))]
 //! External validation: produce exFAT images with the library writer and
 //! verify them with `fsck.exfat` (exfatprogs), and read back images that
 //! `mkfs.exfat` produced. Each test skips silently when the required tool

@@ -251,7 +251,7 @@ impl<E: core::fmt::Display> core::fmt::Display for Error<E> {
     }
 }
 
-#[cfg(feature = "hosted")]
+#[cfg(feature = "std")]
 impl<E: core::fmt::Debug + core::fmt::Display> std::error::Error for Error<E> {}
 
 /// Format-time options for [`Volume::format_with`].
