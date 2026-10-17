@@ -969,6 +969,7 @@ mod imp {
                                 compressed_len: 0,
                                 uncompressed_len: 0,
                                 method: crate::fs::archive::Method::Stored,
+                                crypto: crate::fs::archive::Crypto::None,
                             },
                         );
                         e.kind = EntryKind::Regular;
@@ -999,6 +1000,7 @@ mod imp {
                             compressed_len: 0,
                             uncompressed_len: sub.len,
                             method: crate::fs::archive::Method::Stored,
+                            crypto: crate::fs::archive::Crypto::None,
                         },
                     );
                     e.kind = EntryKind::Regular;

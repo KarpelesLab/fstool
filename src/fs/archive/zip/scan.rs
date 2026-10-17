@@ -1,12 +1,17 @@
 //! ZIP reader: locate the End-Of-Central-Directory, follow ZIP64 when
 //! present, and walk the central directory into an [`ArchiveIndex`].
+//!
+//! Split archives (`disk number start` ≠ 0) are read through a device
+//! that exposes its volumes via [`BlockDevice::segments`]; every
+//! disk-relative offset is translated to the concatenation.
 
 use super::encoding;
 use super::{
-    METHOD_DEFLATE, METHOD_STORE, SIG_CENTRAL, SIG_EOCD, SIG_ZIP64_EOCD, SIG_ZIP64_LOCATOR,
+    METHOD_AES, METHOD_DEFLATE, METHOD_STORE, SIG_CENTRAL, SIG_EOCD, SIG_ZIP64_EOCD,
+    SIG_ZIP64_LOCATOR,
 };
 use crate::block::BlockDevice;
-use crate::fs::archive::{ArchiveEntry, ArchiveIndex, DataLocator, EntryKind, Method};
+use crate::fs::archive::{ArchiveEntry, ArchiveIndex, Crypto, DataLocator, EntryKind, Method};
 use crate::{Error, Result};
 
 const S_IFMT: u32 = 0o170000;
@@ -24,7 +29,32 @@ fn le64(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(a)
 }
 
-/// Central-directory geometry resolved from the EOCD (+ ZIP64).
+/// Translate a (disk, disk-relative offset) pair to an offset in `dev`.
+/// A single-volume device only knows disk 0; a reference to any other
+/// disk means the caller opened one volume of a split set on its own.
+fn resolve(segments: Option<&[u64]>, disk: u64, offset: u64) -> Result<u64> {
+    match segments {
+        None if disk == 0 => Ok(offset),
+        None => Err(Error::InvalidImage(format!(
+            "zip: split archive refers to disk {disk} — open the whole volume set \
+             (the .z01… volumes next to the .zip)"
+        ))),
+        Some(segs) => {
+            let start = segs.get(disk as usize).copied().ok_or_else(|| {
+                Error::InvalidImage(format!(
+                    "zip: entry on disk {disk} but the volume set has only {} volumes",
+                    segs.len()
+                ))
+            })?;
+            start
+                .checked_add(offset)
+                .ok_or_else(|| Error::InvalidImage("zip: offset overflow".into()))
+        }
+    }
+}
+
+/// Central-directory geometry resolved from the EOCD (+ ZIP64), with
+/// every offset already translated to the device.
 struct Eocd {
     cd_offset: u64,
     cd_size: u64,
@@ -63,6 +93,9 @@ fn find_eocd(dev: &mut dyn BlockDevice) -> Result<Eocd> {
         .ok_or_else(|| Error::InvalidImage("zip: end-of-central-directory not found".into()))?;
 
     let eocd_abs = start + i as u64;
+    let segments: Option<Vec<u64>> = dev.segments().map(|s| s.to_vec());
+    let segments = segments.as_deref();
+    let mut cd_disk = le16(&tail, i + 6) as u64;
     let mut cd_size = le32(&tail, i + 12) as u64;
     let mut cd_offset = le32(&tail, i + 16) as u64;
     let mut total_entries = le16(&tail, i + 10) as u64;
@@ -70,7 +103,8 @@ fn find_eocd(dev: &mut dyn BlockDevice) -> Result<Eocd> {
 
     // ZIP64: a locator sits 20 bytes before the EOCD.
     if i >= 20 && le32(&tail, i - 20) == SIG_ZIP64_LOCATOR {
-        let z64_eocd_off = le64(&tail, i - 20 + 8);
+        let z64_disk = le32(&tail, i - 20 + 4) as u64;
+        let z64_eocd_off = resolve(segments, z64_disk, le64(&tail, i - 20 + 8))?;
         let mut rec = [0u8; 56];
         dev.read_at(z64_eocd_off, &mut rec)?;
         if le32(&rec, 0) != SIG_ZIP64_EOCD {
@@ -78,12 +112,14 @@ fn find_eocd(dev: &mut dyn BlockDevice) -> Result<Eocd> {
                 "zip: ZIP64 locator points at a bad record".into(),
             ));
         }
+        cd_disk = le32(&rec, 20) as u64;
         total_entries = le64(&rec, 32);
         cd_size = le64(&rec, 40);
         cd_offset = le64(&rec, 48);
         zip64 = true;
     }
 
+    let cd_offset = resolve(segments, cd_disk, cd_offset)?;
     let cd_end = cd_offset
         .checked_add(cd_size)
         .ok_or_else(|| Error::InvalidImage("zip: central-directory size overflow".into()))?;
@@ -95,8 +131,9 @@ fn find_eocd(dev: &mut dyn BlockDevice) -> Result<Eocd> {
     // The classic EOCD immediately follows the central directory, so any
     // gap is a prepended stub. With ZIP64 the two extra records sit in
     // between, and the locator's own offset would need the same
-    // correction, so don't guess there.
-    let prefix_delta = if zip64 {
+    // correction, so don't guess there — nor on a split set, whose
+    // offsets are already volume-relative.
+    let prefix_delta = if zip64 || segments.is_some() {
         0
     } else {
         eocd_abs.saturating_sub(cd_end)
@@ -109,11 +146,45 @@ fn find_eocd(dev: &mut dyn BlockDevice) -> Result<Eocd> {
     })
 }
 
-/// Walk a per-entry extra field, applying ZIP64 overrides and reading a
-/// Unix mtime from the `UT` (0x5455) extra. `comp`/`uncomp`/`offset`
-/// are overridden from the ZIP64 (0x0001) field only for the values
-/// that were `0xFFFFFFFF`.
-fn apply_extras(extra: &[u8], comp: &mut u64, uncomp: &mut u64, offset: &mut u64, mtime: &mut u64) {
+/// Everything an entry's extra fields may carry that we care about.
+#[derive(Default, Debug)]
+struct Extras {
+    mtime: Option<u64>,
+    atime: Option<u64>,
+    ctime: Option<u64>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    /// Info-ZIP Unicode Path (0x7075), when its CRC matches the raw name.
+    unicode_name: Option<String>,
+    /// WinZip AES (0x9901): vendor version, strength byte, real method.
+    aes: Option<(u16, u8, u16)>,
+    /// ZIP64 disk number, present when the 16-bit field is 0xFFFF.
+    zip64_disk: Option<u32>,
+}
+
+/// Windows FILETIME (100 ns ticks since 1601-01-01) → Unix seconds.
+/// `None` for a zero FILETIME, which writers use for "not recorded"
+/// (7-Zip fills only the mtime slot).
+fn filetime_to_unix(ft: u64) -> Option<u64> {
+    (ft != 0).then(|| (ft / 10_000_000).saturating_sub(11_644_473_600))
+}
+
+/// Walk an extra-field block. ZIP64 (0x0001) overrides `comp` /
+/// `uncomp` / `offset` for the values that were `0xFFFFFFFF` (and the
+/// disk when it was `0xFFFF`); the rest lands in [`Extras`]: Unix mtime /
+/// atime / ctime from the `UT` extra (0x5455), uid / gid from Info-ZIP's
+/// `ux` (0x7875) and legacy `UX` (0x5855), NTFS timestamps (0x000a) as a
+/// fallback, the Unicode path (0x7075), and the AES parameters (0x9901).
+fn parse_extras(
+    extra: &[u8],
+    raw_name: &[u8],
+    comp: &mut u64,
+    uncomp: &mut u64,
+    offset: &mut u64,
+    disk: &mut u64,
+) -> Extras {
+    let mut x = Extras::default();
+    let mut ntfs: Option<(Option<u64>, Option<u64>, Option<u64>)> = None;
     let mut p = 0;
     while p + 4 <= extra.len() {
         let id = le16(extra, p);
@@ -137,22 +208,109 @@ fn apply_extras(extra: &[u8], comp: &mut u64, uncomp: &mut u64, offset: &mut u64
                 }
                 if *offset == 0xffff_ffff && q + 8 <= body.len() {
                     *offset = le64(body, q);
+                    q += 8;
+                }
+                if *disk == 0xffff && q + 4 <= body.len() {
+                    let d = le32(body, q);
+                    *disk = d as u64;
+                    x.zip64_disk = Some(d);
                 }
             }
-            0x5455
-                // UT: flags byte, then mtime if bit 0 set.
-                if !body.is_empty() && (body[0] & 1) != 0 && body.len() >= 5 => {
-                    *mtime = le32(body, 1) as u64;
+            0x5455 if !body.is_empty() => {
+                // UT: flags byte, then mtime / atime / ctime for each set
+                // bit — as many as actually fit (the central copy carries
+                // mtime alone whatever the flags say).
+                let flags = body[0];
+                let mut q = 1;
+                for (bit, slot) in [(1u8, &mut x.mtime), (2, &mut x.atime), (4, &mut x.ctime)] {
+                    if flags & bit != 0 && q + 4 <= body.len() {
+                        *slot = Some(le32(body, q) as u64);
+                        q += 4;
+                    }
                 }
+            }
+            0x5855 => {
+                // UX (legacy Info-ZIP): atime, mtime; in the local header
+                // also 16-bit uid, gid.
+                if body.len() >= 8 {
+                    x.atime.get_or_insert(le32(body, 0) as u64);
+                    x.mtime.get_or_insert(le32(body, 4) as u64);
+                }
+                if body.len() >= 12 {
+                    x.uid.get_or_insert(le16(body, 8) as u32);
+                    x.gid.get_or_insert(le16(body, 10) as u32);
+                }
+            }
+            0x7875 if body.len() >= 2 && body[0] == 1 => {
+                // ux: version 1, then size-prefixed little-endian uid and gid.
+                let read = |q: &mut usize| -> Option<u32> {
+                    let n = *body.get(*q)? as usize;
+                    *q += 1;
+                    let bytes = body.get(*q..*q + n)?;
+                    *q += n;
+                    let mut v = 0u64;
+                    for (i, b) in bytes.iter().enumerate().take(8) {
+                        v |= (*b as u64) << (8 * i);
+                    }
+                    u32::try_from(v).ok()
+                };
+                let mut q = 1;
+                if let Some(uid) = read(&mut q) {
+                    x.uid = Some(uid);
+                    if let Some(gid) = read(&mut q) {
+                        x.gid = Some(gid);
+                    }
+                }
+            }
+            0x000a if body.len() >= 4 => {
+                // NTFS: reserved u32, then tagged attributes; tag 1 holds
+                // three FILETIMEs (mtime, atime, ctime).
+                let mut q = 4;
+                while q + 4 <= body.len() {
+                    let tag = le16(body, q);
+                    let size = le16(body, q + 2) as usize;
+                    q += 4;
+                    if q + size > body.len() {
+                        break;
+                    }
+                    if tag == 1 && size >= 24 {
+                        ntfs = Some((
+                            filetime_to_unix(le64(body, q)),
+                            filetime_to_unix(le64(body, q + 8)),
+                            filetime_to_unix(le64(body, q + 16)),
+                        ));
+                    }
+                    q += size;
+                }
+            }
+            0x7075 if body.len() >= 5 && body[0] == 1 => {
+                if le32(body, 1) == crate::crc::crc32(raw_name)
+                    && let Ok(name) = std::str::from_utf8(&body[5..])
+                {
+                    x.unicode_name = Some(name.to_string());
+                }
+            }
+            0x9901 if body.len() >= 7 && &body[2..4] == b"AE" => {
+                x.aes = Some((le16(body, 0), body[4], le16(body, 5)));
+            }
             _ => {}
         }
         p = body_start + len;
     }
+    if let Some((m, a, c)) = ntfs {
+        x.mtime = x.mtime.or(m);
+        x.atime = x.atime.or(a);
+        x.ctime = x.ctime.or(c);
+    }
+    x
 }
 
 /// General-purpose bit 0: the body is encrypted (traditional PKWARE or,
-/// together with bit 6 / method 99, one of the strong variants).
+/// together with method 99, WinZip AES).
 const GP_ENCRYPTED: u16 = 0x0001;
+/// General-purpose bit 3: sizes and CRC follow the body in a data
+/// descriptor; the ZipCrypto check byte then comes from the DOS time.
+const GP_DESCRIPTOR: u16 = 0x0008;
 
 /// Map a ZIP compression-method id to our [`Method`]. Bits 1 and 2 of
 /// the general-purpose flags are method-specific parameters: the LZMA
@@ -183,10 +341,15 @@ fn method_for(id: u16, gp_flags: u16) -> Method {
     }
 }
 
-pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
+/// Index the archive on `dev`. `password` is only used here to decode
+/// encrypted symlink targets; the handle keeps its own copy for file
+/// bodies.
+pub fn scan(dev: &mut dyn BlockDevice, password: Option<&[u8]>) -> Result<ArchiveIndex> {
     let eocd = find_eocd(dev)?;
     let mut cd = vec![0u8; eocd.cd_size as usize];
     dev.read_at(eocd.cd_offset, &mut cd)?;
+    let segments: Option<Vec<u64>> = dev.segments().map(|s| s.to_vec());
+    let segments = segments.as_deref();
 
     // Self-extracting archives keep offsets relative to the start of the
     // zip data. When the declared offset doesn't land on a central
@@ -223,9 +386,11 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
         let method_id = le16(&cd, p + 10);
         let dos_time = le16(&cd, p + 12);
         let dos_date = le16(&cd, p + 14);
+        let crc = le32(&cd, p + 16);
         let name_len = le16(&cd, p + 28) as usize;
         let extra_len = le16(&cd, p + 30) as usize;
         let comment_len = le16(&cd, p + 32) as usize;
+        let mut disk = le16(&cd, p + 34) as u64;
         let external_attr = le32(&cd, p + 38);
         let mut comp = le32(&cd, p + 20) as u64;
         let mut uncomp = le32(&cd, p + 24) as u64;
@@ -242,14 +407,24 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
         let name_bytes = &cd[name_off..extra_off];
         let extra = &cd[extra_off..comment_off];
 
-        let mut mtime = super::dos_to_unix(dos_date, dos_time);
-        apply_extras(extra, &mut comp, &mut uncomp, &mut local_offset, &mut mtime);
+        let cx = parse_extras(
+            extra,
+            name_bytes,
+            &mut comp,
+            &mut uncomp,
+            &mut local_offset,
+            &mut disk,
+        );
 
-        let name = encoding::decode_name(name_bytes, gp_flags & 0x0800 != 0);
+        let name = match &cx.unicode_name {
+            Some(u) if gp_flags & 0x0800 == 0 => u.clone(),
+            _ => encoding::decode_name(name_bytes, gp_flags & 0x0800 != 0),
+        };
 
         // Resolve the data offset from the *local* header (its extra
-        // field length may differ from the central one).
-        let local_offset = local_offset
+        // field length may differ from the central one), and pick up
+        // the timestamps / ids that only the local copy carries.
+        let local_offset = resolve(segments, disk, local_offset)?
             .checked_add(base)
             .filter(|o| o.saturating_add(30) <= dev.total_size())
             .ok_or_else(|| {
@@ -258,8 +433,25 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
         let mut lh = [0u8; 30];
         dev.read_at(local_offset, &mut lh)?;
         let l_name = le16(&lh, 26) as u64;
-        let l_extra = le16(&lh, 28) as u64;
-        let data_off = local_offset + 30 + l_name + l_extra;
+        let l_extra = le16(&lh, 28) as usize;
+        let data_off = local_offset + 30 + l_name + l_extra as u64;
+        let lx = if l_extra > 0 && data_off <= dev.total_size() {
+            let mut buf = vec![0u8; l_extra];
+            dev.read_at(local_offset + 30 + l_name, &mut buf)?;
+            let (mut d0, mut d1, mut d2, mut d3) = (0u64, 0u64, 0u64, 0u64);
+            parse_extras(&buf, name_bytes, &mut d0, &mut d1, &mut d2, &mut d3)
+        } else {
+            Extras::default()
+        };
+
+        let mtime = cx
+            .mtime
+            .or(lx.mtime)
+            .unwrap_or_else(|| super::dos_to_unix(dos_date, dos_time));
+        let atime = cx.atime.or(lx.atime).unwrap_or(0);
+        let ctime = cx.ctime.or(lx.ctime).unwrap_or(0);
+        let uid = cx.uid.or(lx.uid).unwrap_or(0);
+        let gid = cx.gid.or(lx.gid).unwrap_or(0);
 
         // Host-OS byte (high byte of version-made-by) 3 == Unix → the
         // external-attributes high word is a Unix st_mode.
@@ -282,27 +474,52 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
             0o644
         };
 
-        // An encrypted body is ciphertext whatever the method id says;
-        // index it but refuse to hand it to a decompressor.
-        let method = if gp_flags & GP_ENCRYPTED != 0 {
-            Method::Encrypted
+        // Encryption wraps the compressed body. Method 99 is WinZip AES,
+        // whose real method and key size live in the 0x9901 extra; any
+        // other encrypted member is traditional PKWARE.
+        let aes = cx.aes.or(lx.aes);
+        let (method, crypto) = if gp_flags & GP_ENCRYPTED != 0 {
+            if method_id == METHOD_AES {
+                match aes.and_then(|(ver, strength, m)| {
+                    super::crypto::aes_key_bits(strength).map(|bits| (ver, bits, m))
+                }) {
+                    Some((vendor_version, key_bits, real)) => (
+                        method_for(real, gp_flags),
+                        Crypto::Aes {
+                            key_bits,
+                            vendor_version,
+                        },
+                    ),
+                    None => (Method::Unsupported(METHOD_AES), Crypto::None),
+                }
+            } else {
+                let check = if gp_flags & GP_DESCRIPTOR != 0 {
+                    (dos_time >> 8) as u8
+                } else {
+                    (crc >> 24) as u8
+                };
+                (method_for(method_id, gp_flags), Crypto::ZipCrypto { check })
+            }
         } else {
-            method_for(method_id, gp_flags)
+            (method_for(method_id, gp_flags), Crypto::None)
         };
         let loc = DataLocator {
             offset: data_off,
             compressed_len: comp,
             uncompressed_len: uncomp,
             method,
+            crypto,
         };
 
         let mut entry = ArchiveEntry {
             path: name,
             kind,
             mode,
-            uid: 0,
-            gid: 0,
+            uid,
+            gid,
             mtime,
+            atime,
+            ctime,
             link_target: None,
             device_major: 0,
             device_minor: 0,
@@ -313,7 +530,7 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
             EntryKind::Symlink => {
                 // The body holds the link target; decode it now (targets
                 // are tiny). Unsupported codecs leave it empty.
-                if let Ok(mut r) = crate::fs::archive::reader::open(dev, loc) {
+                if let Ok(mut r) = crate::fs::archive::reader::open(dev, loc, password) {
                     let mut t = String::new();
                     use std::io::Read;
                     if r.read_to_string(&mut t).is_ok() {
@@ -428,7 +645,7 @@ mod tests {
         let mut sfx = vec![0x7fu8; 4096]; // stand-in for the stub
         sfx.extend_from_slice(&zip);
         let mut dev = dev_from(&sfx);
-        let idx = scan(&mut dev).unwrap();
+        let idx = scan(&mut dev, None).unwrap();
         let e = idx
             .entries()
             .iter()
@@ -450,7 +667,7 @@ mod tests {
         let cd = 30 + 5 + 2;
         zip[cd] ^= 0xff;
         let mut dev = dev_from(&zip);
-        let err = match scan(&mut dev) {
+        let err = match scan(&mut dev, None) {
             Ok(_) => panic!("scan accepted an unreadable central directory"),
             Err(e) => e,
         };
@@ -460,27 +677,29 @@ mod tests {
         );
     }
 
-    /// General-purpose bit 0 means the body is ciphertext; it must not be
-    /// fed to the method's decoder.
+    /// General-purpose bit 0 means the body is ciphertext; without a
+    /// passphrase it must not be fed to the method's decoder.
     #[test]
     fn encrypted_entry_is_flagged() {
         let zip = one_entry_zip("secret.txt", b"hi", 0x0001);
         let mut dev = dev_from(&zip);
-        let idx = scan(&mut dev).unwrap();
+        let idx = scan(&mut dev, None).unwrap();
         let e = idx
             .entries()
             .iter()
             .find(|e| e.path == "/secret.txt")
             .expect("entry");
-        assert_eq!(e.data.as_ref().unwrap().method, Method::Encrypted);
         let loc = e.data.clone().unwrap();
-        let err = match crate::fs::archive::reader::open(&mut dev, loc) {
+        assert_eq!(loc.method, Method::Stored);
+        let check = (crate::crc::crc32(b"hi") >> 24) as u8;
+        assert_eq!(loc.crypto, Crypto::ZipCrypto { check });
+        let err = match crate::fs::archive::reader::open(&mut dev, loc, None) {
             Ok(_) => panic!("reader opened an encrypted body"),
             Err(e) => e,
         };
         assert!(
-            matches!(err, crate::Error::Unsupported(_)),
-            "expected Unsupported, got {err:?}"
+            matches!(&err, crate::Error::InvalidArgument(m) if m.contains("passphrase")),
+            "expected a passphrase request, got {err:?}"
         );
     }
 
@@ -508,7 +727,7 @@ mod tests {
 
     fn method_of(arc: &[u8], path: &str) -> Method {
         let mut dev = dev_from(arc);
-        let idx = scan(&mut dev).unwrap();
+        let idx = scan(&mut dev, None).unwrap();
         idx.lookup(path).unwrap().data.as_ref().unwrap().method
     }
 
@@ -649,5 +868,208 @@ mod tests {
             read_member(include_bytes!("../testdata/zip_implode.zip"), "/fox.txt").unwrap(),
             b"The quick brown fox jumps over the lazy dog. ".repeat(5)
         );
+    }
+
+    // ─── encryption, extras, split sets ──────────────────────────────
+    //
+    // `zip_crypt_infozip.zip` is `zip -P secret` (ZipCrypto with data
+    // descriptors, `UT` + `ux` extras); `zip_crypt_7z.zip`, `zip_aes256.zip`
+    // and `zip_aes128.zip` are 7-Zip's `-mem=ZipCrypto` / `AES256` /
+    // `AES128` with the same passphrase (NTFS timestamps, AE-2);
+    // `zip_split.z01` + `zip_split.zip` is `zip -s 64k` and
+    // `zip_sevz.zip.001` + `.002` is `7zz -v64k`, both holding
+    // `zip_split_noise.bin` and `a.txt`.
+
+    fn read_member_pw(arc: &[u8], path: &str, pw: Option<&str>) -> crate::Result<Vec<u8>> {
+        use crate::fs::Filesystem;
+        let mut dev = dev_from(arc);
+        let mut fs = super::super::ZipFs::open_with_password(&mut dev, pw)?;
+        let mut r = fs.read_file(&mut dev, std::path::Path::new(path))?;
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut r, &mut out)?;
+        Ok(out)
+    }
+
+    fn entry_of(arc: &[u8], path: &str) -> ArchiveEntry {
+        let mut dev = dev_from(arc);
+        let idx = scan(&mut dev, None).unwrap();
+        idx.lookup(path).unwrap().clone()
+    }
+
+    const PLAIN: &[u8] = b"hello hello hello hello zip world\n";
+
+    #[test]
+    fn reads_zipcrypto_members() {
+        let want = PLAIN.repeat(40);
+        for arc in [
+            &include_bytes!("../testdata/zip_crypt_infozip.zip")[..],
+            &include_bytes!("../testdata/zip_crypt_7z.zip")[..],
+        ] {
+            let e = entry_of(arc, "/a.txt");
+            assert!(matches!(
+                e.data.as_ref().unwrap().crypto,
+                Crypto::ZipCrypto { .. }
+            ));
+            if cfg!(feature = "gzip") {
+                assert_eq!(read_member_pw(arc, "/a.txt", Some("secret")).unwrap(), want);
+            }
+            let err = read_member_pw(arc, "/a.txt", Some("wrong")).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidArgument(m) if m.contains("wrong passphrase")),
+                "{err:?}"
+            );
+            let err = read_member_pw(arc, "/a.txt", None).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidArgument(m) if m.contains("passphrase")),
+                "{err:?}"
+            );
+        }
+        // A Stored encrypted member with a data descriptor (check byte
+        // from the DOS time).
+        assert_eq!(
+            read_member_pw(
+                include_bytes!("../testdata/zip_crypt_infozip.zip"),
+                "/sub/deep.txt",
+                Some("secret")
+            )
+            .unwrap(),
+            b"nested file contents\n"
+        );
+    }
+
+    #[test]
+    fn aes_members_are_recognised() {
+        for (arc, bits) in [
+            (&include_bytes!("../testdata/zip_aes256.zip")[..], 256u16),
+            (&include_bytes!("../testdata/zip_aes128.zip")[..], 128),
+        ] {
+            let e = entry_of(arc, "/a.txt");
+            let loc = e.data.as_ref().unwrap();
+            assert_eq!(loc.method, Method::Deflate, "{bits}");
+            assert_eq!(
+                loc.crypto,
+                Crypto::Aes {
+                    key_bits: bits,
+                    vendor_version: 2
+                }
+            );
+        }
+    }
+
+    #[cfg(all(feature = "zip-aes", feature = "gzip"))]
+    #[test]
+    fn reads_aes_members() {
+        let want = PLAIN.repeat(40);
+        for arc in [
+            &include_bytes!("../testdata/zip_aes256.zip")[..],
+            &include_bytes!("../testdata/zip_aes128.zip")[..],
+        ] {
+            assert_eq!(read_member_pw(arc, "/a.txt", Some("secret")).unwrap(), want);
+            let err = read_member_pw(arc, "/a.txt", Some("wrong")).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidArgument(m) if m.contains("wrong passphrase")),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "zip-aes"))]
+    #[test]
+    fn aes_without_feature_names_it() {
+        let err = read_member_pw(
+            include_bytes!("../testdata/zip_aes256.zip"),
+            "/a.txt",
+            Some("secret"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::Unsupported(m) if m.contains("zip-aes")),
+            "{err:?}"
+        );
+    }
+
+    /// Info-ZIP's `UT` (mtime in the central copy, atime in the local
+    /// one) and `ux` (32-bit uid / gid) extras.
+    #[test]
+    fn reads_unix_extras() {
+        let e = entry_of(
+            include_bytes!("../testdata/zip_crypt_infozip.zip"),
+            "/a.txt",
+        );
+        assert_eq!(e.uid, 501);
+        assert_eq!(e.gid, 0);
+        assert_eq!(e.mtime, 1_792_209_851);
+        assert_eq!(e.atime, 1_792_209_851);
+        assert_eq!(e.ctime, 0);
+    }
+
+    /// 7-Zip writes NTFS (0x000a) FILETIMEs instead; the mtime it holds
+    /// is the same second the `UT` extra carries for the same file, and
+    /// the atime / ctime slots it leaves zero read as "not recorded".
+    #[test]
+    fn reads_ntfs_timestamps() {
+        let e = entry_of(include_bytes!("../testdata/zip_crypt_7z.zip"), "/a.txt");
+        assert_eq!(e.mtime, 1_792_209_851);
+        assert_eq!(e.atime, 0);
+        assert_eq!(e.ctime, 0);
+        assert_eq!(filetime_to_unix(0x01dd_5dec_90a4_9861), Some(1_792_209_851));
+        assert_eq!(filetime_to_unix(0), None);
+    }
+
+    fn split_dev(parts: &[&[u8]]) -> crate::block::SplitBackend {
+        let devs: Vec<Box<dyn BlockDevice>> = parts
+            .iter()
+            .map(|p| Box::new(dev_from(p)) as Box<dyn BlockDevice>)
+            .collect();
+        crate::block::SplitBackend::new(devs).unwrap()
+    }
+
+    fn read_split(parts: &[&[u8]], path: &str) -> crate::Result<Vec<u8>> {
+        use crate::fs::Filesystem;
+        let mut dev = split_dev(parts);
+        let mut fs = super::super::ZipFs::open(&mut dev)?;
+        let mut r = fs.read_file(&mut dev, std::path::Path::new(path))?;
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut r, &mut out)?;
+        Ok(out)
+    }
+
+    /// An Info-ZIP `.z01` + `.zip` set: the first volume opens with the
+    /// split signature, every offset is volume-relative, and the noise
+    /// member straddles the two volumes.
+    #[test]
+    fn reads_infozip_split_set() {
+        let z01 = &include_bytes!("../testdata/zip_split.z01")[..];
+        let zip = &include_bytes!("../testdata/zip_split.zip")[..];
+        assert_eq!(&z01[..4], &super::super::SIG_SPLIT.to_le_bytes());
+        let noise = &include_bytes!("../testdata/zip_split_noise.bin")[..];
+        // Info-ZIP deflated both members (the noise shrank by a byte or
+        // two), so the bodies need the codec; the geometry does not.
+        let mut set = split_dev(&[z01, zip]);
+        let idx = scan(&mut set, None).unwrap();
+        let loc = idx.lookup("/noise.bin").unwrap().data.clone().unwrap();
+        assert_eq!(loc.uncompressed_len, noise.len() as u64);
+        assert!(loc.offset > 4 && loc.offset + loc.compressed_len > z01.len() as u64);
+        if cfg!(feature = "gzip") {
+            assert_eq!(read_split(&[z01, zip], "/noise.bin").unwrap(), noise);
+            assert_eq!(read_split(&[z01, zip], "/a.txt").unwrap(), PLAIN.repeat(40));
+        }
+        // The final volume alone cannot be read: its central directory
+        // points at disk 0 and the error says so.
+        let err = read_split(&[zip], "/noise.bin").unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidImage(m) if m.contains("volume set")),
+            "{err:?}"
+        );
+    }
+
+    /// 7-Zip's `-v` output is a plain byte split (`.001`, `.002`): disk
+    /// numbers stay 0 and the concatenation is the archive.
+    #[test]
+    fn reads_byte_split_set() {
+        let p1 = &include_bytes!("../testdata/zip_sevz.zip.001")[..];
+        let p2 = &include_bytes!("../testdata/zip_sevz.zip.002")[..];
+        let noise = &include_bytes!("../testdata/zip_split_noise.bin")[..];
+        assert_eq!(read_split(&[p1, p2], "/noise.bin").unwrap(), noise);
     }
 }

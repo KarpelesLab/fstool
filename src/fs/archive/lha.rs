@@ -207,7 +207,7 @@ mod imp {
 
     use crate::block::BlockDevice;
     use crate::fs::archive::reader::BoundedDevReader;
-    use crate::fs::archive::{ArchiveEntry, ArchiveIndex, DataLocator, EntryKind, Method};
+    use crate::fs::archive::{ArchiveEntry, ArchiveIndex, Crypto, DataLocator, EntryKind, Method};
     use crate::{Error, Result};
 
     /// A stored (`-lh0-`) member's verbatim byte range.
@@ -409,6 +409,7 @@ mod imp {
                         compressed_len: comp_size,
                         uncompressed_len: unpack_size,
                         method: Method::Stored,
+                        crypto: Crypto::None,
                     },
                 );
                 entry.kind = EntryKind::Regular;

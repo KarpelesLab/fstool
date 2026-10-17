@@ -132,7 +132,7 @@ alloc = []
 #
 # which drops `clap` and `rustyline` (and their ~30 transitive crates)
 # while keeping every format.
-codecs = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "bzip2", "deflate64", "zip-legacy", "cab", "amiga-lzx", "lha", "arc", "sit", "sevenz", "rar", "dmg-bzip2", "dmg-lzfse"]
+codecs = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "bzip2", "deflate64", "zip-legacy", "zip-aes", "cab", "amiga-lzx", "lha", "arc", "sit", "sevenz", "rar", "dmg-bzip2", "dmg-lzfse"]
 
 # ---------------------------------------------------------------------
 # Filesystems. One feature per backend, every one on by default through
@@ -355,6 +355,11 @@ deflate64 = ["archive", "dep:compcol", "compcol/deflate64"]
 # The PKZIP 1.x methods — Shrink (1), Reduce (2–5) and Implode (6) —
 # read-only; nothing has written them since 1993.
 zip-legacy = ["archive", "dep:compcol", "compcol/zip_shrink", "compcol/zip_reduce", "compcol/zip_implode"]
+# WinZip AES encryption for zip members (method 99, AE-1 / AE-2, 128 /
+# 192 / 256-bit keys), read and write — AES-CTR, HMAC-SHA1 and
+# PBKDF2-SHA1 from `purecrypto`. The traditional PKWARE ("ZipCrypto")
+# scheme needs no dependency and is always compiled.
+zip-aes = ["archive", "dep:purecrypto"]
 # DMG chunk codecs beyond the always-available zero / raw / zlib / ADC set,
 # decoded via compcol (bzip2 + lzfse decoders). Gated so a slim build can
 # drop them. (`lzfse_rust` is a dev-dependency used only to generate the

@@ -3,7 +3,7 @@
 
 use super::{MAGIC_NEWC, MAGIC_NEWC_CRC, MAGIC_ODC, S_IFMT, TRAILER};
 use crate::block::BlockDevice;
-use crate::fs::archive::{ArchiveEntry, ArchiveIndex, DataLocator, EntryKind, Method};
+use crate::fs::archive::{ArchiveEntry, ArchiveIndex, Crypto, DataLocator, EntryKind, Method};
 use crate::{Error, Result};
 
 const NEWC_HEADER_LEN: u64 = 110;
@@ -171,6 +171,8 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
             uid: hdr.uid,
             gid: hdr.gid,
             mtime: hdr.mtime,
+            atime: 0,
+            ctime: 0,
             link_target: None,
             device_major: hdr.rdevmajor,
             device_minor: hdr.rdevminor,
@@ -184,6 +186,7 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
                     compressed_len: hdr.filesize,
                     uncompressed_len: hdr.filesize,
                     method: Method::Stored,
+                    crypto: Crypto::None,
                 });
             }
             EntryKind::Symlink => {

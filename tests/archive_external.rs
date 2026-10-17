@@ -28,13 +28,19 @@ fn which(tool: &str) -> bool {
 }
 
 fn run(args: &[&str]) -> (bool, String, String) {
+    let (ok, out, err) = run_raw(args);
+    (ok, String::from_utf8_lossy(&out).into_owned(), err)
+}
+
+/// [`run`] with stdout as raw bytes, for `cat` of binary members.
+fn run_raw(args: &[&str]) -> (bool, Vec<u8>, String) {
     let out = Command::new(FSTOOL)
         .args(args)
         .output()
         .expect("spawn fstool");
     (
         out.status.success(),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.stdout,
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
 }
@@ -196,6 +202,237 @@ fn zip_methods_cross_check_with_7zip() {
             std::fs::read(dest.join("blob.bin")).unwrap(),
             vec![0x42u8; 5000]
         );
+    }
+}
+
+/// Encrypted output: traditional PKWARE checked by Info-ZIP's `unzip`
+/// (which cannot read AES), WinZip AES-256 by 7-Zip. A wrong passphrase
+/// must be refused by both tools and by `fstool cat`.
+#[test]
+fn zip_encryption_cross_check() {
+    let work = tempfile::tempdir().unwrap();
+    let src = work.path().join("src");
+    stage_tree(&src);
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fs/archive/testdata");
+
+    // Reading what other tools encrypted, through the CLI's --password.
+    let (ok, out, err) = run(&[
+        "--password",
+        "secret",
+        "cat",
+        fixtures.join("zip_crypt_infozip.zip").to_str().unwrap(),
+        "/sub/deep.txt",
+    ]);
+    assert!(ok, "cat encrypted member failed: {err}");
+    assert_eq!(out, "nested file contents\n");
+    let (ok, _, err) = run(&[
+        "--password",
+        "nope",
+        "cat",
+        fixtures.join("zip_crypt_infozip.zip").to_str().unwrap(),
+        "/sub/deep.txt",
+    ]);
+    assert!(!ok && err.contains("wrong passphrase"), "{err}");
+
+    for enc in ["zipcrypto", "aes256"] {
+        let out = work.path().join(format!("{enc}.zip"));
+        let (ok, _, err) = run(&[
+            "--password",
+            "secret",
+            "create",
+            "-t",
+            "zip",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "-O",
+            &format!("encryption={enc}"),
+        ]);
+        if !ok && err.contains("is disabled") {
+            eprintln!("skipping {enc}: {}", err.trim());
+            continue;
+        }
+        assert!(ok, "create encrypted zip ({enc}) failed: {err}");
+
+        // Our own reader, right and wrong passphrase.
+        let (ok, got, err) = run(&[
+            "--password",
+            "secret",
+            "cat",
+            out.to_str().unwrap(),
+            "/sub/deep.txt",
+        ]);
+        assert!(ok, "{enc}: cat failed: {err}");
+        assert_eq!(got, "nested file contents\n");
+        let (ok, _, err) = run(&[
+            "--password",
+            "nope",
+            "cat",
+            out.to_str().unwrap(),
+            "/sub/deep.txt",
+        ]);
+        assert!(!ok && err.contains("wrong passphrase"), "{enc}: {err}");
+
+        if enc == "zipcrypto" && which("unzip") {
+            let status = Command::new("unzip")
+                .args(["-P", "secret", "-t"])
+                .arg(&out)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "unzip rejected fstool's ZipCrypto zip");
+            let status = Command::new("unzip")
+                .args(["-P", "nope", "-t"])
+                .arg(&out)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(!status.success(), "unzip accepted a wrong passphrase");
+        }
+        if let Some(tool) = ["7zz", "7z"].into_iter().find(|t| which(t)) {
+            let status = Command::new(tool)
+                .args(["t", "-psecret", "-bso0", "-bsp0"])
+                .arg(&out)
+                .status()
+                .unwrap();
+            assert!(status.success(), "7-Zip rejected fstool's {enc} zip");
+            let dest = work.path().join(format!("x-{enc}"));
+            std::fs::create_dir_all(&dest).unwrap();
+            let status = Command::new(tool)
+                .args(["x", "-psecret", "-bso0", "-bsp0"])
+                .arg(format!("-o{}", dest.display()))
+                .arg(&out)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            assert_eq!(
+                std::fs::read(dest.join("blob.bin")).unwrap(),
+                vec![0x42u8; 5000]
+            );
+            let status = Command::new(tool)
+                .args(["t", "-pnope", "-bso0", "-bsp0"])
+                .arg(&out)
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(!status.success(), "7-Zip accepted a wrong passphrase");
+        }
+    }
+}
+
+/// Split archives: a set Info-ZIP wrote reads through the `.zip` name,
+/// and the set we write (`-O split=`) is read by 7-Zip and by us.
+#[test]
+fn zip_split_cross_check() {
+    let work = tempfile::tempdir().unwrap();
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fs/archive/testdata");
+    let noise = std::fs::read(fixtures.join("zip_split_noise.bin")).unwrap();
+
+    // Info-ZIP's set, by its final volume.
+    let (ok, out, err) = run_raw(&[
+        "cat",
+        fixtures.join("zip_split.zip").to_str().unwrap(),
+        "/noise.bin",
+    ]);
+    assert!(ok, "cat from split set failed: {err}");
+    assert_eq!(out, noise, "split set content");
+    // 7-Zip's byte split, by its first volume.
+    let (ok, out, err) = run_raw(&[
+        "cat",
+        fixtures.join("zip_sevz.zip.001").to_str().unwrap(),
+        "/noise.bin",
+    ]);
+    assert!(ok, "cat from .001 set failed: {err}");
+    assert_eq!(out, noise, ".001 set content");
+
+    // Our own split output.
+    let src = work.path().join("src");
+    stage_tree(&src);
+    let big: Vec<u8> = (0..150_000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    std::fs::write(src.join("big.bin"), &big).unwrap();
+    let out = work.path().join("set.zip");
+    let (ok, _, err) = run(&[
+        "create",
+        "-t",
+        "zip",
+        src.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "-O",
+        "split=64k,compression=stored",
+    ]);
+    assert!(ok, "create split zip failed: {err}");
+    let z01 = work.path().join("set.z01");
+    let z02 = work.path().join("set.z02");
+    assert!(z01.exists() && z02.exists(), "volumes missing");
+    assert!(std::fs::metadata(&z01).unwrap().len() <= 64 * 1024);
+    assert!(std::fs::metadata(&out).unwrap().len() <= 64 * 1024);
+
+    let (ok, got, err) = run_raw(&["cat", out.to_str().unwrap(), "/big.bin"]);
+    assert!(ok, "cat from our split set failed: {err}");
+    assert_eq!(got, big);
+    let (ok, got, _) = run(&["cat", z01.to_str().unwrap(), "/sub/deep.txt"]);
+    assert!(ok && got == "nested file contents\n", "cat by a .zNN name");
+
+    if let Some(tool) = ["7zz", "7z"].into_iter().find(|t| which(t)) {
+        let status = Command::new(tool)
+            .args(["t", "-bso0", "-bsp0"])
+            .arg(&out)
+            .status()
+            .unwrap();
+        assert!(status.success(), "7-Zip rejected fstool's split set");
+        let dest = work.path().join("x-split");
+        std::fs::create_dir_all(&dest).unwrap();
+        let status = Command::new(tool)
+            .args(["x", "-bso0", "-bsp0"])
+            .arg(format!("-o{}", dest.display()))
+            .arg(&out)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read(dest.join("big.bin")).unwrap(), big);
+    }
+    // Info-ZIP can only test a split set once merged (`zip -s 0`), and
+    // its merge truncates any member spanning three or more volumes —
+    // its own `zip -s 64k` sets included — so merge a two-volume set.
+    if which("unzip") && which("zip") {
+        let src2 = work.path().join("src2");
+        std::fs::create_dir_all(&src2).unwrap();
+        std::fs::write(src2.join("big.bin"), &big[..100_000]).unwrap();
+        std::fs::write(src2.join("tail.txt"), b"tail\n").unwrap();
+        let out2 = work.path().join("two.zip");
+        let (ok, _, err) = run(&[
+            "create",
+            "-t",
+            "zip",
+            src2.to_str().unwrap(),
+            "-o",
+            out2.to_str().unwrap(),
+            "-O",
+            "split=64k,compression=stored",
+        ]);
+        assert!(ok, "create two-volume zip failed: {err}");
+        assert!(work.path().join("two.z01").exists());
+        assert!(!work.path().join("two.z02").exists());
+        let merged = work.path().join("merged.zip");
+        let status = Command::new("zip")
+            .args(["-q", "-s", "0"])
+            .arg(&out2)
+            .arg("--out")
+            .arg(&merged)
+            .status()
+            .unwrap();
+        assert!(status.success(), "zip -s 0 could not merge fstool's set");
+        let status = Command::new("unzip")
+            .arg("-t")
+            .arg(&merged)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "unzip rejected the merged set");
     }
 }
 

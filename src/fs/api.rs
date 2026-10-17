@@ -1068,6 +1068,15 @@ pub trait FilesystemFactory: Filesystem + Sized {
         let _ = opts;
         None
     }
+
+    /// After `flush`, for a writer that produced a multi-volume archive
+    /// laid out back to back in the device: the byte range of each
+    /// volume, in order. The caller cuts the output file accordingly
+    /// (zip: `name.z01`, `name.z02`, …, `name.zip`). `None` — the
+    /// default — means a single file.
+    fn volume_layout(&self) -> Option<Vec<(u64, u64)>> {
+        None
+    }
 }
 
 /// A `Read + Seek` that produces `remaining` zero bytes and then EOF.

@@ -78,7 +78,7 @@ See [web/README.md](web/README.md) for the build and local-dev steps.
 | SquashFS   | ✅    | ✅     | —              | gzip / xz / lz4 / zstd / lzo / lzma via Cargo features; writer round-trips via `unsquashfs`; repack-only           |
 | ISO 9660   | ✅    | ✅     | —              | PVD + Joliet (UCS-2) + Rock Ridge (PX/NM/SL/TF) + El Torito boot catalog; repack-only                              |
 | GRF        | ✅    | ✅     | ✅              | Gravity Ragnarok Online archive — v0x102 / v0x103 / v0x200; permutation cipher (`MIXCRYPT` / `DES`); CP949 filenames |
-| zip        | ✅    | ✅     | —              | central-directory index, ZIP64, Unix mode/symlinks, UTF-8/Shift-JIS/EUC-JP filename detection; every method id recognised — Stored always, Deflate / Deflate64 / bzip2 / LZMA / XZ / Zstandard read **and** written, the PKZIP 1.x methods (Shrink / Reduce / Implode) read, each behind its codec feature; PPMd lists but has no decoder; repack-only writer |
+| zip        | ✅    | ✅     | —              | central-directory index, ZIP64, Unix mode/symlinks, uid/gid + Unix timestamps (`UT` / `ux` / NTFS extras), UTF-8/Shift-JIS/EUC-JP filename detection (+ Unicode-path extra); every method id recognised — Stored always, Deflate / Deflate64 / bzip2 / LZMA / XZ / Zstandard read **and** written, the PKZIP 1.x methods (Shrink / Reduce / Implode) read, each behind its codec feature; PPMd lists but has no decoder; encrypted members (traditional PKWARE, WinZip AES) read and written with `--password`; split archives (`.z01`…, `.001`…) read as a set and written with `-O split=`; repack-only writer |
 | cpio       | ✅    | ✅     | —              | newc / newc-crc / odc read; newc write; repack-only                                                              |
 | ar         | ✅    | ✅     | —              | GNU + BSD long names (read), GNU write; flat (no directories); repack-only                                       |
 | cab        | ✅    | —     | —              | Microsoft Cabinet read-only: Store / MSZIP / LZX / Quantum folders decode via `compcol` (cross-checked with `cabextract`). Spanned cabinets and creation are unsupported |
@@ -560,6 +560,10 @@ through the existing compression codecs.
 fstool create -t zip ./rootfs -o out.zip          # build a zip from a dir
 fstool create -t zip ./rootfs -o out.zip -O compression=stored
 fstool create -t zip ./rootfs -o out.zip -O compression=lzma,level=9   # or deflate64 / bzip2 / xz / zstd
+fstool --password-file pw create -t zip ./rootfs -o out.zip             # AES-256; -O encryption=zipcrypto for PKWARE
+fstool create -t zip ./rootfs -o out.zip -O split=100m                  # out.z01, out.z02, …, out.zip
+fstool --password-file pw cat secret.zip /etc/config                    # encrypted members need the passphrase
+fstool ls out.zip /                                                     # a split set is found by its .z01… siblings
 fstool ls   app.zip /                             # walk any zip/cpio/ar
 fstool cat  app.zip /etc/config
 fstool repack app.zip out.cpio --fs-type cpio     # convert between archives
@@ -567,7 +571,7 @@ fstool repack app.zip out.cpio --fs-type cpio     # convert between archives
 
 | Format | Read | Write | Notes |
 |--------|------|-------|-------|
-| zip    | ✅    | ✅     | ZIP64, Unix mode + symlinks; reads archives from any tool; filenames decoded as UTF-8 (flagged) else auto-detected (Shift-JIS / EUC-JP / Latin-9). On write the UTF-8 flag is set only for non-ASCII names. Methods: Stored and Deflate (`gzip`) by default; `-O compression=` also picks Deflate64 (`deflate64`), bzip2 (`bzip2`), LZMA (`lzma`), XZ (`xz`) or Zstandard (`zstd`); Shrink / Reduce / Implode (`zip-legacy`) are read-only, there being no encoders. A member whose method was compiled out still lists; reading it names the feature to enable. Encrypted members are refused, and so is PPMd (method 98): zip uses PPMd variant I, which `compcol` does not implement (its `ppmd` is variant H). |
+| zip    | ✅    | ✅     | ZIP64, Unix mode + symlinks; reads archives from any tool; filenames decoded as UTF-8 (flagged) else auto-detected (Shift-JIS / EUC-JP / Latin-9). On write the UTF-8 flag is set only for non-ASCII names. Methods: Stored and Deflate (`gzip`) by default; `-O compression=` also picks Deflate64 (`deflate64`), bzip2 (`bzip2`), LZMA (`lzma`), XZ (`xz`) or Zstandard (`zstd`); Shrink / Reduce / Implode (`zip-legacy`) are read-only, there being no encoders. A member whose method was compiled out still lists; reading it names the feature to enable. PPMd (method 98) is refused: zip uses PPMd variant I, which `compcol` does not implement (its `ppmd` is variant H). Every member carries Info-ZIP's `UT` (mtime, atime) and `ux` (uid, gid) extras, and those plus NTFS timestamps and the Unicode-path extra are read. **Encryption:** traditional PKWARE (always) and WinZip AES-128/192/256 (`zip-aes`) members read with `--password` / `--password-file` and are written when `create` gets a passphrase (AES-256 unless `-O encryption=zipcrypto`); a wrong passphrase is refused by the scheme's own check, never decoded into garbage. **Split archives:** an Info-ZIP `.z01`…`.zip` set or a 7-Zip `.zip.001`… byte split is opened as one device when any volume is named; `-O split=SIZE` (≥ 64 KiB) writes one, with headers never straddling a volume. |
 | cpio   | ✅    | ✅     | newc / newc-crc / odc read; newc write. |
 | ar     | ✅    | ✅     | GNU + BSD long names on read, GNU on write. Flat — a nested source tree is rejected with a pointer to tar/zip/cpio. |
 
@@ -640,7 +644,7 @@ none of the other 130 000 lines.
 | `apfs` | APFS | pulls `intl` for the directory-record hash |
 | `grf` | GRF | pulls `charcode` for CP949 names; implies `gzip` (every member is zlib-compressed) |
 | `tar` | tar (streaming reader / writer, tar-as-filesystem) | |
-| `archive` | zip / cpio / ar, plus the per-format readers | pulls `charcode`; `cab`, `lha`, `arc`, `sit`, `sevenz`, `rar`, `amiga-lzx` each imply it. On its own zip handles Stored members; each compression method is a codec feature (`gzip` for Deflate, then `deflate64`, `bzip2`, `lzma`, `xz`, `zstd`, `zip-legacy`), so `--features archive,gzip` is the slim everyday zip build |
+| `archive` | zip / cpio / ar, plus the per-format readers | pulls `charcode`; `cab`, `lha`, `arc`, `sit`, `sevenz`, `rar`, `amiga-lzx` each imply it. On its own zip handles Stored members (and PKWARE-encrypted ones, and split sets); each compression method is a codec feature (`gzip` for Deflate, then `deflate64`, `bzip2`, `lzma`, `xz`, `zstd`, `zip-legacy`) and WinZip AES is `zip-aes` (pulls `purecrypto`), so `--features archive,gzip` is the slim everyday zip build |
 | `ramfs` | the in-memory scratch filesystem `repack` / `merge` / FUSE build on | |
 | `qcow2`, `dmg`, `diskcopy` | disk-image containers | `qcow2-crypto` implies `qcow2`; `dmg-encrypted` / `dmg-bzip2` / `dmg-lzfse` imply `dmg` |
 | `luks` | LUKS1 / LUKS2 | pulls `purecrypto`; implies `json` (LUKS2 metadata is JSON) |
@@ -1081,6 +1085,10 @@ are served by the pure-Rust `compcol` crate:
 | bzip2 | `bzip2` | `.tar.bz2` / `.tbz2`, zip method 12 |
 | Deflate64 | `deflate64` | zip method 9 |
 | Shrink / Reduce / Implode | `zip-legacy` | zip methods 1–6, the PKZIP 1.x formats (read-only) |
+
+Not a codec but gated the same way: `zip-aes` adds WinZip AES-encrypted
+zip members (read and write) on top of the always-available traditional
+PKWARE scheme; it pulls `purecrypto` for AES-CTR, HMAC-SHA1 and PBKDF2.
 
 Crypto is feature-gated the same way, all three served by `purecrypto`:
 

@@ -222,7 +222,7 @@ mod imp {
     use crate::Result;
     use crate::block::BlockDevice;
     use crate::fs::archive::reader::BoundedDevReader;
-    use crate::fs::archive::{ArchiveEntry, ArchiveIndex, DataLocator, EntryKind, Method};
+    use crate::fs::archive::{ArchiveEntry, ArchiveIndex, Crypto, DataLocator, EntryKind, Method};
 
     /// Per-entry header length (bytes).
     const ENTRY_HEADER: u64 = 112;
@@ -336,6 +336,7 @@ mod imp {
                         compressed_len: dfork_clen,
                         uncompressed_len: dfork_ulen,
                         method: Method::Stored,
+                        crypto: Crypto::None,
                     },
                 );
                 entry.kind = EntryKind::Regular;

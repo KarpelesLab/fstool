@@ -130,11 +130,41 @@ pub enum Method {
     /// A method id we can name but not decode. Indexing still succeeds;
     /// reading the body returns `Unsupported`.
     Unsupported(u16),
-    /// The body is encrypted (zip general-purpose bit 0 / bit 6). We
-    /// have no key handling; indexing succeeds, reading returns
-    /// `Unsupported` naming the cause instead of feeding ciphertext to
-    /// a decompressor.
-    Encrypted,
+}
+
+/// How an entry's body is encrypted, if at all. Decryption happens
+/// before decoding: the ciphertext covers the *compressed* body, method
+/// headers included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Crypto {
+    None,
+    /// Traditional PKWARE encryption ("ZipCrypto", zip general-purpose
+    /// bit 0 without method 99): a 12-byte header precedes the body,
+    /// whose last byte must equal `check` once decrypted — the high
+    /// byte of the CRC-32, or of the DOS time when bit 3 is set.
+    ZipCrypto {
+        check: u8,
+    },
+    /// WinZip AES (method 99, extra field 0x9901): a salt and a 2-byte
+    /// password verifier precede the AES-CTR body, a 10-byte HMAC-SHA1
+    /// follows it. `key_bits` is 128 / 192 / 256; `vendor_version` 1
+    /// (AE-1, CRC present) or 2 (AE-2, CRC zeroed).
+    Aes {
+        key_bits: u16,
+        vendor_version: u16,
+    },
+}
+
+impl Crypto {
+    /// Bytes the scheme adds around the ciphertext: the ZipCrypto
+    /// header, or AES's salt + verifier + authentication code.
+    pub fn overhead(self) -> u64 {
+        match self {
+            Self::None => 0,
+            Self::ZipCrypto { .. } => 12,
+            Self::Aes { key_bits, .. } => (key_bits as u64 / 16) + 2 + 10,
+        }
+    }
 }
 
 /// Where an entry's bytes live on the device and how to decode them.
@@ -148,6 +178,8 @@ pub struct DataLocator {
     pub uncompressed_len: u64,
     /// Codec used for the body.
     pub method: Method,
+    /// Encryption wrapped around the (compressed) body.
+    pub crypto: Crypto,
 }
 
 /// One archived entry, fully resolved.
@@ -160,6 +192,10 @@ pub struct ArchiveEntry {
     pub uid: u32,
     pub gid: u32,
     pub mtime: u64,
+    /// Access and change / creation times; `0` when the format does not
+    /// record them, in which case `mtime` stands in.
+    pub atime: u64,
+    pub ctime: u64,
     /// Symlink / hard-link target.
     pub link_target: Option<String>,
     pub device_major: u32,
@@ -180,6 +216,8 @@ impl ArchiveEntry {
             uid: 0,
             gid: 0,
             mtime: 0,
+            atime: 0,
+            ctime: 0,
             link_target: None,
             device_major: 0,
             device_minor: 0,
@@ -196,6 +234,8 @@ impl ArchiveEntry {
             uid: 0,
             gid: 0,
             mtime: 0,
+            atime: 0,
+            ctime: 0,
             link_target: None,
             device_major: 0,
             device_minor: 0,
@@ -391,6 +431,13 @@ pub trait ArchiveBuilder: Send {
     /// Finalise the archive (trailer / central directory) and `sync`.
     fn finish(&mut self, dev: &mut dyn BlockDevice) -> Result<()>;
 
+    /// After `finish`, for a builder that laid out several volumes back
+    /// to back: their byte ranges in the device, in order. `None` for a
+    /// single-volume archive (the default).
+    fn volume_layout(&self) -> Option<Vec<(u64, u64)>> {
+        None
+    }
+
     /// Bytes written to the device so far (the write cursor). Read after
     /// [`finish`](Self::finish) to truncate the over-provisioned backing
     /// file to the archive's true length.
@@ -419,6 +466,9 @@ pub struct ArchiveFs {
     scaffold: bool,
     /// Archive byte length recorded after `flush` finalises the writer.
     flushed_len: Option<u64>,
+    /// Passphrase for encrypted members (zip). `None` refuses them with
+    /// an error naming the need; a wrong one fails each member's check.
+    password: Option<Vec<u8>>,
     /// The index produced by the first `rescan`, kept for the life of the
     /// handle. A sequential handle is read-only (no builder, every write
     /// is refused), so the device cannot change underneath it and a
@@ -441,6 +491,7 @@ impl ArchiveFs {
             cap: MutationCapability::Streaming,
             scaffold: false,
             flushed_len: None,
+            password: None,
             scanned: std::sync::OnceLock::new(),
         }
     }
@@ -461,6 +512,7 @@ impl ArchiveFs {
             cap: MutationCapability::Streaming,
             scaffold: false,
             flushed_len: None,
+            password: None,
             scanned: std::sync::OnceLock::new(),
         }
     }
@@ -475,8 +527,25 @@ impl ArchiveFs {
             cap: MutationCapability::Streaming,
             scaffold: false,
             flushed_len: None,
+            password: None,
             scanned: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Attach the passphrase used to read encrypted members.
+    pub fn with_password(mut self, password: Option<&str>) -> Self {
+        self.password = password.map(|p| p.as_bytes().to_vec());
+        self
+    }
+
+    /// The passphrase attached with [`with_password`](Self::with_password).
+    pub fn password(&self) -> Option<&[u8]> {
+        self.password.as_deref()
+    }
+
+    /// The builder's [`ArchiveBuilder::volume_layout`], for write handles.
+    pub fn volume_layout(&self) -> Option<Vec<(u64, u64)>> {
+        self.builder.as_ref().and_then(|b| b.volume_layout())
     }
 
     /// Detection-only handle for a format whose reader isn't built yet.
@@ -488,6 +557,7 @@ impl ArchiveFs {
             cap: MutationCapability::Immutable,
             scaffold: true,
             flushed_len: None,
+            password: None,
             scanned: std::sync::OnceLock::new(),
         }
     }
@@ -654,7 +724,7 @@ impl crate::fs::Filesystem for ArchiveFs {
         // formats), then let the `dev` borrow end so the returned reader
         // borrows only `dev`, not `self` (the tar trick).
         let loc = self.with_index(dev, |idx| locate_body(idx, kind, &s))?;
-        reader::open(dev, loc)
+        reader::open(dev, loc, self.password.as_deref())
     }
 
     fn open_file_ro<'a>(
@@ -743,9 +813,9 @@ impl crate::fs::Filesystem for ArchiveFs {
             size,
             blocks: size.div_ceil(512),
             nlink: 1,
-            atime: e.mtime as u32,
+            atime: if e.atime != 0 { e.atime } else { e.mtime } as u32,
             mtime: e.mtime as u32,
-            ctime: e.mtime as u32,
+            ctime: if e.ctime != 0 { e.ctime } else { e.mtime } as u32,
             rdev: 0,
             inode,
         })
@@ -966,6 +1036,7 @@ mod tests {
             compressed_len: len,
             uncompressed_len: len,
             method: Method::Stored,
+            crypto: Crypto::None,
         }
     }
 

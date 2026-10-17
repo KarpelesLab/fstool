@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use crate::block::BlockDevice;
-use crate::fs::archive::{ArchiveEntry, ArchiveIndex, DataLocator, EntryKind, Method};
+use crate::fs::archive::{ArchiveEntry, ArchiveIndex, Crypto, DataLocator, EntryKind, Method};
 use crate::{Error, Result};
 
 /// CAB folder compression methods (the low byte of `typeCompress`).
@@ -199,6 +199,7 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<Parsed> {
                 compressed_len: 0,
                 uncompressed_len: cb_file as u64,
                 method: Method::Stored,
+                crypto: Crypto::None,
             },
         );
         entry.kind = EntryKind::Regular;

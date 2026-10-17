@@ -304,7 +304,7 @@ mod imp {
 
     use crate::block::BlockDevice;
     use crate::fs::archive::reader::BoundedDevReader;
-    use crate::fs::archive::{ArchiveEntry, ArchiveIndex, DataLocator, EntryKind, Method};
+    use crate::fs::archive::{ArchiveEntry, ArchiveIndex, Crypto, DataLocator, EntryKind, Method};
     use crate::{Error, Result};
 
     /// Staging chunk pulled from the device per refill while driving the solid
@@ -553,6 +553,7 @@ mod imp {
                             compressed_len: 0,
                             uncompressed_len: unpack_size,
                             method: Method::Stored,
+                            crypto: Crypto::None,
                         },
                     );
                     entry.kind = EntryKind::Regular;

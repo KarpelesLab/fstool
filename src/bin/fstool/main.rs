@@ -49,8 +49,11 @@ struct Cli {
     path_style: fstool::path_style::PathStyle,
 
     /// Passphrase for an encrypted image — a LUKS1/LUKS2 volume, or a
-    /// qcow2 encrypted with either `crypt_method`. Ignored when the
-    /// image is not encrypted.
+    /// qcow2 encrypted with either `crypt_method` — or for the encrypted
+    /// members of a zip archive (traditional PKWARE or WinZip AES).
+    /// Ignored when the image is not encrypted. With `create -t zip` it
+    /// encrypts every file (AES-256 unless `-O encryption=` says
+    /// otherwise).
     ///
     /// A passphrase on the command line is visible in `ps` output and in
     /// your shell history; prefer `--password-file`.
@@ -816,6 +819,7 @@ fn run(cli: Cli) -> fstool::Result<()> {
                 force,
                 create_opts: &create_opts,
                 options: &options,
+                password: password.as_deref(),
             })?;
             #[cfg(feature = "qcow2")]
             if let Some((ctype, level)) = comp {
@@ -1541,7 +1545,10 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
     // the destination build so we stream each file straight through
     // without ever touching the host filesystem.
     fstool::inspect::with_target_device(&src_target, |src_dev| {
-        let src_fs = &mut fstool::inspect::AnyFs::open(src_dev)?;
+        let src_fs = &mut fstool::inspect::AnyFs::open_with_password(
+            src_dev,
+            src_target.password.as_deref(),
+        )?;
         // For ext sources with INCOMPAT_RECOVER / s_start != 0,
         // replay the journal onto the source so we read the
         // post-recovery state (anything still pending in the log
@@ -3025,7 +3032,7 @@ fn shell_cmd(
         // legal browse targets. Shell::dispatch will refuse put /
         // rm / mkdir itself.
         return fstool::inspect::with_target_device_read_only(&target, |dev| {
-            let fs = fstool::inspect::AnyFs::open(dev)?;
+            let fs = fstool::inspect::AnyFs::open_with_password(dev, target.password.as_deref())?;
             let mut sh = shell::Shell::new_read_only(fs, style);
             if with_cache {
                 sh.enable_cache();
@@ -3179,6 +3186,10 @@ struct CreateArgs<'a> {
     /// encryption or backing file the caller asked for.
     create_opts: &'a fstool::block::CreateOpts,
     options: &'a [String],
+    /// `--password`: encrypts the members of an archive format that
+    /// supports it (zip).
+    #[cfg_attr(not(feature = "archive"), allow(dead_code))]
+    password: Option<&'a str>,
 }
 
 /// `fstool create` — format a fresh filesystem image and optionally
@@ -3481,7 +3492,10 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             is_device,
             create_opts,
             fstool::fs::archive::zip::ZipFormatOpts::default(),
-            |o, m| o.apply_options(m),
+            |o, m| {
+                o.password = args.password.map(str::to_owned);
+                o.apply_options(m)
+            },
             DEFAULT_MIN_SIZE,
         )?,
         #[cfg(feature = "archive")]
@@ -3823,6 +3837,7 @@ where
     // Archive writers fill a generously-sized sparse file; truncate it
     // to the true archive length (filesystem images return `None`).
     let archive_len = fstool::fs::Filesystem::image_len(&fs);
+    let volumes = F::volume_layout(&fs);
     drop(fs);
     drop(dev);
     let final_len = match archive_len {
@@ -3832,12 +3847,88 @@ where
         }
         _ => bytes,
     };
+    // A split archive was laid out back to back; cut it into volumes.
+    if let Some(vols) = volumes
+        && vols.len() > 1
+    {
+        if is_device {
+            return Err(fstool::Error::InvalidArgument(
+                "a split archive needs a file destination, not a block device".into(),
+            ));
+        }
+        cut_volumes(output, &vols)?;
+        eprintln!(
+            "wrote {} ({} bytes, {label}, {} volumes)",
+            output.display(),
+            final_len,
+            vols.len()
+        );
+        return Ok(());
+    }
     eprintln!(
         "wrote {} ({} bytes, {label}{})",
         output.display(),
         final_len,
         if is_device { ", block device" } else { "" }
     );
+    Ok(())
+}
+
+/// Cut the linear archive at `output` into the volumes `ranges`
+/// describes: `name.z01`, `name.z02`, … for all but the last, which
+/// stays at `output` (Info-ZIP / PKZIP naming, read by every zip tool).
+/// Stale volumes from an earlier, longer set are removed.
+#[cfg(any(
+    feature = "affs",
+    feature = "apfs",
+    feature = "archive",
+    feature = "f2fs",
+    feature = "grf",
+    feature = "hfs",
+    feature = "hfs-plus",
+    feature = "iso9660",
+    feature = "littlefs",
+    feature = "ntfs",
+    feature = "squashfs",
+    feature = "xfs"
+))]
+fn cut_volumes(output: &std::path::Path, ranges: &[(u64, u64)]) -> fstool::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let volume_path = |n: usize| output.with_extension(format!("z{n:02}"));
+    let mut src = std::fs::File::open(output)?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut copy_range =
+        |dst: &mut std::fs::File, (start, end): (u64, u64)| -> fstool::Result<()> {
+            src.seek(SeekFrom::Start(start))?;
+            let mut left = end - start;
+            while left > 0 {
+                let n = (left.min(buf.len() as u64)) as usize;
+                src.read_exact(&mut buf[..n])?;
+                dst.write_all(&buf[..n])?;
+                left -= n as u64;
+            }
+            Ok(())
+        };
+    for (i, &range) in ranges[..ranges.len() - 1].iter().enumerate() {
+        let mut f = std::fs::File::create(volume_path(i + 1))?;
+        copy_range(&mut f, range)?;
+        f.sync_all()?;
+    }
+    // The last volume replaces the linear file: write it beside, then
+    // rename over.
+    let tmp = output.with_extension("zip.part");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        copy_range(&mut f, ranges[ranges.len() - 1])?;
+        f.sync_all()?;
+    }
+    drop(src);
+    std::fs::rename(&tmp, output)?;
+    let mut n = ranges.len();
+    while volume_path(n).exists() {
+        std::fs::remove_file(volume_path(n))?;
+        n += 1;
+    }
     Ok(())
 }
 
@@ -3973,7 +4064,7 @@ fn ls(
     }
     let target = fstool::inspect::Target::parse(image).with_password(password.map(str::to_owned));
     fstool::inspect::with_target_device(&target, |dev| {
-        let mut fs = fstool::inspect::AnyFs::open(dev)?;
+        let mut fs = fstool::inspect::AnyFs::open_with_password(dev, target.password.as_deref())?;
         let kind = fs.kind();
         let cpath = path_style::to_canonical(path, kind, style);
         let mut out = std::io::stdout().lock();
@@ -4063,7 +4154,7 @@ fn cat(image: &str, path: &str, style: PathStyle, password: Option<&str>) -> fst
     }
     let target = fstool::inspect::Target::parse(image).with_password(password.map(str::to_owned));
     fstool::inspect::with_target_device(&target, |dev| {
-        let mut fs = fstool::inspect::AnyFs::open(dev)?;
+        let mut fs = fstool::inspect::AnyFs::open_with_password(dev, target.password.as_deref())?;
         let cpath = path_style::to_canonical(path, fs.kind(), style);
         let mut out = std::io::stdout().lock();
         fs.copy_file_to(dev, &cpath, &mut out)?;
@@ -4087,7 +4178,7 @@ fn cat_rsrc(
     }
     let target = fstool::inspect::Target::parse(image).with_password(password.map(str::to_owned));
     fstool::inspect::with_target_device(&target, |dev| {
-        let mut fs = fstool::inspect::AnyFs::open(dev)?;
+        let mut fs = fstool::inspect::AnyFs::open_with_password(dev, target.password.as_deref())?;
         let cpath = path_style::to_canonical(path, fs.kind(), style);
         let mut out = std::io::stdout().lock();
         let mut r = fs.open_resource_fork_reader(dev, &cpath)?;
@@ -4109,7 +4200,7 @@ fn resources_cmd(
     use fstool::resfork::ResourceFork;
     let target = fstool::inspect::Target::parse(image).with_password(password.map(str::to_owned));
     fstool::inspect::with_target_device(&target, |dev| {
-        let mut fs = fstool::inspect::AnyFs::open(dev)?;
+        let mut fs = fstool::inspect::AnyFs::open_with_password(dev, target.password.as_deref())?;
         let cpath = path_style::to_canonical(path, fs.kind(), style);
         let raw = fs.read_resource_fork(dev, &cpath)?;
         let total_bytes = raw.len();
@@ -4260,12 +4351,13 @@ fn info(image: &str, password: Option<&str>) -> fstool::Result<()> {
         }
         // No table — fall through to the bare-FS info below using the
         // already-opened disk.
-        let mut fs = fstool::inspect::AnyFs::open(disk.as_mut())?;
+        let mut fs =
+            fstool::inspect::AnyFs::open_with_password(disk.as_mut(), target.password.as_deref())?;
         print_fs_info(disk.as_mut(), &mut fs);
         return Ok(());
     }
     fstool::inspect::with_target_device(&target, |dev| {
-        let mut fs = fstool::inspect::AnyFs::open(dev)?;
+        let mut fs = fstool::inspect::AnyFs::open_with_password(dev, target.password.as_deref())?;
         print_fs_info(dev, &mut fs);
         Ok(())
     })

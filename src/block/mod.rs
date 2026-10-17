@@ -54,6 +54,8 @@ pub mod memory;
 pub mod qcow2;
 pub mod sector;
 pub mod sliced;
+#[cfg(feature = "std")]
+pub mod split;
 
 #[cfg(feature = "std")]
 pub use crash_inject::{CrashInject, FailAfter};
@@ -70,6 +72,8 @@ pub use memory::MemoryBackend;
 pub use qcow2::Qcow2Backend;
 pub use sector::{SectorDevice, SectorIo};
 pub use sliced::SlicedBackend;
+#[cfg(feature = "std")]
+pub use split::SplitBackend;
 
 // The traits a *driver* implements live one layer down, in `crate::device`,
 // because the allocator-free filesystems are written against them and this
@@ -122,6 +126,11 @@ mod host {
         path: &Path,
         password: Option<&str>,
     ) -> crate::Result<Box<dyn BlockDevice>> {
+        // A split archive's volume set reads as one device; `path` may
+        // name any volume of it.
+        if let Some(set) = super::split::SplitBackend::open_volume_set(path, false)? {
+            return Ok(Box::new(set));
+        }
         #[cfg(feature = "qcow2")]
         if Qcow2Backend::probe(path)? {
             return open_qcow2(path, password, false);
@@ -269,6 +278,9 @@ mod host {
         path: &Path,
         password: Option<&str>,
     ) -> crate::Result<Box<dyn BlockDevice>> {
+        if let Some(set) = super::split::SplitBackend::open_volume_set(path, true)? {
+            return Ok(Box::new(set));
+        }
         #[cfg(feature = "qcow2")]
         if Qcow2Backend::probe(path)? {
             return open_qcow2(path, password, true);
@@ -517,6 +529,15 @@ pub trait BlockDevice: Read + Write + Seek + Send {
     /// Persist outstanding writes. For [`FileBackend`] this is `fsync`; for
     /// [`MemoryBackend`] it is a no-op.
     fn sync(&mut self) -> Result<()>;
+
+    /// For a device concatenated from several volumes (a split archive
+    /// opened as a set), the start offset of each volume in this device,
+    /// in order, with the first `0`. A format whose on-disk offsets are
+    /// relative to a volume (zip's "disk number start") translates them
+    /// through this. `None` — the default — means a single volume.
+    fn segments(&self) -> Option<&[u64]> {
+        None
+    }
 
     /// Positional read — fills `buf` from `offset` without moving the
     /// implicit stream cursor across calls (the cursor IS seeked, but callers

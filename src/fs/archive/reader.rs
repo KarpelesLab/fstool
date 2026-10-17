@@ -3,7 +3,7 @@
 
 use std::io::{self, Read, Seek, SeekFrom};
 
-use super::{DataLocator, Method};
+use super::{Crypto, DataLocator, Method};
 use crate::Result;
 use crate::block::BlockDevice;
 use crate::fs::FileReadHandle;
@@ -42,52 +42,87 @@ impl<'a> Read for BoundedDevReader<'a> {
     }
 }
 
-/// Open a streaming reader over one entry's body, decoding per
-/// `loc.method`. The returned reader borrows only `dev`.
+/// Open a streaming reader over one entry's body: the located byte
+/// range, decrypted per `loc.crypto` when a `password` is given, then
+/// decoded per `loc.method`. The returned reader borrows only `dev`.
 ///
 /// Methods whose codec was compiled out return `Unsupported` naming the
 /// feature to enable. The zip-specific methods that carry their
 /// parameters out of band (in the central directory rather than the
 /// stream) are re-framed here into the self-describing header the
-/// compcol codec expects.
-pub fn open<'a>(dev: &'a mut dyn BlockDevice, loc: DataLocator) -> Result<Box<dyn Read + 'a>> {
+/// compcol codec expects; parameters that live at the start of the
+/// body (LZMA's property block) are read from the decrypted stream.
+pub fn open<'a>(
+    dev: &'a mut dyn BlockDevice,
+    loc: DataLocator,
+    password: Option<&[u8]>,
+) -> Result<Box<dyn Read + 'a>> {
+    let raw = BoundedDevReader::new(dev, loc.offset, loc.compressed_len);
+    let body: Box<dyn Read + 'a> = match loc.crypto {
+        Crypto::None => Box::new(raw),
+        Crypto::ZipCrypto { check } => {
+            let pw = password.ok_or_else(crate::fs::archive::zip::crypto::needs_password)?;
+            Box::new(crate::fs::archive::zip::crypto::ZipCryptoReader::new(
+                raw, pw, check,
+            )?)
+        }
+        Crypto::Aes { key_bits, .. } => {
+            let pw = password.ok_or_else(crate::fs::archive::zip::crypto::needs_password)?;
+            aes_reader(raw, pw, key_bits, loc.compressed_len)?
+        }
+    };
+    decode(body, &loc)
+}
+
+#[cfg(feature = "zip-aes")]
+fn aes_reader<'a, R: Read + 'a>(
+    r: R,
+    pw: &[u8],
+    key_bits: u16,
+    total: u64,
+) -> Result<Box<dyn Read + 'a>> {
+    Ok(Box::new(crate::fs::archive::zip::crypto::AesReader::new(
+        r, pw, key_bits, total,
+    )?))
+}
+
+#[cfg(not(feature = "zip-aes"))]
+fn aes_reader<'a, R: Read + 'a>(
+    _r: R,
+    _pw: &[u8],
+    _key_bits: u16,
+    _total: u64,
+) -> Result<Box<dyn Read + 'a>> {
+    Err(crate::fs::archive::zip::crypto::aes_disabled())
+}
+
+/// Wrap the (decrypted) compressed body in the method's decoder.
+fn decode<'a>(body: Box<dyn Read + 'a>, loc: &DataLocator) -> Result<Box<dyn Read + 'a>> {
     match loc.method {
-        Method::Stored => Ok(Box::new(BoundedDevReader::new(
-            dev,
-            loc.offset,
-            loc.compressed_len,
-        ))),
-        Method::Deflate => {
-            deflate_reader(BoundedDevReader::new(dev, loc.offset, loc.compressed_len))
-        }
-        Method::Deflate64 => {
-            deflate64_reader(BoundedDevReader::new(dev, loc.offset, loc.compressed_len))
-        }
-        Method::Codec(algo) => crate::compression::make_reader(
-            algo,
-            BoundedDevReader::new(dev, loc.offset, loc.compressed_len),
-        ),
-        Method::ZipLzma { eos } => zip_lzma_reader(dev, &loc, eos),
+        Method::Stored => Ok(body),
+        Method::Deflate => deflate_reader(body),
+        Method::Deflate64 => deflate64_reader(body),
+        Method::Codec(algo) => crate::compression::make_reader(algo, body),
+        Method::ZipLzma { eos } => zip_lzma_reader(body, loc, eos),
         Method::ZipPpmd => Err(zip_ppmd_unsupported()),
         Method::ZipShrink => {
-            let hdr = legacy_len(&loc)?.to_le_bytes().to_vec();
-            zip_shrink_reader(prefixed(dev, &loc, 0, hdr))
+            let hdr = legacy_len(loc)?.to_le_bytes().to_vec();
+            zip_shrink_reader(io::Cursor::new(hdr).chain(body))
         }
         Method::ZipReduce(factor) => {
             let mut hdr = vec![factor];
-            hdr.extend_from_slice(&legacy_len(&loc)?.to_le_bytes());
-            zip_reduce_reader(prefixed(dev, &loc, 0, hdr))
+            hdr.extend_from_slice(&legacy_len(loc)?.to_le_bytes());
+            zip_reduce_reader(io::Cursor::new(hdr).chain(body))
         }
         Method::ZipImplode {
             large_window,
             lit_tree,
         } => {
             let mut hdr = vec![(large_window as u8) | ((lit_tree as u8) << 1)];
-            hdr.extend_from_slice(&legacy_len(&loc)?.to_le_bytes());
-            zip_implode_reader(prefixed(dev, &loc, 0, hdr))
+            hdr.extend_from_slice(&legacy_len(loc)?.to_le_bytes());
+            zip_implode_reader(io::Cursor::new(hdr).chain(body))
         }
         Method::Unsupported(id) => Err(unsupported_method(id)),
-        Method::Encrypted => Err(encrypted_method()),
     }
 }
 
@@ -100,35 +135,6 @@ fn legacy_len(loc: &DataLocator) -> Result<u32> {
             loc.uncompressed_len
         ))
     })
-}
-
-/// A bounded view over the body starting `skip` bytes in, with `header`
-/// served first — the shape every re-framed codec needs.
-fn prefixed<'a>(
-    dev: &'a mut dyn BlockDevice,
-    loc: &DataLocator,
-    skip: u64,
-    header: Vec<u8>,
-) -> io::Chain<io::Cursor<Vec<u8>>, BoundedDevReader<'a>> {
-    io::Cursor::new(header).chain(BoundedDevReader::new(
-        dev,
-        loc.offset + skip,
-        loc.compressed_len.saturating_sub(skip),
-    ))
-}
-
-/// Read the first `n` bytes of a body (a method's parameter block).
-#[cfg(feature = "lzma")]
-fn body_prefix(dev: &mut dyn BlockDevice, loc: &DataLocator, n: usize) -> Result<Vec<u8>> {
-    if loc.compressed_len < n as u64 {
-        return Err(crate::Error::InvalidImage(format!(
-            "archive: compressed body ({} bytes) is shorter than its {n}-byte method header",
-            loc.compressed_len
-        )));
-    }
-    let mut buf = vec![0u8; n];
-    dev.read_at(loc.offset, &mut buf)?;
-    Ok(buf)
 }
 
 /// Only reachable in a build with some codec feature off.
@@ -174,31 +180,36 @@ fn deflate64_reader<'a, R: Read + 'a>(_r: R) -> Result<Box<dyn Read + 'a>> {
 /// it into the next member's bytes.
 #[cfg(feature = "lzma")]
 fn zip_lzma_reader<'a>(
-    dev: &'a mut dyn BlockDevice,
+    mut body: Box<dyn Read + 'a>,
     loc: &DataLocator,
     eos: bool,
 ) -> Result<Box<dyn Read + 'a>> {
     use compcol::Algorithm;
-    let zh = body_prefix(dev, loc, 4)?;
+    let mut zh = [0u8; 4];
+    body.read_exact(&mut zh).map_err(|_| {
+        crate::Error::InvalidImage("zip: LZMA member shorter than its 4-byte header".into())
+    })?;
     let props_len = u16::from_le_bytes([zh[2], zh[3]]) as usize;
     if props_len != 5 {
         return Err(crate::Error::InvalidImage(format!(
             "zip: LZMA member declares a {props_len}-byte properties block (expected 5)"
         )));
     }
-    let props = body_prefix(dev, loc, 9)?;
-    let mut hdr = props[4..9].to_vec();
+    let mut hdr = vec![0u8; 5];
+    body.read_exact(&mut hdr).map_err(|_| {
+        crate::Error::InvalidImage("zip: LZMA member shorter than its properties block".into())
+    })?;
     let size = if eos { u64::MAX } else { loc.uncompressed_len };
     hdr.extend_from_slice(&size.to_le_bytes());
     Ok(Box::new(compcol::io::DecoderReader::new(
-        prefixed(dev, loc, 9, hdr),
+        io::Cursor::new(hdr).chain(body),
         compcol::lzma::Lzma::decoder(),
     )))
 }
 
 #[cfg(not(feature = "lzma"))]
 fn zip_lzma_reader<'a>(
-    _dev: &'a mut dyn BlockDevice,
+    _body: Box<dyn Read + 'a>,
     _loc: &DataLocator,
     _eos: bool,
 ) -> Result<Box<dyn Read + 'a>> {
@@ -264,12 +275,6 @@ fn unsupported_method(id: u16) -> crate::Error {
     ))
 }
 
-fn encrypted_method() -> crate::Error {
-    crate::Error::Unsupported(
-        "archive: member is encrypted — fstool has no passphrase handling".into(),
-    )
-}
-
 /// Open a random-access (`Read + Seek`) handle over one entry. Only
 /// `Stored` members are genuinely seekable — they map to a cheap
 /// bounded view over the device.
@@ -284,14 +289,18 @@ pub fn open_ro<'a>(
     loc: DataLocator,
 ) -> Result<Box<dyn FileReadHandle + 'a>> {
     match loc.method {
-        Method::Stored => Ok(Box::new(StoredHandle {
+        Method::Stored if loc.crypto == Crypto::None => Ok(Box::new(StoredHandle {
             dev,
             start: loc.offset,
             len: loc.compressed_len,
             pos: 0,
         })),
         Method::Unsupported(id) => Err(unsupported_method(id)),
-        Method::Encrypted => Err(encrypted_method()),
+        _ if loc.crypto != Crypto::None => Err(crate::Error::Unsupported(
+            "archive: member is encrypted; only forward reads are supported \
+             (use read_file / open_file_reader)"
+                .into(),
+        )),
         _ => Err(crate::Error::Unsupported(
             "archive: member is compressed; only forward reads are supported \
              (use read_file / open_file_reader)"

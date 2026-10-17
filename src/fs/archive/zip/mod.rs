@@ -20,6 +20,7 @@
 //!   crosses the 32-bit limits. Names are written per the universal-zip
 //!   technique (host = MS-DOS, bit 11 only for true UTF-8).
 
+pub mod crypto;
 mod encoding;
 mod scan;
 mod write;
@@ -45,6 +46,14 @@ pub const METHOD_LZMA: u16 = 14;
 pub const METHOD_ZSTD: u16 = 93;
 pub const METHOD_XZ: u16 = 95;
 pub const METHOD_PPMD: u16 = 98;
+/// WinZip AES: the real method moves into the 0x9901 extra field.
+pub const METHOD_AES: u16 = 99;
+/// Written at the start of the first volume of a split archive.
+pub const SIG_SPLIT: u32 = 0x0807_4b50;
+
+/// Smallest split volume we write — Info-ZIP's floor, so the sets we
+/// produce are ones every reader has seen before.
+pub const MIN_SPLIT_SIZE: u64 = 64 * 1024;
 
 /// Body compression chosen by the writer. Every method except `Stored`
 /// needs its codec feature; see [`Compression::enabled`].
@@ -145,6 +154,55 @@ impl Compression {
     }
 }
 
+/// Encryption scheme the writer applies when a passphrase is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encryption {
+    /// Traditional PKWARE encryption. Weak (known-plaintext attacks are
+    /// practical) but read by everything since 1990.
+    ZipCrypto,
+    /// WinZip AES-128 / 192 / 256 (`zip-aes`). Read by 7-Zip, WinZip,
+    /// WinRAR, libarchive, Python's `pyzipper` — not by Info-ZIP's
+    /// `unzip` 6.0.
+    Aes128,
+    Aes192,
+    Aes256,
+}
+
+impl Encryption {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::ZipCrypto => "zipcrypto",
+            Self::Aes128 => "aes128",
+            Self::Aes192 => "aes192",
+            Self::Aes256 => "aes256",
+        }
+    }
+
+    /// AES key size, `None` for ZipCrypto.
+    pub fn key_bits(self) -> Option<u16> {
+        match self {
+            Self::ZipCrypto => None,
+            Self::Aes128 => Some(128),
+            Self::Aes192 => Some(192),
+            Self::Aes256 => Some(256),
+        }
+    }
+
+    pub fn enabled(self) -> bool {
+        self == Self::ZipCrypto || cfg!(feature = "zip-aes")
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "zipcrypto" | "pkware" | "traditional" => Self::ZipCrypto,
+            "aes128" | "aes-128" => Self::Aes128,
+            "aes192" | "aes-192" => Self::Aes192,
+            "aes256" | "aes-256" | "aes" => Self::Aes256,
+            _ => return None,
+        })
+    }
+}
+
 /// ZIP creation options.
 #[derive(Debug, Clone)]
 pub struct ZipFormatOpts {
@@ -154,6 +212,17 @@ pub struct ZipFormatOpts {
     /// the bzip2 block size in 100 kB units, and for Zstandard the
     /// level 1–9 of its 1–22 range.
     pub level: u32,
+    /// Encrypt every file body with this passphrase (directories and
+    /// symlink targets stay in the clear, as every zip tool does).
+    pub password: Option<String>,
+    /// Scheme used when `password` is set.
+    pub encryption: Encryption,
+    /// Write a split archive with volumes of at most this many bytes
+    /// (≥ [`MIN_SPLIT_SIZE`]). The writer lays the volumes out back to
+    /// back and reports their boundaries through
+    /// [`ZipFs::volume_layout`]; the caller cuts the file into
+    /// `name.z01`, `name.z02`, … and the final `name.zip`.
+    pub split: Option<u64>,
 }
 
 impl Default for ZipFormatOpts {
@@ -161,6 +230,9 @@ impl Default for ZipFormatOpts {
         Self {
             method: Compression::Deflate,
             level: 6,
+            password: None,
+            encryption: Encryption::Aes256,
+            split: None,
         }
     }
 }
@@ -194,6 +266,41 @@ impl ZipFormatOpts {
             }
             self.level = l;
         }
+        // `-O password=` is a convenience for scripts and specs; the CLI's
+        // `--password` / `--password-file` set the same field without
+        // putting the secret in `ps` output.
+        if let Some(p) = bag.take_str("password") {
+            self.password = Some(p);
+        }
+        if let Some(e) = bag.take_str("encryption") {
+            let enc = Encryption::parse(&e).ok_or_else(|| {
+                crate::Error::InvalidArgument(format!(
+                    "zip: unknown encryption {e:?} (use `zipcrypto`, `aes128`, `aes192` or `aes256`)"
+                ))
+            })?;
+            if !enc.enabled() {
+                return Err(crate::Error::Unsupported(format!(
+                    "zip: {} encryption is disabled — rebuild with `--features zip-aes`",
+                    enc.name()
+                )));
+            }
+            self.encryption = enc;
+        }
+        if let Some(sz) = bag.take_size("split")? {
+            if sz < MIN_SPLIT_SIZE {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "zip: split volume size {sz} is below the {MIN_SPLIT_SIZE}-byte minimum"
+                )));
+            }
+            self.split = Some(sz);
+        }
+        if self.password.is_some() && !self.encryption.enabled() {
+            return Err(crate::Error::Unsupported(format!(
+                "zip: {} encryption is disabled — rebuild with `--features zip-aes` or pick \
+                 `encryption=zipcrypto`",
+                self.encryption.name()
+            )));
+        }
         Ok(())
     }
 }
@@ -202,8 +309,27 @@ impl ZipFormatOpts {
 pub struct ZipFs(pub ArchiveFs);
 
 impl ZipFs {
+    /// Index the archive. Encrypted members list but refuse to read until
+    /// a passphrase is supplied via [`open_with_password`](Self::open_with_password).
     pub fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
-        Ok(Self(ArchiveFs::from_index(scan::scan(dev)?)))
+        Self::open_with_password(dev, None)
+    }
+
+    /// [`open`](Self::open) with the passphrase for encrypted members.
+    /// A wrong one is reported per member, on read, by the scheme's own
+    /// check (ZipCrypto's check byte, AES's verifier).
+    pub fn open_with_password(dev: &mut dyn BlockDevice, password: Option<&str>) -> Result<Self> {
+        let pw = password.map(str::as_bytes);
+        Ok(Self(
+            ArchiveFs::from_index(scan::scan(dev, pw)?).with_password(password),
+        ))
+    }
+
+    /// After `flush` on a handle created with `split`: the byte ranges
+    /// of the volumes in the linear output, in order. `None` for an
+    /// unsplit archive.
+    pub fn volume_layout(&self) -> Option<Vec<(u64, u64)>> {
+        self.0.volume_layout()
     }
 
     pub fn format(dev: &mut dyn BlockDevice, opts: &ZipFormatOpts) -> Result<Self> {
@@ -221,6 +347,9 @@ impl crate::fs::FilesystemFactory for ZipFs {
     }
     fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
         Self::open(dev)
+    }
+    fn volume_layout(&self) -> Option<Vec<(u64, u64)>> {
+        ZipFs::volume_layout(self)
     }
 }
 

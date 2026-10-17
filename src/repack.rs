@@ -1133,7 +1133,8 @@ fn split_rdev(rdev: u32) -> (u32, u32) {
 /// Open `target` as an image and walk its filesystem into `sink`.
 fn walk_image(target: &crate::inspect::Target, sink: &mut dyn RepackSink) -> Result<()> {
     crate::inspect::with_target_device(target, |src_dev| {
-        let mut src_fs = crate::inspect::AnyFs::open(src_dev)?;
+        let mut src_fs =
+            crate::inspect::AnyFs::open_with_password(src_dev, target.password.as_deref())?;
         // Replay any pending ext journal so we read the post-recovery
         // state (anything still in the log would otherwise be lost).
         // (Irrefutable when ext is the only filesystem compiled in — the
@@ -1842,7 +1843,8 @@ pub fn ext_build_plan_for_source(
         Source::TarArchive { path, codec: None } => {
             let target = crate::inspect::Target::parse(&path.to_string_lossy());
             crate::inspect::with_target_device(&target, |src_dev| {
-                let mut src_fs = crate::inspect::AnyFs::open(src_dev)?;
+                let mut src_fs =
+                    crate::inspect::AnyFs::open_with_password(src_dev, target.password.as_deref())?;
                 build_ext_plan_inner(src_dev, &mut src_fs, &mut plan)
             })?;
         }
@@ -1850,7 +1852,8 @@ pub fn ext_build_plan_for_source(
         Source::TarArchive { .. } => return Err(tar_feature_missing()),
         Source::Image(target) => {
             crate::inspect::with_target_device(target, |src_dev| {
-                let mut src_fs = crate::inspect::AnyFs::open(src_dev)?;
+                let mut src_fs =
+                    crate::inspect::AnyFs::open_with_password(src_dev, target.password.as_deref())?;
                 build_ext_plan_inner(src_dev, &mut src_fs, &mut plan)
             })?;
         }
@@ -2062,7 +2065,8 @@ pub fn fat_min_bytes_for_source(source: &Source, fs_type: &str) -> Result<u64> {
             let target = crate::inspect::Target::parse(&path.to_string_lossy());
             let mut sum = 0u64;
             crate::inspect::with_target_device(&target, |src_dev| {
-                let mut src_fs = crate::inspect::AnyFs::open(src_dev)?;
+                let mut src_fs =
+                    crate::inspect::AnyFs::open_with_password(src_dev, target.password.as_deref())?;
                 sum = sum_source_file_bytes(src_dev, &mut src_fs)?;
                 Ok(())
             })?;
@@ -2071,7 +2075,8 @@ pub fn fat_min_bytes_for_source(source: &Source, fs_type: &str) -> Result<u64> {
         Source::Image(target) => {
             let mut sum = 0u64;
             crate::inspect::with_target_device(target, |src_dev| {
-                let mut src_fs = crate::inspect::AnyFs::open(src_dev)?;
+                let mut src_fs =
+                    crate::inspect::AnyFs::open_with_password(src_dev, target.password.as_deref())?;
                 sum = sum_source_file_bytes(src_dev, &mut src_fs)?;
                 Ok(())
             })?;

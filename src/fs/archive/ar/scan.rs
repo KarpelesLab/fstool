@@ -1,7 +1,7 @@
 //! `ar` reader: walk the member chain into an [`ArchiveIndex`].
 
 use crate::block::BlockDevice;
-use crate::fs::archive::{ArchiveEntry, ArchiveIndex, DataLocator, EntryKind, Method};
+use crate::fs::archive::{ArchiveEntry, ArchiveIndex, Crypto, DataLocator, EntryKind, Method};
 use crate::{Error, Result};
 
 const HEADER_LEN: u64 = 60;
@@ -153,6 +153,8 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
             uid,
             gid,
             mtime,
+            atime: 0,
+            ctime: 0,
             link_target: None,
             device_major: 0,
             device_minor: 0,
@@ -161,6 +163,7 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
                 compressed_len: body_len,
                 uncompressed_len: body_len,
                 method: Method::Stored,
+                crypto: Crypto::None,
             }),
         });
 

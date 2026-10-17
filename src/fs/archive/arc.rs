@@ -208,7 +208,7 @@ mod imp {
     use crate::Result;
     use crate::block::BlockDevice;
     use crate::fs::archive::reader::BoundedDevReader;
-    use crate::fs::archive::{ArchiveEntry, ArchiveIndex, DataLocator, EntryKind, Method};
+    use crate::fs::archive::{ArchiveEntry, ArchiveIndex, Crypto, DataLocator, EntryKind, Method};
 
     /// ARC archive marker that prefixes every header.
     const MARK: u8 = 0x1A;
@@ -313,6 +313,7 @@ mod imp {
                         compressed_len: comp_size,
                         uncompressed_len: unpack_size,
                         method: Method::Stored,
+                        crypto: Crypto::None,
                     },
                 );
                 entry.kind = EntryKind::Regular;

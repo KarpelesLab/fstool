@@ -252,9 +252,12 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
     }
 
     // --- archive formats (all offset 0 except lha at offset 2) ---
-    // ZIP: local-file-header "PK\x03\x04" or an empty archive's EOCD
-    // "PK\x05\x06".
-    if &bs[0..2] == b"PK" && ((bs[2] == 3 && bs[3] == 4) || (bs[2] == 5 && bs[3] == 6)) {
+    // ZIP: local-file-header "PK\x03\x04", an empty archive's EOCD
+    // "PK\x05\x06", or the split-archive signature "PK\x07\x08" that
+    // opens the first volume of a `.z01` set (and survives a merge).
+    if &bs[0..2] == b"PK"
+        && ((bs[2] == 3 && bs[3] == 4) || (bs[2] == 5 && bs[3] == 6) || (bs[2] == 7 && bs[3] == 8))
+    {
         detected!("archive", Zip, "ZIP");
     }
     // cpio: newc "070701" / newc-crc "070702" / odc "070707".
@@ -448,13 +451,24 @@ impl AnyFs {
 
     /// Open `dev`, picking the backend automatically.
     pub fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
+        Self::open_with_password(dev, None)
+    }
+
+    /// [`Self::open`] with the passphrase for a format that encrypts
+    /// *members* rather than the whole image — today zip, whose encrypted
+    /// entries list without one and read with it. The container-level
+    /// passphrase (LUKS, qcow2) is handled when the device is opened, so
+    /// a caller holding one passes it to both without harm.
+    pub fn open_with_password(dev: &mut dyn BlockDevice, password: Option<&str>) -> Result<Self> {
         let kind = detect_fs(dev)?;
-        Self::open_kind(dev, kind)
+        Self::open_kind(dev, kind, password)
     }
 
     /// [`Self::open`] for an already-probed `kind` — the shared dispatch
     /// table behind `open` and [`Self::open_writable`].
-    fn open_kind(dev: &mut dyn BlockDevice, kind: FsKind) -> Result<Self> {
+    fn open_kind(dev: &mut dyn BlockDevice, kind: FsKind, password: Option<&str>) -> Result<Self> {
+        #[cfg(not(feature = "archive"))]
+        let _ = password;
         match kind {
             #[cfg(feature = "ramfs")]
             FsKind::Ramfs => {
@@ -498,7 +512,7 @@ impl AnyFs {
             FsKind::Grf => Ok(Self::Grf(Box::new(crate::fs::grf::Grf::open_dev(dev)?))),
             #[cfg(feature = "archive")]
             FsKind::Zip => Ok(Self::Archive(
-                Box::new(ZipFs::open(dev)?),
+                Box::new(ZipFs::open_with_password(dev, password)?),
                 FsKind::Zip,
                 "zip",
             )),
@@ -591,7 +605,7 @@ impl AnyFs {
         // Every other backend's open() already returns a mutable
         // handle (ext journals, FAT/exFAT/NTFS rewrite, …), so
         // just defer to the existing dispatch.
-        Self::open_kind(dev, kind)
+        Self::open_kind(dev, kind, None)
     }
 
     /// Which filesystem this handle is talking to.

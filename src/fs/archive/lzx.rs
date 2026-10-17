@@ -225,7 +225,7 @@ mod imp {
 
     use crate::block::BlockDevice;
     use crate::fs::archive::reader::BoundedDevReader;
-    use crate::fs::archive::{ArchiveEntry, ArchiveIndex, DataLocator, EntryKind, Method};
+    use crate::fs::archive::{ArchiveEntry, ArchiveIndex, Crypto, DataLocator, EntryKind, Method};
     use crate::{Error, Result};
 
     /// A compressed group: one contiguous run owned by an entry with
@@ -309,6 +309,7 @@ mod imp {
                         compressed_len: 0,
                         uncompressed_len: unpack,
                         method: Method::Stored,
+                        crypto: Crypto::None,
                     },
                 );
                 entry.kind = EntryKind::Regular;
