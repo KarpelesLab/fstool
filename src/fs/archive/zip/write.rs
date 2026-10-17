@@ -13,13 +13,19 @@
 //! and symlinks for round-tripping) does not risk the Windows
 //! mangling the note warns about.
 
-#[cfg(feature = "gzip")]
+#[cfg(any(
+    feature = "gzip",
+    feature = "deflate64",
+    feature = "bzip2",
+    feature = "lzma",
+    feature = "xz",
+    feature = "zstd"
+))]
 use std::io::Write;
 
 use super::encoding;
 use super::{
-    Compression, METHOD_DEFLATE, METHOD_STORE, SIG_CENTRAL, SIG_EOCD, SIG_LOCAL, SIG_ZIP64_EOCD,
-    SIG_ZIP64_LOCATOR, ZipFormatOpts,
+    Compression, SIG_CENTRAL, SIG_EOCD, SIG_LOCAL, SIG_ZIP64_EOCD, SIG_ZIP64_LOCATOR, ZipFormatOpts,
 };
 use crate::block::BlockDevice;
 use crate::fs::archive::ArchiveBuilder;
@@ -35,7 +41,11 @@ const S_IFLNK: u32 = 0o120000;
 /// One central-directory record, accumulated until `finish`.
 struct CdRec {
     name: String,
-    utf8: bool,
+    /// General-purpose flags as written in the local header: bit 11 for
+    /// a UTF-8 name, bit 1 for an LZMA end-of-stream marker.
+    gp_flags: u16,
+    /// "Version needed to extract" as written in the local header.
+    version_needed: u16,
     method: u16,
     crc: u32,
     comp_size: u64,
@@ -55,16 +65,30 @@ pub struct ZipWriter {
 }
 
 /// `Write` sink that appends to the device through the shared cursor and
-/// counts the bytes (for the DEFLATE compressed size). Only the DEFLATE
-/// path uses it, so it's gated with the `gzip` feature.
-#[cfg(feature = "gzip")]
+/// counts the bytes (the compressed size). Only the compressed paths
+/// use it, so it's gated on the codec features.
+#[cfg(any(
+    feature = "gzip",
+    feature = "deflate64",
+    feature = "bzip2",
+    feature = "lzma",
+    feature = "xz",
+    feature = "zstd"
+))]
 struct CursorSink<'a> {
     cursor: &'a mut Cursor,
     dev: &'a mut dyn BlockDevice,
     written: u64,
 }
 
-#[cfg(feature = "gzip")]
+#[cfg(any(
+    feature = "gzip",
+    feature = "deflate64",
+    feature = "bzip2",
+    feature = "lzma",
+    feature = "xz",
+    feature = "zstd"
+))]
 impl Write for CursorSink<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.cursor
@@ -89,6 +113,20 @@ impl Write for CursorSink<'_> {
 /// corrupt member.
 fn deflate_max_output(n: u64) -> u64 {
     n.saturating_add(n / 65535 * 5).saturating_add(64)
+}
+
+/// The same ceiling for every method the writer offers. DEFLATE and
+/// Deflate64 have the tight bound above; the others are given a quarter
+/// again plus framing, which no LZ or block-sort codec exceeds on
+/// incompressible input (LZMA's range coder is the worst at ~1.14×).
+/// Only the ZIP64 decision near 4 GiB depends on it, so generosity
+/// costs at most a ZIP64 extra on a member that didn't need one.
+fn compressed_max_output(method: Compression, n: u64) -> u64 {
+    match method {
+        Compression::Stored => n,
+        Compression::Deflate | Compression::Deflate64 => deflate_max_output(n),
+        _ => n.saturating_add(n / 4).saturating_add(4096),
+    }
 }
 
 fn push_u16(v: &mut Vec<u8>, n: u16) {
@@ -117,20 +155,16 @@ impl ZipWriter {
     }
 
     /// Pick the body method: honour the option, but force `Stored` for
-    /// empty bodies and when DEFLATE isn't compiled in.
+    /// empty bodies and when the default DEFLATE isn't compiled in (a
+    /// `gzip`-less build still produces valid archives). Any other
+    /// method reaches here only if `apply_options` found it enabled.
     fn body_method(&self, len: u64) -> Compression {
         if len == 0 {
             return Compression::Stored;
         }
         match self.opts.method {
-            Compression::Stored => Compression::Stored,
-            Compression::Deflate => {
-                if cfg!(feature = "gzip") {
-                    Compression::Deflate
-                } else {
-                    Compression::Stored
-                }
-            }
+            Compression::Deflate if !cfg!(feature = "gzip") => Compression::Stored,
+            m => m,
         }
     }
 
@@ -160,25 +194,32 @@ impl ZipWriter {
             // small in-memory bodies stored verbatim
             Compression::Stored
         };
-        let method_id = match method {
-            Compression::Stored => METHOD_STORE,
-            Compression::Deflate => METHOD_DEFLATE,
+        let method_id = method.method_id();
+        // Bit 11: the name is UTF-8. Bit 1: for LZMA, the stream ends
+        // with an end-of-stream marker (compcol's encoder always writes
+        // one, and leaves the size field unknown).
+        let mut gp_flags = if encoding::needs_utf8_flag(name) {
+            0x0800
+        } else {
+            0
         };
-        let utf8 = encoding::needs_utf8_flag(name);
+        if method == Compression::Lzma {
+            gp_flags |= 0x0002;
+        }
         let (dos_date, dos_time) = super::unix_to_dos(u64::from(meta.mtime));
-        let worst_comp = match method {
-            Compression::Stored => uncomp,
-            Compression::Deflate => deflate_max_output(uncomp),
-        };
+        let worst_comp = compressed_max_output(method, uncomp);
         let entry_zip64 = uncomp >= U32_MAX || worst_comp >= U32_MAX;
+        let version_needed = method
+            .version_needed()
+            .max(if entry_zip64 { 45 } else { 20 });
         let local_offset = self.cursor.position();
         let name_bytes = name.as_bytes();
 
         // --- local file header (30 bytes + name + optional zip64 extra) ---
         let mut hdr = Vec::with_capacity(30 + name_bytes.len() + 20);
         push_u32(&mut hdr, SIG_LOCAL);
-        push_u16(&mut hdr, if entry_zip64 { 45 } else { 20 }); // version needed
-        push_u16(&mut hdr, if utf8 { 0x0800 } else { 0 }); // gp flags
+        push_u16(&mut hdr, version_needed);
+        push_u16(&mut hdr, gp_flags);
         push_u16(&mut hdr, method_id);
         push_u16(&mut hdr, dos_time);
         push_u16(&mut hdr, dos_date);
@@ -226,7 +267,8 @@ impl ZipWriter {
 
         self.central.push(CdRec {
             name: name.to_string(),
-            utf8,
+            gp_flags,
+            version_needed,
             method: method_id,
             crc,
             comp_size,
@@ -264,7 +306,26 @@ impl ZipWriter {
                 Ok((crc, len))
             }
             Compression::Deflate => self.stream_deflate(dev, reader, len, &mut crc, &mut buf),
+            Compression::Deflate64 => self.stream_deflate64(dev, reader, len, &mut crc, &mut buf),
+            Compression::Bzip2 => self.stream_bzip2(dev, reader, len, &mut crc, &mut buf),
+            Compression::Lzma => self.stream_lzma(dev, reader, len, &mut crc, &mut buf),
+            Compression::Xz => self.stream_xz(dev, reader, len, &mut crc, &mut buf),
+            Compression::Zstd => self.stream_zstd(dev, reader, len, &mut crc, &mut buf),
         }
+    }
+
+    /// Codec level in the encoder's own 1-based scale: zip level 0
+    /// (meaning "store") maps up to 1.
+    #[cfg(any(
+        feature = "gzip",
+        feature = "deflate64",
+        feature = "bzip2",
+        feature = "lzma",
+        feature = "xz",
+        feature = "zstd"
+    ))]
+    fn codec_level(&self) -> u8 {
+        self.opts.level.clamp(1, 9) as u8
     }
 
     #[cfg(feature = "gzip")]
@@ -276,26 +337,21 @@ impl ZipWriter {
         crc: &mut u32,
         buf: &mut [u8],
     ) -> Result<(u32, u64)> {
+        use compcol::Algorithm;
+        let cfg = compcol::deflate::EncoderConfig::default().with_level(self.codec_level());
         let sink = CursorSink {
             cursor: &mut self.cursor,
             dev,
             written: 0,
         };
-        use compcol::Algorithm;
-        // compcol's deflate level is 1..=9; map zip level 0 (store) up to 1.
-        let cfg = compcol::deflate::EncoderConfig::default()
-            .with_level(self.opts.level.clamp(1, 9) as u8);
-        let mut enc =
-            compcol::io::EncoderWriter::new(sink, compcol::deflate::Deflate::encoder_with(cfg));
-        let mut remaining = len;
-        while remaining > 0 {
-            let want = remaining.min(buf.len() as u64) as usize;
-            reader.read_exact(&mut buf[..want]).map_err(Error::from)?;
-            *crc = crate::crc::crc32_append(*crc, &buf[..want]);
-            enc.write_all(&buf[..want]).map_err(Error::from)?;
-            remaining -= want as u64;
-        }
-        let sink = enc.finish().map_err(Error::from)?;
+        let sink = stream_encode(
+            sink,
+            compcol::deflate::Deflate::encoder_with(cfg),
+            reader,
+            len,
+            crc,
+            buf,
+        )?;
         Ok((*crc, sink.written))
     }
 
@@ -308,9 +364,305 @@ impl ZipWriter {
         _crc: &mut u32,
         _buf: &mut [u8],
     ) -> Result<(u32, u64)> {
-        Err(Error::Unsupported(
-            "zip: DEFLATE disabled — rebuild with `--features gzip`".into(),
-        ))
+        Err(disabled(Compression::Deflate))
+    }
+
+    #[cfg(feature = "deflate64")]
+    fn stream_deflate64(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        reader: &mut dyn std::io::Read,
+        len: u64,
+        crc: &mut u32,
+        buf: &mut [u8],
+    ) -> Result<(u32, u64)> {
+        use compcol::Algorithm;
+        let cfg = compcol::deflate64::EncoderConfig {
+            level: self.codec_level(),
+        };
+        let sink = CursorSink {
+            cursor: &mut self.cursor,
+            dev,
+            written: 0,
+        };
+        let sink = stream_encode(
+            sink,
+            compcol::deflate64::Deflate64::encoder_with(cfg),
+            reader,
+            len,
+            crc,
+            buf,
+        )?;
+        Ok((*crc, sink.written))
+    }
+
+    #[cfg(not(feature = "deflate64"))]
+    fn stream_deflate64(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _reader: &mut dyn std::io::Read,
+        _len: u64,
+        _crc: &mut u32,
+        _buf: &mut [u8],
+    ) -> Result<(u32, u64)> {
+        Err(disabled(Compression::Deflate64))
+    }
+
+    #[cfg(feature = "bzip2")]
+    fn stream_bzip2(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        reader: &mut dyn std::io::Read,
+        len: u64,
+        crc: &mut u32,
+        buf: &mut [u8],
+    ) -> Result<(u32, u64)> {
+        use compcol::Algorithm;
+        let cfg = compcol::bzip2::EncoderConfig {
+            level: self.codec_level(),
+        };
+        let sink = CursorSink {
+            cursor: &mut self.cursor,
+            dev,
+            written: 0,
+        };
+        let sink = stream_encode(
+            sink,
+            compcol::bzip2::Bzip2::encoder_with(cfg),
+            reader,
+            len,
+            crc,
+            buf,
+        )?;
+        Ok((*crc, sink.written))
+    }
+
+    #[cfg(not(feature = "bzip2"))]
+    fn stream_bzip2(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _reader: &mut dyn std::io::Read,
+        _len: u64,
+        _crc: &mut u32,
+        _buf: &mut [u8],
+    ) -> Result<(u32, u64)> {
+        Err(disabled(Compression::Bzip2))
+    }
+
+    /// LZMA: compcol emits the `.lzma` "alone" framing (5 property bytes
+    /// and an 8-byte size, left unknown so an end-of-stream marker closes
+    /// the body). The zip framing wants a 2-byte version, a 2-byte
+    /// property length, the 5 property bytes, and no size —
+    /// [`ZipLzmaSink`] does that rewrite on the way to the device.
+    #[cfg(feature = "lzma")]
+    fn stream_lzma(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        reader: &mut dyn std::io::Read,
+        len: u64,
+        crc: &mut u32,
+        buf: &mut [u8],
+    ) -> Result<(u32, u64)> {
+        use compcol::Algorithm;
+        let cfg = compcol::lzma::EncoderConfig {
+            level: self.codec_level(),
+        };
+        let sink = ZipLzmaSink {
+            inner: CursorSink {
+                cursor: &mut self.cursor,
+                dev,
+                written: 0,
+            },
+            head: [0u8; 13],
+            seen: 0,
+        };
+        let sink = stream_encode(
+            sink,
+            compcol::lzma::Lzma::encoder_with(cfg),
+            reader,
+            len,
+            crc,
+            buf,
+        )?;
+        if sink.seen < sink.head.len() {
+            return Err(Error::Io(std::io::Error::other(
+                "zip: LZMA encoder produced no stream header",
+            )));
+        }
+        Ok((*crc, sink.inner.written))
+    }
+
+    #[cfg(not(feature = "lzma"))]
+    fn stream_lzma(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _reader: &mut dyn std::io::Read,
+        _len: u64,
+        _crc: &mut u32,
+        _buf: &mut [u8],
+    ) -> Result<(u32, u64)> {
+        Err(disabled(Compression::Lzma))
+    }
+
+    #[cfg(feature = "xz")]
+    fn stream_xz(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        reader: &mut dyn std::io::Read,
+        len: u64,
+        crc: &mut u32,
+        buf: &mut [u8],
+    ) -> Result<(u32, u64)> {
+        use compcol::Algorithm;
+        let cfg = compcol::xz::EncoderConfig {
+            level: self.codec_level(),
+        };
+        let sink = CursorSink {
+            cursor: &mut self.cursor,
+            dev,
+            written: 0,
+        };
+        let sink = stream_encode(
+            sink,
+            compcol::xz::Xz::encoder_with(cfg),
+            reader,
+            len,
+            crc,
+            buf,
+        )?;
+        Ok((*crc, sink.written))
+    }
+
+    #[cfg(not(feature = "xz"))]
+    fn stream_xz(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _reader: &mut dyn std::io::Read,
+        _len: u64,
+        _crc: &mut u32,
+        _buf: &mut [u8],
+    ) -> Result<(u32, u64)> {
+        Err(disabled(Compression::Xz))
+    }
+
+    #[cfg(feature = "zstd")]
+    fn stream_zstd(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        reader: &mut dyn std::io::Read,
+        len: u64,
+        crc: &mut u32,
+        buf: &mut [u8],
+    ) -> Result<(u32, u64)> {
+        use compcol::Algorithm;
+        let cfg = compcol::zstd::EncoderConfig {
+            level: self.codec_level(),
+        };
+        let sink = CursorSink {
+            cursor: &mut self.cursor,
+            dev,
+            written: 0,
+        };
+        let sink = stream_encode(
+            sink,
+            compcol::zstd::Zstd::encoder_with(cfg),
+            reader,
+            len,
+            crc,
+            buf,
+        )?;
+        Ok((*crc, sink.written))
+    }
+
+    #[cfg(not(feature = "zstd"))]
+    fn stream_zstd(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _reader: &mut dyn std::io::Read,
+        _len: u64,
+        _crc: &mut u32,
+        _buf: &mut [u8],
+    ) -> Result<(u32, u64)> {
+        Err(disabled(Compression::Zstd))
+    }
+}
+
+#[allow(dead_code)]
+fn disabled(method: Compression) -> Error {
+    Error::Unsupported(format!(
+        "zip: {} compression is disabled — rebuild with `--features {}`",
+        method.name(),
+        method.feature().unwrap_or_default()
+    ))
+}
+
+/// Pump `len` bytes from `reader` through `enc` into `sink`, folding the
+/// plaintext into `crc`, and hand the sink back once the encoder has
+/// flushed its trailer.
+#[cfg(any(
+    feature = "gzip",
+    feature = "deflate64",
+    feature = "bzip2",
+    feature = "lzma",
+    feature = "xz",
+    feature = "zstd"
+))]
+fn stream_encode<W: Write, E: compcol::Encoder>(
+    sink: W,
+    enc: E,
+    reader: &mut dyn std::io::Read,
+    len: u64,
+    crc: &mut u32,
+    buf: &mut [u8],
+) -> Result<W> {
+    let mut enc = compcol::io::EncoderWriter::new(sink, enc);
+    let mut remaining = len;
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        reader.read_exact(&mut buf[..want]).map_err(Error::from)?;
+        *crc = crate::crc::crc32_append(*crc, &buf[..want]);
+        enc.write_all(&buf[..want]).map_err(Error::from)?;
+        remaining -= want as u64;
+    }
+    enc.finish().map_err(Error::from)
+}
+
+/// Rewrites compcol's 13-byte `.lzma` header into zip's: `09 14`
+/// (LZMA SDK 9.20, the version 7-Zip and Info-ZIP write), `05 00`
+/// (property length), then the 5 property bytes. The 8-byte size that
+/// follows in `.lzma` is dropped — zip keeps the size in its own
+/// headers and bit 1 announces the end-of-stream marker.
+#[cfg(feature = "lzma")]
+struct ZipLzmaSink<'a> {
+    inner: CursorSink<'a>,
+    head: [u8; 13],
+    seen: usize,
+}
+
+#[cfg(feature = "lzma")]
+impl Write for ZipLzmaSink<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = buf.len();
+        let mut rest = buf;
+        if self.seen < self.head.len() {
+            let take = (self.head.len() - self.seen).min(rest.len());
+            self.head[self.seen..self.seen + take].copy_from_slice(&rest[..take]);
+            self.seen += take;
+            rest = &rest[take..];
+            if self.seen == self.head.len() {
+                let mut zip_hdr = [0u8; 9];
+                zip_hdr[..4].copy_from_slice(&[0x09, 0x14, 0x05, 0x00]);
+                zip_hdr[4..].copy_from_slice(&self.head[..5]);
+                self.inner.write_all(&zip_hdr)?;
+            }
+        }
+        if !rest.is_empty() {
+            self.inner.write_all(rest)?;
+        }
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -391,9 +743,12 @@ impl ArchiveBuilder for ZipWriter {
 
             let mut rec = Vec::with_capacity(46 + name_bytes.len() + zip64.len());
             push_u32(&mut rec, SIG_CENTRAL);
-            push_u16(&mut rec, (HOST_UNIX << 8) | 45); // version made by
-            push_u16(&mut rec, if zip64.is_empty() { 20 } else { 45 }); // needed
-            push_u16(&mut rec, if r.utf8 { 0x0800 } else { 0 });
+            push_u16(&mut rec, (HOST_UNIX << 8) | 63); // version made by
+            push_u16(
+                &mut rec,
+                r.version_needed.max(if zip64.is_empty() { 20 } else { 45 }),
+            );
+            push_u16(&mut rec, r.gp_flags);
             push_u16(&mut rec, r.method);
             push_u16(&mut rec, r.dos_time);
             push_u16(&mut rec, r.dos_date);
@@ -436,7 +791,7 @@ impl ArchiveBuilder for ZipWriter {
             let mut z = Vec::with_capacity(56);
             push_u32(&mut z, SIG_ZIP64_EOCD);
             push_u64(&mut z, 44); // size of remaining record
-            push_u16(&mut z, (HOST_UNIX << 8) | 45);
+            push_u16(&mut z, (HOST_UNIX << 8) | 63);
             push_u16(&mut z, 45);
             push_u32(&mut z, 0); // disk
             push_u32(&mut z, 0); // disk w/ cd
@@ -495,5 +850,199 @@ mod tests {
         assert!(deflate_max_output(1 << 20) < U32_MAX);
         // And it never wraps.
         assert_eq!(deflate_max_output(u64::MAX), u64::MAX);
+    }
+
+    // ─── round trips through our own reader ─────────────────────────
+
+    use crate::block::MemoryBackend;
+    use crate::fs::Filesystem;
+    use std::path::Path;
+
+    /// Build a zip holding a compressible text and an incompressible
+    /// blob, trim the device to the archive's length (the scanner wants
+    /// the EOCD at the very end, as a file on disk has it), and hand the
+    /// bytes back.
+    fn build(method: Compression, level: u32) -> Vec<u8> {
+        let text = b"the quick brown fox jumps over the lazy dog\n".repeat(400);
+        let mut noise = Vec::with_capacity(20_000);
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        while noise.len() < 20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            noise.extend_from_slice(&x.to_le_bytes());
+        }
+        let mut dev = MemoryBackend::new(256 * 1024);
+        let mut fs =
+            super::super::ZipFs::format(&mut dev, &ZipFormatOpts { method, level }).unwrap();
+        let meta = FileMeta {
+            mode: 0o644,
+            mtime: 1_700_000_000,
+            ..Default::default()
+        };
+        fs.create_dir(&mut dev, Path::new("/d"), meta).unwrap();
+        fs.create_file_streaming(
+            &mut dev,
+            Path::new("/d/text.txt"),
+            &mut &text[..],
+            text.len() as u64,
+            meta,
+        )
+        .unwrap();
+        fs.create_file_streaming(
+            &mut dev,
+            Path::new("/noise.bin"),
+            &mut &noise[..],
+            noise.len() as u64,
+            meta,
+        )
+        .unwrap();
+        fs.create_file_streaming(&mut dev, Path::new("/empty"), &mut &[][..], 0, meta)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+        let len = fs.image_len().unwrap() as usize;
+        dev.as_slice()[..len].to_vec()
+    }
+
+    fn read_back(arc: &[u8], path: &str) -> (Vec<u8>, crate::fs::archive::Method) {
+        let mut dev = MemoryBackend::new(arc.len() as u64);
+        dev.write_at(0, arc).unwrap();
+        let idx = super::super::scan::scan(&mut dev).unwrap();
+        let method = idx.lookup(path).unwrap().data.as_ref().unwrap().method;
+        let mut fs = super::super::ZipFs::open(&mut dev).unwrap();
+        let mut r = fs.read_file(&mut dev, Path::new(path)).unwrap();
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut r, &mut out).unwrap();
+        (out, method)
+    }
+
+    fn round_trip(method: Compression, want: crate::fs::archive::Method) {
+        let arc = build(method, 6);
+        let text = b"the quick brown fox jumps over the lazy dog\n".repeat(400);
+        let (got, m) = read_back(&arc, "/d/text.txt");
+        assert_eq!(m, want, "{method:?}: method id written");
+        assert_eq!(got, text, "{method:?}: text body");
+        let (noise, _) = read_back(&arc, "/noise.bin");
+        assert_eq!(noise.len(), 20_000, "{method:?}: noise body");
+        // Empty bodies are always Stored, whatever the option says.
+        let (empty, m) = read_back(&arc, "/empty");
+        assert!(empty.is_empty());
+        assert_eq!(m, crate::fs::archive::Method::Stored);
+        // The compressible member must actually have shrunk.
+        if method != Compression::Stored {
+            let mut dev = MemoryBackend::new(arc.len() as u64);
+            dev.write_at(0, &arc).unwrap();
+            let idx = super::super::scan::scan(&mut dev).unwrap();
+            let loc = idx.lookup("/d/text.txt").unwrap().data.clone().unwrap();
+            assert!(
+                loc.compressed_len < loc.uncompressed_len / 4,
+                "{method:?}: {} -> {} bytes",
+                loc.uncompressed_len,
+                loc.compressed_len
+            );
+        }
+    }
+
+    #[test]
+    fn round_trip_stored() {
+        round_trip(Compression::Stored, crate::fs::archive::Method::Stored);
+    }
+
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn round_trip_deflate() {
+        round_trip(Compression::Deflate, crate::fs::archive::Method::Deflate);
+    }
+
+    #[cfg(feature = "deflate64")]
+    #[test]
+    fn round_trip_deflate64() {
+        round_trip(
+            Compression::Deflate64,
+            crate::fs::archive::Method::Deflate64,
+        );
+    }
+
+    #[cfg(feature = "bzip2")]
+    #[test]
+    fn round_trip_bzip2() {
+        round_trip(
+            Compression::Bzip2,
+            crate::fs::archive::Method::Codec(crate::compression::Algo::Bzip2),
+        );
+    }
+
+    /// The header rewrite: 4 zip bytes + 5 property bytes replace
+    /// compcol's 13-byte `.lzma` header, and bit 1 announces the EOS
+    /// marker.
+    #[cfg(feature = "lzma")]
+    #[test]
+    fn round_trip_lzma() {
+        round_trip(
+            Compression::Lzma,
+            crate::fs::archive::Method::ZipLzma { eos: true },
+        );
+        let arc = build(Compression::Lzma, 6);
+        let mut dev = MemoryBackend::new(arc.len() as u64);
+        dev.write_at(0, &arc).unwrap();
+        let idx = super::super::scan::scan(&mut dev).unwrap();
+        let loc = idx.lookup("/d/text.txt").unwrap().data.clone().unwrap();
+        let body = &arc[loc.offset as usize..][..9];
+        assert_eq!(&body[..4], &[0x09, 0x14, 0x05, 0x00]);
+        // Properties byte: lc=3 lp=0 pb=2 is 0x5d, the universal default.
+        assert_eq!(body[4], 0x5d);
+    }
+
+    #[cfg(feature = "xz")]
+    #[test]
+    fn round_trip_xz() {
+        round_trip(
+            Compression::Xz,
+            crate::fs::archive::Method::Codec(crate::compression::Algo::Xz),
+        );
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn round_trip_zstd() {
+        round_trip(
+            Compression::Zstd,
+            crate::fs::archive::Method::Codec(crate::compression::Algo::Zstd),
+        );
+    }
+
+    /// `compression=` names every method; one this build lacks is an
+    /// error naming the feature, not a silent Stored.
+    #[test]
+    fn option_parsing() {
+        let mut bag = crate::format_opts::OptionMap::new();
+        bag.insert("compression", "bogus");
+        let mut o = ZipFormatOpts::default();
+        assert!(o.apply_options(&mut bag).is_err());
+
+        for (name, method) in [
+            ("stored", Compression::Stored),
+            ("deflate", Compression::Deflate),
+            ("deflate64", Compression::Deflate64),
+            ("bzip2", Compression::Bzip2),
+            ("lzma", Compression::Lzma),
+            ("xz", Compression::Xz),
+            ("zstd", Compression::Zstd),
+        ] {
+            let mut bag = crate::format_opts::OptionMap::new();
+            bag.insert("compression", name);
+            let mut o = ZipFormatOpts::default();
+            let r = o.apply_options(&mut bag);
+            if method.enabled() {
+                r.unwrap();
+                assert_eq!(o.method, method);
+            } else {
+                let err = r.unwrap_err();
+                assert!(
+                    matches!(&err, Error::Unsupported(m) if m.contains(method.feature().unwrap())),
+                    "{name}: {err:?}"
+                );
+            }
+        }
     }
 }

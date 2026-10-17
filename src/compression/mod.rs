@@ -1,7 +1,7 @@
 //! Compression / decompression codecs.
 //!
 //! Each algorithm sits behind its own Cargo feature flag (`gzip`, `xz`,
-//! `lzma`, `lz4`, `zstd`, `lzo`). All six are enabled by default; trim
+//! `lzma`, `lz4`, `zstd`, `lzo`, `bzip2`). All seven are enabled by default; trim
 //! the dependency tree by switching `default-features = false` and
 //! picking the subset you need.
 //!
@@ -22,7 +22,7 @@
 //!
 //! ## Crate choices
 //!
-//! - **gzip / zlib / xz / zstd**: [`compcol`], a uniform pure-Rust codec
+//! - **gzip / zlib / xz / zstd / bzip2**: [`compcol`], a uniform pure-Rust codec
 //!   collection behind one `Encoder`/`Decoder` trait. The block API rides
 //!   `compcol::vec`, the stream API `compcol::io`, and the output cap
 //!   `compcol::limit::LimitedDecoder`.
@@ -49,6 +49,9 @@ pub enum Algo {
     Lz4,
     Zstd,
     Lzo,
+    /// bzip2 (`.tar.bz2`, zip method 12). The `bzip2` feature gates the
+    /// codec.
+    Bzip2,
 }
 
 impl Algo {
@@ -63,6 +66,7 @@ impl Algo {
             Self::Lz4 => "lz4",
             Self::Zstd => "zstd",
             Self::Lzo => "lzo",
+            Self::Bzip2 => "bzip2",
         }
     }
 
@@ -77,6 +81,7 @@ impl Algo {
             Self::Lz4 => cfg!(feature = "lz4"),
             Self::Zstd => cfg!(feature = "zstd"),
             Self::Lzo => cfg!(feature = "lzo"),
+            Self::Bzip2 => cfg!(feature = "bzip2"),
         }
     }
 
@@ -98,6 +103,8 @@ impl Algo {
             Some(Self::Zstd)
         } else if lower.ends_with(".lzo") {
             Some(Self::Lzo)
+        } else if lower.ends_with(".bz2") || lower.ends_with(".tbz2") || lower.ends_with(".tbz") {
+            Some(Self::Bzip2)
         } else {
             None
         }
@@ -120,6 +127,10 @@ pub fn detect_magic(prefix: &[u8]) -> Option<Algo> {
     }
     if prefix.len() >= 4 && &prefix[0..4] == b"\x04\x22\x4d\x18" {
         return Some(Algo::Lz4);
+    }
+    // bzip2: "BZh" then the block-size digit '1'..'9'.
+    if prefix.len() >= 4 && &prefix[0..3] == b"BZh" && prefix[3].is_ascii_digit() {
+        return Some(Algo::Bzip2);
     }
     // Legacy LZMA1 stream: 0x5D 0x00 0x00 then a little-endian dict
     // size. Heuristic, not strict — adjust if a false positive shows up.
@@ -144,6 +155,7 @@ pub fn decompress(algo: Algo, compressed: &[u8], max_out: usize) -> Result<Vec<u
         Algo::Lz4 => decompress_lz4(compressed, max_out),
         Algo::Zstd => decompress_zstd(compressed, max_out),
         Algo::Lzo => decompress_lzo(compressed, max_out),
+        Algo::Bzip2 => decompress_bzip2(compressed, max_out),
     }
 }
 
@@ -158,6 +170,7 @@ pub fn compress(algo: Algo, plain: &[u8]) -> Result<Vec<u8>> {
         Algo::Lz4 => compress_lz4(plain),
         Algo::Zstd => compress_zstd(plain),
         Algo::Lzo => compress_lzo(plain),
+        Algo::Bzip2 => compress_bzip2(plain),
     }
 }
 
@@ -174,6 +187,7 @@ pub fn make_reader<'a, R: std::io::Read + 'a>(
         Algo::Lz4 => make_reader_lz4(reader),
         Algo::Zstd => make_reader_zstd(reader),
         Algo::Lzo => make_reader_lzo(reader),
+        Algo::Bzip2 => make_reader_bzip2(reader),
     }
 }
 
@@ -193,6 +207,7 @@ pub fn make_writer<'a, W: std::io::Write + 'a>(
         Algo::Lz4 => make_writer_lz4(writer),
         Algo::Zstd => make_writer_zstd(writer),
         Algo::Lzo => make_writer_lzo(writer),
+        Algo::Bzip2 => make_writer_bzip2(writer),
     }
 }
 
@@ -233,7 +248,13 @@ fn cap_check(buf: &[u8], max_out: usize) -> Result<()> {
 /// `src` slice — the same shape as `compcol::vec::decompress_to_vec` —
 /// rather than `compcol::io::DecoderReader`, which mishandles end-of-input
 /// on some complete streams (e.g. small zlib; KarpelesLab/compcol#17).
-#[cfg(any(feature = "gzip", feature = "xz", feature = "zstd", feature = "lzma"))]
+#[cfg(any(
+    feature = "gzip",
+    feature = "xz",
+    feature = "zstd",
+    feature = "lzma",
+    feature = "bzip2"
+))]
 fn cc_decompress<A: compcol::Algorithm>(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
     use compcol::{Decoder, Status};
     let mut dec = compcol::limit::LimitedDecoder::new(A::decoder(), max_out as u64);
@@ -271,7 +292,13 @@ fn cc_decompress<A: compcol::Algorithm>(src: &[u8], max_out: usize) -> Result<Ve
 }
 
 /// One-shot compress with `A`'s default encoder config.
-#[cfg(any(feature = "gzip", feature = "xz", feature = "zstd", feature = "lzma"))]
+#[cfg(any(
+    feature = "gzip",
+    feature = "xz",
+    feature = "zstd",
+    feature = "lzma",
+    feature = "bzip2"
+))]
 fn cc_compress<A: compcol::Algorithm>(plain: &[u8]) -> Result<Vec<u8>> {
     compcol::vec::compress_to_vec::<A>(plain).map_err(|e| {
         crate::Error::Io(std::io::Error::other(format!(
@@ -287,7 +314,8 @@ fn cc_compress<A: compcol::Algorithm>(plain: &[u8]) -> Result<Vec<u8>> {
     feature = "xz",
     feature = "zstd",
     feature = "lz4",
-    feature = "lzma"
+    feature = "lzma",
+    feature = "bzip2"
 ))]
 fn cc_reader<'a, A: compcol::Algorithm, R: std::io::Read + 'a>(r: R) -> Box<dyn std::io::Read + 'a>
 where
@@ -303,7 +331,8 @@ where
     feature = "xz",
     feature = "zstd",
     feature = "lz4",
-    feature = "lzma"
+    feature = "lzma",
+    feature = "bzip2"
 ))]
 fn cc_writer<'a, A: compcol::Algorithm, W: std::io::Write + 'a>(
     w: W,
@@ -630,6 +659,48 @@ fn make_writer_lzo<'a, W: std::io::Write + 'a>(w: W) -> Result<Box<dyn std::io::
 #[cfg(not(feature = "lzo"))]
 fn make_writer_lzo<'a, W: std::io::Write + 'a>(_w: W) -> Result<Box<dyn std::io::Write + 'a>> {
     Err(disabled(Algo::Lzo))
+}
+
+// =========================== bzip2 ==========================
+
+#[cfg(feature = "bzip2")]
+fn decompress_bzip2(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
+    cc_decompress::<compcol::bzip2::Bzip2>(src, max_out)
+}
+
+#[cfg(not(feature = "bzip2"))]
+fn decompress_bzip2(_src: &[u8], _max_out: usize) -> Result<Vec<u8>> {
+    Err(disabled(Algo::Bzip2))
+}
+
+#[cfg(feature = "bzip2")]
+fn compress_bzip2(plain: &[u8]) -> Result<Vec<u8>> {
+    cc_compress::<compcol::bzip2::Bzip2>(plain)
+}
+
+#[cfg(not(feature = "bzip2"))]
+fn compress_bzip2(_plain: &[u8]) -> Result<Vec<u8>> {
+    Err(disabled(Algo::Bzip2))
+}
+
+#[cfg(feature = "bzip2")]
+fn make_reader_bzip2<'a, R: std::io::Read + 'a>(r: R) -> Result<Box<dyn std::io::Read + 'a>> {
+    Ok(cc_reader::<compcol::bzip2::Bzip2, _>(r))
+}
+
+#[cfg(not(feature = "bzip2"))]
+fn make_reader_bzip2<'a, R: std::io::Read + 'a>(_r: R) -> Result<Box<dyn std::io::Read + 'a>> {
+    Err(disabled(Algo::Bzip2))
+}
+
+#[cfg(feature = "bzip2")]
+fn make_writer_bzip2<'a, W: std::io::Write + 'a>(w: W) -> Result<Box<dyn std::io::Write + 'a>> {
+    Ok(cc_writer::<compcol::bzip2::Bzip2, _>(w))
+}
+
+#[cfg(not(feature = "bzip2"))]
+fn make_writer_bzip2<'a, W: std::io::Write + 'a>(_w: W) -> Result<Box<dyn std::io::Write + 'a>> {
+    Err(disabled(Algo::Bzip2))
 }
 
 // ====================== streaming adapters ======================

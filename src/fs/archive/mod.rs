@@ -97,10 +97,36 @@ pub enum Method {
     /// No compression — the byte range is the file content verbatim.
     Stored,
     /// Raw DEFLATE (zip method 8). Decoded via `compcol::deflate` directly
-    /// (the shared codec layer only exposes gzip/zlib *framing*).
+    /// (the shared codec layer only exposes gzip/zlib *framing*). The
+    /// `gzip` feature.
     Deflate,
-    /// One of the streaming codecs in [`crate::compression`].
+    /// Raw Deflate64 (zip method 9): DEFLATE with a 64 KiB window. The
+    /// `deflate64` feature.
+    Deflate64,
+    /// One of the streaming codecs in [`crate::compression`] — bzip2, xz
+    /// and zstd members (zip methods 12 / 95 / 93) are plain `.bz2` /
+    /// `.xz` / `.zst` streams and go through here.
     Codec(crate::compression::Algo),
+    /// zip method 14: a 4-byte zip header (version + properties size),
+    /// the 5 LZMA property bytes, then a raw LZMA stream with no size
+    /// field. `eos` is general-purpose bit 1 — an end-of-stream marker
+    /// terminates the body, so the decoder must not stop at the declared
+    /// length alone. The `lzma` feature.
+    ZipLzma { eos: bool },
+    /// zip method 98: PPMd variant I, revision 1 — a 2-byte parameter
+    /// word, then Shkarin's carry-less range coder over the var.I model.
+    /// Recognised but not decodable: compcol's `ppmd` codec is variant H
+    /// (the 7z / RAR3 flavour), a different model and coder.
+    ZipPpmd,
+    /// zip method 1 (PKZIP 1.x Shrink — dynamic LZW). `zip-legacy`.
+    ZipShrink,
+    /// zip methods 2–5 (PKZIP 1.x Reduce) with the compression factor
+    /// 1..=4 (method − 1). `zip-legacy`.
+    ZipReduce(u8),
+    /// zip method 6 (PKZIP 1.x Implode). The two flags come from
+    /// general-purpose bits 1 and 2: an 8 KiB (vs 4 KiB) window, and a
+    /// Shannon–Fano tree over the literals. `zip-legacy`.
+    ZipImplode { large_window: bool, lit_tree: bool },
     /// A method id we can name but not decode. Indexing still succeeds;
     /// reading the body returns `Unsupported`.
     Unsupported(u16),

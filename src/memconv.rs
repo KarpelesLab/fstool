@@ -919,6 +919,7 @@ fn tar_codec(name: &str) -> Option<Algo> {
         "lz4" => Algo::Lz4,
         "lzma" => Algo::Lzma,
         "lzo" => Algo::Lzo,
+        "bz2" | "bzip2" => Algo::Bzip2,
         _ => return None,
     };
     algo.enabled().then_some(algo)

@@ -2611,7 +2611,8 @@ fn is_stream_repack_target(fs: &str) -> bool {
 /// — they're inspectable via ls/cat/info but not yet wired into the
 /// FS-to-FS copy walkers.
 /// If `path` looks like a compressed tar (`.tar.gz`, `.tar.zst`,
-/// `.tar.xz`, `.tgz`, `.txz`, `.tar.lz4`, `.tar.lzma`, `.tar.lzo`),
+/// `.tar.xz`, `.tar.bz2`, `.tgz`, `.txz`, `.tbz2`, `.tar.lz4`, `.tar.lzma`,
+/// `.tar.lzo`),
 /// return the codec to use; otherwise `None`. Used by repack to pick a
 /// streaming compressor for the output file.
 fn tar_output_codec(path: &std::path::Path) -> Option<fstool::compression::Algo> {
@@ -2621,6 +2622,9 @@ fn tar_output_codec(path: &std::path::Path) -> Option<fstool::compression::Algo>
     }
     if s.ends_with(".txz") {
         return Some(fstool::compression::Algo::Xz);
+    }
+    if s.ends_with(".tbz2") || s.ends_with(".tbz") {
+        return Some(fstool::compression::Algo::Bzip2);
     }
     if !s.contains(".tar.") {
         // Bare `.gz` / `.zst` etc. without a `.tar.` prefix isn't tar.

@@ -4,14 +4,21 @@
 //!   a trailing comment, ZIP64 (locator + EOCD record + per-entry
 //!   extra field `0x0001`), Unix permissions/symlinks from the
 //!   external-attributes field, and the encoding handling in the
-//!   `encoding` submodule. `Stored` and `Deflate` bodies decode; other methods
-//!   index but report `Unsupported` on read.
+//!   `encoding` submodule. Every method id is recognised; the body
+//!   decodes when its codec feature is compiled in (`Stored` always,
+//!   `Deflate` on `gzip`, then `deflate64`, `bzip2`, `lzma`, `xz`,
+//!   `zstd`, and `zip-legacy` for Shrink / Reduce / Implode), otherwise
+//!   the member indexes and reading it reports `Unsupported` naming the
+//!   feature. Encrypted members, and PPMd (variant I, which compcol
+//!   lacks), are refused the same way.
 //! - **Write:** streams local headers + bodies at a bumping cursor
 //!   (CRC-32 + sizes back-patched after each body), then the central
-//!   directory + EOCD on flush. `Stored` and `Deflate`; ZIP64 is
-//!   emitted only when an entry, offset, or count crosses the 32-bit
-//!   limits. Names are written per the universal-zip technique (host =
-//!   MS-DOS, bit 11 only for true UTF-8).
+//!   directory + EOCD on flush. `Stored` and `Deflate` by default, and
+//!   `-O compression=` picks Deflate64, bzip2, LZMA, XZ or Zstandard
+//!   when its feature is on (the PKZIP 1.x methods have no encoder).
+//!   ZIP64 is emitted only when an entry, offset, or count
+//!   crosses the 32-bit limits. Names are written per the universal-zip
+//!   technique (host = MS-DOS, bit 11 only for true UTF-8).
 
 mod encoding;
 mod scan;
@@ -28,20 +35,124 @@ pub const SIG_ZIP64_EOCD: u32 = 0x0606_4b50;
 pub const SIG_ZIP64_LOCATOR: u32 = 0x0706_4b50;
 
 pub const METHOD_STORE: u16 = 0;
+pub const METHOD_SHRINK: u16 = 1;
+// Methods 2–5 are Reduce with factors 1–4.
+pub const METHOD_IMPLODE: u16 = 6;
 pub const METHOD_DEFLATE: u16 = 8;
+pub const METHOD_DEFLATE64: u16 = 9;
+pub const METHOD_BZIP2: u16 = 12;
+pub const METHOD_LZMA: u16 = 14;
+pub const METHOD_ZSTD: u16 = 93;
+pub const METHOD_XZ: u16 = 95;
+pub const METHOD_PPMD: u16 = 98;
 
-/// Body compression chosen by the writer.
+/// Body compression chosen by the writer. Every method except `Stored`
+/// needs its codec feature; see [`Compression::enabled`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
     Stored,
+    /// Method 8, the universal default. `gzip`.
     Deflate,
+    /// Method 9. `deflate64`.
+    Deflate64,
+    /// Method 12. `bzip2`.
+    Bzip2,
+    /// Method 14, written with an end-of-stream marker. `lzma`.
+    Lzma,
+    /// Method 95. `xz`.
+    Xz,
+    /// Method 93. `zstd`.
+    Zstd,
+}
+
+impl Compression {
+    /// The `compression=` option spelling, and the name used in errors.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Stored => "stored",
+            Self::Deflate => "deflate",
+            Self::Deflate64 => "deflate64",
+            Self::Bzip2 => "bzip2",
+            Self::Lzma => "lzma",
+            Self::Xz => "xz",
+            Self::Zstd => "zstd",
+        }
+    }
+
+    /// The Cargo feature that compiles the encoder in (`None` for
+    /// `Stored`).
+    pub fn feature(self) -> Option<&'static str> {
+        match self {
+            Self::Stored => None,
+            Self::Deflate => Some("gzip"),
+            Self::Deflate64 => Some("deflate64"),
+            Self::Bzip2 => Some("bzip2"),
+            Self::Lzma => Some("lzma"),
+            Self::Xz => Some("xz"),
+            Self::Zstd => Some("zstd"),
+        }
+    }
+
+    /// Whether this build can encode the method.
+    pub fn enabled(self) -> bool {
+        match self {
+            Self::Stored => true,
+            Self::Deflate => cfg!(feature = "gzip"),
+            Self::Deflate64 => cfg!(feature = "deflate64"),
+            Self::Bzip2 => cfg!(feature = "bzip2"),
+            Self::Lzma => cfg!(feature = "lzma"),
+            Self::Xz => cfg!(feature = "xz"),
+            Self::Zstd => cfg!(feature = "zstd"),
+        }
+    }
+
+    /// The zip method id.
+    pub fn method_id(self) -> u16 {
+        match self {
+            Self::Stored => METHOD_STORE,
+            Self::Deflate => METHOD_DEFLATE,
+            Self::Deflate64 => METHOD_DEFLATE64,
+            Self::Bzip2 => METHOD_BZIP2,
+            Self::Lzma => METHOD_LZMA,
+            Self::Xz => METHOD_XZ,
+            Self::Zstd => METHOD_ZSTD,
+        }
+    }
+
+    /// The "version needed to extract" APPNOTE assigns the method
+    /// (2.0 for Stored / Deflate, 2.1 Deflate64, 4.6 bzip2, 6.3 the
+    /// rest).
+    pub fn version_needed(self) -> u16 {
+        match self {
+            Self::Stored | Self::Deflate => 20,
+            Self::Deflate64 => 21,
+            Self::Bzip2 => 46,
+            Self::Lzma | Self::Xz | Self::Zstd => 63,
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "store" | "stored" | "none" => Self::Stored,
+            "deflate" | "deflated" => Self::Deflate,
+            "deflate64" | "enhanced-deflate" => Self::Deflate64,
+            "bzip2" | "bz2" => Self::Bzip2,
+            "lzma" => Self::Lzma,
+            "xz" => Self::Xz,
+            "zstd" | "zst" | "zstandard" => Self::Zstd,
+            _ => return None,
+        })
+    }
 }
 
 /// ZIP creation options.
 #[derive(Debug, Clone)]
 pub struct ZipFormatOpts {
     pub method: Compression,
-    /// DEFLATE level 0..=9 (6 = default).
+    /// Compression level 0..=9 (6 = default), in the codec's own scale:
+    /// DEFLATE / Deflate64 / LZMA / XZ levels 1–9 (0 is treated as 1),
+    /// the bzip2 block size in 100 kB units, and for Zstandard the
+    /// level 1–9 of its 1–22 range.
     pub level: u32,
 }
 
@@ -57,15 +168,23 @@ impl Default for ZipFormatOpts {
 impl ZipFormatOpts {
     pub fn apply_options(&mut self, bag: &mut crate::format_opts::OptionMap) -> Result<()> {
         if let Some(c) = bag.take_str("compression") {
-            self.method = match c.to_ascii_lowercase().as_str() {
-                "store" | "stored" | "none" => Compression::Stored,
-                "deflate" | "deflated" => Compression::Deflate,
-                other => {
-                    return Err(crate::Error::InvalidArgument(format!(
-                        "zip: unknown compression {other:?} (use `stored` or `deflate`)"
-                    )));
-                }
-            };
+            let method = Compression::parse(&c).ok_or_else(|| {
+                crate::Error::InvalidArgument(format!(
+                    "zip: unknown compression {c:?} (use `stored`, `deflate`, `deflate64`, \
+                     `bzip2`, `lzma`, `xz` or `zstd`)"
+                ))
+            })?;
+            // An explicit request for a codec this build lacks is an
+            // error, not a silent fall-back to Stored — the caller asked
+            // for that method for a reason.
+            if !method.enabled() {
+                return Err(crate::Error::Unsupported(format!(
+                    "zip: {} compression is disabled — rebuild with `--features {}`",
+                    method.name(),
+                    method.feature().unwrap_or_default()
+                )));
+            }
+            self.method = method;
         }
         if let Some(l) = bag.take_u32("level")? {
             if l > 9 {

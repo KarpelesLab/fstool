@@ -154,12 +154,31 @@ fn apply_extras(extra: &[u8], comp: &mut u64, uncomp: &mut u64, offset: &mut u64
 /// together with bit 6 / method 99, one of the strong variants).
 const GP_ENCRYPTED: u16 = 0x0001;
 
-/// Map a ZIP compression-method id to our [`Method`].
-fn method_for(id: u16) -> Method {
+/// Map a ZIP compression-method id to our [`Method`]. Bits 1 and 2 of
+/// the general-purpose flags are method-specific parameters: the LZMA
+/// end-of-stream marker, and Implode's window size / literal tree.
+fn method_for(id: u16, gp_flags: u16) -> Method {
+    use super::{
+        METHOD_BZIP2, METHOD_DEFLATE64, METHOD_IMPLODE, METHOD_LZMA, METHOD_PPMD, METHOD_SHRINK,
+        METHOD_XZ, METHOD_ZSTD,
+    };
+    let bit1 = gp_flags & 0x0002 != 0;
+    let bit2 = gp_flags & 0x0004 != 0;
     match id {
         METHOD_STORE => Method::Stored,
+        METHOD_SHRINK => Method::ZipShrink,
+        2..=5 => Method::ZipReduce((id - 1) as u8),
+        METHOD_IMPLODE => Method::ZipImplode {
+            large_window: bit1,
+            lit_tree: bit2,
+        },
         METHOD_DEFLATE => Method::Deflate,
-        93 => Method::Codec(crate::compression::Algo::Zstd),
+        METHOD_DEFLATE64 => Method::Deflate64,
+        METHOD_BZIP2 => Method::Codec(crate::compression::Algo::Bzip2),
+        METHOD_LZMA => Method::ZipLzma { eos: bit1 },
+        METHOD_ZSTD => Method::Codec(crate::compression::Algo::Zstd),
+        METHOD_XZ => Method::Codec(crate::compression::Algo::Xz),
+        METHOD_PPMD => Method::ZipPpmd,
         other => Method::Unsupported(other),
     }
 }
@@ -268,7 +287,7 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
         let method = if gp_flags & GP_ENCRYPTED != 0 {
             Method::Encrypted
         } else {
-            method_for(method_id)
+            method_for(method_id, gp_flags)
         };
         let loc = DataLocator {
             offset: data_off,
@@ -462,6 +481,173 @@ mod tests {
         assert!(
             matches!(err, crate::Error::Unsupported(_)),
             "expected Unsupported, got {err:?}"
+        );
+    }
+
+    // ─── real archives, one per compression method ───────────────────
+    //
+    // `zip_{deflate64,ppmd,bzip2,lzma,xz}.zip` were written by 7-Zip
+    // (`7zz a -tzip -mm=<Method>`; PPMd there is variant I, which we
+    // only recognise), `zip_lzma_py.zip` by Python's
+    // `zipfile` (a different LZMA version header), all holding the same
+    // 1360-byte `a.txt`. The PKZIP 1.x members wrap compcol's own test
+    // vectors: `zip_shrink.zip` (method 1) and `zip_reduce4.zip`
+    // (method 5, factor 4) are payloads a reference encoder produced and
+    // Info-ZIP verified; `zip_implode.zip` (method 6, 8 KiB window +
+    // literal tree) was emitted by compcol's Implode fixture builder.
+
+    fn read_member(arc: &[u8], path: &str) -> crate::Result<Vec<u8>> {
+        use crate::fs::Filesystem;
+        let mut dev = dev_from(arc);
+        let mut fs = super::super::ZipFs::open(&mut dev)?;
+        let mut r = fs.read_file(&mut dev, std::path::Path::new(path))?;
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut r, &mut out)?;
+        Ok(out)
+    }
+
+    fn method_of(arc: &[u8], path: &str) -> Method {
+        let mut dev = dev_from(arc);
+        let idx = scan(&mut dev).unwrap();
+        idx.lookup(path).unwrap().data.as_ref().unwrap().method
+    }
+
+    #[cfg(any(
+        feature = "deflate64",
+        feature = "bzip2",
+        feature = "lzma",
+        feature = "xz"
+    ))]
+    fn a_txt() -> Vec<u8> {
+        b"hello hello hello hello zip world\n".repeat(40)
+    }
+
+    /// Every method id indexes, whatever this build can decode.
+    #[test]
+    fn every_method_is_recognised() {
+        use crate::compression::Algo;
+        let cases: [(&[u8], &str, Method); 8] = [
+            (
+                include_bytes!("../testdata/zip_deflate64.zip"),
+                "/a.txt",
+                Method::Deflate64,
+            ),
+            (
+                include_bytes!("../testdata/zip_ppmd.zip"),
+                "/a.txt",
+                Method::ZipPpmd,
+            ),
+            (
+                include_bytes!("../testdata/zip_bzip2.zip"),
+                "/a.txt",
+                Method::Codec(Algo::Bzip2),
+            ),
+            (
+                include_bytes!("../testdata/zip_lzma.zip"),
+                "/a.txt",
+                Method::ZipLzma { eos: true },
+            ),
+            (
+                include_bytes!("../testdata/zip_xz.zip"),
+                "/a.txt",
+                Method::Codec(Algo::Xz),
+            ),
+            (
+                include_bytes!("../testdata/zip_shrink.zip"),
+                "/lorem.txt",
+                Method::ZipShrink,
+            ),
+            (
+                include_bytes!("../testdata/zip_reduce4.zip"),
+                "/hello.txt",
+                Method::ZipReduce(4),
+            ),
+            (
+                include_bytes!("../testdata/zip_implode.zip"),
+                "/fox.txt",
+                Method::ZipImplode {
+                    large_window: true,
+                    lit_tree: true,
+                },
+            ),
+        ];
+        for (arc, path, want) in cases {
+            assert_eq!(method_of(arc, path), want);
+        }
+    }
+
+    /// PPMd lists but reads `Unsupported` in every build: zip's variant I
+    /// has no decoder in compcol (its `ppmd` is variant H).
+    #[test]
+    fn ppmd_lists_but_reads_unsupported() {
+        let err = read_member(include_bytes!("../testdata/zip_ppmd.zip"), "/a.txt").unwrap_err();
+        assert!(
+            matches!(&err, Error::Unsupported(m) if m.contains("PPMd")),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
+    /// A method whose codec is compiled out reads `Unsupported` naming
+    /// the feature, never garbage.
+    #[cfg(not(feature = "zip-legacy"))]
+    #[test]
+    fn compiled_out_method_reads_unsupported() {
+        let err =
+            read_member(include_bytes!("../testdata/zip_shrink.zip"), "/lorem.txt").unwrap_err();
+        assert!(
+            matches!(&err, Error::Unsupported(m) if m.contains("zip-legacy")),
+            "expected Unsupported naming the feature, got {err:?}"
+        );
+    }
+
+    #[cfg(feature = "deflate64")]
+    #[test]
+    fn reads_deflate64() {
+        let out = read_member(include_bytes!("../testdata/zip_deflate64.zip"), "/a.txt").unwrap();
+        assert_eq!(out, a_txt());
+    }
+
+    #[cfg(feature = "bzip2")]
+    #[test]
+    fn reads_bzip2() {
+        let out = read_member(include_bytes!("../testdata/zip_bzip2.zip"), "/a.txt").unwrap();
+        assert_eq!(out, a_txt());
+    }
+
+    /// Both LZMA writers in the wild: 7-Zip and Python's zipfile set
+    /// the end-of-stream bit and differ only in the version header.
+    #[cfg(feature = "lzma")]
+    #[test]
+    fn reads_lzma() {
+        for arc in [
+            &include_bytes!("../testdata/zip_lzma.zip")[..],
+            &include_bytes!("../testdata/zip_lzma_py.zip")[..],
+        ] {
+            assert_eq!(read_member(arc, "/a.txt").unwrap(), a_txt());
+        }
+    }
+
+    #[cfg(feature = "xz")]
+    #[test]
+    fn reads_xz() {
+        let out = read_member(include_bytes!("../testdata/zip_xz.zip"), "/a.txt").unwrap();
+        assert_eq!(out, a_txt());
+    }
+
+    #[cfg(feature = "zip-legacy")]
+    #[test]
+    fn reads_pkzip_1x_methods() {
+        assert_eq!(
+            read_member(include_bytes!("../testdata/zip_shrink.zip"), "/lorem.txt").unwrap(),
+            b"lorem ipsum dolor sit amet ".repeat(4)
+        );
+        assert_eq!(
+            read_member(include_bytes!("../testdata/zip_reduce4.zip"), "/hello.txt").unwrap(),
+            b"hello world"
+        );
+        assert_eq!(
+            read_member(include_bytes!("../testdata/zip_implode.zip"), "/fox.txt").unwrap(),
+            b"The quick brown fox jumps over the lazy dog. ".repeat(5)
         );
     }
 }

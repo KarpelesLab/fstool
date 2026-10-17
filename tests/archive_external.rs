@@ -140,6 +140,65 @@ fn zip_cross_check_with_unzip() {
     );
 }
 
+/// Every non-default method the writer offers, checked by 7-Zip (`7zz t`
+/// verifies CRCs, so a mis-framed body fails here even if it round-trips
+/// through our own reader). Zstandard is skipped: 7-Zip's zip handler
+/// does not decode method 93.
+#[test]
+fn zip_methods_cross_check_with_7zip() {
+    let tool = ["7zz", "7z"].into_iter().find(|t| which(t));
+    let Some(tool) = tool else {
+        eprintln!("skipping: 7-Zip not installed");
+        return;
+    };
+    let work = tempfile::tempdir().unwrap();
+    let src = work.path().join("src");
+    stage_tree(&src);
+    for method in ["deflate64", "bzip2", "lzma", "xz"] {
+        let out = work.path().join(format!("{method}.zip"));
+        let (ok, _, err) = run(&[
+            "create",
+            "-t",
+            "zip",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "-O",
+            &format!("compression={method}"),
+        ]);
+        if !ok && err.contains("is disabled") {
+            eprintln!("skipping {method}: {}", err.trim());
+            continue;
+        }
+        assert!(ok, "create zip ({method}) failed: {err}");
+        let status = Command::new(tool)
+            .args(["t", "-bso0", "-bsp0"])
+            .arg(&out)
+            .status()
+            .expect("spawn 7-Zip");
+        assert!(status.success(), "7-Zip rejected fstool's {method} zip");
+
+        // And the content survives a 7-Zip extraction byte for byte.
+        let dest = work.path().join(format!("x-{method}"));
+        std::fs::create_dir_all(&dest).unwrap();
+        let status = Command::new(tool)
+            .args(["x", "-bso0", "-bsp0"])
+            .arg(format!("-o{}", dest.display()))
+            .arg(&out)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read(dest.join("sub/deep.txt")).unwrap(),
+            b"nested file contents\n"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("blob.bin")).unwrap(),
+            vec![0x42u8; 5000]
+        );
+    }
+}
+
 #[test]
 fn read_zip_made_by_system_zip() {
     if !which("zip") {
