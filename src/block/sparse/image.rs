@@ -935,6 +935,16 @@ mod tests {
         tempfile::tempdir().unwrap()
     }
 
+    /// The image file's bytes, read through the backend's own handle:
+    /// Windows locks are mandatory, so a second handle can't read the
+    /// file while the backend holds it.
+    fn raw_bytes(img: &mut SparseImageBackend) -> Vec<u8> {
+        let len = img.file.metadata().unwrap().len();
+        let mut v = vec![0u8; len as usize];
+        read_full_at(&mut img.file, 0, &mut v).unwrap();
+        v
+    }
+
     #[test]
     fn table_capacities_match_hdiutil() {
         assert_eq!(FIRST_TABLE_ENTRIES, 1008);
@@ -1039,7 +1049,7 @@ mod tests {
         img.sync().unwrap();
         img.write_at(4096, b"lost").unwrap();
         // Simulate a crash: the file as it stands before any write-back.
-        let snapshot = std::fs::read(&p).unwrap();
+        let snapshot = raw_bytes(&mut img);
         drop(img);
         let p = d.path().join("crashed.sparseimage");
         std::fs::write(&p, snapshot).unwrap();
@@ -1062,11 +1072,11 @@ mod tests {
         img.write_at(6 * 4096, b"far").unwrap();
         img.resize(16 * 4096, ShrinkPolicy::RequireZero).unwrap();
         assert_eq!(img.total_size(), 16 * 4096);
-        let before = std::fs::read(&p).unwrap();
+        let before = raw_bytes(&mut img);
         // Shrinking over nonzero data is refused and changes nothing.
         let err = img.resize(4 * 4096, ShrinkPolicy::RequireZero);
         assert!(err.is_err());
-        assert_eq!(std::fs::read(&p).unwrap(), before);
+        assert_eq!(raw_bytes(&mut img), before);
         assert_eq!(img.total_size(), 16 * 4096);
         // Straddling shrink with only zeros past the end: in place.
         img.write_at(6 * 4096, &[0u8; 3]).unwrap();
