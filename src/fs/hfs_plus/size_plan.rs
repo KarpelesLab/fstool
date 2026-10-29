@@ -1,4 +1,5 @@
-//! Content-fit size plan for HFS+.
+//! Content-fit size plan for HFS+ — and the capacity reservation for
+//! decorated volumes.
 //!
 //! Phase 1 models the catalog B-tree the writer builds: every entry contributes
 //! a catalog record (folder 88 B / file 248 B body, plus a `8 + 2·name` key) and
@@ -6,14 +7,53 @@
 //! `node_size`-byte leaves (usable = `node_size − 14 − 2`, each record costing
 //! `key + body + 2`); index nodes sit above. Files contribute data
 //! (allocation) blocks; symlinks a data block for the target. Phase 2
-//! (`total_size`) folds in the extents B-tree, the size-dependent allocation
-//! bitmap (resolved by a short fixed point), the journal when enabled, and the
-//! boot/volume-header blocks.
+//! (`total_size`) folds in the extents B-tree, the attributes B-tree, the
+//! size-dependent allocation bitmap (resolved by a short fixed point), the
+//! journal when enabled, and the boot/volume-header blocks.
 //!
 //! A safe upper bound: the leaf count uses a conservative fill so greedy
 //! packing never overflows the computed size (validated `fsck.hfsplus`-clean).
+//!
+//! ## Reserving capacity for a decorated volume
+//!
+//! A volume that carries Finder metadata needs room for more than file
+//! data: resource forks, the attributes B-tree that holds xattrs (and the
+//! extents of large xattr values), catalog growth for every entry — and,
+//! when some files are only generated *after* the tree is laid down (a
+//! `.DS_Store` that embeds aliases to entries whose CNIDs are known only
+//! then), room for those too. The recipe:
+//!
+//! ```no_run
+//! # fn main() -> fstool::Result<()> {
+//! use fstool::fs::FsSizePlan;
+//! use fstool::fs::hfs_plus::FormatOpts;
+//! use fstool::fs::hfs_plus::size_plan::{GeneratedBudget, HfsPlusSizePlan};
+//!
+//! let mut opts = FormatOpts::default();
+//! let mut plan = HfsPlusSizePlan::new(&opts);
+//! // 1. The imported tree, entry by entry …
+//! plan.add_dir("/App.app");
+//! plan.add_file("/App.app/Info.plist", 1_234);
+//! plan.add_resource_fork(512);                  // … its resource forks …
+//! plan.add_xattr("com.apple.quarantine", 57);   // … and xattrs.
+//! // 2. What will be generated after the identities are known.
+//! let mut later = GeneratedBudget::default();
+//! later.files = 2;               // .DS_Store, .VolumeIcon.icns
+//! later.data_bytes = 1 << 20;    // their combined size
+//! plan.add_budget(&later);
+//! // 3. Pre-size the metadata trees and pick the volume size.
+//! plan.apply_to(&mut opts);
+//! let bytes = plan.total_size();
+//! # let _ = bytes; Ok(()) }
+//! ```
+//!
+//! [`HfsPlusSizePlan::apply_to`] writes the computed catalog and
+//! attributes node counts into the [`FormatOpts`], so `format` reserves
+//! them up front and nothing has to be carved out of free space later;
+//! [`total_size`](crate::fs::FsSizePlan::total_size) then covers metadata
+//! *and* data. Names count at their HFS+-normalised length.
 
-use super::writer::{DEFAULT_JOURNAL_BUFFER_BLOCKS, FormatOpts};
+use super::writer::{DEFAULT_JOURNAL_BUFFER_BLOCKS, FormatOpts, attr_node_size_for};
 
 /// Blocks a B-tree fork of `nodes` nodes occupies (matches the writer's
 /// `blocks_for_nodes`).
@@ -26,18 +66,53 @@ const NODE_OVERHEAD: u64 = 16;
 /// Folder / file catalog record bodies.
 const FOLDER_BODY: u64 = 88;
 const FILE_BODY: u64 = 248;
+/// Longest catalog name, in UTF-16 units.
+const MAX_NAME_UNITS: u64 = 255;
+/// Longest attribute name, in UTF-16 units.
+const MAX_ATTR_NAME_UNITS: u64 = 127;
+
+/// Things a caller will add to the volume *after* planning — typically
+/// files generated once the tree's CNIDs are known (`.DS_Store`,
+/// `.VolumeIcon.icns`, `.background/…`). Every count is charged at its
+/// worst case (255-unit names, a block of rounding per fork, …), so the
+/// budget is safe without knowing the exact names.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct GeneratedBudget {
+    /// Regular files (and symlinks) to be created later.
+    pub files: u64,
+    /// Folders to be created later.
+    pub dirs: u64,
+    /// Combined data-fork bytes of those files.
+    pub data_bytes: u64,
+    /// Resource forks to be written later.
+    pub resource_forks: u64,
+    /// Combined resource-fork bytes.
+    pub resource_fork_bytes: u64,
+    /// Extended attributes (outside Finder info) to be set later.
+    pub xattrs: u64,
+    /// Combined value bytes of those attributes.
+    pub xattr_bytes: u64,
+}
 
 /// Exact-ish (safe upper bound) HFS+ size accumulator.
 pub struct HfsPlusSizePlan {
     block_size: u64,
     node_size: u64,
+    attr_node_size: u64,
     journaled: bool,
     extents_nodes: u64,
     catalog_nodes_min: u64,
+    attributes_nodes_min: u64,
     /// Σ over records of `record_len + 2` (the catalog B-tree leaf payload).
     catalog_bytes: u64,
-    /// Allocation blocks for file data + symlink targets.
+    /// Allocation blocks for file data + symlink targets + resource forks
+    /// + extent-based xattr values.
     data_blocks: u64,
+    /// Σ over attribute records of `record_len + 2`.
+    attr_bytes: u64,
+    /// Number of attribute records (to bound index fan-out).
+    attr_records: u64,
 }
 
 impl HfsPlusSizePlan {
@@ -46,14 +121,19 @@ impl HfsPlusSizePlan {
         let mut p = Self {
             block_size: u64::from(opts.block_size),
             node_size: u64::from(opts.node_size),
+            attr_node_size: u64::from(attr_node_size_for(opts.node_size)),
             journaled: opts.journaled,
             extents_nodes: u64::from(opts.extents_nodes),
             catalog_nodes_min: u64::from(opts.catalog_nodes),
+            attributes_nodes_min: u64::from(opts.attributes_nodes),
             catalog_bytes: 0,
             data_blocks: 0,
+            attr_bytes: 0,
+            attr_records: 0,
         };
-        // The root folder: its folder record + thread record.
-        p.add_catalog_entry(0, FOLDER_BODY);
+        // The root folder: its folder record + thread record. The volume
+        // name is the root's catalog name.
+        p.add_catalog_entry(Self::name_units(&opts.volume_name), FOLDER_BODY);
         p
     }
 
@@ -69,8 +149,10 @@ impl HfsPlusSizePlan {
         self.catalog_bytes += cat + thread;
     }
 
+    /// UTF-16 length of `name` as HFS+ stores it (normalised, so a
+    /// precomposed `é` counts two units).
     fn name_units(name: &str) -> u64 {
-        name.encode_utf16().count() as u64
+        super::unicode::normalize_name(name).encode_utf16().count() as u64
     }
 
     fn data_blocks_for(&self, len: u64) -> u64 {
@@ -78,6 +160,66 @@ impl HfsPlusSizePlan {
             0
         } else {
             len.div_ceil(self.block_size)
+        }
+    }
+
+    /// Account for a resource fork of `len` bytes (on a file added with
+    /// [`add_file`](crate::fs::FsSizePlan::add_file)).
+    pub fn add_resource_fork(&mut self, len: u64) {
+        self.data_blocks += self.data_blocks_for(len);
+    }
+
+    /// Account for an extended attribute `name` holding `len` bytes.
+    /// `com.apple.FinderInfo` is free (it lives in the catalog record) and
+    /// `com.apple.ResourceFork` is charged as a resource fork; anything
+    /// else costs an attributes-B-tree record, plus its own blocks when
+    /// the value is too big to be stored inline.
+    pub fn add_xattr(&mut self, name: &str, len: u64) {
+        match name {
+            super::meta::XATTR_FINDER_INFO => {}
+            super::meta::XATTR_RESOURCE_FORK => self.add_resource_fork(len),
+            _ => self.add_attr_record(name.encode_utf16().count() as u64, len),
+        }
+    }
+
+    fn add_attr_record(&mut self, name_units: u64, len: u64) {
+        let key = 14 + 2 * name_units;
+        let max_inline = super::attributes::max_inline_attr_size(self.attr_node_size as u32) as u64;
+        if len <= max_inline {
+            let body = 16 + len + (len & 1);
+            self.attr_bytes += key + body + 2;
+            self.attr_records += 1;
+        } else {
+            let blocks = self.data_blocks_for(len);
+            self.data_blocks += blocks;
+            // Fork record (88 B body); one extents record (72 B body) per
+            // further eight runs. A fresh volume allocates contiguously, so
+            // one run is the norm — charge one extents record anyway.
+            self.attr_bytes += (key + 88 + 2) + (key + 72 + 2);
+            self.attr_records += 2;
+        }
+    }
+
+    /// Reserve room for entries and bytes that will only be added after
+    /// planning; see [`GeneratedBudget`].
+    pub fn add_budget(&mut self, b: &GeneratedBudget) {
+        for _ in 0..b.dirs {
+            self.add_catalog_entry(MAX_NAME_UNITS, FOLDER_BODY);
+        }
+        for _ in 0..b.files {
+            self.add_catalog_entry(MAX_NAME_UNITS, FILE_BODY);
+        }
+        // Each fork rounds up to a block: one block of slack per fork.
+        self.data_blocks += self.data_blocks_for(b.data_bytes) + b.files;
+        self.data_blocks += self.data_blocks_for(b.resource_fork_bytes) + b.resource_forks;
+        if b.xattrs > 0 {
+            // Charge every attribute as if it might go out of line, and the
+            // bytes as if they all sat inline — whichever way each lands,
+            // this covers it.
+            let per_record = (14 + 2 * MAX_ATTR_NAME_UNITS) * 2 + 88 + 72 + 4;
+            self.attr_bytes += b.xattrs * per_record + b.xattr_bytes + b.xattrs;
+            self.attr_records += 2 * b.xattrs;
+            self.data_blocks += self.data_blocks_for(b.xattr_bytes) + b.xattrs;
         }
     }
 
@@ -94,6 +236,42 @@ impl HfsPlusSizePlan {
         let index = leaves.div_ceil(200).max(1) + 1;
         // + 1 header node, + 1 map node.
         leaves + index + 2
+    }
+
+    /// Attributes B-tree node count, `0` when no attribute is planned.
+    /// Records can be up to half a node, so greedy packing keeps every
+    /// leaf at least half full: `2 · bytes / usable + 1` leaves bound it.
+    fn attributes_nodes(&self) -> u64 {
+        if self.attr_records == 0 {
+            return self.attributes_nodes_min;
+        }
+        let usable = self.attr_node_size - NODE_OVERHEAD;
+        let leaves = (2 * self.attr_bytes).div_ceil(usable) + 1;
+        // Index records carry a full key (≤ 270 B) + pointer: ~15 per
+        // 4 KiB node at worst.
+        let per_index = (usable / (2 * 276)).max(2);
+        let mut index = 0;
+        let mut level = leaves;
+        while level > 1 {
+            level = level.div_ceil(per_index);
+            index += level;
+        }
+        (leaves + index + 1).max(self.attributes_nodes_min)
+    }
+
+    /// Write the planned catalog and attributes node counts into `opts`
+    /// (never shrinking what is already there), so `format` reserves the
+    /// metadata trees up front — contiguous, next to the other special
+    /// files, and part of the budget rather than carved out of free space
+    /// at flush time.
+    pub fn apply_to(&mut self, opts: &mut FormatOpts) {
+        let cat = u32::try_from(self.catalog_nodes()).unwrap_or(u32::MAX);
+        opts.catalog_nodes = opts.catalog_nodes.max(cat);
+        let attr = u32::try_from(self.attributes_nodes()).unwrap_or(u32::MAX);
+        opts.attributes_nodes = opts.attributes_nodes.max(attr);
+        // The plan now describes the reserved layout: no lazy-creation slack.
+        self.catalog_nodes_min = u64::from(opts.catalog_nodes);
+        self.attributes_nodes_min = u64::from(opts.attributes_nodes);
     }
 
     fn bitmap_blocks(&self, total_blocks: u64) -> u64 {
@@ -126,10 +304,19 @@ impl crate::fs::FsSizePlan for HfsPlusSizePlan {
         let cat_nodes = self.catalog_nodes().max(self.catalog_nodes_min);
         let catalog_blocks = blocks_for_nodes(cat_nodes, self.node_size, self.block_size);
         let extents_blocks = blocks_for_nodes(self.extents_nodes, self.node_size, self.block_size);
+        let attr_nodes = self.attributes_nodes();
+        let attr_blocks = blocks_for_nodes(attr_nodes, self.attr_node_size, self.block_size);
+        // Created lazily (no format-time reservation), the attributes
+        // fork is rounded up to the B-tree clump size — ≤ 1 MiB.
+        let attr_lazy_slack = if self.attr_records > 0 && self.attributes_nodes_min == 0 {
+            (1024 * 1024u64).div_ceil(self.block_size)
+        } else {
+            0
+        };
 
         // Journal: info block + buffer sized from the metadata it must cover.
         let journal_blocks = if self.journaled {
-            let meta = catalog_blocks + extents_blocks + 16;
+            let meta = catalog_blocks + extents_blocks + attr_blocks + 16;
             1 + u64::from(DEFAULT_JOURNAL_BUFFER_BLOCKS).max(meta)
         } else {
             0
@@ -138,7 +325,13 @@ impl crate::fs::FsSizePlan for HfsPlusSizePlan {
         // Fixed: block 0 (boot/VH) + alternate volume header block.
         let fixed = 2u64;
         // Size-independent metadata + data.
-        let core = fixed + catalog_blocks + extents_blocks + journal_blocks + self.data_blocks;
+        let core = fixed
+            + catalog_blocks
+            + extents_blocks
+            + attr_blocks
+            + attr_lazy_slack
+            + journal_blocks
+            + self.data_blocks;
 
         // Resolve the allocation-bitmap fixed point (its size depends on the
         // total block count).
@@ -183,5 +376,30 @@ mod tests {
             p.add_file(&format!("/file_{i:05}.txt"), 0);
         }
         assert!(p.catalog_nodes() > base);
+    }
+
+    #[test]
+    fn metadata_is_charged() {
+        let opts = FormatOpts::default();
+        let base = HfsPlusSizePlan::new(&opts).total_size();
+        let mut p = HfsPlusSizePlan::new(&opts);
+        p.add_xattr("com.apple.FinderInfo", 32);
+        assert_eq!(p.total_size(), base, "Finder info lives in the catalog");
+        p.add_resource_fork(10_000);
+        assert!(p.total_size() >= base + 3 * 4096);
+        let before = p.total_size();
+        p.add_xattr("user.big", 100_000);
+        assert!(p.total_size() >= before + 100_000);
+        let mut o = opts.clone();
+        p.apply_to(&mut o);
+        assert!(o.attributes_nodes > 0);
+        let b = GeneratedBudget {
+            files: 1,
+            data_bytes: 50_000,
+            ..GeneratedBudget::default()
+        };
+        let before = p.total_size();
+        p.add_budget(&b);
+        assert!(p.total_size() >= before + 50_000);
     }
 }

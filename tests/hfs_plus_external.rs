@@ -1080,7 +1080,13 @@ fn writer_folds_non_latin_names_the_way_fsck_does() {
         .map(|e| e.name)
         .collect();
     for name in names {
-        assert!(listed.contains(name), "{name:?} missing from {listed:?}");
+        // Names are stored HFS+-normalised (Ё is decomposed to Е + ◌̈),
+        // exactly as macOS would store them; lookups accept either form.
+        let stored = fstool::fs::hfs_plus::unicode::normalize_name(name);
+        assert!(
+            listed.contains(&stored),
+            "{stored:?} missing from {listed:?}"
+        );
         let mut got = String::new();
         hfs.open_file_reader(&mut dev, &format!("/{name}"))
             .unwrap()

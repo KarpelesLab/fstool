@@ -53,6 +53,77 @@ pub const REC_FORK_DATA: u32 = 0x20;
 /// `kHFSPlusAttrExtents` — overflow extents for a fork-data attribute.
 pub const REC_EXTENTS: u32 = 0x30;
 
+/// Bytes ahead of the value in an inline (`HFSPlusAttrData`) record:
+/// recordType(4) + reserved[2](8) + attrSize(4).
+pub(crate) const INLINE_HEADER_LEN: usize = 16;
+
+/// `kHFSPlusAttrKeyMaximumLength`: the attribute key's `keyLength` for a
+/// 127-unit name (`sizeof(HFSPlusAttrKey) - 2`).
+pub(crate) const ATTR_MAX_KEY_LENGTH: u16 = 266;
+
+/// Longest attribute name, in UTF-16 code units (`kHFSMaxAttrNameLen`).
+pub const MAX_ATTR_NAME_UNITS: usize = 127;
+
+/// Largest value xnu stores inline for a given attributes-tree node size
+/// (`getmaxinlineattrsize`): two maximal records must fit a node. Larger
+/// values go to an extent-based (`kHFSPlusAttrForkData`) record. 3802
+/// bytes at the usual 8 KiB node size.
+pub fn max_inline_attr_size(node_size: u32) -> usize {
+    let mut n = node_size as usize;
+    n = n.saturating_sub(14); // BTNodeDescriptor
+    n = n.saturating_sub(3 * 2); // three offset slots
+    n /= 2; // two key/record pairs minimum
+    n = n.saturating_sub(268); // sizeof(HFSPlusAttrKey)
+    n = n.saturating_sub(INLINE_HEADER_LEN); // sizeof(HFSPlusAttrData) - 2
+    n & !1
+}
+
+/// Encode an `HFSPlusAttrKey` (padded to even length — it already is).
+pub(crate) fn encode_attr_key(file_id: u32, name: &[u16], start_block: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(14 + 2 * name.len());
+    out.extend_from_slice(&((12 + 2 * name.len()) as u16).to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes()); // pad
+    out.extend_from_slice(&file_id.to_be_bytes());
+    out.extend_from_slice(&start_block.to_be_bytes());
+    out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    for u in name {
+        out.extend_from_slice(&u.to_be_bytes());
+    }
+    out
+}
+
+/// Encode an inline `HFSPlusAttrData` record body, padded to even length
+/// the way xnu sizes it.
+pub(crate) fn encode_inline_body(value: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(INLINE_HEADER_LEN + value.len() + 1);
+    out.extend_from_slice(&REC_INLINE_DATA.to_be_bytes());
+    out.extend_from_slice(&[0u8; 8]);
+    out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    out.extend_from_slice(value);
+    if out.len() % 2 != 0 {
+        out.push(0);
+    }
+    out
+}
+
+/// Decode the eight extents of an `HFSPlusAttrExtents` (0x30) record body.
+pub(crate) fn decode_extents_body(
+    body: &[u8],
+) -> Result<[super::volume_header::ExtentDescriptor; 8]> {
+    if body.len() < 8 + 64 || u32::from_be_bytes(body[0..4].try_into().unwrap()) != REC_EXTENTS {
+        return Err(crate::Error::InvalidImage(
+            "hfs+: malformed HFSPlusAttrExtents record".into(),
+        ));
+    }
+    let mut out = [super::volume_header::ExtentDescriptor::default(); 8];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let mut e = [0u8; 8];
+        e.copy_from_slice(&body[8 + i * 8..16 + i * 8]);
+        *slot = super::volume_header::ExtentDescriptor::decode(&e);
+    }
+    Ok(out)
+}
+
 /// A decoded attribute key.
 #[derive(Debug, Clone)]
 pub struct AttrKey {
@@ -119,9 +190,15 @@ impl AttrKey {
     }
 
     /// Compare two attribute keys. Order is `(fileID, name, startBlock)`.
-    pub fn compare(&self, other: &AttrKey, case_sensitive: bool) -> Ordering {
+    ///
+    /// Attribute names are always compared as raw UTF-16 code units
+    /// (xnu's `hfs_attrkeycompare`), on HFS+ and HFSX alike — the
+    /// attributes B-tree header carries `keyCompareType` 0 regardless of
+    /// the catalog's case folding. `_case_sensitive` is accepted for API
+    /// compatibility and ignored.
+    pub fn compare(&self, other: &AttrKey, _case_sensitive: bool) -> Ordering {
         match self.file_id.cmp(&other.file_id) {
-            Ordering::Equal => match compare_unistr(&self.name, &other.name, case_sensitive) {
+            Ordering::Equal => match compare_unistr(&self.name, &other.name, true) {
                 Ordering::Equal => self.start_block.cmp(&other.start_block),
                 o => o,
             },
@@ -160,20 +237,24 @@ impl AttrRecord {
         let rec_type = u32::from_be_bytes(body[0..4].try_into().unwrap());
         match rec_type {
             REC_INLINE_DATA => {
-                if body.len() < 12 {
+                // xnu's `HFSPlusAttrData`: recordType(4) + reserved[2](8)
+                // + attrSize(4) + attrData. (TN1150's older
+                // `HFSPlusAttrInlineData` with a single reserved word was
+                // never what shipped.)
+                if body.len() < INLINE_HEADER_LEN {
                     return Err(crate::Error::InvalidImage(
-                        "hfs+: short HFSPlusAttrInlineData".into(),
+                        "hfs+: short HFSPlusAttrData".into(),
                     ));
                 }
-                let attr_size = u32::from_be_bytes(body[8..12].try_into().unwrap()) as usize;
-                if body.len() < 12 + attr_size {
+                let attr_size = u32::from_be_bytes(body[12..16].try_into().unwrap()) as usize;
+                if body.len() - INLINE_HEADER_LEN < attr_size {
                     return Err(crate::Error::InvalidImage(format!(
-                        "hfs+: HFSPlusAttrInlineData attrSize {attr_size} exceeds record body ({} bytes)",
-                        body.len() - 12
+                        "hfs+: HFSPlusAttrData attrSize {attr_size} exceeds record body ({} bytes)",
+                        body.len() - INLINE_HEADER_LEN
                     )));
                 }
                 Ok(Self::Inline {
-                    data: body[12..12 + attr_size].to_vec(),
+                    data: body[INLINE_HEADER_LEN..INLINE_HEADER_LEN + attr_size].to_vec(),
                 })
             }
             REC_FORK_DATA => {
@@ -339,7 +420,7 @@ mod tests {
         // Pad to 2-byte alignment (already aligned: 14 + 2*N is even)
         // Inline record body
         out.extend_from_slice(&REC_INLINE_DATA.to_be_bytes());
-        out.extend_from_slice(&0u32.to_be_bytes()); // reserved
+        out.extend_from_slice(&[0u8; 8]); // reserved[2]
         out.extend_from_slice(&(value.len() as u32).to_be_bytes()); // attrSize
         out.extend_from_slice(value);
         out

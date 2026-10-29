@@ -5,9 +5,10 @@
 //!
 //! * `nodeSize = 8192` for all B-trees (the HFS+ default).
 //! * Single contiguous extent for every special file: allocation bitmap,
-//!   extents-overflow, catalog, attributes (empty), startup (empty).
-//! * Plain HFS+ (signature `"H+"`, version 4). HFSX, journaling, and
-//!   resource forks are intentionally out of scope.
+//!   extents-overflow, catalog, attributes (empty unless
+//!   reserved via `FormatOpts::attributes_nodes`), startup (empty).
+//! * Plain HFS+ (signature `"H+"`, version 4); HFSX volumes are
+//!   rewritten in place when re-opened.
 //! * No iCloud/Spotlight/HFS+ private data directories — these only
 //!   appear on volumes with hard links.
 //!
@@ -120,6 +121,15 @@ pub struct FormatOpts {
     /// clean (transaction-count-zero) journal header. The kernel will
     /// see a journaled volume with no replay work to do. Default false.
     pub journaled: bool,
+    /// Nodes to reserve up front for the attributes (extended-attribute)
+    /// B-tree, laid out next to the catalog. `0` (the default) creates
+    /// the attributes file lazily, at the first [`super::HfsPlus::flush`]
+    /// that has an xattr to store, from whatever space is free then.
+    /// Reserving it at format time keeps the tree contiguous with the
+    /// other metadata and makes its cost part of the format-time budget
+    /// (see [`super::size_plan::HfsPlusSizePlan`]). Nodes are
+    /// `max(node_size, 4096)` bytes.
+    pub attributes_nodes: u32,
 }
 
 impl Default for FormatOpts {
@@ -136,8 +146,16 @@ impl Default for FormatOpts {
             volume_name: "Untitled".into(),
             create_date: 0,
             journaled: false,
+            attributes_nodes: 0,
         }
     }
+}
+
+/// Node size used for a freshly created attributes B-tree: the volume's
+/// node size, but never below 4 KiB (xnu needs two maximal 268-byte keys
+/// plus records per node).
+pub(crate) fn attr_node_size_for(node_size: u32) -> u32 {
+    node_size.max(4096)
 }
 
 impl FormatOpts {
@@ -171,6 +189,9 @@ impl FormatOpts {
         if let Some(b) = map.take_bool("journaled")? {
             self.journaled = b;
         }
+        if let Some(n) = map.take_u32("attributes_nodes")? {
+            self.attributes_nodes = n;
+        }
         Ok(())
     }
 }
@@ -186,7 +207,7 @@ pub(crate) struct OwnedKey {
 }
 
 impl OwnedKey {
-    fn thread(cnid: u32) -> Self {
+    pub(crate) fn thread(cnid: u32) -> Self {
         Self {
             parent_id: cnid,
             name: UniStr::default(),
@@ -355,9 +376,47 @@ pub struct Writer {
 
     /// True once [`flush`] has been called successfully.
     pub(crate) flushed: bool,
+
+    /// Extended-attribute records, keyed in attributes-B-tree order:
+    /// `(fileID, name code units, startBlock)` compared as plain integers
+    /// / code units — exactly xnu's `hfs_attrkeycompare`. Values are the
+    /// encoded record bodies (`HFSPlusAttrData`, `HFSPlusAttrForkData` or
+    /// `HFSPlusAttrExtents`), kept verbatim for records read off disk.
+    pub(crate) attrs: BTreeMap<AttrMapKey, Vec<u8>>,
+    /// Node size of the attributes B-tree (taken from the on-disk header
+    /// on re-open; at least 4 KiB on a fresh volume so two maximal
+    /// records fit a node).
+    pub(crate) attr_node_size: u32,
+    /// `HFSPlusVolumeHeader.createDate`. Kept apart from
+    /// [`Self::create_date`] (the stamp given to new entries) so a
+    /// re-opened volume keeps its header date — which macOS writes in
+    /// *local* time, unlike every catalog date.
+    pub(crate) volume_create_date: u32,
 }
 
+/// Key of [`Writer::attrs`]: `(fileID, attribute name as UTF-16, startBlock)`.
+pub(crate) type AttrMapKey = (u32, Vec<u16>, u32);
+
 impl Writer {
+    /// Map a canonical path component under `parent_id` to the catalog
+    /// name it refers to. The HFS+-normalised form (see
+    /// [`super::unicode`]) wins — it is what a new entry is created as
+    /// and what macOS itself looks up — but a name stored un-normalised
+    /// by some other writer is still found verbatim.
+    pub(crate) fn resolve_component(&self, parent_id: u32, component: &str) -> Result<UniStr> {
+        let normalized = super::unicode::component_to_unistr(component);
+        if let Ok(n) = &normalized
+            && self.lookup(parent_id, n).is_some()
+        {
+            return normalized;
+        }
+        let raw = UniStr::from_path_component(component);
+        if self.lookup(parent_id, &raw).is_some() {
+            return Ok(raw);
+        }
+        normalized
+    }
+
     /// Whether `cnid` is currently a directory in the in-memory catalog.
     pub(crate) fn is_dir(&self, cnid: u32) -> bool {
         let key = OwnedKey::thread(cnid);
@@ -1328,8 +1387,17 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
     let cat_blocks = blocks_for_nodes(opts.catalog_nodes, opts.node_size, bs)?;
     let catalog_file = layout_special(&mut cursor, cat_blocks, bs, btree_clump)?;
 
-    // Attributes B-tree and startup file: empty (zero fork data).
-    let attributes_file = ForkData::default();
+    // Attributes B-tree: reserved here when asked for, otherwise created
+    // lazily at the first flush that has an xattr to store. Startup
+    // file: always empty (zero fork data).
+    let attr_node_size = attr_node_size_for(opts.node_size);
+    let (attributes_file, attr_blocks) = if opts.attributes_nodes > 0 {
+        let blocks = blocks_for_nodes(opts.attributes_nodes, attr_node_size, bs)?;
+        let clump = btree_clump_size(total_blocks, bs, attr_node_size);
+        (layout_special(&mut cursor, blocks, bs, clump)?, blocks)
+    } else {
+        (ForkData::default(), 0)
+    };
     let startup_file = ForkData::default();
 
     // Journal stub: one block for the JournalInfoBlock, plus N blocks
@@ -1356,6 +1424,7 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
         let metadata_blocks = alloc_blocks_needed
             .saturating_add(ext_blocks)
             .saturating_add(cat_blocks)
+            .saturating_add(attr_blocks)
             .saturating_add(16);
         let jbuf_blocks = DEFAULT_JOURNAL_BUFFER_BLOCKS.max(metadata_blocks);
         cursor = cursor.checked_add(jbuf_blocks).ok_or_else(|| {
@@ -1418,13 +1487,17 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
         free_blocks = free_blocks.saturating_sub(total_blocks - tail_start);
     }
 
-    let volume_name_unistr = UniStr::from_str_lossy(&opts.volume_name);
+    // The volume name is the root folder's catalog name, so it gets the
+    // same HFS+ normalisation and 255-unit limit as any other name.
+    let volume_name_unistr = UniStr {
+        code_units: super::unicode::validate_name(&opts.volume_name)?,
+    };
 
     let mut writer = Writer {
         block_size: bs,
         node_size: opts.node_size,
         total_blocks,
-        volume_name: opts.volume_name.clone(),
+        volume_name: volume_name_unistr.to_string_lossy(),
         create_date: opts.create_date,
         next_cnid: 16, // CNIDs 0..15 are reserved per TN1150
         bitmap,
@@ -1444,6 +1517,9 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
         journal_buffer_start,
         journal_buffer_blocks,
         flushed: false,
+        attrs: BTreeMap::new(),
+        attr_node_size,
+        volume_create_date: opts.create_date,
     };
 
     // Seed the root folder + thread.
@@ -1758,6 +1834,7 @@ pub(crate) fn insert_folder(
             "hfs+ writer: directory name must not be empty".into(),
         ));
     }
+    check_name_len(name)?;
     if !writer.is_dir(parent_id) {
         return Err(crate::Error::InvalidArgument(format!(
             "hfs+ writer: parent CNID {parent_id} is not a directory"
@@ -1815,6 +1892,7 @@ pub(crate) fn insert_file(
             "hfs+ writer: file name must not be empty".into(),
         ));
     }
+    check_name_len(name)?;
     if !writer.is_dir(parent_id) {
         return Err(crate::Error::InvalidArgument(format!(
             "hfs+ writer: parent CNID {parent_id} is not a directory"
@@ -2054,6 +2132,7 @@ pub(crate) fn insert_hardlink_entry(
             "hfs+ writer: hard-link name must not be empty".into(),
         ));
     }
+    check_name_len(name)?;
     if !writer.is_dir(parent_id) {
         return Err(crate::Error::InvalidArgument(format!(
             "hfs+ writer: parent CNID {parent_id} is not a directory"
@@ -2477,8 +2556,510 @@ pub(crate) fn remove_entry(writer: &mut Writer, parent_id: u32, name: &UniStr) -
     };
     writer.catalog.remove(&key);
     writer.catalog.remove(&OwnedKey::thread(cnid));
+    // Orphaned attribute records would fail fsck ("Orphaned extended
+    // attribute") and leak an extent-based value's blocks.
+    remove_all_attrs(writer, cnid)?;
     writer.bump_valence(parent_id, -1)?;
     Ok(())
+}
+
+/// Reject a catalog name longer than `HFSUniStr255` can hold — encoding
+/// would otherwise truncate it silently.
+fn check_name_len(name: &UniStr) -> Result<()> {
+    if name.code_units.len() > super::unicode::MAX_NAME_UNITS {
+        return Err(crate::Error::InvalidArgument(format!(
+            "hfs+ writer: name {:?} is {} UTF-16 code units; HFS+ allows {}",
+            name.to_string_lossy(),
+            name.code_units.len(),
+            super::unicode::MAX_NAME_UNITS
+        )));
+    }
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// Resource forks and extended attributes
+// ----------------------------------------------------------------------
+
+/// Byte offset of the resource fork's `HFSPlusForkData` in a file record.
+pub(crate) const RSRC_FORK_OFF: usize = 88 + FORK_DATA_SIZE;
+
+/// `kHFSHasAttributesMask` in a catalog record's `flags`.
+pub(crate) const FLAG_HAS_ATTRIBUTES: u16 = 0x0004;
+/// `kHFSHasSecurityMask` in a catalog record's `flags`.
+pub(crate) const FLAG_HAS_SECURITY: u16 = 0x0008;
+/// The ACL attribute whose presence `kHFSHasSecurityMask` advertises.
+pub(crate) const SECURITY_ATTR: &str = "com.apple.system.Security";
+
+/// Free every block of `fork` (inline extents) plus the overflow
+/// records queued for `(fork_type, file_id)`.
+pub(crate) fn free_fork(writer: &mut Writer, fork: &ForkData, fork_type: u8, file_id: u32) {
+    for ext in &fork.extents {
+        if ext.block_count != 0 {
+            writer.free(ext.start_block, ext.block_count);
+        }
+    }
+    let keys: Vec<(u8, u32, u32)> = writer
+        .overflow_extents
+        .range((fork_type, file_id, 0)..=(fork_type, file_id, u32::MAX))
+        .map(|(k, _)| *k)
+        .collect();
+    for k in keys {
+        if let Some(group) = writer.overflow_extents.remove(&k) {
+            for ext in &group {
+                if ext.block_count != 0 {
+                    writer.free(ext.start_block, ext.block_count);
+                }
+            }
+        }
+    }
+}
+
+/// Allocate up to `len` bytes' worth of blocks as a run list and stream
+/// `src` into them, zero-padding the tail block. Returns the runs in
+/// order. Shared by data/resource forks and extent-based xattrs.
+fn stream_into_runs<R: Read + ?Sized>(
+    writer: &mut Writer,
+    dev: &mut dyn BlockDevice,
+    src: &mut R,
+    len: u64,
+) -> Result<(Vec<ExtentDescriptor>, u32)> {
+    let bs = u64::from(writer.block_size);
+    let total_blocks = u32::try_from(len.div_ceil(bs)).map_err(|_| {
+        crate::Error::InvalidArgument("hfs+ writer: fork size overflows u32 blocks".into())
+    })?;
+    if u64::from(total_blocks) > u64::from(writer.free_blocks) {
+        return Err(crate::Error::Unsupported(format!(
+            "hfs+ writer: out of space ({} free blocks, need {total_blocks})",
+            writer.free_blocks
+        )));
+    }
+    let mut runs: Vec<ExtentDescriptor> = Vec::new();
+    let mut remaining = total_blocks;
+    while remaining > 0 {
+        let run = match writer.allocate_largest_run(remaining) {
+            Ok(r) => r,
+            Err(e) => {
+                for r in &runs {
+                    writer.free(r.start_block, r.block_count);
+                }
+                return Err(e);
+            }
+        };
+        remaining -= run.block_count;
+        runs.push(run);
+    }
+    let result = (|| -> Result<()> {
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut written: u64 = 0;
+        for run in &runs {
+            let run_end = u64::from(run.start_block + run.block_count) * bs;
+            let mut off = u64::from(run.start_block) * bs;
+            while off < run_end {
+                let want = ((run_end - off).min(buf.len() as u64)) as usize;
+                let data_left = len - written;
+                let take = (data_left.min(want as u64)) as usize;
+                let mut filled = 0;
+                while filled < take {
+                    let n = src.read(&mut buf[filled..take]).map_err(crate::Error::Io)?;
+                    if n == 0 {
+                        return Err(crate::Error::InvalidArgument(format!(
+                            "hfs+ writer: source ended early at {} of {len} bytes",
+                            written + filled as u64
+                        )));
+                    }
+                    filled += n;
+                }
+                // Zero the slack after the data (a reused block may hold
+                // stale bytes).
+                buf[take..want].fill(0);
+                dev.write_at(off, &buf[..want])?;
+                off += want as u64;
+                written += take as u64;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        for r in &runs {
+            writer.free(r.start_block, r.block_count);
+        }
+        return Err(e);
+    }
+    Ok((runs, total_blocks))
+}
+
+/// Stream `len` bytes into a new fork of `fork_type` for `file_id`,
+/// queueing extents-overflow records past the eight inline extents.
+pub(crate) fn stream_fork_to_blocks<R: Read + ?Sized>(
+    writer: &mut Writer,
+    dev: &mut dyn BlockDevice,
+    src: &mut R,
+    len: u64,
+    file_id: u32,
+    fork_type: u8,
+) -> Result<ForkData> {
+    if fork_type == FORK_DATA {
+        return stream_data_to_blocks(writer, dev, src, len, file_id);
+    }
+    if len == 0 {
+        return Ok(ForkData::default());
+    }
+    let (runs, total_blocks) = stream_into_runs(writer, dev, src, len)?;
+    let mut extents = [ExtentDescriptor::default(); FORK_EXTENT_COUNT];
+    for (slot, ext) in extents.iter_mut().zip(runs.iter()) {
+        *slot = *ext;
+    }
+    if runs.len() > FORK_EXTENT_COUNT {
+        record_fork_overflow(
+            writer,
+            fork_type,
+            file_id,
+            &extents,
+            &runs[FORK_EXTENT_COUNT..],
+        );
+    }
+    Ok(ForkData {
+        logical_size: len,
+        clump_size: writer.block_size,
+        total_blocks,
+        extents,
+    })
+}
+
+/// Iterate the keys of every record (all segments) of attribute `name`
+/// on `file_id`.
+fn attr_record_keys(writer: &Writer, file_id: u32, name: &[u16]) -> Vec<AttrMapKey> {
+    let lo = (file_id, name.to_vec(), 0u32);
+    let hi = (file_id, name.to_vec(), u32::MAX);
+    writer
+        .attrs
+        .range(lo..=hi)
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
+/// Remove attribute `name` from `file_id`, freeing the blocks of an
+/// extent-based value. Returns whether anything was removed.
+pub(crate) fn remove_attr(writer: &mut Writer, file_id: u32, name: &[u16]) -> Result<bool> {
+    let keys = attr_record_keys(writer, file_id, name);
+    if keys.is_empty() {
+        return Ok(false);
+    }
+    for k in keys {
+        let Some(body) = writer.attrs.remove(&k) else {
+            continue;
+        };
+        free_attr_record_blocks(writer, &body)?;
+    }
+    Ok(true)
+}
+
+fn free_attr_record_blocks(writer: &mut Writer, body: &[u8]) -> Result<()> {
+    if body.len() < 4 {
+        return Ok(());
+    }
+    match u32::from_be_bytes(body[0..4].try_into().unwrap()) {
+        super::attributes::REC_FORK_DATA => {
+            if let super::attributes::AttrRecord::Fork { fork } =
+                super::attributes::AttrRecord::decode(body)?
+            {
+                for e in &fork.extents {
+                    if e.block_count != 0 {
+                        writer.free(e.start_block, e.block_count);
+                    }
+                }
+            }
+        }
+        super::attributes::REC_EXTENTS => {
+            for e in &super::attributes::decode_extents_body(body)? {
+                if e.block_count != 0 {
+                    writer.free(e.start_block, e.block_count);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Drop every attribute of `file_id` (used when the entry is removed).
+pub(crate) fn remove_all_attrs(writer: &mut Writer, file_id: u32) -> Result<()> {
+    let keys: Vec<AttrMapKey> = writer
+        .attrs
+        .range((file_id, Vec::new(), 0)..(file_id.saturating_add(1), Vec::new(), 0))
+        .map(|(k, _)| k.clone())
+        .filter(|k| k.0 == file_id)
+        .collect();
+    for k in keys {
+        if let Some(body) = writer.attrs.remove(&k) {
+            free_attr_record_blocks(writer, &body)?;
+        }
+    }
+    Ok(())
+}
+
+/// Store attribute `name` = `value` on `file_id`, replacing any previous
+/// value. Values up to [`super::attributes::max_inline_attr_size`] are
+/// stored inline (`kHFSPlusAttrInlineData`), larger ones in their own
+/// extents (`kHFSPlusAttrForkData`, plus `kHFSPlusAttrExtents` records
+/// past eight runs) — the same split xnu makes.
+pub(crate) fn set_attr(
+    writer: &mut Writer,
+    dev: &mut dyn BlockDevice,
+    file_id: u32,
+    name: &[u16],
+    value: &[u8],
+) -> Result<()> {
+    if name.is_empty() || name.len() > super::attributes::MAX_ATTR_NAME_UNITS {
+        return Err(crate::Error::InvalidArgument(format!(
+            "hfs+: xattr name must be 1..={} UTF-16 code units (got {})",
+            super::attributes::MAX_ATTR_NAME_UNITS,
+            name.len()
+        )));
+    }
+    if u32::try_from(value.len()).is_err() || value.len() > i32::MAX as usize {
+        return Err(crate::Error::Unsupported(format!(
+            "hfs+: xattr value of {} bytes exceeds the HFS+ limit (2 GiB - 1)",
+            value.len()
+        )));
+    }
+    let max_inline = super::attributes::max_inline_attr_size(writer.attr_node_size);
+    // Allocate the new value before dropping the old one, so a failure
+    // (out of space) leaves the previous value intact.
+    let mut new_records: Vec<(AttrMapKey, Vec<u8>)> = Vec::new();
+    if value.len() <= max_inline {
+        new_records.push((
+            (file_id, name.to_vec(), 0),
+            super::attributes::encode_inline_body(value),
+        ));
+    } else {
+        let mut cursor = std::io::Cursor::new(value);
+        let (runs, total_blocks) = stream_into_runs(writer, dev, &mut cursor, value.len() as u64)?;
+        let mut fork = ForkData {
+            logical_size: value.len() as u64,
+            clump_size: 0,
+            total_blocks,
+            extents: [ExtentDescriptor::default(); FORK_EXTENT_COUNT],
+        };
+        for (slot, ext) in fork.extents.iter_mut().zip(runs.iter()) {
+            *slot = *ext;
+        }
+        let mut body = Vec::with_capacity(88);
+        body.extend_from_slice(&super::attributes::REC_FORK_DATA.to_be_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes());
+        encode_fork(&fork, &mut body);
+        new_records.push(((file_id, name.to_vec(), 0), body));
+        let mut start: u32 = runs
+            .iter()
+            .take(FORK_EXTENT_COUNT)
+            .map(|e| e.block_count)
+            .sum();
+        for chunk in runs[runs.len().min(FORK_EXTENT_COUNT)..].chunks(FORK_EXTENT_COUNT) {
+            let mut body = Vec::with_capacity(72);
+            body.extend_from_slice(&super::attributes::REC_EXTENTS.to_be_bytes());
+            body.extend_from_slice(&0u32.to_be_bytes());
+            for i in 0..FORK_EXTENT_COUNT {
+                let e = chunk.get(i).copied().unwrap_or_default();
+                body.extend_from_slice(&e.start_block.to_be_bytes());
+                body.extend_from_slice(&e.block_count.to_be_bytes());
+            }
+            new_records.push(((file_id, name.to_vec(), start), body));
+            start += chunk.iter().map(|e| e.block_count).sum::<u32>();
+        }
+    }
+    remove_attr(writer, file_id, name)?;
+    for (k, v) in new_records {
+        writer.attrs.insert(k, v);
+    }
+    Ok(())
+}
+
+/// Read attribute `name` of `file_id`, following extent-based storage.
+pub(crate) fn get_attr(
+    writer: &Writer,
+    dev: &mut dyn BlockDevice,
+    file_id: u32,
+    name: &[u16],
+) -> Result<Option<Vec<u8>>> {
+    let Some(first) = writer.attrs.get(&(file_id, name.to_vec(), 0)) else {
+        return Ok(None);
+    };
+    match super::attributes::AttrRecord::decode(first)? {
+        super::attributes::AttrRecord::Inline { data } => Ok(Some(data)),
+        super::attributes::AttrRecord::Fork { fork } => {
+            let mut extra: Vec<ExtentDescriptor> = Vec::new();
+            for k in attr_record_keys(writer, file_id, name) {
+                if k.2 == 0 {
+                    continue;
+                }
+                extra.extend(
+                    super::attributes::decode_extents_body(&writer.attrs[&k])?
+                        .into_iter()
+                        .filter(|e| e.block_count != 0),
+                );
+            }
+            if fork.logical_size > dev.total_size() {
+                return Err(crate::Error::InvalidImage(format!(
+                    "hfs+: xattr claims {} bytes, larger than the device",
+                    fork.logical_size
+                )));
+            }
+            let reader = if extra.is_empty() {
+                ForkReader::from_inline(&fork, writer.block_size, "xattr")?
+            } else {
+                ForkReader::from_inline_plus_overflow(&fork, &extra, writer.block_size, "xattr")?
+            };
+            let mut buf = vec![0u8; fork.logical_size as usize];
+            reader.read(dev, 0, &mut buf)?;
+            Ok(Some(buf))
+        }
+    }
+}
+
+/// Names of every attribute stored for `file_id`, in B-tree order.
+pub(crate) fn list_attr_names(writer: &Writer, file_id: u32) -> Vec<Vec<u16>> {
+    writer
+        .attrs
+        .range((file_id, Vec::new(), 0)..(file_id.saturating_add(1), Vec::new(), 0))
+        .filter(|(k, _)| k.0 == file_id && k.2 == 0)
+        .map(|(k, _)| k.1.clone())
+        .collect()
+}
+
+/// Set / clear `kHFSHasAttributesMask` and `kHFSHasSecurityMask` on every
+/// file and folder record from the attribute map.
+fn sync_attribute_flags(writer: &mut Writer) {
+    let security: Vec<u16> = SECURITY_ATTR.encode_utf16().collect();
+    let mut with_attrs: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut with_security: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for (fid, name, _) in writer.attrs.keys() {
+        with_attrs.insert(*fid);
+        if *name == security {
+            with_security.insert(*fid);
+        }
+    }
+    for (_, body) in writer.catalog.iter_mut() {
+        if body.len() < 12 {
+            continue;
+        }
+        let rt = i16::from_be_bytes([body[0], body[1]]);
+        if rt != REC_FILE && rt != REC_FOLDER {
+            continue;
+        }
+        let cnid = u32::from_be_bytes(body[8..12].try_into().unwrap());
+        let mut flags = u16::from_be_bytes([body[2], body[3]]);
+        flags &= !(FLAG_HAS_ATTRIBUTES | FLAG_HAS_SECURITY);
+        if with_attrs.contains(&cnid) {
+            flags |= FLAG_HAS_ATTRIBUTES;
+        }
+        if with_security.contains(&cnid) {
+            flags |= FLAG_HAS_SECURITY;
+        }
+        body[2..4].copy_from_slice(&flags.to_be_bytes());
+    }
+}
+
+/// Grow (or create) the attributes B-tree fork so it holds `needed_nodes`
+/// nodes, rounding a fresh fork up to the B-tree clump size.
+fn grow_attributes_fork(writer: &mut Writer, needed_nodes: u32) -> Result<()> {
+    let ns = writer.attr_node_size;
+    let bs = writer.block_size;
+    let fresh = writer.attributes_file.total_blocks == 0;
+    let mut needed_blocks = blocks_for_nodes(needed_nodes.max(1), ns, bs)?;
+    if fresh {
+        let clump = btree_clump_size(writer.total_blocks, bs, ns);
+        writer.attributes_file.clump_size = clump;
+        needed_blocks = needed_blocks.max(clump.div_ceil(bs));
+    }
+    if needed_blocks <= writer.attributes_file.total_blocks {
+        return Ok(());
+    }
+    let extra = needed_blocks - writer.attributes_file.total_blocks;
+    // A fresh tree should not starve user data: fall back to the bare
+    // minimum when the clump-rounded size doesn't fit.
+    let start = match writer.allocate(extra) {
+        Ok(s) => s,
+        Err(e) => {
+            if !fresh {
+                return Err(e);
+            }
+            let min = blocks_for_nodes(needed_nodes.max(1), ns, bs)?;
+            let s = writer.allocate(min).map_err(|_| {
+                crate::Error::Unsupported(format!(
+                    "hfs+ writer: no contiguous room for the attributes B-tree \
+                     ({min} blocks); reserve it at format time with \
+                     FormatOpts::attributes_nodes or size the volume larger"
+                ))
+            })?;
+            writer.attributes_file.extents[0] = ExtentDescriptor {
+                start_block: s,
+                block_count: min,
+            };
+            writer.attributes_file.total_blocks = min;
+            writer.attributes_file.logical_size = u64::from(min) * u64::from(bs);
+            return Ok(());
+        }
+    };
+    let slot = writer
+        .attributes_file
+        .extents
+        .iter()
+        .position(|e| e.block_count == 0)
+        .ok_or_else(|| {
+            crate::Error::Unsupported(
+                "hfs+ writer: attributes fork needs more than 8 extents".into(),
+            )
+        })?;
+    writer.attributes_file.extents[slot] = ExtentDescriptor {
+        start_block: start,
+        block_count: extra,
+    };
+    writer.attributes_file.total_blocks += extra;
+    writer.attributes_file.logical_size =
+        u64::from(writer.attributes_file.total_blocks) * u64::from(bs);
+    Ok(())
+}
+
+/// Serialise the attributes B-tree, creating / growing its fork as
+/// needed. `None` when the volume has neither an attributes file nor
+/// any attribute to store.
+fn build_attributes_tree(writer: &mut Writer) -> Result<Option<Vec<Vec<u8>>>> {
+    if writer.attrs.is_empty() && writer.attributes_file.total_blocks == 0 {
+        return Ok(None);
+    }
+    let ns = writer.attr_node_size;
+    let records = |w: &Writer| -> Vec<PackedRecord> {
+        w.attrs
+            .iter()
+            .map(|((fid, name, sb), body)| PackedRecord {
+                key: super::attributes::encode_attr_key(*fid, name, *sb),
+                body: body.clone(),
+            })
+            .collect()
+    };
+    let capacity = |w: &Writer| -> u32 {
+        (u64::from(w.attributes_file.total_blocks) * u64::from(w.block_size) / u64::from(ns)) as u32
+    };
+    let mut built = build_btree(records(writer), ns, capacity(writer))?;
+    if built.nodes.len() as u32 > capacity(writer) {
+        grow_attributes_fork(writer, built.nodes.len() as u32)?;
+        built = build_btree(records(writer), ns, capacity(writer))?;
+    }
+    let mut nodes = built.nodes;
+    if let Some(header) = nodes.first_mut() {
+        let h = NODE_DESCRIPTOR_SIZE;
+        // maxKeyLength 266, btreeType 0, keyCompareType 0 (xnu compares
+        // attribute keys itself), BigKeys | VariableIndexKeys — exactly
+        // what newfs_hfs writes.
+        header[h + 20..h + 22]
+            .copy_from_slice(&super::attributes::ATTR_MAX_KEY_LENGTH.to_be_bytes());
+        header[h + 32..h + 36].copy_from_slice(&writer.attributes_file.clump_size.to_be_bytes());
+        header[h + 36] = 0;
+        header[h + 37] = 0;
+        header[h + 38..h + 42].copy_from_slice(&6u32.to_be_bytes());
+    }
+    Ok(Some(nodes))
 }
 
 // ----------------------------------------------------------------------
@@ -2571,6 +3152,12 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
         }
     }
 
+    // `kHFSHasAttributesMask` / `kHFSHasSecurityMask` on every file and
+    // folder record must agree with the attributes B-tree (`fsck_hfs`
+    // checks both directions, and xnu skips the attribute lookup for a
+    // record without the flag). Derive them from the in-memory map.
+    sync_attribute_flags(writer);
+
     let cat_records = |w: &Writer| -> Vec<PackedRecord> {
         w.catalog
             .iter()
@@ -2657,6 +3244,18 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
         writer.block_size,
     )?;
 
+    // 2b. Attributes B-tree. Created on demand (and grown) here, before
+    //     the bitmap is written, so its blocks are accounted for.
+    if let Some(attr_nodes) = build_attributes_tree(writer)? {
+        write_btree_to_fork(
+            &mut sink,
+            &attr_nodes,
+            &writer.attributes_file,
+            writer.attr_node_size,
+            writer.block_size,
+        )?;
+    }
+
     // 3. Allocation bitmap.
     //
     // TN1150: when the bitmap has more bits than allocation blocks (the last
@@ -2732,6 +3331,7 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
     // The catalog fork may have grown (extra extents appended) while
     // building the B-tree; sync the header's fork descriptor so it matches.
     vh.catalog_file = writer.catalog_file;
+    vh.attributes_file = writer.attributes_file;
     // Count files vs. folders by scanning catalog (record types 1/2).
     let mut file_count: u32 = 0;
     let mut folder_count: u32 = 0;
@@ -2764,7 +3364,7 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
         writer.next_alloc,
         file_count,
         folder_count,
-        writer.create_date,
+        writer.volume_create_date,
         jib,
     );
     sink.write_at(VOLUME_HEADER_OFFSET, &buf)?;
@@ -3069,6 +3669,65 @@ pub fn open_writable(
         })
     };
 
+    // ---- 5. Attributes B-tree: load every leaf record verbatim so a
+    // rebuild on flush preserves them (and so xattrs can be edited).
+    let mut attrs: BTreeMap<AttrMapKey, Vec<u8>> = BTreeMap::new();
+    let mut attr_node_size = attr_node_size_for(node_size);
+    if vh.attributes_file.total_blocks > 0 {
+        let attr_fork = ForkReader::from_inline(
+            &vh.attributes_file,
+            block_size,
+            "attributes (writable open)",
+        )?;
+        let hdr = read_btree_header(dev, &attr_fork)?;
+        attr_node_size = u32::from(hdr.node_size);
+        let total = hdr.total_nodes;
+        let mut idx = hdr.first_leaf_node;
+        let mut steps_left = total as usize;
+        while idx != 0 {
+            if steps_left == 0 {
+                return Err(crate::Error::InvalidImage(
+                    "hfs+ open_writable: attributes leaf chain exceeded node count (cycle?)".into(),
+                ));
+            }
+            steps_left -= 1;
+            if idx >= total {
+                return Err(crate::Error::InvalidImage(format!(
+                    "hfs+ open_writable: attributes leaf node {idx} >= total_nodes {total}"
+                )));
+            }
+            let node = read_node(dev, &attr_fork, idx, attr_node_size)?;
+            let desc = NodeDescriptor::decode(&node)?;
+            if desc.kind != KIND_LEAF {
+                return Err(crate::Error::InvalidImage(format!(
+                    "hfs+ open_writable: attributes leaf chain node {idx} has kind {}",
+                    desc.kind
+                )));
+            }
+            let offs = record_offsets(&node, desc.num_records)?;
+            for i in 0..desc.num_records as usize {
+                let rec = record_bytes(&node, &offs, i);
+                let key = super::attributes::AttrKey::decode(rec)?;
+                if key.encoded_len > rec.len() {
+                    return Err(crate::Error::InvalidImage(
+                        "hfs+ open_writable: attribute key overruns record".into(),
+                    ));
+                }
+                attrs.insert(
+                    (key.file_id, key.name.code_units, key.start_block),
+                    rec[key.encoded_len..].to_vec(),
+                );
+            }
+            idx = desc.f_link;
+        }
+    }
+
+    // The volume header's createDate isn't kept in `VolumeHeader`; read
+    // it straight off the primary header so a rewrite preserves it.
+    let mut raw_vh = [0u8; 4];
+    dev.read_at(VOLUME_HEADER_OFFSET + 16, &mut raw_vh)?;
+    let volume_create_date = u32::from_be_bytes(raw_vh);
+
     // next_cnid: per TN1150, vh.nextCatalogID always names the next
     // unused CNID. Fall back to 16 (the first user CNID) if the header
     // value is below that, just in case.
@@ -3083,7 +3742,9 @@ pub fn open_writable(
         node_size,
         total_blocks,
         volume_name,
-        create_date: 0,
+        // New entries on a re-opened volume are stamped with the
+        // volume's own creation date, not 1904.
+        create_date: volume_create_date,
         next_cnid,
         bitmap,
         // Force first-fit on the next alloc; subsequent allocs resume
@@ -3107,6 +3768,9 @@ pub fn open_writable(
         journal_buffer_start: 0,
         journal_buffer_blocks: 0,
         flushed: false,
+        attrs,
+        attr_node_size,
+        volume_create_date,
     })
 }
 

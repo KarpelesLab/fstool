@@ -19,6 +19,15 @@
 //! (clean, no transactions to replay) can be requested via
 //! [`writer::FormatOpts::journaled`].
 //!
+//! Authoring metadata: 32-byte Finder info on any entry including the root
+//! ([`HfsPlus::set_finder_info`]), streaming resource forks
+//! ([`HfsPlus::write_resource_fork`]), extended attributes in the
+//! attributes B-tree, inline or extent-based ([`HfsPlus::set_xattr`]),
+//! stable CNIDs and creation dates readable before the final flush
+//! ([`HfsPlus::entry_info`], [`HfsPlus::set_create_date`]). Names are
+//! stored in the HFS+ decomposed form ([`unicode`]) and collide under
+//! the catalog comparator. [`size_plan`] budgets all of it.
+//!
 //! Implementation is based on Apple Technical Note TN1150, the
 //! canonical public reference for HFS+ on-disk structures.
 //!
@@ -27,14 +36,17 @@
 //! * No journal replay on read — the on-disk catalog is read as-is.
 //! * HFSX case-sensitive comparison is honoured at the catalog-key
 //!   level; non-ASCII case folding follows a simplified table.
-//! * Extended-attribute B-tree (`attributesFile`) is parsed on the
-//!   read side (for HFSCompression / `com.apple.decmpfs`); the writer
-//!   never produces one.
+//! * Extended-attribute B-tree (`attributesFile`) is read (xattrs,
+//!   HFSCompression's `com.apple.decmpfs`) and rewritten on flush;
+//!   the writer creates it on demand or at format time
+//!   ([`writer::FormatOpts::attributes_nodes`]).
 //! * HFSCompression (`UF_COMPRESSED` + `com.apple.decmpfs`) is decoded
 //!   for compression types 1, 3, and 4 (uncompressed inline, zlib
 //!   inline, zlib in the resource fork); LZVN (7, 8) and LZFSE
 //!   (11, 12) return [`crate::Error::Unsupported`].
-//! * Resource forks are always written as empty.
+//! * HFS+ name decomposition uses current Unicode data with Apple's
+//!   exclusions; names with several combining marks unassigned in
+//!   Unicode 3.2 may order differently from the kernel (see [`unicode`]).
 //!
 //! ## Module layout
 //!
@@ -51,12 +63,17 @@ pub(crate) mod case_fold;
 pub mod catalog;
 pub mod decmpfs;
 pub mod extents;
+pub mod finder;
 pub mod handle;
 pub(crate) mod journal;
+mod meta;
 pub mod size_plan;
+pub mod unicode;
 pub mod volume_header;
 pub mod writer;
 
+pub use finder::FinderInfo;
+pub use meta::{EntryInfo, hfs_date_from_unix, unix_from_hfs_date};
 pub use writer::FormatOpts;
 
 use std::io::Read;
@@ -536,6 +553,8 @@ impl HfsPlus {
             "catalog",
         )?;
         self.catalog = Catalog::open(dev, cat_fork, hfsx)?;
+        // The flush may have created or grown the attributes B-tree.
+        self.attributes = open_attributes(dev, &self.volume_header, hfsx)?;
         w.flushed = false;
         Ok(())
     }
@@ -556,7 +575,7 @@ impl HfsPlus {
             .as_ref()
             .ok_or_else(|| crate::Error::InvalidArgument("hfs+: volume is read-only".into()))?;
         for part in prefix {
-            let name = UniStr::from_path_component(part);
+            let name = w.resolve_component(cnid, part)?;
             let (_, child_cnid, rec_type) = w.lookup(cnid, &name).ok_or_else(|| {
                 crate::Error::InvalidArgument(format!(
                     "hfs+: parent component {part:?} does not exist"
@@ -569,12 +588,26 @@ impl HfsPlus {
             }
             cnid = child_cnid;
         }
-        Ok((cnid, UniStr::from_path_component(last)))
+        Ok((cnid, w.resolve_component(cnid, last)?))
     }
 
     /// Total byte capacity advertised by the volume header.
     pub fn total_bytes(&self) -> u64 {
         u64::from(self.volume_header.total_blocks) * u64::from(self.volume_header.block_size)
+    }
+
+    /// Bytes still free for new data, resource forks and extent-based
+    /// xattrs, as of the in-memory state (so it reflects unflushed
+    /// creates). A caller holding back a budget for generated files can
+    /// check it before writing them. Metadata trees that still have to
+    /// grow at flush time (an attributes B-tree created lazily, a catalog
+    /// past its reserved nodes) also draw from this pool.
+    pub fn free_bytes(&self) -> u64 {
+        let free = match &self.writer {
+            Some(w) => w.free_blocks,
+            None => self.volume_header.free_blocks,
+        };
+        u64::from(free) * u64::from(self.volume_header.block_size)
     }
 
     /// Allocation block size in bytes.
@@ -681,49 +714,22 @@ impl HfsPlus {
         dev: &'a mut dyn BlockDevice,
         path: &str,
     ) -> Result<HfsPlusFileReader<'a>> {
-        let file = self.resource_fork_file(dev, path)?.ok_or_else(|| {
+        let (file_id, fork) = self.rsrc_fork_of(path)?.ok_or_else(|| {
             crate::Error::InvalidArgument(format!("hfs+: {path:?} has no resource fork"))
         })?;
-        let size = file.resource_fork.logical_size;
-        let fork = self.open_fork(
-            dev,
-            &file.resource_fork,
-            file.file_id,
-            extents::FORK_RESOURCE,
-            "resource",
-        )?;
-        Ok(HfsPlusFileReader::streaming(dev, fork, size))
+        let reader = self.writer_fork_reader(&fork, file_id, extents::FORK_RESOURCE)?;
+        Ok(HfsPlusFileReader::streaming(dev, reader, fork.logical_size))
     }
 
     /// Resource-fork logical size for `path`, or `None` when the file has no
     /// usable resource fork (absent, not a regular file, or HFS-compressed).
-    pub fn resource_fork_size(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<Option<u64>> {
-        Ok(self
-            .resource_fork_file(dev, path)?
-            .map(|f| f.resource_fork.logical_size))
-    }
-
-    /// Resolve `path` to a regular file carrying a genuine (non-`decmpfs`)
-    /// resource fork. `Ok(None)` means the path exists but has no usable
-    /// resource fork; a missing path propagates as an error.
-    fn resource_fork_file(
+    /// Like the reader above, this sees forks written since the last flush.
+    pub fn resource_fork_size(
         &self,
-        dev: &mut dyn BlockDevice,
+        _dev: &mut dyn BlockDevice,
         path: &str,
-    ) -> Result<Option<CatalogFile>> {
-        let file = match self.lookup_path(dev, path)? {
-            CatalogRecord::File(f) => self.resolve_hard_link(dev, f)?,
-            _ => return Ok(None),
-        };
-        // An HFS-compressed file stores its compressed payload in the resource
-        // fork (decmpfs type 4/8/12); that is not a user resource fork.
-        if file.bsd.owner_flags & decmpfs::UF_COMPRESSED != 0 {
-            return Ok(None);
-        }
-        if file.resource_fork.logical_size == 0 {
-            return Ok(None);
-        }
-        Ok(Some(file))
+    ) -> Result<Option<u64>> {
+        Ok(self.rsrc_fork_of(path)?.map(|(_, f)| f.logical_size))
     }
 
     /// Read a symlink's target by absolute path. Returns the raw
@@ -833,6 +839,19 @@ impl HfsPlus {
         parent_id: u32,
         name: &str,
     ) -> Result<CatalogRecord> {
+        // HFS+-normalised form first (what macOS stores and looks up),
+        // then the verbatim spelling for names some other writer left
+        // un-normalised.
+        if let Ok(normalized) = unicode::component_to_unistr(name) {
+            let key = CatalogKey {
+                parent_id,
+                name: normalized,
+                encoded_len: 0,
+            };
+            if let Some(rec) = self.catalog.lookup(dev, &key)? {
+                return Ok(rec);
+            }
+        }
         let key = CatalogKey {
             parent_id,
             name: UniStr::from_path_component(name),
@@ -1684,10 +1703,10 @@ impl crate::fs::Filesystem for HfsPlus {
         Ok(Box::new(r))
     }
 
-    /// Surface a file's resource fork as the macOS-standard
-    /// `com.apple.ResourceFork` extended attribute (read-only, capped at
-    /// 16 MiB), mirroring classic HFS. HFS-compressed files (whose resource
-    /// fork holds `decmpfs` storage) yield no such xattr.
+    /// Every extended attribute as macOS presents it: the Finder info as
+    /// `com.apple.FinderInfo` (when non-zero), the resource fork as
+    /// `com.apple.ResourceFork` (capped at 16 MiB, mirroring classic HFS;
+    /// HFS-compressed files have none), then the attributes B-tree.
     fn list_xattrs(
         &mut self,
         dev: &mut dyn BlockDevice,
@@ -1696,24 +1715,53 @@ impl crate::fs::Filesystem for HfsPlus {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("hfs+: non-UTF-8 path".into()))?;
-        let Some(file) = self.resource_fork_file(dev, s)? else {
-            return Ok(Vec::new());
-        };
-        const CAP: u64 = 16 * 1024 * 1024;
-        let size = file.resource_fork.logical_size.min(CAP) as usize;
-        let fork = self.open_fork(
-            dev,
-            &file.resource_fork,
-            file.file_id,
-            extents::FORK_RESOURCE,
-            "resource",
-        )?;
-        let mut buf = vec![0u8; size];
-        fork.read(dev, 0, &mut buf)?;
-        Ok(vec![crate::fs::XattrPair {
-            name: "com.apple.ResourceFork".into(),
-            value: buf,
-        }])
+        let mut out = Vec::new();
+        for name in self.list_xattr_names(s)? {
+            if name == meta::XATTR_RESOURCE_FORK {
+                const CAP: u64 = 16 * 1024 * 1024;
+                let Some((file_id, fork)) = self.rsrc_fork_of(s)? else {
+                    continue;
+                };
+                let size = fork.logical_size.min(CAP) as usize;
+                let reader = self.writer_fork_reader(&fork, file_id, extents::FORK_RESOURCE)?;
+                let mut buf = vec![0u8; size];
+                reader.read(dev, 0, &mut buf)?;
+                out.push(crate::fs::XattrPair { name, value: buf });
+                continue;
+            }
+            if let Some(value) = self.get_xattr(dev, s, &name)? {
+                out.push(crate::fs::XattrPair { name, value });
+            }
+        }
+        Ok(out)
+    }
+
+    /// See [`HfsPlus::set_xattr`]: `com.apple.FinderInfo` and
+    /// `com.apple.ResourceFork` map onto the catalog record, everything
+    /// else lands in the attributes B-tree.
+    fn set_xattr(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        name: &str,
+        value: &[u8],
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: non-UTF-8 path".into()))?;
+        HfsPlus::set_xattr(self, dev, s, name, value)
+    }
+
+    fn remove_xattr(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        name: &str,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: non-UTF-8 path".into()))?;
+        HfsPlus::remove_xattr(self, dev, s, name).map(|_| ())
     }
 
     fn getattr(
@@ -3301,7 +3349,7 @@ mod tests {
         // Record body: inline-data.
         let mut body = Vec::new();
         body.extend_from_slice(&attributes::REC_INLINE_DATA.to_be_bytes());
-        body.extend_from_slice(&0u32.to_be_bytes()); // reserved
+        body.extend_from_slice(&[0u8; 8]); // reserved[2]
         body.extend_from_slice(&(decmpfs_value.len() as u32).to_be_bytes());
         body.extend_from_slice(decmpfs_value);
 

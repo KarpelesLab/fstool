@@ -215,8 +215,9 @@ f2fs = ["std"]
 apfs = ["std", "dep:intl"]
 # Classic HFS (Mac OS ≤ 8) — also the resource-fork + MacRoman helpers.
 hfs = ["std"]
-# HFS+ / HFSX.
-hfs-plus = ["std"]
+# HFS+ / HFSX. `intl` supplies the canonical decomposition behind the
+# HFS+ name normalisation (Unicode NFD with Apple's exclusions).
+hfs-plus = ["std", "dep:intl"]
 # Amiga OFS / FFS.
 affs = ["std"]
 # ISO 9660 (+ Joliet, Rock Ridge, El Torito).
@@ -441,7 +442,7 @@ tomlproc = { version = "0.1.1", optional = true, default-features = false, featu
 # folds, so getting it wrong files a drec in a bucket the kernel never
 # looks up (see the `apfs_drec_hash_known_vectors` test, which pins the
 # exact hashes).
-intl = { version = "0.6.1", optional = true, default-features = false, features = ["case", "full"] }
+intl = { version = "0.6.3", optional = true, default-features = false, features = ["case", "full"] }
 
 # Legacy character encodings, via `charcode` (KarpelesLab) — the WHATWG
 # Encoding Standard with no dependencies of its own. Four of its tables
