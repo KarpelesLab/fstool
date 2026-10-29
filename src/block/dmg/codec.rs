@@ -231,13 +231,25 @@ pub fn decode_lzfse(_src: &[u8], _plain_len: usize) -> Result<Vec<u8>> {
     ))
 }
 
-/// Decode an LZMA chunk payload into a vector of exactly `plain_len`
-/// bytes. DMG uses the raw LZMA1 frame (the legacy `.lzma` shape with
-/// a 13-byte header carrying properties + dictionary size +
-/// uncompressed length), not the XZ container.
-#[cfg(feature = "lzma")]
+/// Decode an LZMA chunk (ULMO) payload into a vector of exactly
+/// `plain_len` bytes. Current `hdiutil` writes each chunk as an XZ
+/// container; the raw LZMA1 frame (the legacy `.lzma` shape: a 13-byte
+/// header with properties, dictionary size and length) is accepted too.
+/// Which one it is follows from the XZ magic.
 pub fn decode_lzma(src: &[u8], plain_len: usize) -> Result<Vec<u8>> {
-    let out = crate::compression::decompress(crate::compression::Algo::Lzma, src, plain_len)?;
+    use crate::compression::Algo;
+    let (algo, feature) = if src.starts_with(b"\xFD7zXZ\x00") {
+        (Algo::Xz, "xz")
+    } else {
+        (Algo::Lzma, "lzma")
+    };
+    if !algo.enabled() {
+        return Err(crate::Error::Unsupported(format!(
+            "dmg: this LZMA chunk is {}-framed and needs the `{feature}` Cargo feature",
+            algo.name()
+        )));
+    }
+    let out = crate::compression::decompress(algo, src, plain_len)?;
     if out.len() != plain_len {
         return Err(crate::Error::InvalidImage(format!(
             "dmg: lzma chunk inflated to {} bytes but sector_count*512 = {}",
@@ -246,14 +258,6 @@ pub fn decode_lzma(src: &[u8], plain_len: usize) -> Result<Vec<u8>> {
         )));
     }
     Ok(out)
-}
-
-/// Stub when the LZMA dep was compiled out.
-#[cfg(not(feature = "lzma"))]
-pub fn decode_lzma(_src: &[u8], _plain_len: usize) -> Result<Vec<u8>> {
-    Err(crate::Error::Unsupported(
-        "dmg: LZMA chunks require the `lzma` Cargo feature".into(),
-    ))
 }
 
 /// Decode an ADC chunk into a vector of exactly `plain_len` bytes.
@@ -467,6 +471,17 @@ mod tests {
         ];
         let plain = decode_bzip2(compressed, b"hello world\n".len()).unwrap();
         assert_eq!(plain, b"hello world\n");
+    }
+
+    #[cfg(feature = "xz")]
+    #[test]
+    fn xz_framed_lzma_chunk_decodes() {
+        // Native ULMO chunks are XZ containers.
+        let plain: Vec<u8> = (0..4096u32).map(|i| (i % 7) as u8).collect();
+        let compressed =
+            crate::compression::compress(crate::compression::Algo::Xz, &plain).unwrap();
+        assert!(compressed.starts_with(b"\xFD7zXZ\x00"));
+        assert_eq!(decode_lzma(&compressed, plain.len()).unwrap(), plain);
     }
 
     #[cfg(feature = "lzma")]

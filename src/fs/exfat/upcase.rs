@@ -16,7 +16,7 @@
 //! ```
 //!
 //! The last form is not an edge case: the specification's recommended
-//! table ends with it (see [`super::upcase_table`]).
+//! table ends with it (see `upcase_table.rs`).
 //!
 //! ## Validation
 //!

@@ -273,12 +273,9 @@ fn dmg_ulfo_lzfse_reads_every_sector() {
     dmg_read_every_sector("ULFO");
 }
 
-// Native ULMO chunks are XZ containers (`FD 37 7A 58 5A 00`), but
-// `codec::decode_lzma` expects a raw `.lzma` (LZMA-alone) frame. Tracked
-// separately from the Mish/ADC fix; un-ignore once ULMO uses XZ.
-#[cfg(feature = "lzma")]
+// Native ULMO chunks are XZ containers (`FD 37 7A 58 5A 00`).
+#[cfg(feature = "xz")]
 #[test]
-#[ignore = "native ULMO chunks are XZ, decoder expects LZMA-alone (separate bug)"]
 fn dmg_ulmo_lzma_reads_every_sector() {
     dmg_read_every_sector("ULMO");
 }
