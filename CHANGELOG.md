@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/KarpelesLab/fstool/compare/v0.5.0...v0.5.1) - 2026-10-29
+
+### Added
+
+- *(cramfs)* cramfs read + write (create / repack)
+- *(zip)* encryption, split volumes, uid/gid and Unix timestamps
+- *(zip)* every compression method behind its compcol feature
+
+### Fixed
+
+- last struct literals of #[non_exhaustive] option structs
+- *(dmg)* ULMO chunks are XZ containers
+- *(apfs)* list regular files with their data-stream size
+- *(exfat)* write + allocate the spec's full compressed up-case table
+- *(fat)* hosted driver honours NT short-name case flags (byte 12)
+- *(dmg)* Mish descriptors start at 0xCC; ADC literal flag is bit 7
+- *(cramfs)* images pass fsck.cramfs — drop FLAG_HOLES, use --extract=
+
+### Other
+
+- [**breaking**] raise MSRV to 1.95
+- *(api)* [**breaking**] #[non_exhaustive] on growing enums and option structs
+- *(grf)* build the CP949 test's tar by hand instead of with host tar
+
 ## [0.5.0](https://github.com/KarpelesLab/fstool/compare/v0.4.35...v0.5.0) - 2026-10-04
 
 ### Added
