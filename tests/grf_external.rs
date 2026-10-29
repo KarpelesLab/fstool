@@ -123,29 +123,40 @@ fn build_grf_from_tar_and_round_trip() {
     );
 }
 
+/// A one-member ustar archive, written by hand so the test doesn't
+/// depend on how the host `tar` encodes a non-ASCII argument (Windows'
+/// `tar` fails to archive a Hangul filename outright).
+fn ustar_one_file(name: &str, body: &[u8]) -> Vec<u8> {
+    let mut hdr = [0u8; 512];
+    hdr[..name.len()].copy_from_slice(name.as_bytes());
+    hdr[100..108].copy_from_slice(b"0000644\0");
+    hdr[108..116].copy_from_slice(b"0000000\0");
+    hdr[116..124].copy_from_slice(b"0000000\0");
+    hdr[124..136].copy_from_slice(format!("{:011o}\0", body.len()).as_bytes());
+    hdr[136..148].copy_from_slice(b"00000000000\0");
+    hdr[156] = b'0';
+    hdr[257..263].copy_from_slice(b"ustar\0");
+    hdr[263..265].copy_from_slice(b"00");
+    // The checksum is computed with its own field read as spaces.
+    hdr[148..156].fill(b' ');
+    let sum: u32 = hdr.iter().map(|&b| u32::from(b)).sum();
+    hdr[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    let mut out = hdr.to_vec();
+    out.extend_from_slice(body);
+    out.resize(out.len().div_ceil(512) * 512, 0);
+    // End-of-archive: two zero blocks.
+    out.extend_from_slice(&[0u8; 1024]);
+    out
+}
+
 #[test]
 fn cp949_filename_round_trips_through_cli() {
-    if which("tar").is_none() {
-        eprintln!("skipping: tar not installed");
-        return;
-    }
     ensure_built();
 
     let work = tempfile::tempdir().unwrap();
-    let stage = work.path().join("stage");
-    std::fs::create_dir_all(&stage).unwrap();
     let korean_name = "한글.txt";
-    std::fs::write(stage.join(korean_name), b"korean text\n").unwrap();
-
     let tar_path = work.path().join("src.tar");
-    let status = Command::new("tar")
-        .arg("cf")
-        .arg(&tar_path)
-        .arg(korean_name)
-        .current_dir(&stage)
-        .status()
-        .expect("spawn tar");
-    assert!(status.success(), "tar cf failed");
+    std::fs::write(&tar_path, ustar_one_file(korean_name, b"korean text\n")).unwrap();
 
     let grf_path = work.path().join("out.grf");
     let status = Command::new(fstool())
