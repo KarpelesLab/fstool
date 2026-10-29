@@ -12,7 +12,11 @@
 //! ```text
 //!     decompressed[i]      = next u16 (i increments by 1)
 //!     0xFFFF, count        = decompressed[i..i+count] = i..i+count
+//!     0xFFFF <end>         = decompressed[i] = 0xFFFF (a literal, not a run)
 //! ```
+//!
+//! The last form is not an edge case: the specification's recommended
+//! table ends with it (see [`super::upcase_table`]).
 //!
 //! ## Validation
 //!
@@ -74,13 +78,13 @@ impl Upcase {
         while i + 2 <= slice.len() {
             let v = u16::from_le_bytes(slice[i..i + 2].try_into().unwrap());
             i += 2;
-            if v == 0xFFFF {
-                // Expect a count u16; identity-fill that many slots.
-                if i + 2 > slice.len() {
-                    return Err(crate::Error::InvalidImage(
-                        "exfat: upcase table truncated after 0xFFFF escape".into(),
-                    ));
-                }
+            if v == 0xFFFF && i + 2 > slice.len() {
+                // A 0xFFFF with nothing after it is not a run marker but
+                // a literal mapping: the recommended table ends this way,
+                // its last entry saying U+FFFF maps to itself.
+                table.push(v);
+            } else if v == 0xFFFF {
+                // A count u16 follows; identity-fill that many slots.
                 let count = u16::from_le_bytes(slice[i..i + 2].try_into().unwrap()) as usize;
                 i += 2;
                 let base = table.len();
@@ -210,6 +214,39 @@ mod tests {
         assert_eq!(uc.up(6), 6);
         // Slot 7 is the explicit 0xABCD.
         assert_eq!(uc.up(7), 0xABCD);
+    }
+
+    #[test]
+    fn trailing_ffff_is_a_literal_not_a_truncated_run() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(b'A' as u16).to_le_bytes());
+        bytes.extend_from_slice(&0xFFFFu16.to_le_bytes());
+        let uc = Upcase::decode(&bytes, bytes.len() as u64).unwrap();
+        assert_eq!(uc.len(), 2);
+        assert_eq!(uc.up(0), b'A' as u16);
+        assert_eq!(uc.up(1), 0xFFFF);
+    }
+
+    #[test]
+    fn recommended_table_decodes_the_whole_bmp() {
+        let bytes = super::super::upcase_table::UPCASE_TABLE;
+        let uc = Upcase::decode(bytes, bytes.len() as u64).unwrap();
+        assert_eq!(uc.len(), 0x1_0000, "covers every BMP code unit");
+        assert_eq!(uc.up(0xFFFF), 0xFFFF);
+        assert_eq!(uc.up('a' as u16), 'A' as u16);
+        assert_eq!(uc.up('z' as u16), 'Z' as u16);
+        assert_eq!(uc.up('A' as u16), 'A' as u16);
+        assert_eq!(uc.up(0x00E9), 0x00C9, "é → É");
+        assert_eq!(uc.up(0x00FF), 0x0178, "ÿ → Ÿ");
+        assert_eq!(uc.up(0x03C9), 0x03A9, "ω → Ω");
+        assert_eq!(uc.up(0x044F), 0x042F, "я → Я");
+        assert_eq!(uc.up(0xFF41), 0xFF21, "fullwidth a → A");
+        for cjk in [0x4E00u16, 0x6C34, 0x9FFF, 0xAC00] {
+            assert_eq!(uc.up(cjk), cjk, "CJK/Hangul {cjk:#06x} is identity");
+        }
+        let a: Vec<u16> = "Ελληνικά é я".encode_utf16().collect();
+        let b: Vec<u16> = "ΕΛΛΗΝΙΚΆ É Я".encode_utf16().collect();
+        assert!(uc.eq_ignore_case(&a, &b));
     }
 
     #[test]

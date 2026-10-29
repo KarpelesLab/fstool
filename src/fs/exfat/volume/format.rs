@@ -26,10 +26,10 @@ use super::super::layout::{self, ENTRY_SIZE};
 use super::{Error, SectorDriver, Volume};
 
 /// The specification's recommended up-case table, compressed.
-const UPCASE: &[u8] = include_bytes!("../upcase_table.bin");
+const UPCASE: &[u8] = super::super::upcase_table::UPCASE_TABLE;
 
 /// Its checksum, as the up-case directory entry records it.
-const UPCASE_CHECKSUM: u32 = 0xE619_D30D;
+const UPCASE_CHECKSUM: u32 = super::super::upcase_table::UPCASE_TABLE_CHECKSUM;
 
 /// How [`Volume::format`] lays a volume out. The default picks the cluster
 /// size from the volume's size.

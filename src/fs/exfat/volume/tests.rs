@@ -1025,6 +1025,70 @@ mod cross {
         assert!(!names.contains(&String::from("d5.bin")), "{names:?}");
         assert_eq!(hosted_read(&mut fs, &mut dev, "/after.txt"), b"last word");
     }
+
+    /// Names beyond ASCII, created by one half, found under another case
+    /// by the other. The driver checks NameHash before comparing names, so
+    /// this also proves both halves hash through the same full table.
+    const NAME: &str = "/Élan-Ωmega-Ярус.txt";
+    const OTHER_CASE: &str = "/éLAN-ωMEGA-яРУС.TXT";
+
+    #[test]
+    fn a_non_ascii_name_the_hosted_half_wrote_is_found_case_insensitively_by_the_driver() {
+        for spc_shift in [0u8, 3] {
+            let mut dev = MemoryBackend::new(8 * 1024 * 1024);
+            let opts = FormatOpts {
+                sectors_per_cluster_shift: spc_shift,
+                ..Default::default()
+            };
+            let mut fs = Exfat::format(&mut dev, &opts).unwrap();
+            fs.create_file(&mut dev, NAME, &mut Cursor::new(b"hi".to_vec()), 2, 0)
+                .unwrap();
+            fs.flush(&mut dev).unwrap();
+            // The hosted half itself, before and after a re-open.
+            assert_eq!(hosted_read(&mut fs, &mut dev, OTHER_CASE), b"hi");
+            let mut fs = Exfat::open(&mut dev).unwrap();
+            assert_eq!(hosted_read(&mut fs, &mut dev, OTHER_CASE), b"hi");
+            assert!(
+                fs.create_file(&mut dev, OTHER_CASE, &mut Cursor::new(Vec::new()), 0, 0)
+                    .is_err(),
+                "the other case is the same name"
+            );
+
+            let mut vol = Volume::<_, 512>::mount(as_card(dev)).unwrap();
+            assert_eq!(
+                read_all(&mut vol, OTHER_CASE),
+                b"hi",
+                "spc_shift {spc_shift}"
+            );
+            assert!(matches!(
+                vol.create_file(OTHER_CASE),
+                Err(Error::AlreadyExists)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_non_ascii_name_the_driver_wrote_is_found_case_insensitively_by_the_hosted_half() {
+        for cluster in [512u32, 4096] {
+            let opts = VolumeFormatOpts {
+                cluster_size: Some(cluster),
+                ..Default::default()
+            };
+            // The driver's formatter writes the recommended table, which
+            // ends with a literal 0xFFFF the hosted decoder must accept.
+            let mut vol = Volume::<_, 512>::format(RamCard::new(16 * 1024), &opts).unwrap();
+            write_file(&mut vol, NAME, b"from the driver");
+            let card = vol.unmount().unwrap();
+
+            let mut dev = MemoryBackend::from_bytes(card.data);
+            let mut fs = Exfat::open(&mut dev).unwrap();
+            assert_eq!(
+                hosted_read(&mut fs, &mut dev, OTHER_CASE),
+                b"from the driver",
+                "cluster {cluster}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1293,6 +1357,80 @@ mod formatting {
             vol.create_file("/ωmega-æøå-straße.txt"),
             Err(Error::AlreadyExists)
         ));
+    }
+
+    #[test]
+    fn cyrillic_and_accented_names_fold_at_every_cluster_size() {
+        for cluster in [512u32, 4096] {
+            let opts = VolumeFormatOpts {
+                cluster_size: Some(cluster),
+                ..Default::default()
+            };
+            let mut vol = Volume::<_, 512>::format(Sparse::new(16 * MIB, 512), &opts).unwrap();
+            vol.create_file("/Élan-Ярус.txt").unwrap();
+            let card = vol.unmount().unwrap();
+            let mut vol = Volume::<_, 512>::mount(card).unwrap();
+            assert!(vol.exists("/éLAN-яРУС.TXT").unwrap(), "cluster {cluster}");
+            assert!(!vol.exists("/Elan-Ярус.txt").unwrap(), "É is not E");
+        }
+    }
+
+    /// The up-case table is 5836 bytes: twelve 512-byte clusters, two of
+    /// 4 KiB. Every one of them must be chained in the FAT and marked in
+    /// the bitmap, with the root directory after the last.
+    #[test]
+    fn the_up_case_table_gets_its_whole_chain() {
+        use super::super::super::upcase_table::{UPCASE_TABLE, UPCASE_TABLE_CHECKSUM};
+        let bytes = 16 * MIB;
+        for (cluster, want) in [(512u32, 12u32), (4096, 2)] {
+            let opts = VolumeFormatOpts {
+                cluster_size: Some(cluster),
+                ..Default::default()
+            };
+            let vol = Volume::<_, 512>::format(Sparse::new(bytes, 512), &opts).unwrap();
+            let p = plan(bytes / 512, 512, Some(cluster)).unwrap();
+            assert_eq!(p.upcase_clusters, want);
+            let card = vol.unmount().unwrap();
+            let byte_at = |off: u64| {
+                card.data
+                    .get(&(off / 512))
+                    .map_or(0xE5, |s| s[(off % 512) as usize])
+            };
+            let u32_at =
+                |off: u64| u32::from_le_bytes(core::array::from_fn(|i| byte_at(off + i as u64)));
+            let fat = |c: u32| u32_at(p.fat_offset as u64 * 512 + c as u64 * 4);
+            let cluster_off = |c: u32| (p.heap_offset as u64 + (c as u64 - 2) * p.spc as u64) * 512;
+
+            let first = 2 + p.bitmap_clusters;
+            let root = p.root_cluster();
+            assert_eq!(root, first + want);
+            for c in first..root - 1 {
+                assert_eq!(fat(c), c + 1, "cluster {c}");
+            }
+            assert_eq!(fat(root - 1), layout::FAT_EOC);
+            assert_eq!(fat(root), layout::FAT_EOC);
+            assert_eq!(fat(root + 1), layout::FAT_FREE);
+
+            let bit = |c: u32| byte_at(cluster_off(2) + (c as u64 - 2) / 8) >> ((c - 2) % 8) & 1;
+            for c in 2..=root {
+                assert_eq!(bit(c), 1, "cluster {c} marked");
+            }
+            assert_eq!(bit(root + 1), 0);
+
+            let table: Vec<u8> = (0..UPCASE_TABLE.len() as u64)
+                .map(|i| byte_at(cluster_off(first) + i))
+                .collect();
+            assert_eq!(table, UPCASE_TABLE);
+
+            // The root's up-case entry: checksum, first cluster, length.
+            let entry = (0..4u64)
+                .map(|i| cluster_off(root) + i * 32)
+                .find(|&o| byte_at(o) == layout::ENTRY_UPCASE_TABLE)
+                .expect("an up-case entry");
+            assert_eq!(u32_at(entry + 4), UPCASE_TABLE_CHECKSUM);
+            assert_eq!(u32_at(entry + 20), first);
+            assert_eq!(u32_at(entry + 24), 5836);
+        }
     }
 
     #[test]

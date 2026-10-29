@@ -62,6 +62,10 @@
 // nothing, so it is compiled in every configuration.
 pub(crate) mod layout;
 
+// The specification's recommended up-case table, which both formatters
+// write. Plain bytes, so it too is compiled in every configuration.
+pub(crate) mod upcase_table;
+
 mod volume;
 
 // The driver's test fixtures, for the generic layer's tests to lay volumes

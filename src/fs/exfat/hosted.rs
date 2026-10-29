@@ -42,6 +42,7 @@ pub mod upcase;
 // The on-disk vocabulary both halves speak lives in the module root; the
 // re-export keeps `super::layout` resolving for the submodules above.
 pub(super) use super::layout;
+pub(super) use super::upcase_table;
 
 use boot::BootSector;
 use dir::{ENTRY_FILE, ENTRY_INUSE, ENTRY_SIZE, FileEntrySet, RawSlot};
@@ -230,18 +231,19 @@ impl Exfat {
         format::write_boot_region(dev, &geom, 12 * ss as u64)?;
 
         // --- 2. FAT. Initialise reserved entries; chain the bitmap's
-        //        clusters (2..) and make the up-case table and root each a
-        //        one-cluster EOC chain after it.
+        //        clusters (2..), then the up-case table's (as many as
+        //        its 5836 bytes need), then a one-cluster root.
         let mut fat = Fat::new_blank(geom.cluster_count as usize + 2);
         const CL_BITMAP: u32 = 2;
         let cl_upcase: u32 = CL_BITMAP + geom.bitmap_clusters;
-        let cl_root: u32 = cl_upcase + 1;
+        let cl_root: u32 = cl_upcase + geom.upcase_clusters;
         debug_assert_eq!(cl_root, geom.first_cluster_of_root_directory);
-        for c in CL_BITMAP..cl_upcase {
-            let next = if c + 1 == cl_upcase { fat::EOC } else { c + 1 };
-            fat.set_raw(c, next);
+        for (start, end) in [(CL_BITMAP, cl_upcase), (cl_upcase, cl_root)] {
+            for c in start..end {
+                let next = if c + 1 == end { fat::EOC } else { c + 1 };
+                fat.set_raw(c, next);
+            }
         }
-        fat.set_raw(cl_upcase, fat::EOC);
         fat.set_raw(cl_root, fat::EOC);
 
         // --- 3. Allocation bitmap. -------------------------------------
@@ -252,8 +254,8 @@ impl Exfat {
         }
 
         // --- 4. Up-case table. -----------------------------------------
-        let (upcase_bytes, upcase_csum) = format::make_ascii_upcase_table();
-        let upcase = Upcase::decode(&upcase_bytes, upcase_bytes.len() as u64)?;
+        let (upcase_bytes, upcase_csum) = format::recommended_upcase_table();
+        let upcase = Upcase::decode(upcase_bytes, upcase_bytes.len() as u64)?;
 
         // --- 5. Root directory: VolumeLabel + Bitmap + UpcaseTable. ----
         let mut root = Vec::new();
@@ -288,10 +290,13 @@ impl Exfat {
         let bm_off = geom.cluster_byte_offset(CL_BITMAP);
         let up_off = geom.cluster_byte_offset(cl_upcase);
         let root_off = geom.cluster_byte_offset(cl_root);
-        dev.zero_range(bm_off, (geom.bitmap_clusters as u64 + 2) * bpc)?;
+        dev.zero_range(
+            bm_off,
+            (geom.bitmap_clusters as u64 + geom.upcase_clusters as u64 + 1) * bpc,
+        )?;
 
         dev.write_at(bm_off, &bitmap)?;
-        dev.write_at(up_off, &upcase_bytes)?;
+        dev.write_at(up_off, upcase_bytes)?;
         dev.write_at(root_off, &root)?;
 
         // --- 7. Build the in-memory BootSector mirror. -----------------
@@ -2655,6 +2660,78 @@ mod tests {
         assert_eq!(fs2.volume_label(), "");
     }
 
+    /// The formatter writes the specification's recommended up-case table
+    /// (5836 bytes, checksum 0xE619D30D) and allocates every cluster it
+    /// needs — twelve at 512 bytes — in both the FAT and the bitmap.
+    #[test]
+    fn format_writes_and_allocates_the_full_upcase_table() {
+        for (spc_shift, want) in [(0u8, 12u32), (3, 2)] {
+            let mut dev = MemoryBackend::new(8 * 1024 * 1024);
+            let opts = FormatOpts {
+                sectors_per_cluster_shift: spc_shift,
+                ..FormatOpts::default()
+            };
+            Exfat::format(&mut dev, &opts).unwrap();
+            let fs = Exfat::open(&mut dev).unwrap();
+            let root = fs.root_directory_cluster();
+            let bm_clusters = fs.dir_chain(2).unwrap().len() as u32;
+            let cl_upcase = 2 + bm_clusters;
+            assert_eq!(root, cl_upcase + want, "spc_shift {spc_shift}");
+            assert_eq!(
+                fs.dir_chain(cl_upcase).unwrap(),
+                (cl_upcase..root).collect::<Vec<_>>()
+            );
+            for c in 2..=root {
+                assert_eq!(fs.bitmap_bit(c), Some(true), "metadata cluster {c}");
+            }
+            assert_eq!(fs.bitmap_bit(root + 1), Some(false));
+
+            // The root's up-case entry.
+            let root_bytes = fs.read_chain_bytes(&mut dev, root, false, None).unwrap();
+            let entry = root_bytes
+                .chunks(ENTRY_SIZE)
+                .find(|e| e[0] == dir::ENTRY_UPCASE_TABLE)
+                .expect("an up-case entry");
+            assert_eq!(&entry[4..8], &0xE619_D30Du32.to_le_bytes());
+            assert_eq!(&entry[20..24], &cl_upcase.to_le_bytes());
+            assert_eq!(&entry[24..32], &5836u64.to_le_bytes());
+            let table = fs
+                .read_chain_bytes(&mut dev, cl_upcase, false, Some(5836))
+                .unwrap();
+            assert_eq!(&table[..], &upcase_table::UPCASE_TABLE[..]);
+
+            // And it is what lookups use.
+            assert_eq!(fs.upcase.up(0x00E9), 0x00C9);
+            assert_eq!(fs.upcase.up(0x03C9), 0x03A9);
+            assert_eq!(fs.upcase.up(0x044F), 0x042F);
+            assert_eq!(fs.upcase.up(0x4E2D), 0x4E2D);
+        }
+    }
+
+    #[test]
+    fn non_ascii_names_match_case_insensitively() {
+        let (mut dev, mut fs) = fresh_volume("");
+        let mut reader: &[u8] = b"x";
+        fs.create_file(&mut dev, "/Ωmega-Élan-Ярус", &mut reader, 1, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+        let fs = Exfat::open(&mut dev).unwrap();
+        for spelling in ["/ωMEGA-éLAN-ярус", "/ΩMEGA-ÉLAN-ЯРУС", "/ωmega-élan-ярус"]
+        {
+            assert!(
+                fs.open_file_reader(&mut dev, spelling).is_ok(),
+                "{spelling}"
+            );
+        }
+        assert!(fs.open_file_reader(&mut dev, "/Omega-Elan-Ярус").is_err());
+        // NameHash is over the up-cased name, through the full table.
+        let up: Vec<u8> = "ΩMEGA-ÉLAN-ЯРУС"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(fs.name_hash_for("ωmega-élan-ярус"), dir::name_hash(&up));
+    }
+
     /// Format a volume whose allocation bitmap needs more than one cluster
     /// and verify the bitmap neither clobbers the up-case table / root
     /// directory nor gets truncated on re-open.
@@ -2676,10 +2753,15 @@ mod tests {
             "test needs a multi-cluster bitmap (got {bm_clusters})"
         );
         let cl_upcase = 2 + bm_clusters;
-        let cl_root = cl_upcase + 1;
+        let up_clusters = 5836u64.div_ceil(cb) as u32;
+        let cl_root = cl_upcase + up_clusters;
         assert_eq!(fs.root_directory_cluster(), cl_root);
         assert_eq!(fs.bitmap.len() as u64, bm_bytes);
         assert_eq!(fs.dir_chain(2).unwrap().len(), bm_clusters as usize);
+        assert_eq!(
+            fs.dir_chain(cl_upcase).unwrap(),
+            (cl_upcase..cl_root).collect::<Vec<_>>()
+        );
 
         let n = 5u32;
         for i in 0..n {
@@ -2707,7 +2789,7 @@ mod tests {
             assert_eq!(fs2.bitmap_bit(c), Some(true), "metadata cluster {c}");
         }
         // The up-case table on disk is still the one the formatter wrote.
-        let (upcase_bytes, _) = format::make_ascii_upcase_table();
+        let (upcase_bytes, _) = format::recommended_upcase_table();
         let mut on_disk = vec![0u8; upcase_bytes.len()];
         dev.read_at(fs2.boot.cluster_byte_offset(cl_upcase), &mut on_disk)
             .unwrap();
@@ -2918,9 +3000,10 @@ mod tests {
         let listed = fs2.list_path(&mut dev, "/").unwrap();
         assert_eq!(listed.len(), 2, "{listed:?}");
         let used: u32 = fs2.bitmap.iter().map(|b| b.count_ones()).sum();
-        // bitmap + upcase + root + Dup.txt's cluster + d's cluster: the
-        // rejected creates allocated nothing.
-        assert_eq!(used, 5);
+        // bitmap + upcase (5836 bytes: two 4 KiB clusters) + root +
+        // Dup.txt's cluster + d's cluster: the rejected creates allocated
+        // nothing.
+        assert_eq!(used, 6);
     }
 
     #[test]

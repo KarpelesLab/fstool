@@ -706,10 +706,8 @@ impl<D: SectorDriver, const SECTOR: usize> Volume<D, SECTOR> {
         while index < UP_ASCII && off + 2 <= table.len {
             let v = self.stream_u16(&table, off)?;
             off += 2;
-            if v == 0xFFFF {
-                if off + 2 > table.len {
-                    break;
-                }
+            // A trailing 0xFFFF is a literal (U+FFFF → U+FFFF), not a run.
+            if v == 0xFFFF && off + 2 <= table.len {
                 let count = self.stream_u16(&table, off)? as usize;
                 off += 2;
                 for _ in 0..count {
@@ -1367,10 +1365,9 @@ impl<D: SectorDriver, const SECTOR: usize> Volume<D, SECTOR> {
         while off + 2 <= table.len {
             let v = self.stream_u16(&table, off)?;
             off += 2;
-            if v == 0xFFFF {
-                if off + 2 > table.len {
-                    break;
-                }
+            // A 0xFFFF with no count after it is a literal mapping (the
+            // recommended table's last entry), not a run marker.
+            if v == 0xFFFF && off + 2 <= table.len {
                 let count = self.stream_u16(&table, off)? as usize;
                 off += 2;
                 // An identity run: every unit in it maps to itself.
@@ -1413,10 +1410,8 @@ impl<D: SectorDriver, const SECTOR: usize> Volume<D, SECTOR> {
         while off + 2 <= table.len && out.len() < 0x1_0000 {
             let v = self.stream_u16(&table, off)?;
             off += 2;
-            if v == 0xFFFF {
-                if off + 2 > table.len {
-                    break;
-                }
+            // A trailing 0xFFFF is a literal (U+FFFF → U+FFFF), not a run.
+            if v == 0xFFFF && off + 2 <= table.len {
                 let count = self.stream_u16(&table, off)? as usize;
                 off += 2;
                 for _ in 0..count {

@@ -567,13 +567,226 @@ fn the_hosted_half_and_fsck_agree_with_the_driver_after_edits() {
     assert!(listing.iter().all(|e| e.name != "hello.txt"));
 }
 
+// ---------------------------------------------------------------------
+// macOS: the system's own `fsck_exfat`.
+//
+// It refuses a plain file (it asks the device for its block size), so the
+// image is attached as a raw disk with `hdiutil`, checked read-only with
+// `-n`, and detached again. Skipped anywhere `/sbin/fsck_exfat` or
+// `hdiutil` is missing.
+// ---------------------------------------------------------------------
+
+const MACOS_FSCK: &str = "/sbin/fsck_exfat";
+
+fn macos_fsck_present() -> bool {
+    Path::new(MACOS_FSCK).exists() && which("hdiutil").is_some()
+}
+
+/// Detaches the attached image even when an assertion fails.
+struct Attached(String);
+
+impl Drop for Attached {
+    fn drop(&mut self) {
+        let _ = Command::new("hdiutil")
+            .args(["detach", "-force", &self.0])
+            .output();
+    }
+}
+
+/// Run macOS `fsck_exfat -n` on `path` and fail unless it calls the volume
+/// OK. Returns `false` (and checks nothing) when the image could not be
+/// attached, e.g. in a sandbox without disk-image support.
+fn macos_fsck(path: &Path, what: &str) -> bool {
+    let out = Command::new("hdiutil")
+        .args([
+            "attach",
+            "-imagekey",
+            "diskimage-class=CRawDiskImage",
+            "-nomount",
+        ])
+        .arg(path)
+        .output()
+        .unwrap();
+    if !out.status.success() {
+        eprintln!(
+            "skipping native fsck: hdiutil attach failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let dev = stdout
+        .split_whitespace()
+        .next()
+        .expect("hdiutil printed no device")
+        .to_string();
+    let _attached = Attached(dev.clone());
+    let out = Command::new(MACOS_FSCK)
+        .args(["-n", &dev])
+        .output()
+        .unwrap();
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && report.contains("appears to be OK"),
+        "fsck_exfat rejected {what} (exit {:?}):\n{report}",
+        out.status.code(),
+    );
+    true
+}
+
+/// A volume both formatters lay down, at the smallest cluster size (where
+/// the up-case table spans twelve clusters) and at 4 KiB, with a non-ASCII
+/// name in it, has to satisfy the system's own checker.
+#[test]
+fn macos_fsck_exfat_accepts_fstool_formatted_volumes() {
+    if !macos_fsck_present() {
+        eprintln!("skipping: macOS fsck_exfat / hdiutil not present");
+        return;
+    }
+    const NAMES: [&str; 3] = ["/Élan-Ωmega.txt", "/Ярус.txt", "/こんにちは.txt"];
+    for spc_shift in [0u8, 3] {
+        // The hosted formatter, populated by the hosted writer.
+        let tmp = NamedTempFile::new().unwrap();
+        let bytes = 16u64 * 1024 * 1024;
+        {
+            let mut dev = FileBackend::create(tmp.path(), bytes).unwrap();
+            let opts = FormatOpts {
+                bytes_per_sector_shift: 9,
+                sectors_per_cluster_shift: spc_shift,
+                volume_serial_number: 0x5EED_0057,
+                volume_label: "FSTOOL".to_string(),
+            };
+            let mut fs = Exfat::format(&mut dev, &opts).unwrap();
+            for name in NAMES {
+                let mut r: &[u8] = name.as_bytes();
+                fs.create_file(&mut dev, name, &mut r, name.len() as u64, 0)
+                    .unwrap();
+            }
+            fs.create_dir(&mut dev, "/Каталог", 0).unwrap();
+            fs.flush(&mut dev).unwrap();
+            dev.sync().unwrap();
+            // Case-insensitive beyond ASCII through the volume's table.
+            assert!(fs.open_file_reader(&mut dev, "/éLAN-ωMEGA.TXT").is_ok());
+        }
+        if !macos_fsck(
+            tmp.path(),
+            &format!("a hosted-formatted volume (spc_shift {spc_shift})"),
+        ) {
+            return;
+        }
+
+        // The allocation-free formatter, populated by the driver.
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::File::create(tmp.path())
+            .unwrap()
+            .set_len(bytes)
+            .unwrap();
+        {
+            let opts = fstool::fs::exfat::VolumeFormatOpts {
+                cluster_size: Some(512 << spc_shift),
+                volume_serial: 0x5EED_0058,
+                label: "FSTOOLDRV",
+            };
+            let mut vol = Volume::<_, 512>::format(FileCard::open(tmp.path()), &opts).unwrap();
+            for name in NAMES {
+                let mut f = vol.create_file(name).unwrap();
+                f.write_all(&mut vol, name.as_bytes()).unwrap();
+                f.flush(&mut vol).unwrap();
+            }
+            vol.create_dir("/Каталог").unwrap();
+            assert!(vol.exists("/яРУС.TXT").unwrap());
+            vol.unmount().unwrap();
+        }
+        macos_fsck(
+            tmp.path(),
+            &format!("a driver-formatted volume (spc_shift {spc_shift})"),
+        );
+    }
+}
+
+/// The other direction: a volume macOS `newfs_exfat` formatted carries the
+/// recommended table, ending in a literal 0xFFFF. Both halves have to
+/// decode it and fold non-ASCII names through it, and what they write
+/// there has to keep `fsck_exfat` happy (NameHash over the up-cased name).
+#[test]
+fn both_halves_fold_non_ascii_names_on_a_newfs_exfat_volume() {
+    let newfs = "/sbin/newfs_exfat";
+    if !macos_fsck_present() || !Path::new(newfs).exists() {
+        eprintln!("skipping: macOS newfs_exfat / fsck_exfat / hdiutil not present");
+        return;
+    }
+    let tmp = NamedTempFile::new().unwrap();
+    std::fs::File::create(tmp.path())
+        .unwrap()
+        .set_len(32 * 1024 * 1024)
+        .unwrap();
+    {
+        let out = Command::new("hdiutil")
+            .args([
+                "attach",
+                "-imagekey",
+                "diskimage-class=CRawDiskImage",
+                "-nomount",
+            ])
+            .arg(tmp.path())
+            .output()
+            .unwrap();
+        if !out.status.success() {
+            eprintln!("skipping: hdiutil attach failed");
+            return;
+        }
+        let dev = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string();
+        let _attached = Attached(dev.clone());
+        let out = Command::new(newfs)
+            .args(["-v", "NATIVE", &dev])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "newfs_exfat failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    {
+        let mut dev = FileBackend::open(tmp.path()).unwrap();
+        let mut fs = Exfat::open(&mut dev).unwrap();
+        let mut r: &[u8] = b"hosted";
+        fs.create_file(&mut dev, "/Élan-Ωmega.txt", &mut r, 6, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+        assert!(fs.open_file_reader(&mut dev, "/éLAN-ωMEGA.TXT").is_ok());
+    }
+    {
+        let mut vol = Volume::<_, 512>::mount(FileCard::open(tmp.path())).unwrap();
+        // Found by NameHash + name through the driver's decode of the table.
+        assert!(vol.exists("/ÉLAN-ΩMEGA.TXT").unwrap());
+        let mut f = vol.create_file("/Ярус.txt").unwrap();
+        f.write_all(&mut vol, b"driver").unwrap();
+        f.flush(&mut vol).unwrap();
+        vol.unmount().unwrap();
+    }
+    {
+        let mut dev = FileBackend::open(tmp.path()).unwrap();
+        let fs = Exfat::open(&mut dev).unwrap();
+        assert!(fs.open_file_reader(&mut dev, "/яРУС.TXT").is_ok());
+    }
+    macos_fsck(tmp.path(), "a newfs_exfat volume both halves wrote to");
+}
+
 #[test]
 fn the_driver_folds_non_ascii_names_through_the_standard_upcase_table() {
     // A volume `mkfs.exfat` formatted carries the standard up-case table:
-    // 0x10000 entries, run-length compressed, which is the only thing that
-    // exercises the driver's decoder past ASCII. (fstool's own formatter
-    // writes an ASCII-only table, where these names are case-sensitive
-    // because the volume says so.)
+    // 0x10000 entries, run-length compressed. (fstool's own formatters
+    // write the same table; this checks the reference tool's copy.)
     if !tool_present("mkfs.exfat") || !tool_present("fsck.exfat") {
         eprintln!("skipping: exfatprogs not installed");
         return;

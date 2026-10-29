@@ -36,6 +36,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::dir::{ATTR_DIRECTORY, ENTRY_SIZE};
+use super::upcase_table::{UPCASE_TABLE, UPCASE_TABLE_CHECKSUM, UPCASE_TABLE_LEN};
 
 /// Knobs for [`super::Exfat::format`]. All defaults yield a usable
 /// volume; only `bytes_per_sector_shift`, `sectors_per_cluster_shift`,
@@ -109,6 +110,10 @@ pub struct Geometry {
     /// bytes rounded up to whole clusters. It starts at cluster 2; the
     /// Up-case Table and the root directory follow it.
     pub bitmap_clusters: u32,
+    /// Clusters the Up-case Table occupies — the recommended table's 5836
+    /// bytes rounded up to whole clusters (12 with 512-byte clusters). It
+    /// follows the bitmap; the root directory follows it.
+    pub upcase_clusters: u32,
     pub first_cluster_of_root_directory: u32,
     pub volume_serial_number: u32,
 }
@@ -228,9 +233,10 @@ pub fn compute_geometry(total_bytes: u64, opts: &FormatOpts) -> Result<Geometry>
     let bitmap_clusters = u32::try_from(bitmap_bytes.div_ceil(u64::from(bytes_per_cluster)))
         .map_err(|_| crate::Error::InvalidArgument("exfat: bitmap size overflows u32".into()))?
         .max(1);
+    let upcase_clusters = UPCASE_TABLE_LEN.div_ceil(bytes_per_cluster as usize) as u32;
     // Bitmap + Up-case + Root, plus a couple of clusters of slack so a
     // user file fits. Fail loud rather than producing an unusable volume.
-    let min_clusters = bitmap_clusters + 4;
+    let min_clusters = bitmap_clusters + upcase_clusters + 3;
     if cluster_count < min_clusters {
         return Err(crate::Error::InvalidArgument(format!(
             "exfat: only {cluster_count} clusters available; need >= {min_clusters}"
@@ -249,7 +255,8 @@ pub fn compute_geometry(total_bytes: u64, opts: &FormatOpts) -> Result<Geometry>
         cluster_heap_offset_sectors,
         cluster_count,
         bitmap_clusters,
-        first_cluster_of_root_directory: 2 + bitmap_clusters + 1,
+        upcase_clusters,
+        first_cluster_of_root_directory: 2 + bitmap_clusters + upcase_clusters,
         volume_serial_number: opts.volume_serial_number,
     })
 }
@@ -356,27 +363,12 @@ pub fn write_boot_region(
     Ok(checksum)
 }
 
-/// Emit a simple Up-case Table: lowercase ASCII a..z → A..Z, every other
-/// BMP code unit identity. Returns the uncompressed table bytes along
-/// with its 32-bit table checksum (per the rolling checksum in `upcase.rs`).
-pub fn make_ascii_upcase_table() -> (Vec<u8>, u32) {
-    // We emit the first 128 explicit slots (covers ASCII), then an
-    // identity-run for the remainder of the BMP would balloon the table
-    // unnecessarily — readers default to identity beyond the populated
-    // range. We mirror what the reader's `Upcase::ascii()` produces so
-    // round-tripping is exact.
-    let mut bytes = Vec::with_capacity(0x80 * 2);
-    for i in 0..0x80u16 {
-        let c = i as u8;
-        let v = if c.is_ascii_lowercase() {
-            (c - b'a' + b'A') as u16
-        } else {
-            i
-        };
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    let csum = super::upcase::table_checksum(&bytes);
-    (bytes, csum)
+/// The Up-case Table the formatter writes: the exFAT specification's
+/// recommended compressed table (5836 bytes) and its TableChecksum
+/// (`0xE619D30D`). It needs `ceil(5836 / cluster_size)` clusters; see
+/// [`Geometry::upcase_clusters`].
+pub fn recommended_upcase_table() -> (&'static [u8], u32) {
+    (UPCASE_TABLE, UPCASE_TABLE_CHECKSUM)
 }
 
 /// Build an Allocation Bitmap directory-entry slot (32 bytes).
@@ -554,10 +546,30 @@ mod tests {
     }
 
     #[test]
-    fn ascii_upcase_round_trip() {
-        let (bytes, _) = make_ascii_upcase_table();
-        let uc = super::super::upcase::Upcase::decode(&bytes, bytes.len() as u64).unwrap();
+    fn recommended_upcase_round_trip() {
+        let (bytes, csum) = recommended_upcase_table();
+        assert_eq!(bytes.len(), 5836);
+        assert_eq!(csum, 0xE619_D30D);
+        assert_eq!(super::super::upcase::table_checksum(bytes), csum);
+        let uc = super::super::upcase::Upcase::decode(bytes, bytes.len() as u64).unwrap();
         assert_eq!(uc.up(b'a' as u16), b'A' as u16);
         assert_eq!(uc.up(b'Z' as u16), b'Z' as u16);
+    }
+
+    #[test]
+    fn geometry_reserves_the_whole_upcase_chain() {
+        // 512 B sectors: 1, 8 and 16 sectors per cluster.
+        for (spc_shift, want) in [(0u8, 12u32), (3, 2), (4, 1)] {
+            let opts = FormatOpts {
+                sectors_per_cluster_shift: spc_shift,
+                ..FormatOpts::default()
+            };
+            let g = compute_geometry(4 * 1024 * 1024, &opts).unwrap();
+            assert_eq!(g.upcase_clusters, want, "spc_shift {spc_shift}");
+            assert_eq!(
+                g.first_cluster_of_root_directory,
+                2 + g.bitmap_clusters + g.upcase_clusters
+            );
+        }
     }
 }
