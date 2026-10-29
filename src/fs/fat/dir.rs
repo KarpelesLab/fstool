@@ -23,11 +23,21 @@
 //! UTF-16 code units and a checksum tying it to the 8.3 name.
 
 use alloc::format;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 /// Size of one directory entry.
 pub const ENTRY_SIZE: usize = 32;
+
+/// NT case flag in directory-entry byte 12: the 8.3 base is lower case.
+///
+/// Windows NT and Linux vfat store a name such as `readme.txt` or
+/// `README.txt` — a valid 8.3 name whose base and extension are each in a
+/// single case — as a bare short entry with these flags instead of a long
+/// name.
+pub const NT_LOWER_BASE: u8 = crate::fs::fat::volume::NT_LOWER_BASE;
+/// NT case flag in directory-entry byte 12: the 8.3 extension is lower case.
+pub const NT_LOWER_EXT: u8 = crate::fs::fat::volume::NT_LOWER_EXT;
 
 /// Attribute bits.
 pub const ATTR_READ_ONLY: u8 = 0x01;
@@ -144,6 +154,11 @@ pub struct DirEntry {
     /// encodes as the reproducible FAT epoch (1980-01-01). FAT has 2-second
     /// resolution, so odd seconds round down on encode.
     pub mtime: u32,
+    /// Byte 12 — the NT case flags ([`NT_LOWER_BASE`], [`NT_LOWER_EXT`])
+    /// that give the display case of the upper-case 8.3 name. Kept whole,
+    /// unknown bits included, so rewriting an entry round-trips it; `0` for
+    /// a new entry.
+    pub nt_flags: u8,
 }
 
 impl DirEntry {
@@ -154,6 +169,7 @@ impl DirEntry {
         let mut b = [0u8; ENTRY_SIZE];
         b[0..11].copy_from_slice(&self.name_83);
         b[11] = self.attr;
+        b[12] = self.nt_flags;
         let (date, time) = if self.mtime == 0 {
             (DOS_DATE_EPOCH, 0)
         } else {
@@ -195,23 +211,21 @@ impl DirEntry {
             first_cluster: (hi << 16) | lo,
             file_size: u32::from_le_bytes(b[28..32].try_into().unwrap()),
             mtime: dos_datetime_to_unix(write_date, write_time),
+            nt_flags: b[12],
         })
     }
 
-    /// The human-readable form of the 8.3 name (`BASE.EXT`, lower-cased).
+    /// The human-readable form of the 8.3 name: `BASE.EXT`, decoded from
+    /// OEM (CP437), with the base and extension lower-cased only when the
+    /// NT case flags in [`nt_flags`](Self::nt_flags) say so. A plain
+    /// `PAYLOAD TXT` entry reads as `PAYLOAD.TXT`. Shares its decoder with
+    /// the allocation-free [`Volume`](crate::fs::fat::Volume) driver.
     pub fn short_name_string(&self) -> String {
-        let base = String::from_utf8_lossy(&self.name_83[0..8])
-            .trim_end()
-            .to_string();
-        let ext = String::from_utf8_lossy(&self.name_83[8..11])
-            .trim_end()
-            .to_string();
-        let name = if ext.is_empty() {
-            base
-        } else {
-            format!("{base}.{ext}")
-        };
-        name.to_ascii_lowercase()
+        use crate::fs::fat::volume::{MAX_SHORT_NAME_BYTES, decode_short_name};
+        let mut buf = [0u8; MAX_SHORT_NAME_BYTES];
+        let len = decode_short_name(&self.name_83, self.nt_flags, &mut buf);
+        // The decoder only ever writes whole UTF-8 sequences.
+        String::from_utf8_lossy(&buf[..len]).into_owned()
     }
 }
 
@@ -479,12 +493,13 @@ mod tests {
             first_cluster: 0x0012_3456,
             file_size: 4096,
             mtime: 0,
+            nt_flags: 0,
         };
         let dec = DirEntry::decode(&e.encode()).unwrap();
         assert_eq!(dec.name_83, *b"HELLO   TXT");
         assert_eq!(dec.first_cluster, 0x0012_3456);
         assert_eq!(dec.file_size, 4096);
-        assert_eq!(dec.short_name_string(), "hello.txt");
+        assert_eq!(dec.short_name_string(), "HELLO.TXT");
         assert_eq!(dec.mtime, 0); // epoch sentinel → "no timestamp"
     }
 

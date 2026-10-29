@@ -729,6 +729,7 @@ impl Fat32 {
             first_cluster,
             file_size,
             mtime,
+            nt_flags: 0,
         };
         entries.extend_from_slice(&entry.encode());
         Ok(())
@@ -757,6 +758,7 @@ fn dot_entry(name_83: &[u8; 11], cluster: u32) -> [u8; dir::ENTRY_SIZE] {
         first_cluster: cluster,
         file_size: 0,
         mtime: 0,
+        nt_flags: 0,
     }
     .encode()
 }

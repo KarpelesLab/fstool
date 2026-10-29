@@ -93,6 +93,9 @@ mod format;
 
 pub use boot::{Geometry, MAX_SECTOR_SIZE, MIN_SECTOR_SIZE};
 pub use dir::{DirEntry, DirIter};
+// The hosted driver decodes short names through the same function.
+#[cfg(feature = "alloc")]
+pub(crate) use dir::{MAX_SHORT_NAME_BYTES, NT_LOWER_BASE, NT_LOWER_EXT, decode_short_name};
 pub use file::{File, MAX_FILE_LEN};
 pub use format::FormatOpts;
 

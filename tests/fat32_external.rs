@@ -826,3 +826,71 @@ fn detect_fs_recognises_every_flavour() {
         );
     }
 }
+
+/// Issue #56: names mtools writes with a single case per 8.3 part —
+/// stored natively either as a bare short entry with the NT case flags in
+/// byte 12, or with a long name — must list with exactly that spelling,
+/// and open under any case.
+#[test]
+fn mtools_short_name_case_survives_our_reader() {
+    for tool in ["mkfs.vfat", "mcopy", "mmd"] {
+        if which(tool).is_none() {
+            eprintln!("skipping: {tool} not installed");
+            return;
+        }
+    }
+    const NAMES: [&str; 4] = ["PAYLOAD.TXT", "payload.TXT", "PAYLOAD.txt", "payload.txt"];
+    let tmp = NamedTempFile::new().unwrap();
+    std::fs::File::create(tmp.path())
+        .unwrap()
+        .set_len(32 * 1024 * 1024)
+        .unwrap();
+    let img = tmp.path().display().to_string();
+    let run = |cmd: &mut Command| {
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{cmd:?} failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(Command::new("mkfs.vfat").args(["-F", "16"]).arg(tmp.path()));
+    let host = TempDir::new().unwrap();
+    for (i, name) in NAMES.iter().enumerate() {
+        let hostf = host.path().join(format!("src{i}"));
+        std::fs::write(&hostf, name.as_bytes()).unwrap();
+        run(Command::new("mmd").args(["-i", &img, &format!("::/d{i}")]));
+        run(Command::new("mcopy")
+            .args(["-i", &img])
+            .arg(&hostf)
+            .arg(format!("::/d{i}/{name}")));
+    }
+
+    // Which encoding mtools chose, for the log: byte 12 of each bare
+    // `PAYLOAD TXT` entry.
+    let raw = std::fs::read(tmp.path()).unwrap();
+    let flags: Vec<u8> = raw
+        .windows(13)
+        .filter(|w| &w[..11] == b"PAYLOAD TXT")
+        .map(|w| w[12])
+        .collect();
+    eprintln!("mtools short-entry case bytes: {flags:02x?}");
+
+    let mut dev = FileBackend::open(tmp.path()).unwrap();
+    let fs = Fat32::open(&mut dev).unwrap();
+    for (i, name) in NAMES.iter().enumerate() {
+        let names: Vec<String> = fs
+            .list_path(&mut dev, &format!("/d{i}"))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, [*name], "/d{i}");
+        let mut body = Vec::new();
+        fs.open_file_reader(&mut dev, &format!("/d{i}/payload.txt"))
+            .unwrap()
+            .read_to_end(&mut body)
+            .unwrap();
+        assert_eq!(body, name.as_bytes());
+    }
+}

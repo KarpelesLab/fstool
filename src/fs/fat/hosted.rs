@@ -624,6 +624,7 @@ impl Fat32 {
             first_cluster: 0,
             file_size: 0,
             mtime: 0,
+            nt_flags: 0,
         }
         .encode()
     }
@@ -934,6 +935,7 @@ impl Fat32 {
             first_cluster,
             file_size,
             mtime,
+            nt_flags: 0,
         };
         entries.extend_from_slice(&entry.encode());
     }
@@ -1407,6 +1409,7 @@ fn dot_entry(name_83: &[u8; 11], cluster: u32) -> [u8; dir::ENTRY_SIZE] {
         first_cluster: cluster,
         file_size: 0,
         mtime: 0,
+        nt_flags: 0,
     }
     .encode()
 }
@@ -2532,5 +2535,177 @@ mod tests {
         let mut buf2 = [0u8; 32];
         h.read_exact(&mut buf2).unwrap();
         assert_eq!(&buf2[..], &data[123..155]);
+    }
+
+    // -- NT case flags (directory-entry byte 12) -------------------------
+
+    /// Device offset of `path`'s 8.3 entry slot.
+    fn short_entry_offset(fs: &mut Fat32, dev: &mut dyn BlockDevice, path: &str) -> u64 {
+        fs.flush_dir_batches(dev).unwrap();
+        let (parent, leaf) = fs.resolve_parent(dev, path).unwrap();
+        let found = fs
+            .find_entry(dev, parent, &leaf)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{path} not found"));
+        found.layout.offset_of(found.entry_pos)
+    }
+
+    /// Byte 12 of `path`'s 8.3 entry, as it sits on disk.
+    fn nt_byte(fs: &mut Fat32, dev: &mut MemoryBackend, path: &str) -> u8 {
+        let off = short_entry_offset(fs, dev, path);
+        let mut b = [0u8; 1];
+        dev.read_at(off + 12, &mut b).unwrap();
+        b[0]
+    }
+
+    /// A volume holding one short-name-only `PAYLOAD.TXT` whose byte 12 is
+    /// patched to `nt`, reopened from disk.
+    fn payload_with_nt(nt: u8) -> (MemoryBackend, Fat32) {
+        let (mut dev, mut fs) = fresh_volume();
+        fs.add_file_from_reader(&mut dev, "/PAYLOAD.TXT", &mut &b"payload"[..], 7, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+        let off = short_entry_offset(&mut fs, &mut dev, "/PAYLOAD.TXT");
+        let mut raw = [0u8; dir::ENTRY_SIZE];
+        dev.read_at(off, &mut raw).unwrap();
+        assert_eq!(&raw[..11], b"PAYLOAD TXT");
+        assert_eq!(raw[12], 0, "a fresh upper-case 8.3 entry carries no flags");
+        dev.write_at(off + 12, &[nt]).unwrap();
+        let fs = Fat32::open(&mut dev).unwrap();
+        (dev, fs)
+    }
+
+    const NT_CASES: [(u8, &str); 4] = [
+        (0, "PAYLOAD.TXT"),
+        (dir::NT_LOWER_BASE, "payload.TXT"),
+        (dir::NT_LOWER_EXT, "PAYLOAD.txt"),
+        (dir::NT_LOWER_BASE | dir::NT_LOWER_EXT, "payload.txt"),
+    ];
+
+    /// Issue #56: the hosted driver lower-cased every 8.3 name and ignored
+    /// byte 12, so a native `PAYLOAD.TXT` came out as `payload.txt`. Each
+    /// of the four defined flag combinations must give its own spelling —
+    /// with unknown bits beside them ignored — and lookup stays
+    /// case-insensitive.
+    #[test]
+    fn nt_case_flags_give_the_short_name_its_spelling() {
+        for (flags, want) in NT_CASES {
+            for nt in [flags, flags | 0x84] {
+                let (mut dev, mut fs) = payload_with_nt(nt);
+                let names: Vec<String> = fs
+                    .list(&mut dev, Path::new("/"))
+                    .unwrap()
+                    .into_iter()
+                    .map(|e| e.name)
+                    .collect();
+                assert_eq!(names, [want], "byte 12 = {nt:#04x}");
+                for spelling in ["/PAYLOAD.TXT", "/payload.txt", "/Payload.Txt", want] {
+                    assert_eq!(
+                        read_all(&mut fs, &mut dev, spelling),
+                        b"payload",
+                        "lookup of {spelling} with byte 12 = {nt:#04x}"
+                    );
+                }
+                let (entry, _) = fs.resolve_entry(&mut dev, "/payload.TXT").unwrap();
+                assert_eq!(entry.nt_flags, nt);
+                assert_eq!(entry.short_name_string(), want);
+            }
+        }
+    }
+
+    /// Rewriting an existing entry — growing the file through an rw handle,
+    /// flipping its read-only bit — must carry byte 12 through whole,
+    /// unknown bits included.
+    #[test]
+    fn rewriting_an_entry_keeps_its_nt_case_byte() {
+        use crate::fs::SetAttrs;
+        let nt = dir::NT_LOWER_BASE | dir::NT_LOWER_EXT | 0x80;
+        let (mut dev, mut fs) = payload_with_nt(nt);
+        {
+            let mut h = fs
+                .open_file_rw(
+                    &mut dev,
+                    Path::new("/payload.txt"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .unwrap();
+            h.seek(SeekFrom::End(0)).unwrap();
+            h.write_all(&[0x5A; 9000]).unwrap();
+            h.sync().unwrap();
+        }
+        fs.flush(&mut dev).unwrap();
+        assert_eq!(nt_byte(&mut fs, &mut dev, "/payload.txt"), nt);
+
+        fs.set_attrs(
+            &mut dev,
+            Path::new("/payload.txt"),
+            SetAttrs {
+                mode: Some(0o444),
+                ..SetAttrs::default()
+            },
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+        assert_eq!(nt_byte(&mut fs, &mut dev, "/payload.txt"), nt);
+
+        let mut fs = Fat32::open(&mut dev).unwrap();
+        let listed = fs.list(&mut dev, Path::new("/")).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "payload.txt");
+        assert_eq!(listed[0].size, 7 + 9000);
+        let body = read_all(&mut fs, &mut dev, "/PAYLOAD.TXT");
+        assert_eq!(&body[..7], b"payload");
+        assert!(body[7..].iter().all(|&b| b == 0x5A));
+    }
+
+    /// A valid long name still wins over the short name, whatever the case
+    /// flags say about the latter.
+    #[test]
+    fn a_long_name_outranks_the_nt_case_flags() {
+        let (mut dev, mut fs) = fresh_volume();
+        fs.add_file_from_reader(&mut dev, "/PayLoad.Txt", &mut &b"x"[..], 1, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+        let off = short_entry_offset(&mut fs, &mut dev, "/PayLoad.Txt");
+        dev.write_at(off + 12, &[dir::NT_LOWER_BASE | dir::NT_LOWER_EXT])
+            .unwrap();
+        let mut fs = Fat32::open(&mut dev).unwrap();
+        let listed = fs.list(&mut dev, Path::new("/")).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "PayLoad.Txt");
+        assert_eq!(read_all(&mut fs, &mut dev, "/payload.txt"), b"x");
+    }
+
+    /// What the hosted writer stores for a name that fits 8.3 in one case
+    /// per part — a bare short entry when it is upper case, a long name
+    /// otherwise — reads back with the spelling it was given.
+    #[test]
+    fn single_case_short_names_round_trip_through_the_writer() {
+        let (mut dev, mut fs) = fresh_volume();
+        for (i, (_, name)) in NT_CASES.iter().enumerate() {
+            let d = alloc::format!("/d{i}");
+            fs.add_dir(&mut dev, &d, 0).unwrap();
+            fs.add_file_from_reader(
+                &mut dev,
+                &alloc::format!("{d}/{name}"),
+                &mut &b"z"[..],
+                1,
+                0,
+            )
+            .unwrap();
+        }
+        fs.flush(&mut dev).unwrap();
+        let mut fs = Fat32::open(&mut dev).unwrap();
+        for (i, (_, name)) in NT_CASES.iter().enumerate() {
+            let d = alloc::format!("/d{i}");
+            let listed = fs.list(&mut dev, Path::new(&d)).unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].name, *name);
+            assert_eq!(
+                read_all(&mut fs, &mut dev, &alloc::format!("{d}/{name}")),
+                b"z"
+            );
+        }
     }
 }

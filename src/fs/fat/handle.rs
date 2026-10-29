@@ -45,6 +45,9 @@ pub struct FatFileHandle<'a> {
     /// Modification time (Unix epoch seconds) — preserved across rewrites so
     /// re-encoding the entry after a write doesn't reset it to the FAT epoch.
     entry_mtime: u32,
+    /// NT case flags (byte 12) — preserved across rewrites, unknown bits
+    /// included, so the name keeps the case it was stored with.
+    entry_nt_flags: u8,
     /// True once writes (or set_len) have made the in-memory FAT / entry
     /// diverge from disk. Cleared on `sync()` and `Drop`.
     dirty: bool,
@@ -77,6 +80,7 @@ impl<'a> FatFileHandle<'a> {
             entry_attr: entry.attr,
             entry_name_83: entry.name_83,
             entry_mtime: entry.mtime,
+            entry_nt_flags: entry.nt_flags,
             dirty: false,
         })
     }
@@ -201,6 +205,7 @@ impl<'a> FatFileHandle<'a> {
             first_cluster,
             file_size: self.file_size as u32,
             mtime: self.entry_mtime,
+            nt_flags: self.entry_nt_flags,
         };
         let enc = entry.encode();
         self.dev.write_at(self.entry_off, &enc)?;

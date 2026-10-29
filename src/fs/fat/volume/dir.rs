@@ -100,12 +100,31 @@ fn fold(c: char) -> char {
     }
 }
 
+/// NT case flag (directory-entry byte 12): the 8.3 base is lower case.
+pub(crate) const NT_LOWER_BASE: u8 = 0x08;
+/// NT case flag (directory-entry byte 12): the 8.3 extension is lower case.
+pub(crate) const NT_LOWER_EXT: u8 = 0x10;
+
 /// Write a short name into `out` as `BASE.EXT`, honouring the two NT
 /// case flags, and return its length in bytes.
 fn short_name(raw: &[u8; ENTRY], out: &mut [u8]) -> usize {
-    let nt = raw[12];
-    let lower_base = nt & 0x08 != 0;
-    let lower_ext = nt & 0x10 != 0;
+    let mut name = [0u8; 11];
+    name.copy_from_slice(&raw[..11]);
+    decode_short_name(&name, raw[12], out)
+}
+
+/// Decode an 11-byte 8.3 name field into `out` as UTF-8 `BASE.EXT` and
+/// return its length in bytes. The bytes are OEM (CP437); a leading `0x05`
+/// stands for `0xE5`. `nt` is directory-entry byte 12: [`NT_LOWER_BASE`]
+/// lower-cases the base and [`NT_LOWER_EXT`] the extension, as Windows NT
+/// and Linux vfat store an all-lower-case part without a long name. Other
+/// bits are ignored.
+///
+/// Both FAT drivers decode short names through this one function, so they
+/// agree on every spelling. `out` should hold [`MAX_SHORT_NAME_BYTES`].
+pub(crate) fn decode_short_name(raw: &[u8; 11], nt: u8, out: &mut [u8]) -> usize {
+    let lower_base = nt & NT_LOWER_BASE != 0;
+    let lower_ext = nt & NT_LOWER_EXT != 0;
     let mut at = 0;
 
     let base_len = (0..8).rev().find(|&i| raw[i] != b' ').map_or(0, |i| i + 1);
@@ -256,7 +275,7 @@ fn try_short_name(name: &str) -> Option<([u8; 11], u8)> {
 
     let mut out = [b' '; 11];
     let mut flags = 0u8;
-    for (part, span, lower_flag) in [(base, 0..8, 0x08u8), (ext, 8..11, 0x10u8)] {
+    for (part, span, lower_flag) in [(base, 0..8, NT_LOWER_BASE), (ext, 8..11, NT_LOWER_EXT)] {
         if part.is_empty() {
             continue;
         }
@@ -1115,7 +1134,7 @@ impl<D: SectorDriver, const S: usize> Volume<D, S> {
 
 /// 8 base and 3 extension characters, each up to three UTF-8 bytes once
 /// CP437's upper half is decoded, plus the separating dot.
-const MAX_SHORT_NAME_BYTES: usize = 8 * 3 + 1 + 3 * 3;
+pub(crate) const MAX_SHORT_NAME_BYTES: usize = 8 * 3 + 1 + 3 * 3;
 
 /// Case-insensitive comparison of an entry's 8.3 name against `name`.
 fn short_name_matches(raw: &[u8; ENTRY], name: &str) -> bool {

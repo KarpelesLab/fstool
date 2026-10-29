@@ -969,6 +969,129 @@ mod cross {
             );
         }
     }
+
+    /// Every name in `path` but `.` and `..`, as this driver lists it.
+    fn names_here(vol: &mut Vol, path: &str) -> Vec<alloc::string::String> {
+        let dir = vol.open_dir(path).unwrap();
+        let mut it = vol.iter_dir(dir);
+        let mut out = Vec::new();
+        while let Some(e) = it.next().unwrap() {
+            if !matches!(e.name(), "." | "..") {
+                out.push(e.name().to_string());
+            }
+        }
+        out
+    }
+
+    /// Every name in `path`, as the hosted driver lists it.
+    fn hosted_names(
+        fs: &mut Fat32,
+        dev: &mut MemoryBackend,
+        path: &str,
+    ) -> Vec<alloc::string::String> {
+        fs.list(dev, Path::new(path))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect()
+    }
+
+    /// Issue #56: this driver stores a single-case 8.3 name as a bare short
+    /// entry with the NT case flags; the hosted driver used to read every
+    /// one of them back lower-cased. Both must now give every spelling —
+    /// and keep giving it after the hosted driver rewrites the entry.
+    #[test]
+    fn both_drivers_spell_nt_case_flagged_short_names_alike() {
+        const NAMES: [&str; 4] = ["PAYLOAD.TXT", "payload.TXT", "PAYLOAD.txt", "payload.txt"];
+        let dev = hosted_format();
+        let mut vol = mount(RamCard::new(dev.into_bytes()));
+        for (i, name) in NAMES.iter().enumerate() {
+            let d = alloc::format!("/d{i}");
+            vol.create_dir(&d).unwrap();
+            let mut f = vol.create_file(&alloc::format!("{d}/{name}")).unwrap();
+            f.write_all(&mut vol, name.as_bytes()).unwrap();
+            f.flush(&mut vol).unwrap();
+        }
+        for (i, name) in NAMES.iter().enumerate() {
+            assert_eq!(names_here(&mut vol, &alloc::format!("/d{i}")), [*name]);
+        }
+        let card = vol.unmount().unwrap();
+
+        let mut dev = MemoryBackend::from_bytes(card.data);
+        let mut fs = Fat32::open(&mut dev).unwrap();
+        for (i, name) in NAMES.iter().enumerate() {
+            let d = alloc::format!("/d{i}");
+            assert_eq!(hosted_names(&mut fs, &mut dev, &d), [*name]);
+            // A short entry and nothing else: the case lives in byte 12.
+            let (entry, _) = fs
+                .resolve_entry(&mut dev, &alloc::format!("{d}/{name}"))
+                .unwrap();
+            assert_eq!(&entry.name_83, b"PAYLOAD TXT");
+            assert_eq!(
+                read_all(&mut fs, &mut dev, &alloc::format!("{d}/payload.txt")),
+                name.as_bytes()
+            );
+        }
+
+        // The hosted driver rewrites each entry (a size change), then the
+        // allocation-free one must still read the same spellings.
+        for i in 0..NAMES.len() {
+            let mut h = fs
+                .open_file_rw(
+                    &mut dev,
+                    Path::new(&alloc::format!("/d{i}/PAYLOAD.TXT")),
+                    crate::fs::OpenFlags::default(),
+                    None,
+                )
+                .unwrap();
+            h.set_len(3).unwrap();
+            h.sync().unwrap();
+        }
+        fs.flush(&mut dev).unwrap();
+        let mut vol = mount(RamCard::new(dev.into_bytes()));
+        for (i, name) in NAMES.iter().enumerate() {
+            assert_eq!(names_here(&mut vol, &alloc::format!("/d{i}")), [*name]);
+            assert_eq!(
+                vol.metadata(&alloc::format!("/d{i}/{name}")).unwrap().len,
+                3
+            );
+        }
+    }
+
+    /// Every value byte 12 can hold decodes to the same name in both
+    /// drivers — the defined bits and whatever sits beside them.
+    #[test]
+    fn both_drivers_agree_on_every_nt_byte() {
+        let mut dev = hosted_format();
+        let mut fs = Fat32::open(&mut dev).unwrap();
+        fs.create_file(
+            &mut dev,
+            Path::new("/MIXED.BIN"),
+            FileSource::Reader {
+                reader: Box::new(Cursor::new(vec![1u8; 5])),
+                len: 5,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+        // The only short entry on the volume with this name.
+        let mut bytes = dev.into_bytes();
+        let off = bytes
+            .windows(11)
+            .position(|w| w == b"MIXED   BIN")
+            .expect("the entry is on disk");
+        for nt in 0..=u8::MAX {
+            bytes[off + 12] = nt;
+            let mut dev = MemoryBackend::from_bytes(bytes);
+            let mut fs = Fat32::open(&mut dev).unwrap();
+            let hosted = hosted_names(&mut fs, &mut dev, "/");
+            let mut vol = mount(RamCard::new(dev.into_bytes()));
+            let ours = names_here(&mut vol, "/");
+            assert_eq!(hosted, ours, "byte 12 = {nt:#04x}");
+            bytes = vol.unmount().unwrap().data;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
