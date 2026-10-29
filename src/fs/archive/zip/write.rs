@@ -1254,9 +1254,13 @@ mod tests {
                 loc.compressed_len,
                 want.len() as u64 + loc.crypto.overhead()
             );
+            // Usually the passphrase check rejects it up front; when a
+            // wrong passphrase slips past ZipCrypto's one-byte check (or
+            // AES's two-byte one), the CRC / HMAC check at the end does.
             let err = read_back_pw(&arc, path, Some("wrong")).unwrap_err();
             assert!(
-                matches!(&err, Error::InvalidArgument(m) if m.contains("wrong passphrase")),
+                err.to_string().contains("wrong passphrase")
+                    || err.to_string().contains("authentication code mismatch"),
                 "{encryption:?} {path}: {err:?}"
             );
             assert!(read_back_pw(&arc, path, None).is_err());
@@ -1294,6 +1298,38 @@ mod tests {
         assert_eq!(&arc[desc..desc + 4], &SIG_DESCRIPTOR.to_le_bytes());
         assert_eq!(&arc[desc + 8..desc + 12], &112u32.to_le_bytes());
         assert_eq!(&arc[desc + 12..desc + 16], &100u32.to_le_bytes());
+    }
+
+    /// ZipCrypto checks a passphrase against one byte, so about one wrong
+    /// passphrase in 256 gets through it. Reading such a member must then
+    /// fail on its CRC-32 instead of returning garbage.
+    #[test]
+    fn zipcrypto_wrong_passphrase_past_check_byte_fails_on_crc() {
+        let (arc, _) = build_with(
+            ZipFormatOpts {
+                method: Compression::Stored,
+                password: Some("secret".into()),
+                encryption: Encryption::ZipCrypto,
+                ..ZipFormatOpts::default()
+            },
+            4096,
+        );
+        let mut slipped = 0;
+        for i in 0..20_000 {
+            let pw = format!("wrong{i}");
+            match read_back_pw(&arc, "/noise.bin", Some(&pw)) {
+                Ok((got, _)) => panic!("{pw:?} read {} bytes of garbage", got.len()),
+                Err(Error::InvalidArgument(m)) if m.contains("wrong passphrase") => {}
+                Err(e) => {
+                    assert!(e.to_string().contains("CRC-32"), "{pw:?}: {e:?}");
+                    slipped += 1;
+                    if slipped == 3 {
+                        return;
+                    }
+                }
+            }
+        }
+        panic!("no wrong passphrase got past the check byte in 20 000 tries");
     }
 
     #[cfg(feature = "zip-aes")]

@@ -200,6 +200,7 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<Parsed> {
                 uncompressed_len: cb_file as u64,
                 method: Method::Stored,
                 crypto: Crypto::None,
+                crc32: None,
             },
         );
         entry.kind = EntryKind::Regular;

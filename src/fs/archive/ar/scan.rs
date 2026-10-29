@@ -164,6 +164,7 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
                 uncompressed_len: body_len,
                 method: Method::Stored,
                 crypto: Crypto::None,
+                crc32: None,
             }),
         });
 

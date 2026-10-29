@@ -503,12 +503,20 @@ pub fn scan(dev: &mut dyn BlockDevice, password: Option<&[u8]>) -> Result<Archiv
         } else {
             (method_for(method_id, gp_flags), Crypto::None)
         };
+        // AE-2 zeroes the CRC (its HMAC authenticates the body instead).
+        let crc32 = match crypto {
+            Crypto::Aes {
+                vendor_version: 2, ..
+            } => None,
+            _ => Some(crc),
+        };
         let loc = DataLocator {
             offset: data_off,
             compressed_len: comp,
             uncompressed_len: uncomp,
             method,
             crypto,
+            crc32,
         };
 
         let mut entry = ArchiveEntry {

@@ -77,7 +77,58 @@ pub fn open_with_password<'a>(
             aes_reader(raw, pw, key_bits, loc.compressed_len)?
         }
     };
-    decode(body, &loc)
+    let decoded = decode(body, &loc)?;
+    Ok(match loc.crc32 {
+        Some(crc) => Box::new(CrcCheckReader {
+            inner: decoded,
+            want_crc: crc,
+            want_len: loc.uncompressed_len,
+            crc: 0,
+            len: 0,
+            encrypted: loc.crypto != Crypto::None,
+        }),
+        None => decoded,
+    })
+}
+
+/// Checks a member's CRC-32 and length once its decoded stream ends.
+///
+/// The end of the stream is the only point the whole body has been seen,
+/// so a mismatch surfaces as an error from the final `read`. That is what
+/// turns a wrong ZipCrypto passphrase which passes the format's one-byte
+/// check (about one in 256) into an error rather than garbage.
+struct CrcCheckReader<'a> {
+    inner: Box<dyn Read + 'a>,
+    want_crc: u32,
+    want_len: u64,
+    crc: u32,
+    len: u64,
+    encrypted: bool,
+}
+
+impl Read for CrcCheckReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.crc = crate::crc::crc32_append(self.crc, &buf[..n]);
+            self.len += n as u64;
+        } else if !buf.is_empty() && (self.crc != self.want_crc || self.len != self.want_len) {
+            let cause = if self.encrypted {
+                "wrong passphrase or corrupt member"
+            } else {
+                "corrupt member"
+            };
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "zip: CRC-32 / length check failed ({cause}): got {:08x} over {} bytes, \
+                     expected {:08x} over {} bytes",
+                    self.crc, self.len, self.want_crc, self.want_len
+                ),
+            ));
+        }
+        Ok(n)
+    }
 }
 
 #[cfg(feature = "zip-aes")]

@@ -187,6 +187,7 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
                     uncompressed_len: hdr.filesize,
                     method: Method::Stored,
                     crypto: Crypto::None,
+                    crc32: None,
                 });
             }
             EntryKind::Symlink => {

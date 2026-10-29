@@ -337,6 +337,7 @@ mod imp {
                         uncompressed_len: dfork_ulen,
                         method: Method::Stored,
                         crypto: Crypto::None,
+                        crc32: None,
                     },
                 );
                 entry.kind = EntryKind::Regular;

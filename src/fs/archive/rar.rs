@@ -554,6 +554,7 @@ mod imp {
                             uncompressed_len: unpack_size,
                             method: Method::Stored,
                             crypto: Crypto::None,
+                            crc32: None,
                         },
                     );
                     entry.kind = EntryKind::Regular;

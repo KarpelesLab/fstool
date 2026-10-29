@@ -182,6 +182,13 @@ pub struct DataLocator {
     pub method: Method,
     /// Encryption wrapped around the (compressed) body.
     pub crypto: Crypto,
+    /// CRC-32 of the decoded body when the format records one, checked
+    /// at the end of a sequential read so that corrupt data, or a wrong
+    /// ZipCrypto passphrase that slips past its one-byte check, is an
+    /// error instead of silently wrong bytes. `None` when there is no CRC
+    /// to check (most non-zip formats, and WinZip AE-2, which zeroes it and
+    /// relies on its HMAC).
+    pub crc32: Option<u32>,
 }
 
 /// One archived entry, fully resolved.
@@ -1040,6 +1047,7 @@ mod tests {
             uncompressed_len: len,
             method: Method::Stored,
             crypto: Crypto::None,
+            crc32: None,
         }
     }
 
