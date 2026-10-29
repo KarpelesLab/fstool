@@ -151,6 +151,25 @@ impl InodeVal {
             dstream,
         })
     }
+
+    /// Logical byte length of the inode's default data stream — the one
+    /// size every reader surface (directory listings, `getattr`, the file
+    /// body reader) reports, so they all agree on the same bytes.
+    ///
+    /// This is `j_dstream_t.size` from the `INO_EXT_TYPE_DSTREAM` xfield,
+    /// or 0 when the inode carries no data stream (an empty file written
+    /// without one, a directory, a native symlink).
+    ///
+    /// The fixed `uncompressed_size` field is deliberately *not*
+    /// consulted: on native images it is only meaningful for
+    /// `UF_COMPRESSED` (decmpfs) files and is commonly 0 for ordinary
+    /// ones. Compressed files are not decoded by this reader — their
+    /// body is read as the (usually absent) default data stream — so
+    /// reporting `uncompressed_size` for them would only trade one
+    /// size/bytes mismatch for another.
+    pub fn data_size(&self) -> u64 {
+        self.dstream.map(|d| d.size).unwrap_or(0)
+    }
 }
 
 /// j_dstream_t stored in INO_EXT_TYPE_DSTREAM xfield (0x28 / 40 bytes).
@@ -510,5 +529,39 @@ mod tests {
         let d = ino.dstream.expect("dstream xf should be present");
         assert_eq!(d.size, 1000);
         assert_eq!(d.alloced_size, 4096);
+        assert_eq!(ino.data_size(), 1000);
+    }
+
+    /// Native-shaped regular file: DSTREAM says 53 bytes while the fixed
+    /// `uncompressed_size` is 0 (macOS only fills it for decmpfs files).
+    /// The logical size is the DSTREAM one (issue #58).
+    #[test]
+    fn data_size_comes_from_dstream_not_uncompressed_size() {
+        let mut buf = vec![0u8; J_INODE_VAL_FIXED_SIZE + 4 + 4 + 40];
+        buf[80..82].copy_from_slice(&0o0100644u16.to_le_bytes());
+        buf[84..92].copy_from_slice(&0u64.to_le_bytes()); // uncompressed_size
+        let xoff = J_INODE_VAL_FIXED_SIZE;
+        buf[xoff..xoff + 2].copy_from_slice(&1u16.to_le_bytes());
+        buf[xoff + 2..xoff + 4].copy_from_slice(&40u16.to_le_bytes());
+        buf[xoff + 4] = INO_EXT_TYPE_DSTREAM;
+        buf[xoff + 6..xoff + 8].copy_from_slice(&40u16.to_le_bytes());
+        buf[xoff + 8..xoff + 16].copy_from_slice(&53u64.to_le_bytes());
+        buf[xoff + 16..xoff + 24].copy_from_slice(&4096u64.to_le_bytes());
+        let ino = InodeVal::decode(&buf).unwrap();
+        assert_eq!(ino.uncompressed_size, 0);
+        assert_eq!(ino.data_size(), 53);
+    }
+
+    /// No DSTREAM xfield → no data stream → size 0, even when the fixed
+    /// `uncompressed_size` is non-zero (a decmpfs-compressed file, whose
+    /// payload this reader does not decode and reads as empty).
+    #[test]
+    fn data_size_without_dstream_is_zero() {
+        let mut buf = vec![0u8; J_INODE_VAL_FIXED_SIZE];
+        buf[80..82].copy_from_slice(&0o0100644u16.to_le_bytes());
+        buf[84..92].copy_from_slice(&53u64.to_le_bytes());
+        let ino = InodeVal::decode(&buf).unwrap();
+        assert!(ino.dstream.is_none());
+        assert_eq!(ino.data_size(), 0);
     }
 }

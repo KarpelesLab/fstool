@@ -2459,3 +2459,148 @@ fn apfs_open_writable_refuses_multi_volume_container() {
     let err = Apfs::open_writable(&mut dev).unwrap_err().to_string();
     assert!(err.contains("2-volume container"), "{err}");
 }
+
+/// Issue #58 — listings, `getattr` and the body reader agree on a
+/// natively-written image.
+///
+/// macOS stores an ordinary file's logical size only in the DSTREAM
+/// xfield and leaves the inode's fixed `uncompressed_size` at 0, so a
+/// listing that reported 0 (or `uncompressed_size`) disagreed with the
+/// bytes the reader returns. Build an APFS image with `hdiutil`, mount
+/// it, plant a 53-byte file, an empty file and a multi-MB file written
+/// in interleaved chunks (so it spans several extents), plus a
+/// decmpfs-compressed file when `ditto --hfsCompression` works; detach,
+/// then check through fstool that list size == getattr size == bytes
+/// read for each. The plain files must also match their real contents;
+/// the compressed one only has to be self-consistent (its decmpfs
+/// payload is not decoded, so it reads as empty).
+#[test]
+fn apfs_native_list_sizes_match_getattr_and_bytes() {
+    use fstool::fs::Filesystem;
+    use std::io::{Read, Write};
+    use std::path::Path;
+
+    if !cfg!(target_os = "macos") {
+        eprintln!("skipping: native APFS image creation requires macOS (hdiutil)");
+        return;
+    }
+    if which("hdiutil").is_none() || !hdiutil_usable() {
+        eprintln!("skipping: hdiutil not usable");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("sizes.dmg");
+    let mnt = dir.path().join("mnt");
+    std::fs::create_dir(&mnt).unwrap();
+
+    let out = Command::new("hdiutil")
+        .args([
+            "create", "-size", "32m", "-fs", "APFS", "-volname", "SIZES", "-layout", "NONE",
+        ])
+        .arg(&img)
+        .output()
+        .expect("hdiutil create failed to spawn");
+    if !out.status.success() {
+        eprintln!(
+            "skipping: hdiutil create -fs APFS -layout NONE failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+    let attach = Command::new("hdiutil")
+        .args([
+            "attach",
+            "-nobrowse",
+            "-owners",
+            "off",
+            "-plist",
+            "-mountpoint",
+        ])
+        .arg(&mnt)
+        .arg(&img)
+        .output()
+        .expect("hdiutil attach failed to spawn");
+    if !attach.status.success() {
+        eprintln!(
+            "skipping: hdiutil attach failed:\n{}",
+            String::from_utf8_lossy(&attach.stderr)
+        );
+        return;
+    }
+    let (_devs, whole) = parse_hdiutil_devices(&String::from_utf8_lossy(&attach.stdout));
+    let whole = whole.expect("no device node in hdiutil attach output");
+
+    let small: Vec<u8> = (0..53u8).map(|i| b'a' + i % 26).collect();
+    // Interleave appends to two files with an fsync after each chunk so
+    // the allocator can't hand either one a single contiguous run.
+    let chunk = 256 * 1024;
+    let rounds = 12;
+    let big_expected: Vec<u8> = (0..chunk * rounds).map(|i| (i % 251) as u8).collect();
+    let setup = (|| -> std::io::Result<bool> {
+        std::fs::write(mnt.join("small.txt"), &small)?;
+        std::fs::write(mnt.join("empty"), b"")?;
+        let mut big = std::fs::File::create(mnt.join("big.bin"))?;
+        let mut other = std::fs::File::create(mnt.join("spacer.bin"))?;
+        for r in 0..rounds {
+            big.write_all(&big_expected[r * chunk..(r + 1) * chunk])?;
+            big.sync_all()?;
+            other.write_all(&vec![0x5a; chunk])?;
+            other.sync_all()?;
+        }
+        // Optional decmpfs-compressed file.
+        std::fs::write(dir.path().join("plain.txt"), "compress me ".repeat(4096))?;
+        let compressed = Command::new("ditto")
+            .arg("--hfsCompression")
+            .arg(dir.path().join("plain.txt"))
+            .arg(mnt.join("compressed.txt"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        Ok(compressed)
+    })();
+    // Flush and detach before reading the image file, whatever happened.
+    let _ = Command::new("sync").status();
+    let detach = Command::new("hdiutil").arg("detach").arg(&whole).output();
+    if !detach.as_ref().is_ok_and(|o| o.status.success()) {
+        hdiutil_detach(&whole);
+    }
+    let have_compressed = setup.expect("populating the mounted volume failed");
+
+    let mut dev = FileBackend::open(&img).expect("FileBackend::open");
+    let mut apfs = Apfs::open(&mut dev).expect("Apfs::open on native image");
+    let listing = apfs.list(&mut dev, Path::new("/")).unwrap();
+
+    let mut check = |name: &str, expected: Option<&[u8]>| {
+        let e = listing
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("{name} missing from listing {listing:?}"));
+        let path = format!("/{name}");
+        let attrs = apfs.getattr(&mut dev, Path::new(&path)).unwrap();
+        let mut body = Vec::new();
+        apfs.read_file(&mut dev, Path::new(&path))
+            .unwrap()
+            .read_to_end(&mut body)
+            .unwrap();
+        assert_eq!(e.size, attrs.size, "{name}: listed size vs getattr");
+        assert_eq!(
+            e.size,
+            body.len() as u64,
+            "{name}: listed size vs bytes read"
+        );
+        if let Some(want) = expected {
+            assert_eq!(body.len(), want.len(), "{name}: length");
+            assert!(body == want, "{name}: content differs");
+        }
+        eprintln!("{name}: list = getattr = read = {}", e.size);
+    };
+    check("small.txt", Some(&small));
+    check("empty", Some(b""));
+    check("big.bin", Some(&big_expected));
+    if have_compressed {
+        check("compressed.txt", None);
+    } else {
+        eprintln!("note: ditto --hfsCompression failed; compressed case not exercised");
+    }
+}

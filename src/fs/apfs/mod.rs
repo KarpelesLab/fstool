@@ -1719,14 +1719,39 @@ impl Apfs {
                 jrec::DT_SOCK => EntryKind::Socket,
                 _ => EntryKind::Unknown,
             };
-            out.push(FsDirEntry {
-                name: key.name,
-                inode: val.file_id as u32,
-                kind,
-                size: 0,
-            });
+            out.push((
+                val.file_id,
+                FsDirEntry {
+                    name: key.name,
+                    inode: val.file_id as u32,
+                    kind,
+                    size: 0,
+                },
+            ));
         }
-        Ok(out)
+        // Release the scan's borrow of the shared fs-tree context before
+        // the per-entry inode lookups below re-borrow it.
+        drop(scan);
+        drop(ctx);
+        // Directory records carry no size, so a regular file's size
+        // comes from its inode — the same `data_size()` that `getattr`
+        // and the body reader use, so listings agree with both. One
+        // inode lookup per regular file; the lookups share the fs-tree
+        // / omap node caches in `fs_ctx`, so a large directory mostly
+        // re-hits already-loaded nodes. A dangling drec (no inode
+        // record) keeps the old size of 0 rather than failing the whole
+        // listing, matching how undecodable drecs are skipped above.
+        Ok(out
+            .into_iter()
+            .map(|(oid, mut e)| {
+                if e.kind == EntryKind::Regular
+                    && let Ok(ino) = self.read_inode_val(dev, oid)
+                {
+                    e.size = ino.data_size();
+                }
+                e
+            })
+            .collect())
     }
 
     /// Find the inode record for `oid` and return `(size, dstream_oid)`.
@@ -1760,7 +1785,7 @@ impl Apfs {
                     ino.mode
                 )));
             }
-            let size = ino.dstream.map(|d| d.size).unwrap_or(0);
+            let size = ino.data_size();
             let dstream_oid = if ino.private_id != 0 && ino.private_id != oid {
                 Some(ino.private_id)
             } else {
@@ -2246,7 +2271,7 @@ impl crate::fs::Filesystem for Apfs {
             0o140_000 => crate::fs::EntryKind::Socket,
             _ => crate::fs::EntryKind::Regular,
         };
-        let size = ino.dstream.map(|d| d.size).unwrap_or(0);
+        let size = ino.data_size();
         // APFS timestamps are nanoseconds since the Unix epoch.
         let to_secs = |ns: u64| (ns / 1_000_000_000) as u32;
         let nlink = if kind == crate::fs::EntryKind::Dir {
@@ -3306,6 +3331,103 @@ mod tests {
             .read_to_end(&mut buf)
             .unwrap();
         assert_eq!(buf, b"top-level");
+    }
+
+    /// Issue #58: directory listings report a regular file's data-stream
+    /// size — the same value `getattr` reports and the body reader
+    /// returns — rather than 0. The 53-byte file's inode is patched to the
+    /// native shape (fixed `uncompressed_size` = 0, DSTREAM = 53) so the
+    /// listing can't be leaning on `uncompressed_size`.
+    #[test]
+    fn list_sizes_match_getattr_and_body() {
+        use crate::fs::{EntryKind, FileMeta, FileSource, Filesystem};
+        use std::io::Read;
+        use std::path::Path;
+
+        let total_blocks = 512u64;
+        let bs = 4096u32;
+        let mut dev = MemoryBackend::new(total_blocks * bs as u64);
+        let mut apfs = Apfs::format(&mut dev, total_blocks, bs, "Sizes").unwrap();
+        let small: Vec<u8> = (0..53u8).map(|i| b'a' + i % 26).collect();
+        let big: Vec<u8> = (0..(3 * 4096 + 1234u32)).map(|i| (i % 251) as u8).collect();
+        for (name, body) in [
+            ("/small.txt", small.clone()),
+            ("/empty", Vec::new()),
+            ("/big.bin", big.clone()),
+        ] {
+            apfs.create_file(
+                &mut dev,
+                Path::new(name),
+                FileSource::Reader {
+                    len: body.len() as u64,
+                    reader: Box::new(std::io::Cursor::new(body)),
+                },
+                FileMeta::with_mode(0o644),
+            )
+            .unwrap();
+        }
+        apfs.create_dir(&mut dev, Path::new("/d"), FileMeta::with_mode(0o755))
+            .unwrap();
+        apfs.flush(&mut dev).unwrap();
+        drop(apfs);
+
+        // Rewrite the 53-byte file's fixed `uncompressed_size` to 0, the
+        // way macOS leaves it for an uncompressed file. The fixed inode
+        // tail is `mode(u16) pad(u16) uncompressed_size(u64)`, followed by
+        // the xfield blob header (1 ext, 40 bytes used).
+        let mut needle = Vec::new();
+        needle.extend_from_slice(&0o100_644u16.to_le_bytes());
+        needle.extend_from_slice(&0u16.to_le_bytes());
+        needle.extend_from_slice(&53u64.to_le_bytes());
+        needle.extend_from_slice(&1u16.to_le_bytes());
+        needle.extend_from_slice(&40u16.to_le_bytes());
+        let mut img = vec![0u8; (total_blocks * bs as u64) as usize];
+        dev.read_at(0, &mut img).unwrap();
+        let hits: Vec<usize> = img
+            .windows(needle.len())
+            .enumerate()
+            .filter(|(_, w)| *w == needle.as_slice())
+            .map(|(i, _)| i)
+            .collect();
+        assert!(!hits.is_empty(), "53-byte inode not found in image");
+        for off in hits {
+            dev.write_at((off + 4) as u64, &0u64.to_le_bytes()).unwrap();
+        }
+
+        let mut apfs = Apfs::open(&mut dev).unwrap();
+        let oid = apfs.resolve_path_to_oid(&mut dev, "/small.txt").unwrap();
+        let ino = apfs.read_inode_val(&mut dev, oid).unwrap();
+        assert_eq!(ino.uncompressed_size, 0, "patch did not land");
+        assert_eq!(ino.data_size(), 53);
+
+        let listing = apfs.list(&mut dev, Path::new("/")).unwrap();
+        let listed = |n: &str| {
+            listing
+                .iter()
+                .find(|e| e.name == n)
+                .unwrap_or_else(|| panic!("{n} missing from {listing:?}"))
+                .clone()
+        };
+        for (name, body) in [
+            ("small.txt", &small),
+            ("empty", &Vec::new()),
+            ("big.bin", &big),
+        ] {
+            let path = format!("/{name}");
+            let e = listed(name);
+            assert_eq!(e.kind, EntryKind::Regular);
+            assert_eq!(e.size, body.len() as u64, "{name}: listed size");
+            let attrs = apfs.getattr(&mut dev, Path::new(&path)).unwrap();
+            assert_eq!(attrs.size, e.size, "{name}: getattr vs list");
+            let mut got = Vec::new();
+            apfs.read_file(&mut dev, Path::new(&path))
+                .unwrap()
+                .read_to_end(&mut got)
+                .unwrap();
+            assert_eq!(&got, body, "{name}: body");
+        }
+        assert_eq!(listed("d").kind, EntryKind::Dir);
+        assert_eq!(listed("d").size, 0);
     }
 
     /// `open_file_ro` returns a Read+Seek+len handle in Read state;
