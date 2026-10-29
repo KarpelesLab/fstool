@@ -86,11 +86,12 @@ impl SectorDriver for RamCard {
 #[unsafe(link_section = ".text.reset")]
 pub extern "C" fn reset() -> ! {
     // A blank card gets a filesystem — no heap needed for that either.
-    let opts = FormatOpts {
-        label: *b"HEAPLESS   ",
-        ..FormatOpts::default()
-    };
-    if Volume::<_, 512>::format(RamCard, &opts).and_then(Volume::unmount).is_err() {
+    let mut opts = FormatOpts::default();
+    opts.label = *b"HEAPLESS   ";
+    if Volume::<_, 512>::format(RamCard, &opts)
+        .and_then(Volume::unmount)
+        .is_err()
+    {
         loop {}
     }
 

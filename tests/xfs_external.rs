@@ -180,10 +180,8 @@ fn xfs_writer_passes_xfs_repair_single_ag() {
     let size: u64 = 64 * 1024 * 1024;
     let tmp = NamedTempFile::new().unwrap();
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
-    let opts = FormatOpts {
-        uuid: [0x42u8; 16],
-        ..Default::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.uuid = [0x42u8; 16];
     {
         let mut x = xfs::format(&mut dev, &opts).unwrap();
         x.begin_writes(opts.uuid);
@@ -218,10 +216,8 @@ fn xfs_writer_passes_xfs_repair_multi_ag() {
     let size: u64 = 768 * 1024 * 1024;
     let tmp = NamedTempFile::new().unwrap();
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
-    let opts = FormatOpts {
-        uuid: [0x7eu8; 16],
-        ..Default::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.uuid = [0x7eu8; 16];
     {
         let mut x = xfs::format(&mut dev, &opts).unwrap();
         x.begin_writes(opts.uuid);
@@ -254,10 +250,8 @@ fn xfs_db_dumps_primary_superblock() {
     let size: u64 = 64 * 1024 * 1024;
     let tmp = NamedTempFile::new().unwrap();
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
-    let opts = FormatOpts {
-        uuid: [0xa5u8; 16],
-        ..Default::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.uuid = [0xa5u8; 16];
     {
         let mut x = xfs::format(&mut dev, &opts).unwrap();
         x.begin_writes(opts.uuid);
@@ -379,10 +373,8 @@ fn open_file_rw_round_trip_passes_xfs_repair() {
     let size: u64 = 64 * 1024 * 1024;
     let tmp = NamedTempFile::new().unwrap();
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
-    let opts = FormatOpts {
-        uuid: [0x9au8; 16],
-        ..Default::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.uuid = [0x9au8; 16];
     // First lifecycle: format + populate + flush.
     {
         let mut x = xfs::format(&mut dev, &opts).unwrap();
@@ -464,10 +456,8 @@ fn set_attrs_round_trip_passes_xfs_repair() {
     let size: u64 = 64 * 1024 * 1024;
     let tmp = NamedTempFile::new().unwrap();
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
-    let opts = FormatOpts {
-        uuid: [0x5au8; 16],
-        ..Default::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.uuid = [0x5au8; 16];
     // First lifecycle: format + create a file (default mode 0o644) + flush.
     {
         let mut x = xfs::format(&mut dev, &opts).unwrap();
@@ -552,10 +542,8 @@ fn writer_image_opts_in_reflink() {
     let tmp = NamedTempFile::new().unwrap();
     let size: u64 = 512 * 1024 * 1024;
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
-    let opts = FormatOpts {
-        uuid: [0x42u8; 16],
-        ..Default::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.uuid = [0x42u8; 16];
     {
         let mut x = xfs::format(&mut dev, &opts).unwrap();
         x.begin_writes(opts.uuid);
@@ -646,10 +634,8 @@ fn clone_file_round_trip_via_reflink() {
     let tmp = NamedTempFile::new().unwrap();
     let size: u64 = 64 * 1024 * 1024;
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
-    let opts = FormatOpts {
-        uuid: [0x42u8; 16],
-        ..Default::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.uuid = [0x42u8; 16];
     let body: Vec<u8> = (0..32 * 1024).map(|i| (i & 0xFF) as u8).collect();
     {
         let mut x = xfs::format(&mut dev, &opts).unwrap();
@@ -735,10 +721,8 @@ fn open_file_rw_refused_on_reflinked_file() {
 
     let tmp = NamedTempFile::new().unwrap();
     let mut dev = FileBackend::create(tmp.path(), 64 * 1024 * 1024).unwrap();
-    let opts = FormatOpts {
-        uuid: [0x43u8; 16],
-        ..Default::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.uuid = [0x43u8; 16];
     let body: Vec<u8> = (0..16 * 1024).map(|i| (i & 0xFF) as u8).collect();
     {
         let mut x = xfs::format(&mut dev, &opts).unwrap();
@@ -824,10 +808,8 @@ fn xfs_writer_large_directory_leaf_and_node() {
         let size: u64 = 256 * 1024 * 1024;
         let tmp = NamedTempFile::new().unwrap();
         let mut dev = FileBackend::create(tmp.path(), size).unwrap();
-        let opts = FormatOpts {
-            uuid: [0x42u8; 16],
-            ..Default::default()
-        };
+        let mut opts = FormatOpts::default();
+        opts.uuid = [0x42u8; 16];
         {
             let mut x = xfs::format(&mut dev, &opts).unwrap();
             x.begin_writes(opts.uuid);

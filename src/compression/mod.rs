@@ -36,6 +36,7 @@ use crate::Result;
 
 /// Which compression algorithm a stream / block is encoded with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Algo {
     /// gzip framing: 10-byte header + deflate + 8-byte trailer (crc32 + isize).
     /// Used by `.tar.gz`. The `gzip` feature gates the codec.

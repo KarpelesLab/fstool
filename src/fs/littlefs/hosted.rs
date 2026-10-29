@@ -91,6 +91,7 @@ const XATTR_PREFIX: &str = "user.littlefs.";
 
 /// Format-time options for [`LittleFs::format`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct LittleFsFormatOpts {
     /// Logical block size — the flash erase-block size. littlefs stores it
     /// in the superblock; 4 KiB is the common default.

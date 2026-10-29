@@ -78,6 +78,7 @@ pub enum KdfChoice {
 
 /// Knobs for [`format()`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FormatOpts {
     /// On-disk format to write.
     pub version: Version,

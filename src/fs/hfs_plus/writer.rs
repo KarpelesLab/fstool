@@ -96,6 +96,7 @@ mod m {
 
 /// Options for [`super::HfsPlus::format`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FormatOpts {
     /// Allocation block size in bytes (must be a power of two ≥ 512).
     pub block_size: u32,

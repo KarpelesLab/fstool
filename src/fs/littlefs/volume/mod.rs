@@ -256,6 +256,7 @@ impl<E: core::fmt::Debug + core::fmt::Display> std::error::Error for Error<E> {}
 
 /// Format-time options for [`Volume::format_with`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FormatOpts {
     /// Blocks to use. `None` takes every block the driver reports. The
     /// block size and program size come from the driver, not from here.

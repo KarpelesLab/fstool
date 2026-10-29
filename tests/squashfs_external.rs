@@ -94,13 +94,12 @@ fn build_image<F: FnOnce(&mut FileBackend, &mut Squashfs)>(
     // worst-case overhead from the metablock + fragment tables.
     let capacity: u64 = 16 * 1024 * 1024;
     let mut dev = FileBackend::create(path, capacity).unwrap();
-    let mut sq = Squashfs::format(
-        &mut dev,
-        &FormatOpts {
-            block_size: 4096,
-            compression,
-        },
-    )
+    let mut sq = Squashfs::format(&mut dev, &{
+        let mut o = FormatOpts::default();
+        o.block_size = 4096;
+        o.compression = compression;
+        o
+    })
     .unwrap();
     builder(&mut dev, &mut sq);
     sq.flush(&mut dev).unwrap();

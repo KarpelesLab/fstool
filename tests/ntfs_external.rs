@@ -43,10 +43,8 @@ fn which(tool: &str) -> Option<std::path::PathBuf> {
 fn build_image_with_tree(volume_bytes: u64) -> NamedTempFile {
     let tmp = NamedTempFile::new().unwrap();
     let mut dev = FileBackend::create(tmp.path(), volume_bytes).unwrap();
-    let opts = FormatOpts {
-        volume_label: "FSTOOL-EXT".to_string(),
-        ..Default::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.volume_label = "FSTOOL-EXT".to_string();
     let mut ntfs = Ntfs::format(&mut dev, &opts).unwrap();
 
     // Resident-data file at root.
@@ -497,10 +495,8 @@ fn writer_device_nodes_round_trip_via_ntfscat() {
     // a tighter root for the device-node assertions below).
     let tmp = NamedTempFile::new().unwrap();
     let mut dev = FileBackend::create(tmp.path(), 16 * 1024 * 1024).unwrap();
-    let opts = FormatOpts {
-        volume_label: "FSTOOL-DEV".to_string(),
-        ..Default::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.volume_label = "FSTOOL-DEV".to_string();
     let mut ntfs = Ntfs::format(&mut dev, &opts).unwrap();
 
     use fstool::fs::DeviceKind;
@@ -714,10 +710,8 @@ fn remove_files_and_empty_dir_round_trip() {
 fn remove_from_promoted_index_passes_ntfsfix() {
     let tmp = NamedTempFile::new().unwrap();
     let mut dev = FileBackend::create(tmp.path(), 16 * 1024 * 1024).unwrap();
-    let opts = FormatOpts {
-        volume_label: "FSTOOL-REM-LG".to_string(),
-        ..Default::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.volume_label = "FSTOOL-REM-LG".to_string();
     let mut ntfs = Ntfs::format(&mut dev, &opts).unwrap();
     ntfs.create_dir(&mut dev, "/many", FileMeta::default())
         .unwrap();
@@ -866,10 +860,8 @@ fn large_directory_scales_and_mounts_clean() {
     const N: usize = 4000;
     let tmp = NamedTempFile::new().unwrap();
     let mut dev = FileBackend::create(tmp.path(), 64 * 1024 * 1024).unwrap();
-    let opts = FormatOpts {
-        volume_label: "FSTOOL-BIG".to_string(),
-        ..Default::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.volume_label = "FSTOOL-BIG".to_string();
     let mut ntfs = Ntfs::format(&mut dev, &opts).unwrap();
     ntfs.create_dir(&mut dev, "/big", FileMeta::default())
         .unwrap();

@@ -225,14 +225,12 @@ fn anyfs_put_flush_survives(path: &Path) {
 fn ext4_reopen_mutate() {
     use fstool::fs::ext::{Ext, FormatOpts, FsKind};
     let tmp = NamedTempFile::new().unwrap();
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        blocks_count: 16384,
-        inodes_count: 256,
-        journal_blocks: 1024,
-        sparse: true,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.blocks_count = 16384;
+    opts.inodes_count = 256;
+    opts.journal_blocks = 1024;
+    opts.sparse = true;
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     {
         let mut dev = FileBackend::create(tmp.path(), size).unwrap();
@@ -277,12 +275,10 @@ fn fat32_reopen_mutate() {
     let total_sectors = 64 * 1024 * 1024 / 512; // 64 MiB
     {
         let mut dev = FileBackend::create(tmp.path(), total_sectors as u64 * 512).unwrap();
-        let opts = FatFormatOpts {
-            total_sectors,
-            volume_id: 0xCAFE_F00D,
-            volume_label: *b"FSTOOL     ",
-            ..Default::default()
-        };
+        let mut opts = FatFormatOpts::default();
+        opts.total_sectors = total_sectors;
+        opts.volume_id = 0xCAFE_F00D;
+        opts.volume_label = *b"FSTOOL     ";
         let mut fs: Box<dyn Filesystem> = Box::new(Fat32::format(&mut dev, &opts).unwrap());
         fs.create_file(
             &mut dev,
@@ -325,12 +321,11 @@ fn exfat_reopen_mutate() {
     let tmp = NamedTempFile::new().unwrap();
     {
         let mut dev = FileBackend::create(tmp.path(), 64 * 1024 * 1024).unwrap();
-        let opts = FormatOpts {
-            bytes_per_sector_shift: 9,
-            sectors_per_cluster_shift: 3,
-            volume_serial_number: 0xCAFE_F00D,
-            volume_label: "FSTOOL".to_string(),
-        };
+        let mut opts = FormatOpts::default();
+        opts.bytes_per_sector_shift = 9;
+        opts.sectors_per_cluster_shift = 3;
+        opts.volume_serial_number = 0xCAFE_F00D;
+        opts.volume_label = "FSTOOL".to_string();
         let mut fs: Box<dyn Filesystem> = Box::new(Exfat::format(&mut dev, &opts).unwrap());
         fs.create_file(
             &mut dev,
@@ -402,10 +397,8 @@ fn ntfs_reopen_mutate() {
     let tmp = NamedTempFile::new().unwrap();
     {
         let mut dev = FileBackend::create(tmp.path(), 32 * 1024 * 1024).unwrap();
-        let opts = FormatOpts {
-            volume_label: "FSTOOL".to_string(),
-            ..Default::default()
-        };
+        let mut opts = FormatOpts::default();
+        opts.volume_label = "FSTOOL".to_string();
         let mut fs: Box<dyn Filesystem> = Box::new(Ntfs::format(&mut dev, &opts).unwrap());
         fs.create_file(
             &mut dev,
@@ -445,10 +438,8 @@ fn ntfs_reopen_mutate() {
 fn xfs_reopen_mutate() {
     use fstool::fs::xfs::{self, FormatOpts};
     let tmp = NamedTempFile::new().unwrap();
-    let opts = FormatOpts {
-        uuid: [0x42u8; 16],
-        ..Default::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.uuid = [0x42u8; 16];
     {
         let mut dev = FileBackend::create(tmp.path(), 64 * 1024 * 1024).unwrap();
         let mut x = xfs::format(&mut dev, &opts).unwrap();
@@ -502,10 +493,8 @@ fn hfs_plus_reopen_mutate() {
     let tmp = NamedTempFile::new().unwrap();
     {
         let mut dev = FileBackend::create(tmp.path(), 16 * 1024 * 1024).unwrap();
-        let opts = FormatOpts {
-            volume_name: "FstoolHFS".into(),
-            ..FormatOpts::default()
-        };
+        let mut opts = FormatOpts::default();
+        opts.volume_name = "FstoolHFS".into();
         let mut fs: Box<dyn Filesystem> = Box::new(HfsPlus::format(&mut dev, &opts).unwrap());
         fs.create_file(
             &mut dev,

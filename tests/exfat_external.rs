@@ -48,12 +48,13 @@ fn tool_present(tool: &str) -> bool {
 fn format_volume(path: &Path, mib: u32, label: &str) -> Exfat {
     let bytes = mib as u64 * 1024 * 1024;
     let mut dev = FileBackend::create(path, bytes).expect("create image");
-    let opts = FormatOpts {
-        bytes_per_sector_shift: 9,    // 512 B sectors
-        sectors_per_cluster_shift: 3, // 4 KiB clusters
-        volume_serial_number: 0xCAFE_F00D,
-        volume_label: label.to_string(),
-    };
+    let mut opts = FormatOpts::default();
+    opts.bytes_per_sector_shift = 9;
+    // 512 B sectors
+    opts.sectors_per_cluster_shift = 3;
+    // 4 KiB clusters
+    opts.volume_serial_number = 0xCAFE_F00D;
+    opts.volume_label = label.to_string();
     let fs = Exfat::format(&mut dev, &opts).expect("format exfat");
     dev.sync().expect("sync");
     drop(dev);
@@ -654,12 +655,11 @@ fn macos_fsck_exfat_accepts_fstool_formatted_volumes() {
         let bytes = 16u64 * 1024 * 1024;
         {
             let mut dev = FileBackend::create(tmp.path(), bytes).unwrap();
-            let opts = FormatOpts {
-                bytes_per_sector_shift: 9,
-                sectors_per_cluster_shift: spc_shift,
-                volume_serial_number: 0x5EED_0057,
-                volume_label: "FSTOOL".to_string(),
-            };
+            let mut opts = FormatOpts::default();
+            opts.bytes_per_sector_shift = 9;
+            opts.sectors_per_cluster_shift = spc_shift;
+            opts.volume_serial_number = 0x5EED_0057;
+            opts.volume_label = "FSTOOL".to_string();
             let mut fs = Exfat::format(&mut dev, &opts).unwrap();
             for name in NAMES {
                 let mut r: &[u8] = name.as_bytes();
@@ -686,11 +686,10 @@ fn macos_fsck_exfat_accepts_fstool_formatted_volumes() {
             .set_len(bytes)
             .unwrap();
         {
-            let opts = fstool::fs::exfat::VolumeFormatOpts {
-                cluster_size: Some(512 << spc_shift),
-                volume_serial: 0x5EED_0058,
-                label: "FSTOOLDRV",
-            };
+            let mut opts = fstool::fs::exfat::VolumeFormatOpts::default();
+            opts.cluster_size = Some(512 << spc_shift);
+            opts.volume_serial = 0x5EED_0058;
+            opts.label = "FSTOOLDRV";
             let mut vol = Volume::<_, 512>::format(FileCard::open(tmp.path()), &opts).unwrap();
             for name in NAMES {
                 let mut f = vol.create_file(name).unwrap();

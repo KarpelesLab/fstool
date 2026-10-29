@@ -45,6 +45,7 @@ const PVD_BYTE: u64 = 16 * SECTOR;
 /// Format options. `volume_id` is required; everything else has sane
 /// defaults.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FormatOpts {
     pub volume_id: String,
     pub publisher_id: String,

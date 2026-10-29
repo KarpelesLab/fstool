@@ -608,12 +608,10 @@ fn resolve_encrypt(
     } else {
         version
     };
-    let mut luks = FormatOpts {
-        version,
-        cipher: cli.encrypt_cipher.clone(),
-        key_bytes: cli.encrypt_key_bytes.unwrap_or(64),
-        ..FormatOpts::default()
-    };
+    let mut luks = FormatOpts::default();
+    luks.version = version;
+    luks.cipher = cli.encrypt_cipher.clone();
+    luks.key_bytes = cli.encrypt_key_bytes.unwrap_or(64);
     luks.kdf = match version {
         // LUKS1 has no Argon2 keyslots. 2 000 000 rounds of PBKDF2 lands
         // in the range cryptsetup's own benchmark picks on current
@@ -704,9 +702,10 @@ impl ContainerFlags {
     fn base_opts(&self) -> fstool::block::CreateOpts {
         #[cfg(feature = "luks")]
         {
-            fstool::block::CreateOpts {
-                encrypt: self.encrypt.clone(),
-                ..fstool::block::CreateOpts::default()
+            {
+                let mut o = fstool::block::CreateOpts::default();
+                o.encrypt = self.encrypt.clone();
+                o
             }
         }
         #[cfg(not(feature = "luks"))]
@@ -1783,13 +1782,11 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
                         "repack: FAT size doesn't fit in a u32 sector count".into(),
                     )
                 })?;
-                let opts = fstool::fs::fat::FatFormatOpts {
-                    kind: fstool::fs::fat::parse_fat_kind(&lower)?,
-                    total_sectors,
-                    volume_id: 0,
-                    volume_label: *b"REPACKED   ",
-                    ..Default::default()
-                };
+                let mut opts = fstool::fs::fat::FatFormatOpts::default();
+                opts.kind = fstool::fs::fat::parse_fat_kind(&lower)?;
+                opts.total_sectors = total_sectors;
+                opts.volume_id = 0;
+                opts.volume_label = *b"REPACKED   ";
                 let mut dst_fat = fstool::fs::fat::Fat32::format(dst_dev.as_mut(), &opts)?;
                 {
                     let mut sink =
@@ -1860,11 +1857,9 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
             )?,
             #[cfg(feature = "iso9660")]
             "iso" | "iso9660" => {
-                let opts = fstool::fs::iso9660::FormatOpts {
-                    volume_id: "FSTOOL".into(),
-                    application_id: "fstool".into(),
-                    ..fstool::fs::iso9660::FormatOpts::default()
-                };
+                let mut opts = fstool::fs::iso9660::FormatOpts::default();
+                opts.volume_id = "FSTOOL".into();
+                opts.application_id = "fstool".into();
                 repack_via_trait::<fstool::fs::iso9660::Iso9660>(
                     dst_dev.as_mut(),
                     &opts,
@@ -1892,7 +1887,7 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
             #[cfg(feature = "archive")]
             "cpio" => repack_via_trait::<fstool::fs::archive::cpio::CpioFs>(
                 dst_dev.as_mut(),
-                &fstool::fs::archive::cpio::CpioFormatOpts,
+                &fstool::fs::archive::cpio::CpioFormatOpts::default(),
                 src_fs,
                 src_dev,
                 false,
@@ -1900,7 +1895,7 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
             #[cfg(feature = "archive")]
             "ar" => repack_via_trait::<fstool::fs::archive::ar::ArFs>(
                 dst_dev.as_mut(),
-                &fstool::fs::archive::ar::ArFormatOpts,
+                &fstool::fs::archive::ar::ArFormatOpts::default(),
                 src_fs,
                 src_dev,
                 true,
@@ -2189,13 +2184,11 @@ fn repack_layered_to_dst(
                     "repack: FAT size doesn't fit in a u32 sector count".into(),
                 )
             })?;
-            let opts = fstool::fs::fat::FatFormatOpts {
-                kind: fstool::fs::fat::parse_fat_kind(&lower)?,
-                total_sectors,
-                volume_id: 0,
-                volume_label: *b"REPACKED   ",
-                ..Default::default()
-            };
+            let mut opts = fstool::fs::fat::FatFormatOpts::default();
+            opts.kind = fstool::fs::fat::parse_fat_kind(&lower)?;
+            opts.total_sectors = total_sectors;
+            opts.volume_id = 0;
+            opts.volume_label = *b"REPACKED   ";
             let mut dst = fstool::fs::fat::Fat32::format(dst_dev.as_mut(), &opts)?;
             {
                 let mut sink = FsSink::new(&mut dst, dst_dev.as_mut()).lossy();
@@ -2262,11 +2255,9 @@ fn repack_layered_to_dst(
         )?,
         #[cfg(feature = "iso9660")]
         "iso" | "iso9660" => {
-            let opts = fstool::fs::iso9660::FormatOpts {
-                volume_id: "FSTOOL".into(),
-                application_id: "fstool".into(),
-                ..fstool::fs::iso9660::FormatOpts::default()
-            };
+            let mut opts = fstool::fs::iso9660::FormatOpts::default();
+            opts.volume_id = "FSTOOL".into();
+            opts.application_id = "fstool".into();
             repack_layered_via_trait::<fstool::fs::iso9660::Iso9660>(
                 dst_dev.as_mut(),
                 &opts,
@@ -2294,7 +2285,7 @@ fn repack_layered_to_dst(
         #[cfg(feature = "archive")]
         "cpio" => repack_layered_via_trait::<fstool::fs::archive::cpio::CpioFs>(
             dst_dev.as_mut(),
-            &fstool::fs::archive::cpio::CpioFormatOpts,
+            &fstool::fs::archive::cpio::CpioFormatOpts::default(),
             &model,
             &layers,
             false,
@@ -2480,13 +2471,11 @@ fn repack_tar_stream_to_fs(
                     "repack: FAT size doesn't fit in a u32 sector count".into(),
                 )
             })?;
-            let opts = fstool::fs::fat::FatFormatOpts {
-                kind: fstool::fs::fat::parse_fat_kind(lower)?,
-                total_sectors,
-                volume_id: 0,
-                volume_label: *b"REPACKED   ",
-                ..Default::default()
-            };
+            let mut opts = fstool::fs::fat::FatFormatOpts::default();
+            opts.kind = fstool::fs::fat::parse_fat_kind(lower)?;
+            opts.total_sectors = total_sectors;
+            opts.volume_id = 0;
+            opts.volume_label = *b"REPACKED   ";
             let mut dst_fat = fstool::fs::fat::Fat32::format(dst_dev.as_mut(), &opts)?;
             {
                 let mut sink = fstool::repack::FsSink::new(&mut dst_fat, dst_dev.as_mut()).lossy();
@@ -2556,11 +2545,9 @@ fn repack_tar_stream_to_fs(
         )?,
         #[cfg(feature = "iso9660")]
         "iso" | "iso9660" => {
-            let opts = fstool::fs::iso9660::FormatOpts {
-                volume_id: "FSTOOL".into(),
-                application_id: "fstool".into(),
-                ..fstool::fs::iso9660::FormatOpts::default()
-            };
+            let mut opts = fstool::fs::iso9660::FormatOpts::default();
+            opts.volume_id = "FSTOOL".into();
+            opts.application_id = "fstool".into();
             repack_stream_via_trait::<fstool::fs::iso9660::Iso9660>(
                 dst_dev.as_mut(),
                 &opts,
@@ -2588,7 +2575,7 @@ fn repack_tar_stream_to_fs(
         #[cfg(feature = "archive")]
         "cpio" => repack_stream_via_trait::<fstool::fs::archive::cpio::CpioFs>(
             dst_dev.as_mut(),
-            &fstool::fs::archive::cpio::CpioFormatOpts,
+            &fstool::fs::archive::cpio::CpioFormatOpts::default(),
             tar_path,
             codec,
             false,
@@ -3561,7 +3548,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             opts,
             is_device,
             create_opts,
-            fstool::fs::archive::cpio::CpioFormatOpts,
+            fstool::fs::archive::cpio::CpioFormatOpts::default(),
             |o, m| o.apply_options(m),
             DEFAULT_MIN_SIZE,
         )?,
@@ -3574,7 +3561,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             opts,
             is_device,
             create_opts,
-            fstool::fs::archive::ar::ArFormatOpts,
+            fstool::fs::archive::ar::ArFormatOpts::default(),
             |o, m| o.apply_options(m),
             DEFAULT_MIN_SIZE,
         )?,
@@ -3722,12 +3709,10 @@ fn create_fat(
         .unwrap_or_else(|| "NO NAME".into());
     let label_bytes = fat32_label_bytes(&label_str);
     let volume_id = bag.take_u32("volume_id")?.unwrap_or(0);
-    let mut fat_opts = fstool::fs::fat::FatFormatOpts {
-        kind,
-        volume_id,
-        volume_label: label_bytes,
-        ..Default::default()
-    };
+    let mut fat_opts = fstool::fs::fat::FatFormatOpts::default();
+    fat_opts.kind = kind;
+    fat_opts.volume_id = volume_id;
+    fat_opts.volume_label = label_bytes;
     fat_opts.apply_options(&mut bag)?;
     bag.check_empty(name)?;
     let kind = fat_opts.kind;
@@ -4658,6 +4643,9 @@ fn print_fs_info(dev: &mut dyn fstool::block::BlockDevice, fs: &mut fstool::insp
         // ramfs is in-memory with no superblock; the listing covers it.
         #[cfg(feature = "ramfs")]
         fstool::inspect::AnyFs::Ramfs(_) => {}
+        // `AnyFs` is `#[non_exhaustive]`; a backend without a dedicated
+        // printer just gets the statfs + listing below.
+        _ => {}
     }
     println!();
     print_statfs(dev, fs);

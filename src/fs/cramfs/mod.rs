@@ -236,6 +236,7 @@ fn find_super(dev: &mut dyn BlockDevice) -> Result<Option<(u64, Endian)>> {
 
 /// Format-time options for [`Cramfs::format`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FormatOpts {
     /// Data block size — the page size of the kernel that will mount the
     /// image. A power of two between 4 KiB and 64 KiB; 4 KiB by default.

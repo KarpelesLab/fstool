@@ -117,7 +117,10 @@ pub extern "C" fn reset() -> ! {
     if f.write_all(&mut vol, body).is_err() {
         loop {}
     }
-    if vol.set_attr("/log/boot.txt", 1, &1_700_000_000u32.to_le_bytes()).is_err() {
+    if vol
+        .set_attr("/log/boot.txt", 1, &1_700_000_000u32.to_le_bytes())
+        .is_err()
+    {
         loop {}
     }
 

@@ -18,6 +18,7 @@ use crate::io;
 /// variant's arm in `Display` — the match is exhaustive, so the compiler
 /// will say so if you forget.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// Underlying I/O failure (file backend, host file source, etc.).
     Io(io::Error),

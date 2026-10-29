@@ -1222,10 +1222,8 @@ fn qemu_reads_an_encrypted_image_we_created() {
     }
     let dir = tempfile::TempDir::new().unwrap();
     let img = dir.path().join("ours-enc.qcow2");
-    let opts = FormatOpts {
-        version: Version::V1,
-        ..FormatOpts::fast_for_tests()
-    };
+    let mut opts = FormatOpts::fast_for_tests();
+    opts.version = Version::V1;
     {
         let mut back =
             Qcow2Backend::create_encrypted(&img, 16 * 1024 * 1024, 65536, "s3cret", &opts).unwrap();
@@ -1340,18 +1338,14 @@ fn hosts_a_filesystem_inside_an_encrypted_image() {
 
     let dir = tempfile::TempDir::new().unwrap();
     let img = dir.path().join("fs-enc.qcow2");
-    let luks = LuksOpts {
-        version: Version::V1,
-        ..LuksOpts::fast_for_tests()
-    };
+    let mut luks = LuksOpts::fast_for_tests();
+    luks.version = Version::V1;
     let body = b"secret payload\n";
     {
         let mut dev =
             Qcow2Backend::create_encrypted(&img, 16 * 1024 * 1024, 65536, "pw", &luks).unwrap();
-        let ext_opts = ExtOpts {
-            blocks_count: (dev.total_size() / 1024) as u32,
-            ..ExtOpts::default()
-        };
+        let mut ext_opts = ExtOpts::default();
+        ext_opts.blocks_count = (dev.total_size() / 1024) as u32;
         let mut fs = Ext::format_with(&mut dev, &ext_opts).unwrap();
         fs.create_file(
             &mut dev,

@@ -110,10 +110,8 @@ fn populated_ext2_passes_e2fsck_and_debugfs() {
     let tmp = NamedTempFile::new().unwrap();
     // We add 6 user entries + lost+found + reserved 1..10 + root = 18 inodes,
     // so default inodes_count=16 isn't enough.
-    let opts = FormatOpts {
-        inodes_count: 64,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.inodes_count = 64;
     let size = opts.blocks_count as u64 * opts.block_size as u64;
 
     use fstool::block::BlockDevice;
@@ -257,11 +255,9 @@ fn ext2_with_standard_rootdevs_passes_e2fsck() {
     let tmp = NamedTempFile::new().unwrap();
     // Standard set is 71 nodes + /dev dir + lost+found + root + 10 reserved
     // → ~84 inodes. Round up to 128 to leave headroom.
-    let opts = FormatOpts {
-        blocks_count: 4096,
-        inodes_count: 128,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.blocks_count = 4096;
+    opts.inodes_count = 128;
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
     let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
@@ -324,10 +320,8 @@ fn ext2_with_standard_rootdevs_passes_e2fsck() {
 fn ext2_open_lists_and_reads_what_was_written() {
     use fstool::block::BlockDevice;
     let tmp = NamedTempFile::new().unwrap();
-    let opts = FormatOpts {
-        inodes_count: 64,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.inodes_count = 64;
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
     {
@@ -375,10 +369,8 @@ fn ext2_via_filesystem_trait() {
     use std::path::Path;
 
     let tmp = NamedTempFile::new().unwrap();
-    let opts = FormatOpts {
-        inodes_count: 64,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.inodes_count = 64;
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
     let mut ext = <Ext as FilesystemFactory>::format(&mut dev, &opts).unwrap();
@@ -499,12 +491,10 @@ fn ext2_sparse_file_uses_holes() {
     let srcfile = NamedTempFile::new().unwrap();
     std::fs::write(srcfile.path(), &body).unwrap();
 
-    let opts = FormatOpts {
-        blocks_count: 8192,
-        inodes_count: 64,
-        sparse: true,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.blocks_count = 8192;
+    opts.inodes_count = 64;
+    opts.sparse = true;
     let tmp = NamedTempFile::new().unwrap();
     let mut dev = FileBackend::create(
         tmp.path(),
@@ -779,12 +769,10 @@ fn ext2_large_directory_uses_indirect_block() {
         return;
     };
 
-    let opts = FormatOpts {
-        block_size: 1024,
-        blocks_count: 16 * 1024,
-        inodes_count: 4096,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.block_size = 1024;
+    opts.blocks_count = 16 * 1024;
+    opts.inodes_count = 4096;
     let tmp = NamedTempFile::new().unwrap();
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     use fstool::block::BlockDevice;
@@ -891,15 +879,13 @@ fn prezeroed_skips_full_device_zero_and_stays_sparse() {
     // a few MB. With prezeroed = true the rest must stay as a hole.
     let bs: u32 = 4096;
     let blocks: u32 = (128 * 1024 * 1024) / bs;
-    let mut opts = FormatOpts {
-        kind: fstool::fs::ext::FsKind::Ext4,
-        block_size: bs,
-        blocks_count: blocks,
-        inodes_count: 4096,
-        sparse_super: true,
-        prezeroed: true,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = fstool::fs::ext::FsKind::Ext4;
+    opts.block_size = bs;
+    opts.blocks_count = blocks;
+    opts.inodes_count = 4096;
+    opts.sparse_super = true;
+    opts.prezeroed = true;
     // mke2fs's flex_bg packs metadata; mirror it so untouched groups
     // really do stay zero.
     opts.log_groups_per_flex =
@@ -1062,10 +1048,8 @@ fn symlink_target_of_exactly_60_bytes_is_not_stored_inline() {
     use fstool::block::BlockDevice;
 
     let tmp = NamedTempFile::new().unwrap();
-    let opts = FormatOpts {
-        inodes_count: 64,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.inodes_count = 64;
     let mut dev = FileBackend::create(
         tmp.path(),
         opts.blocks_count as u64 * opts.block_size as u64,
@@ -1150,12 +1134,10 @@ fn used_dirs_count_is_charged_per_block_group() {
 
     // 1 KiB blocks keep inodes_per_group small, so a few hundred
     // directories are enough to spill into group 1.
-    let opts = FormatOpts {
-        block_size: 1024,
-        blocks_count: 16384,
-        inodes_count: 1024,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.block_size = 1024;
+    opts.blocks_count = 16384;
+    opts.inodes_count = 1024;
     let tmp = NamedTempFile::new().unwrap();
     let mut dev = FileBackend::create(
         tmp.path(),
@@ -1355,10 +1337,8 @@ fn device_numbers_and_high_ids_match_debugfs() {
         }
     }
     let tmp = NamedTempFile::new().unwrap();
-    let opts = FormatOpts {
-        inodes_count: 64,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.inodes_count = 64;
     // fstool writes; debugfs reads.
     {
         use fstool::block::BlockDevice;

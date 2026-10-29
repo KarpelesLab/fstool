@@ -54,11 +54,9 @@ fn sink(v: u32) {
 pub extern "C" fn reset() -> ! {
     // Format a 1 MiB FAT12 volume in RAM, add a file, list, read it back.
     let mut dev = MemoryBackend::new(1 << 20);
-    let opts = FatFormatOpts {
-        kind: FatKind::Fat12,
-        total_sectors: 2048,
-        ..Default::default()
-    };
+    let mut opts = FatFormatOpts::default();
+    opts.kind = FatKind::Fat12;
+    opts.total_sectors = 2048;
     let mut fs = Fat32::format(&mut dev, &opts).unwrap();
     let body: &[u8] = b"hello from a microcontroller";
     fs.create_file(

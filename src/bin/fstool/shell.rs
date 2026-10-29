@@ -2202,10 +2202,8 @@ mod tests {
     #[cfg(feature = "ext")]
     fn ext_shell() -> (fstool::block::MemoryBackend, Shell) {
         use fstool::fs::ext::{Ext, FormatOpts};
-        let opts = FormatOpts {
-            inodes_count: 64,
-            ..FormatOpts::default()
-        };
+        let mut opts = FormatOpts::default();
+        opts.inodes_count = 64;
         let mut dev =
             fstool::block::MemoryBackend::new(opts.blocks_count as u64 * opts.block_size as u64);
         {

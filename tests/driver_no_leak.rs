@@ -141,11 +141,9 @@ fn fat_image() -> Vec<u8> {
 
     const SECTORS: u32 = 128 * 1024; // 64 MiB: comfortably FAT32
     let mut dev = MemoryBackend::new(SECTORS as u64 * 512);
-    let opts = FatFormatOpts {
-        kind: FatKind::Fat32,
-        total_sectors: SECTORS,
-        ..Default::default()
-    };
+    let mut opts = FatFormatOpts::default();
+    opts.kind = FatKind::Fat32;
+    opts.total_sectors = SECTORS;
     let mut fs = Fat32::format(&mut dev, &opts).expect("format");
     fs.create_file(
         &mut dev,

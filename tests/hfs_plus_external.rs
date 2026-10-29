@@ -177,10 +177,8 @@ fn writer_image_passes_fsck_hfs() {
     };
 
     let tmp = NamedTempFile::new().unwrap();
-    let opts = FormatOpts {
-        volume_name: "FstoolHFS".into(),
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.volume_name = "FstoolHFS".into();
     let (mut dev, mut hfs) = fresh_image(&tmp, &opts);
 
     // /etc + /etc/conf
@@ -241,11 +239,9 @@ fn writer_journaled_image_passes_fsck_hfs() {
     };
 
     let tmp = NamedTempFile::new().unwrap();
-    let opts = FormatOpts {
-        volume_name: "FstoolJrnl".into(),
-        journaled: true,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.volume_name = "FstoolJrnl".into();
+    opts.journaled = true;
     let (mut dev, mut hfs) = fresh_image(&tmp, &opts);
 
     // Sprinkle a single regular file so the catalog has something to
@@ -328,10 +324,8 @@ fn newfs_hfsplus_image_opens_via_fstool() {
 #[test]
 fn writer_device_nodes_round_trip() {
     let tmp = NamedTempFile::new().unwrap();
-    let opts = FormatOpts {
-        volume_name: "FstoolDev".into(),
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.volume_name = "FstoolDev".into();
     let (mut dev, mut hfs) = fresh_image(&tmp, &opts);
 
     use fstool::fs::DeviceKind;
@@ -429,10 +423,8 @@ fn dump_mkfs_vs_fstool_extents_header() {
     let fstool_tmp = NamedTempFile::new().unwrap();
     {
         let mut dev = FileBackend::create(fstool_tmp.path(), VOL_BYTES).unwrap();
-        let opts = FormatOpts {
-            volume_name: "FstoolHFS".into(),
-            ..FormatOpts::default()
-        };
+        let mut opts = FormatOpts::default();
+        opts.volume_name = "FstoolHFS".into();
         let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
         hfs.flush(&mut dev).unwrap();
         dev.sync().unwrap();
@@ -494,10 +486,8 @@ fn dump_mkfs_vs_fstool_extents_header() {
 #[ignore = "diagnostic — run via `cargo test -- --ignored`"]
 fn dump_fstool_catalog_leaf() {
     let tmp = NamedTempFile::new().unwrap();
-    let opts = FormatOpts {
-        volume_name: "FstoolHFS".into(),
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.volume_name = "FstoolHFS".into();
     let (mut dev, mut hfs) = fresh_image(&tmp, &opts);
     hfs.create_dir(&mut dev, "/etc", 0o755, 0, 0, 0).unwrap();
     let body = b"x=1\n";
@@ -611,10 +601,8 @@ fn writer_large_directory_grows_catalog_passes_fsck() {
     let tmp = NamedTempFile::new().unwrap();
     // 600 MiB: above the ~512 MiB point where fsck checks the clump size.
     let mut dev = FileBackend::create(tmp.path(), 600 * 1024 * 1024).unwrap();
-    let opts = FormatOpts {
-        volume_name: "FstoolBig".into(),
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.volume_name = "FstoolBig".into();
     let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
     hfs.create_dir(&mut dev, "/big", 0o755, 0, 0, 0).unwrap();
     for i in 0..6000 {
@@ -874,11 +862,9 @@ fn hdiutil_journaled_image_opens_and_replays() {
 #[test]
 fn writer_journaled_reopen_multi_transaction_flush() {
     let tmp = NamedTempFile::new().unwrap();
-    let opts = FormatOpts {
-        volume_name: "FstoolJrnl2".into(),
-        journaled: true,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.volume_name = "FstoolJrnl2".into();
+    opts.journaled = true;
     let (mut dev, mut hfs) = fresh_image(&tmp, &opts);
     hfs.create_dir(&mut dev, "/d", 0o755, 0, 0, 0).unwrap();
     hfs.flush(&mut dev).unwrap();
@@ -984,10 +970,8 @@ fn make_case_sensitive_hfsx(path: &std::path::Path) {
 #[test]
 fn hfsx_case_sensitive_writer_keeps_case_variant_names() {
     let tmp = NamedTempFile::new().unwrap();
-    let opts = FormatOpts {
-        volume_name: "CaseVol".into(),
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.volume_name = "CaseVol".into();
     {
         let (mut dev, _hfs) = fresh_image(&tmp, &opts);
         dev.sync().unwrap();
@@ -1053,10 +1037,8 @@ fn hfsx_case_sensitive_writer_keeps_case_variant_names() {
 #[test]
 fn writer_folds_non_latin_names_the_way_fsck_does() {
     let tmp = NamedTempFile::new().unwrap();
-    let opts = FormatOpts {
-        volume_name: "FoldVol".into(),
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.volume_name = "FoldVol".into();
     let (mut dev, mut hfs) = fresh_image(&tmp, &opts);
     // Pairs that only a full-BMP fold table orders consistently:
     // Ё/ё (U+0401/U+0451), Ω/ω (U+03A9/U+03C9), Ä (NFD) and a
@@ -1128,11 +1110,9 @@ fn fragmented_allocation_file_round_trips() {
     use std::os::unix::fs::FileExt;
 
     let tmp = NamedTempFile::new().unwrap();
-    let opts = FormatOpts {
-        volume_name: "FragBM".into(),
-        block_size: 512,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.volume_name = "FragBM".into();
+    opts.block_size = 512;
     {
         let (mut dev, mut hfs) = fresh_image(&tmp, &opts);
         hfs.flush(&mut dev).unwrap();

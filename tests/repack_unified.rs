@@ -690,13 +690,11 @@ fn duplicate_stream_entries_collapse_into_ext4() {
         w.finish().unwrap();
     }
 
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        blocks_count: 8192,
-        inodes_count: 64,
-        journal_blocks: 1024,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.blocks_count = 8192;
+    opts.inodes_count = 64;
+    opts.journal_blocks = 1024;
     let mut dev = MemoryBackend::new(opts.blocks_count as u64 * opts.block_size as u64);
     let mut fs = Ext::format_with(&mut dev, &opts).unwrap();
     let src = fstool::repack::Source::TarArchive {
@@ -756,13 +754,11 @@ fn add_dir_tree_lands_under_destination() {
     std::fs::write(host.join("index.html"), b"<h1>hi</h1>").unwrap();
     std::fs::write(host.join("assets/a.css"), b"body{}").unwrap();
 
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        blocks_count: 8192,
-        inodes_count: 64,
-        journal_blocks: 1024,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.blocks_count = 8192;
+    opts.inodes_count = 64;
+    opts.journal_blocks = 1024;
     let mut dev = MemoryBackend::new(opts.blocks_count as u64 * opts.block_size as u64);
     {
         let mut fs = Ext::format_with(&mut dev, &opts).unwrap();

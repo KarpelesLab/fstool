@@ -56,13 +56,11 @@ fn build_flavour(path: &Path, kind: FatKind, mib: u32, src: &Path) {
     use fstool::block::BlockDevice;
     let total_sectors = mib * 1024 * 1024 / 512;
     let mut dev = FileBackend::create(path, total_sectors as u64 * 512).unwrap();
-    let opts = FatFormatOpts {
-        kind,
-        total_sectors,
-        volume_id: 0xCAFE_F00D,
-        volume_label: *b"FSTOOL     ",
-        ..Default::default()
-    };
+    let mut opts = FatFormatOpts::default();
+    opts.kind = kind;
+    opts.total_sectors = total_sectors;
+    opts.volume_id = 0xCAFE_F00D;
+    opts.volume_label = *b"FSTOOL     ";
     let mut fs = Fat32::format(&mut dev, &opts).expect("format");
     assert_eq!(fs.kind(), kind, "format produced the wrong flavour");
     fs.populate_from_host_dir(&mut dev, src).expect("populate");
@@ -88,12 +86,10 @@ fn format_empty(path: &Path, mib: u32) {
     let total_sectors = mib * 1024 * 1024 / 512;
     let bytes = total_sectors as u64 * 512;
     let mut dev = FileBackend::create(path, bytes).expect("create image");
-    let opts = FatFormatOpts {
-        total_sectors,
-        volume_id: 0xCAFE_F00D,
-        volume_label: *b"FSTOOL     ",
-        ..Default::default()
-    };
+    let mut opts = FatFormatOpts::default();
+    opts.total_sectors = total_sectors;
+    opts.volume_id = 0xCAFE_F00D;
+    opts.volume_label = *b"FSTOOL     ";
     Fat32::format(&mut dev, &opts).expect("format fat32");
     use fstool::block::BlockDevice;
     dev.sync().expect("sync");
@@ -498,13 +494,11 @@ fn every_flavour_passes_fsck_vfat() {
             use fstool::block::BlockDevice;
             let total_sectors = mib * 1024 * 1024 / 512;
             let mut dev = FileBackend::create(empty.path(), total_sectors as u64 * 512).unwrap();
-            let opts = FatFormatOpts {
-                kind,
-                total_sectors,
-                volume_id: 0xCAFE_F00D,
-                volume_label: *b"FSTOOL     ",
-                ..Default::default()
-            };
+            let mut opts = FatFormatOpts::default();
+            opts.kind = kind;
+            opts.total_sectors = total_sectors;
+            opts.volume_id = 0xCAFE_F00D;
+            opts.volume_label = *b"FSTOOL     ";
             Fat32::format(&mut dev, &opts).expect("format");
             dev.sync().unwrap();
         }
@@ -682,15 +676,14 @@ fn narrow_flavours_survive_modify_in_place() {
 fn fixed_root_reports_a_clear_error_when_full() {
     use fstool::block::BlockDevice;
     let mut dev = fstool::block::MemoryBackend::new(4 * 1024 * 1024);
-    let opts = FatFormatOpts {
-        kind: FatKind::Fat16,
-        total_sectors: 4 * 1024 * 1024 / 512,
-        volume_id: 0,
-        volume_label: *b"TINYROOT   ",
-        // The smallest sector-aligned root: 16 slots, one of which the
-        // volume label takes.
-        root_entries: Some(16),
-    };
+    let mut opts = FatFormatOpts::default();
+    opts.kind = FatKind::Fat16;
+    opts.total_sectors = 4 * 1024 * 1024 / 512;
+    opts.volume_id = 0;
+    opts.volume_label = *b"TINYROOT   ";
+    // The smallest sector-aligned root: 16 slots, one of which the
+    // volume label takes.
+    opts.root_entries = Some(16);
     let mut fs = Fat32::format(&mut dev, &opts).unwrap();
     let host = TempDir::new().unwrap();
     let f = host.path().join("f.txt");

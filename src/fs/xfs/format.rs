@@ -55,6 +55,7 @@ use super::superblock::Superblock;
 /// allocation group of however many blocks the device holds — and only
 /// exposes the cosmetic knobs that don't change the on-disk geometry.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct FormatOpts {
     /// 16-byte filesystem UUID. Defaults to all-zero; pass a random one
     /// if you want each image to be uniquely identifiable.

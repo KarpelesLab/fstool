@@ -27,6 +27,7 @@ pub const MAGIC: &[u8; 8] = b"!<arch>\n";
 
 /// Format options for `ar` (none today).
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ArFormatOpts;
 
 impl ArFormatOpts {

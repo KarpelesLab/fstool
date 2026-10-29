@@ -59,6 +59,7 @@ pub(crate) const HEADER_SIZE: usize = 0x2e;
 /// version 0x200 today; older versions are readable but not writeable
 /// (they're rarely useful outside legacy game clients).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FormatOpts {
     /// GRF version word to write. Only 0x200 is supported by the
     /// writer right now.

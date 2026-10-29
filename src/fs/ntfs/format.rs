@@ -74,6 +74,7 @@ pub const LOGFILE_BYTES: u64 = 64 * 1024;
 
 /// Options controlling a fresh NTFS format.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FormatOpts {
     /// Logical sector size. Default 512.
     pub bytes_per_sector: u16,

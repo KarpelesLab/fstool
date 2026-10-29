@@ -36,12 +36,10 @@ fn which(tool: &str) -> Option<std::path::PathBuf> {
 fn build_tiny_iso(path: &Path) {
     let capacity: u64 = 4 * 1024 * 1024;
     let mut dev = FileBackend::create(path, capacity).unwrap();
-    let opts = FormatOpts {
-        volume_id: "SPCHECK".into(),
-        joliet: true,
-        rock_ridge: true,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.volume_id = "SPCHECK".into();
+    opts.joliet = true;
+    opts.rock_ridge = true;
     let mut w = Iso9660Writer::new(opts);
     w.add_dir(Path::new("/etc"), FileMeta::default()).unwrap();
     let body = b"hi\n".to_vec();
@@ -69,12 +67,10 @@ fn bsdtar_lists_large_rock_ridge_directory_and_symlinks() {
     let tmp = NamedTempFile::new().unwrap();
     {
         let mut dev = FileBackend::create(tmp.path(), 16 * 1024 * 1024).unwrap();
-        let opts = FormatOpts {
-            volume_id: "BIGDIR".into(),
-            joliet: true,
-            rock_ridge: true,
-            ..FormatOpts::default()
-        };
+        let mut opts = FormatOpts::default();
+        opts.volume_id = "BIGDIR".into();
+        opts.joliet = true;
+        opts.rock_ridge = true;
         let mut w = Iso9660Writer::new(opts);
         for i in 0..N {
             let name = format!("/big/file-number-{i:03}-with-a-longish-name.txt");

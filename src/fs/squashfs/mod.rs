@@ -169,6 +169,7 @@ pub fn probe(dev: &mut dyn BlockDevice) -> Result<bool> {
 
 /// Format-time options for [`Squashfs::format`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FormatOpts {
     /// Data block size, must be a power of two between 4 KiB and 1 MiB.
     /// Defaults to 128 KiB.

@@ -63,10 +63,8 @@ fn writer_image_passes_fsck_f2fs() {
     let mut dev = FileBackend::create(tmp.path(), IMAGE_BYTES).unwrap();
 
     // Canonical f2fs geometry: 2 MiB segments (log_blocks_per_seg = 9).
-    let opts = FormatOpts {
-        volume_label: "fstool-ext".into(),
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.volume_label = "fstool-ext".into();
     let mut fs = F2fs::format(&mut dev, &opts).unwrap();
 
     // A directory + an inline-sized file inside it.
@@ -267,10 +265,8 @@ fn writer_large_directory_passes_fsck_f2fs() {
     const N: usize = 10_000;
     let tmp = NamedTempFile::new().unwrap();
     let mut dev = FileBackend::create(tmp.path(), 256 * 1024 * 1024).unwrap();
-    let opts = FormatOpts {
-        volume_label: "fstool-big".into(),
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.volume_label = "fstool-big".into();
     let mut fs = F2fs::format(&mut dev, &opts).unwrap();
     fs.create_dir(
         &mut dev,

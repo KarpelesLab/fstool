@@ -84,6 +84,7 @@ const FLOPPY_MAX_SECTORS: u32 = 5760;
 
 /// Options for [`Fat32::format`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FatFormatOpts {
     /// Which FAT flavour to produce. Defaults to [`FatKind::Fat32`], so a
     /// caller that says nothing keeps the historical behaviour.

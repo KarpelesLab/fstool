@@ -19,6 +19,7 @@ use super::{Error, FatKind, SectorDriver, Timestamp, Volume};
 /// How [`Volume::format`] lays a volume out. The default picks everything
 /// from the volume's size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FormatOpts {
     /// FAT12, FAT16 or FAT32; `None` chooses by size.
     pub kind: Option<FatKind>,

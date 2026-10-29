@@ -45,6 +45,7 @@ use super::superblock::{F2FS_MAGIC, F2FS_ROOT_INO_DEFAULT, SB_OFFSET_BACKUP, SB_
 /// User-facing format knobs. Anything not in here is derived from the
 /// device size and a couple of geometry defaults.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FormatOpts {
     /// 16-byte UUID stamped into the superblock. Defaults to all zero
     /// (caller decides whether to randomise).

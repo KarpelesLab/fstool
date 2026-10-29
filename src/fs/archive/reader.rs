@@ -42,6 +42,12 @@ impl<'a> Read for BoundedDevReader<'a> {
     }
 }
 
+/// Open a streaming reader over an entry's body. Encrypted entries need
+/// [`open_with_password`].
+pub fn open<'a>(dev: &'a mut dyn BlockDevice, loc: DataLocator) -> Result<Box<dyn Read + 'a>> {
+    open_with_password(dev, loc, None)
+}
+
 /// Open a streaming reader over one entry's body: the located byte
 /// range, decrypted per `loc.crypto` when a `password` is given, then
 /// decoded per `loc.method`. The returned reader borrows only `dev`.
@@ -52,7 +58,7 @@ impl<'a> Read for BoundedDevReader<'a> {
 /// stream) are re-framed here into the self-describing header the
 /// compcol codec expects; parameters that live at the start of the
 /// body (LZMA's property block) are read from the decrypted stream.
-pub fn open<'a>(
+pub fn open_with_password<'a>(
     dev: &'a mut dyn BlockDevice,
     loc: DataLocator,
     password: Option<&[u8]>,

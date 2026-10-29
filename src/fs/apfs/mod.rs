@@ -2448,6 +2448,7 @@ impl crate::fs::FilesystemFactory for Apfs {
 /// surface. Mirrors the positional arguments on the inherent
 /// `Apfs::format` method.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ApfsFormatOpts {
     /// Image size in blocks. Must satisfy
     /// `total_blocks * block_size <= dev.total_size()`.

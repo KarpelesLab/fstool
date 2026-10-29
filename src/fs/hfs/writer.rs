@@ -49,6 +49,7 @@ fn mac_time(unix: u32) -> u32 {
 
 /// Options for formatting a fresh classic-HFS volume (`Hfs::format`).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct HfsFormatOpts {
     /// Volume name (also the root directory's catalog name). ≤ 27 MacRoman
     /// bytes.

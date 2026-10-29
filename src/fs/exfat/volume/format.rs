@@ -34,6 +34,7 @@ const UPCASE_CHECKSUM: u32 = super::super::upcase_table::UPCASE_TABLE_CHECKSUM;
 /// How [`Volume::format`] lays a volume out. The default picks the cluster
 /// size from the volume's size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VolumeFormatOpts<'a> {
     /// Cluster size in bytes: a power of two from one sector to 32 MiB.
     /// `None` takes Microsoft's defaults — 4 KiB up to 256 MiB, 32 KiB up to

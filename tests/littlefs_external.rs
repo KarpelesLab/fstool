@@ -321,12 +321,10 @@ fn version_2_0_images_mount_in_the_reference_implementation() {
         return;
     };
     let img = h.image("v2_0.img");
-    let opts = LittleFsFormatOpts {
-        disk_version: DISK_VERSION_2_0,
-        block_size: 512,
-        prog_size: 128,
-        ..LittleFsFormatOpts::default()
-    };
+    let mut opts = LittleFsFormatOpts::default();
+    opts.disk_version = DISK_VERSION_2_0;
+    opts.block_size = 512;
+    opts.prog_size = 128;
     let (mut dev, mut fs) = create_image(&img, 1024 * 1024, &opts);
     put(&mut fs, &mut dev, "/a.txt", b"small");
     put(&mut fs, &mut dev, "/b.bin", &pattern(20_000));
@@ -353,11 +351,9 @@ fn every_geometry_mounts_in_the_reference_implementation() {
     // to agree on — and small blocks are where the margins are tightest.
     for (block_size, prog_size) in [(128u32, 8u32), (512, 128), (1024, 64), (16384, 512)] {
         let img = h.image(&format!("geom-{block_size}-{prog_size}.img"));
-        let opts = LittleFsFormatOpts {
-            block_size,
-            prog_size,
-            ..LittleFsFormatOpts::default()
-        };
+        let mut opts = LittleFsFormatOpts::default();
+        opts.block_size = block_size;
+        opts.prog_size = prog_size;
         let (mut dev, mut fs) = create_image(&img, 4 * 1024 * 1024, &opts);
         fs.create_dir(&mut dev, Path::new("/d"), FileMeta::default())
             .unwrap();

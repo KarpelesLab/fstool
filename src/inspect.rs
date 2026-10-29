@@ -116,9 +116,6 @@ pub enum FsKind {
     /// SquashFS — read + write via `repack` (compressed, repack-only).
     #[cfg(feature = "squashfs")]
     Squashfs,
-    /// cramfs — read + write via `create` / `repack` (zlib, build-once).
-    #[cfg(feature = "cramfs")]
-    Cramfs,
     /// ISO 9660 (optical media). Read-only on this trait surface;
     /// writing happens through `repack` to a fresh image.
     #[cfg(feature = "iso9660")]
@@ -160,6 +157,10 @@ pub enum FsKind {
     /// [`detect_fs`] — only constructed explicitly (`AnyFs::new_ramfs`).
     #[cfg(feature = "ramfs")]
     Ramfs,
+    // New variants go last: inserting one mid-enum renumbers the rest.
+    /// cramfs — read + write via `create` / `repack` (zlib, build-once).
+    #[cfg(feature = "cramfs")]
+    Cramfs,
 }
 
 /// The error for a format whose on-disk signature was recognised (or whose
@@ -402,6 +403,7 @@ fn is_cramfs_super(head: &[u8]) -> bool {
 /// those don't ask you to know the variant list. `AnyFs` is the
 /// in-crate dispatch helper they build on; matching on its variants
 /// is fine in-crate but isn't a stable surface.
+#[non_exhaustive]
 pub enum AnyFs {
     #[cfg(feature = "ext")]
     Ext(Box<Ext>),

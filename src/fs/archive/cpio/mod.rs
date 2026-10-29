@@ -31,6 +31,7 @@ pub const S_IFMT: u32 = 0o170000;
 
 /// Format options for `cpio` (none today).
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct CpioFormatOpts;
 
 impl CpioFormatOpts {

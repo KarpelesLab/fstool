@@ -236,7 +236,7 @@ impl Exfat {
         let mut fat = Fat::new_blank(geom.cluster_count as usize + 2);
         const CL_BITMAP: u32 = 2;
         let cl_upcase: u32 = CL_BITMAP + geom.bitmap_clusters;
-        let cl_root: u32 = cl_upcase + geom.upcase_clusters;
+        let cl_root: u32 = cl_upcase + geom.upcase_clusters();
         debug_assert_eq!(cl_root, geom.first_cluster_of_root_directory);
         for (start, end) in [(CL_BITMAP, cl_upcase), (cl_upcase, cl_root)] {
             for c in start..end {
@@ -292,7 +292,7 @@ impl Exfat {
         let root_off = geom.cluster_byte_offset(cl_root);
         dev.zero_range(
             bm_off,
-            (geom.bitmap_clusters as u64 + geom.upcase_clusters as u64 + 1) * bpc,
+            (geom.bitmap_clusters as u64 + geom.upcase_clusters() as u64 + 1) * bpc,
         )?;
 
         dev.write_at(bm_off, &bitmap)?;

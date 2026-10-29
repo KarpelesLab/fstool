@@ -58,6 +58,7 @@ pub const MIN_SPLIT_SIZE: u64 = 64 * 1024;
 /// Body compression chosen by the writer. Every method except `Stored`
 /// needs its codec feature; see [`Compression::enabled`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Compression {
     Stored,
     /// Method 8, the universal default. `gzip`.
@@ -205,6 +206,7 @@ impl Encryption {
 
 /// ZIP creation options.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ZipFormatOpts {
     pub method: Compression,
     /// Compression level 0..=9 (6 = default), in the codec's own scale:

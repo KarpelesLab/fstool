@@ -91,6 +91,7 @@ impl FsKind {
 /// features, all-zero UUID + label, mtime 0, 5% reserved blocks, lost+found
 /// pre-allocated.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FormatOpts {
     pub kind: FsKind,
     pub block_size: u32,

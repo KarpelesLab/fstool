@@ -332,6 +332,7 @@ mod host {
 
     /// Options for [`create_image`].
     #[derive(Debug, Clone)]
+    #[non_exhaustive]
     pub struct CreateOpts {
         /// qcow2 cluster size in bytes (power of two, ≥ 512). Default 64 KiB,
         /// matching qemu-img. Ignored when creating a raw image.

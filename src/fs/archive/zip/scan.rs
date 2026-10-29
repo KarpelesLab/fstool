@@ -530,7 +530,9 @@ pub fn scan(dev: &mut dyn BlockDevice, password: Option<&[u8]>) -> Result<Archiv
             EntryKind::Symlink => {
                 // The body holds the link target; decode it now (targets
                 // are tiny). Unsupported codecs leave it empty.
-                if let Ok(mut r) = crate::fs::archive::reader::open(dev, loc, password) {
+                if let Ok(mut r) =
+                    crate::fs::archive::reader::open_with_password(dev, loc, password)
+                {
                     let mut t = String::new();
                     use std::io::Read;
                     if r.read_to_string(&mut t).is_ok() {
@@ -693,7 +695,7 @@ mod tests {
         assert_eq!(loc.method, Method::Stored);
         let check = (crate::crc::crc32(b"hi") >> 24) as u8;
         assert_eq!(loc.crypto, Crypto::ZipCrypto { check });
-        let err = match crate::fs::archive::reader::open(&mut dev, loc, None) {
+        let err = match crate::fs::archive::reader::open(&mut dev, loc) {
             Ok(_) => panic!("reader opened an encrypted body"),
             Err(e) => e,
         };

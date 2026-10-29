@@ -299,10 +299,8 @@ fn cryptsetup_reads_our_header(version: Version, name: &str) {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join(name);
     let dev = FileBackend::create(&path, 64 * 1024 * 1024).unwrap();
-    let opts = FormatOpts {
-        version,
-        ..FormatOpts::fast_for_tests()
-    };
+    let mut opts = FormatOpts::fast_for_tests();
+    opts.version = version;
     let vol = format(dev, PASSPHRASE, &opts).unwrap();
     let ours = vol.master_key().as_bytes().to_vec();
     let uuid = vol.header().uuid().to_owned();
@@ -391,11 +389,9 @@ fn qemu_io_reads_payload_we_wrote() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("ours-payload.luks");
     let dev = FileBackend::create(&path, 32 * 1024 * 1024).unwrap();
-    let opts = FormatOpts {
-        // QEMU's LUKS driver reads LUKS1 only.
-        version: Version::V1,
-        ..FormatOpts::fast_for_tests()
-    };
+    let mut opts = FormatOpts::fast_for_tests();
+    // QEMU's LUKS driver reads LUKS1 only.
+    opts.version = Version::V1;
     let mut vol = format(dev, PASSPHRASE, &opts).unwrap();
     vol.write_at(0, &[0x31u8; 8192]).unwrap();
     vol.write_at(2 * 1024 * 1024, b"fstool wrote this").unwrap();
@@ -435,10 +431,8 @@ fn hosts_an_ext2_filesystem() {
     let mut vol = format(dev, PASSPHRASE, &FormatOpts::fast_for_tests()).unwrap();
 
     // Size the filesystem to whatever the payload turned out to be.
-    let ext_opts = ExtOpts {
-        blocks_count: (vol.total_size() / 1024) as u32,
-        ..ExtOpts::default()
-    };
+    let mut ext_opts = ExtOpts::default();
+    ext_opts.blocks_count = (vol.total_size() / 1024) as u32;
     let mut fs = Ext::format_with(&mut vol, &ext_opts).unwrap();
     let body = b"encrypted at rest\n";
     fs.create_file(

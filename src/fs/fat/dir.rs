@@ -144,6 +144,7 @@ pub fn dos_datetime_to_unix(date: u16, time: u16) -> u32 {
 
 /// A decoded 8.3 directory entry.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DirEntry {
     /// Raw 11-byte 8.3 name (8 base + 3 extension, space-padded).
     pub name_83: [u8; 11],

@@ -152,14 +152,12 @@ fn ext4_sparse_file_uses_holes() {
     let srcdir = tempfile::tempdir().unwrap();
     std::fs::write(srcdir.path().join("hole.bin"), &body).unwrap();
 
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        blocks_count: 8192,
-        inodes_count: 64,
-        journal_blocks: 1024,
-        sparse: true,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.blocks_count = 8192;
+    opts.inodes_count = 64;
+    opts.journal_blocks = 1024;
+    opts.sparse = true;
     let tmp = NamedTempFile::new().unwrap();
     let mut dev = FileBackend::create(
         tmp.path(),
@@ -225,13 +223,11 @@ fn ext4_passes_e2fsck_and_advertises_features() {
     };
 
     let tmp = NamedTempFile::new().unwrap();
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        blocks_count: 8192,
-        inodes_count: 64,
-        journal_blocks: 1024,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.blocks_count = 8192;
+    opts.inodes_count = 64;
+    opts.journal_blocks = 1024;
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
     let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
@@ -310,13 +306,11 @@ fn ext4_passes_e2fsck_and_advertises_features() {
 fn ext4_open_reads_extent_file() {
     use std::io::Read;
     let tmp = NamedTempFile::new().unwrap();
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        blocks_count: 8192,
-        inodes_count: 64,
-        journal_blocks: 1024,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.blocks_count = 8192;
+    opts.inodes_count = 64;
+    opts.journal_blocks = 1024;
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
     {
@@ -361,14 +355,12 @@ fn ext4_sparse_super_skips_non_backup_groups() {
     };
 
     // 4 groups (32 MiB at 1 KiB blocks).
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        blocks_count: 32 * 1024,
-        inodes_count: 64,
-        journal_blocks: 1024,
-        sparse_super: true,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.blocks_count = 32 * 1024;
+    opts.inodes_count = 64;
+    opts.journal_blocks = 1024;
+    opts.sparse_super = true;
     let tmp = NamedTempFile::new().unwrap();
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
@@ -455,14 +447,12 @@ fn ext4_large_directory_spans_multiple_blocks() {
     // 4 KiB blocks → ~120 short entries per dir block. 500 names guarantees
     // we cross the single-block cap, but stays well under the depth-0 extent
     // cap (4 contiguous-or-coalescing extents).
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        block_size: 4096,
-        blocks_count: 8192,
-        inodes_count: 1024,
-        journal_blocks: 1024,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.block_size = 4096;
+    opts.blocks_count = 8192;
+    opts.inodes_count = 1024;
+    opts.journal_blocks = 1024;
     let tmp = NamedTempFile::new().unwrap();
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
@@ -588,14 +578,12 @@ fn ext4_fragmented_directory_promotes_to_depth1_extent_tree() {
         return;
     };
 
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        block_size: 4096,
-        blocks_count: 32 * 1024,
-        inodes_count: 4096,
-        journal_blocks: 1024,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.block_size = 4096;
+    opts.blocks_count = 32 * 1024;
+    opts.inodes_count = 4096;
+    opts.journal_blocks = 1024;
     let tmp = NamedTempFile::new().unwrap();
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
@@ -693,14 +681,12 @@ fn ext4_open_file_rw_depth2_extent_tree_passes_e2fsck() {
         return;
     };
 
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        block_size: 1024,
-        blocks_count: 32 * 1024,
-        inodes_count: 4096,
-        journal_blocks: 1024,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.block_size = 1024;
+    opts.blocks_count = 32 * 1024;
+    opts.inodes_count = 4096;
+    opts.journal_blocks = 1024;
     let tmp = NamedTempFile::new().unwrap();
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
@@ -786,14 +772,12 @@ fn ext4_streaming_directory_depth2_extent_tree_passes_e2fsck() {
         return;
     };
 
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        block_size: 1024,
-        blocks_count: 64 * 1024,
-        inodes_count: 8192,
-        journal_blocks: 1024,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.block_size = 1024;
+    opts.blocks_count = 64 * 1024;
+    opts.inodes_count = 8192;
+    opts.journal_blocks = 1024;
     let tmp = NamedTempFile::new().unwrap();
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
@@ -874,14 +858,12 @@ fn ext4_indexed_directory_passes_e2fsck() {
     };
     use fstool::fs::ext::FormatOpts;
 
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        block_size: 4096,
-        blocks_count: 16 * 1024,
-        inodes_count: 2048,
-        journal_blocks: 1024,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.block_size = 4096;
+    opts.blocks_count = 16 * 1024;
+    opts.inodes_count = 2048;
+    opts.journal_blocks = 1024;
     let tmp = NamedTempFile::new().unwrap();
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
@@ -1132,15 +1114,13 @@ fn ext4_repack_preserves_sparse_files() {
 
     // Source: build directly via fstool with sparse=true so the source
     // file's blocks_512 is small even though its logical size is 248 KiB.
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        block_size: 4096,
-        blocks_count: 16 * 1024,
-        inodes_count: 64,
-        journal_blocks: 1024,
-        sparse: true,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.block_size = 4096;
+    opts.blocks_count = 16 * 1024;
+    opts.inodes_count = 64;
+    opts.journal_blocks = 1024;
+    opts.sparse = true;
     let src_tmp = NamedTempFile::new().unwrap();
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut src_dev = FileBackend::create(src_tmp.path(), size).unwrap();
@@ -1245,14 +1225,12 @@ fn ext4_repack_replays_pending_journal() {
     use fstool::fs::ext::jbd2;
 
     // ── Build the source clean.
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        block_size: 4096,
-        blocks_count: 8192,
-        inodes_count: 64,
-        journal_blocks: 1024,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.block_size = 4096;
+    opts.blocks_count = 8192;
+    opts.inodes_count = 64;
+    opts.journal_blocks = 1024;
     let src_tmp = NamedTempFile::new().unwrap();
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut src_dev = FileBackend::create(src_tmp.path(), size).unwrap();
@@ -1432,14 +1410,12 @@ fn ext4_indexed_directory_two_level_passes_e2fsck() {
     };
     use fstool::fs::ext::FormatOpts;
 
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        block_size: 1024,
-        blocks_count: 64 * 1024,
-        inodes_count: 8192,
-        journal_blocks: 8192,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.block_size = 1024;
+    opts.blocks_count = 64 * 1024;
+    opts.inodes_count = 8192;
+    opts.journal_blocks = 8192;
     let tmp = NamedTempFile::new().unwrap();
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
@@ -1521,14 +1497,12 @@ fn ext4_mutation_api_round_trips_through_e2fsck() {
     };
     use fstool::block::BlockDevice as _;
 
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        block_size: 4096,
-        blocks_count: 8192,
-        inodes_count: 128,
-        journal_blocks: 1024,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.block_size = 4096;
+    opts.blocks_count = 8192;
+    opts.inodes_count = 128;
+    opts.journal_blocks = 1024;
     let tmp = NamedTempFile::new().unwrap();
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
@@ -1654,18 +1628,16 @@ fn ext4_inline_data_stores_small_files_in_inode() {
         return;
     };
 
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        block_size: 4096,
-        blocks_count: 8192,
-        inodes_count: 64,
-        journal_blocks: 1024,
-        inline_data: true,
-        // inline_data needs the in-inode xattr area for its
-        // `system.data` marker, so 256-byte inodes are mandatory.
-        inode_size: 256,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.block_size = 4096;
+    opts.blocks_count = 8192;
+    opts.inodes_count = 64;
+    opts.journal_blocks = 1024;
+    opts.inline_data = true;
+    // inline_data needs the in-inode xattr area for its
+    // `system.data` marker, so 256-byte inodes are mandatory.
+    opts.inode_size = 256;
     let tmp = NamedTempFile::new().unwrap();
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
@@ -1772,14 +1744,12 @@ fn ext4_inline_data_stores_small_files_in_inode() {
 fn ext4_crash_during_flush_recovers_cleanly() {
     use fstool::block::{BlockDevice as _, CrashInject, FailAfter, MemoryBackend};
 
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        block_size: 1024,
-        blocks_count: 4096,
-        inodes_count: 128,
-        journal_blocks: 1024,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.block_size = 1024;
+    opts.blocks_count = 4096;
+    opts.inodes_count = 128;
+    opts.journal_blocks = 1024;
     let total = opts.blocks_count as u64 * opts.block_size as u64;
 
     for &fail_after_n in &[5u64, 20, 100, 500] {
@@ -1877,17 +1847,15 @@ fn ext4_fragmented_file_one_shot_promotes_to_depth1() {
         return;
     };
 
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        block_size: 4096,
-        blocks_count: 16 * 1024,
-        inodes_count: 1024,
-        journal_blocks: 1024,
-        // Non-sparse so every block is really allocated — otherwise an
-        // all-zero block would become a hole and not fragment.
-        sparse: false,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.block_size = 4096;
+    opts.blocks_count = 16 * 1024;
+    opts.inodes_count = 1024;
+    opts.journal_blocks = 1024;
+    // Non-sparse so every block is really allocated — otherwise an
+    // all-zero block would become a hole and not fragment.
+    opts.sparse = false;
     let tmp = NamedTempFile::new().unwrap();
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
@@ -2140,16 +2108,14 @@ fn ext4_format_with_metadata_csum_seed() {
         }
     }
 
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        block_size: 4096,
-        blocks_count: 8192,
-        inodes_count: 64,
-        journal_blocks: 1024,
-        uuid: [0x5a; 16],
-        metadata_csum_seed: true,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.block_size = 4096;
+    opts.blocks_count = 8192;
+    opts.inodes_count = 64;
+    opts.journal_blocks = 1024;
+    opts.uuid = [0x5a; 16];
+    opts.metadata_csum_seed = true;
     let tmp = NamedTempFile::new().unwrap();
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
@@ -2221,15 +2187,13 @@ fn ext4_format_with_metadata_csum_seed() {
 #[test]
 fn ext_metadata_csum_seed_requires_ext4() {
     for kind in [FsKind::Ext2, FsKind::Ext3] {
-        let opts = FormatOpts {
-            kind,
-            block_size: 1024,
-            blocks_count: 8192,
-            inodes_count: 64,
-            journal_blocks: 1024,
-            metadata_csum_seed: true,
-            ..FormatOpts::default()
-        };
+        let mut opts = FormatOpts::default();
+        opts.kind = kind;
+        opts.block_size = 1024;
+        opts.blocks_count = 8192;
+        opts.inodes_count = 64;
+        opts.journal_blocks = 1024;
+        opts.metadata_csum_seed = true;
         let mut dev = fstool::block::MemoryBackend::new(8192 * 1024);
         let err = Ext::format_with(&mut dev, &opts).unwrap_err();
         assert!(

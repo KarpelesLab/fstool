@@ -93,6 +93,7 @@ impl EntryKind {
 
 /// How one entry's body is encoded in the archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Method {
     /// No compression — the byte range is the file content verbatim.
     Stored,
@@ -169,6 +170,7 @@ impl Crypto {
 
 /// Where an entry's bytes live on the device and how to decode them.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DataLocator {
     /// Absolute byte offset of the (possibly compressed) body in the device.
     pub offset: u64,
@@ -184,6 +186,7 @@ pub struct DataLocator {
 
 /// One archived entry, fully resolved.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ArchiveEntry {
     /// Normalised path: starts with `/`, no trailing `/`.
     pub path: String,
@@ -724,7 +727,7 @@ impl crate::fs::Filesystem for ArchiveFs {
         // formats), then let the `dev` borrow end so the returned reader
         // borrows only `dev`, not `self` (the tar trick).
         let loc = self.with_index(dev, |idx| locate_body(idx, kind, &s))?;
-        reader::open(dev, loc, self.password.as_deref())
+        reader::open_with_password(dev, loc, self.password.as_deref())
     }
 
     fn open_file_ro<'a>(

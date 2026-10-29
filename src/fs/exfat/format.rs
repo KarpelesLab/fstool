@@ -42,6 +42,7 @@ use super::upcase_table::{UPCASE_TABLE, UPCASE_TABLE_CHECKSUM, UPCASE_TABLE_LEN}
 /// volume; only `bytes_per_sector_shift`, `sectors_per_cluster_shift`,
 /// and `volume_label` are typically of interest.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FormatOpts {
     /// log2 of the sector size in bytes. Must be in 9..=12 (512..=4096).
     pub bytes_per_sector_shift: u8,
@@ -110,15 +111,18 @@ pub struct Geometry {
     /// bytes rounded up to whole clusters. It starts at cluster 2; the
     /// Up-case Table and the root directory follow it.
     pub bitmap_clusters: u32,
-    /// Clusters the Up-case Table occupies — the recommended table's 5836
-    /// bytes rounded up to whole clusters (12 with 512-byte clusters). It
-    /// follows the bitmap; the root directory follows it.
-    pub upcase_clusters: u32,
     pub first_cluster_of_root_directory: u32,
     pub volume_serial_number: u32,
 }
 
 impl Geometry {
+    /// Clusters the Up-case Table occupies — the recommended table's 5836
+    /// bytes rounded up to whole clusters (12 with 512-byte clusters). It
+    /// follows the bitmap; the root directory follows it.
+    pub fn upcase_clusters(&self) -> u32 {
+        UPCASE_TABLE_LEN.div_ceil(self.bytes_per_cluster as usize) as u32
+    }
+
     pub fn fat_byte_offset(&self) -> u64 {
         self.fat_offset_sectors as u64 * self.bytes_per_sector as u64
     }
@@ -255,7 +259,6 @@ pub fn compute_geometry(total_bytes: u64, opts: &FormatOpts) -> Result<Geometry>
         cluster_heap_offset_sectors,
         cluster_count,
         bitmap_clusters,
-        upcase_clusters,
         first_cluster_of_root_directory: 2 + bitmap_clusters + upcase_clusters,
         volume_serial_number: opts.volume_serial_number,
     })
@@ -366,9 +369,39 @@ pub fn write_boot_region(
 /// The Up-case Table the formatter writes: the exFAT specification's
 /// recommended compressed table (5836 bytes) and its TableChecksum
 /// (`0xE619D30D`). It needs `ceil(5836 / cluster_size)` clusters; see
-/// [`Geometry::upcase_clusters`].
+/// [`Geometry::upcase_clusters()`].
 pub fn recommended_upcase_table() -> (&'static [u8], u32) {
     (UPCASE_TABLE, UPCASE_TABLE_CHECKSUM)
+}
+
+/// Emit a simple Up-case Table: lowercase ASCII a..z → A..Z, every other
+/// BMP code unit identity.
+///
+/// The formatter no longer uses this: an ASCII-only table makes
+/// non-ASCII names case-sensitive and native `fsck` rejects it. Returns the uncompressed table bytes along
+/// with its 32-bit table checksum (per the rolling checksum in `upcase.rs`).
+#[deprecated(
+    since = "0.6.0",
+    note = "the formatter writes the full table; use `recommended_upcase_table`"
+)]
+pub fn make_ascii_upcase_table() -> (Vec<u8>, u32) {
+    // We emit the first 128 explicit slots (covers ASCII), then an
+    // identity-run for the remainder of the BMP would balloon the table
+    // unnecessarily — readers default to identity beyond the populated
+    // range. We mirror what the reader's `Upcase::ascii()` produces so
+    // round-tripping is exact.
+    let mut bytes = Vec::with_capacity(0x80 * 2);
+    for i in 0..0x80u16 {
+        let c = i as u8;
+        let v = if c.is_ascii_lowercase() {
+            (c - b'a' + b'A') as u16
+        } else {
+            i
+        };
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    let csum = super::upcase::table_checksum(&bytes);
+    (bytes, csum)
 }
 
 /// Build an Allocation Bitmap directory-entry slot (32 bytes).
@@ -565,10 +598,10 @@ mod tests {
                 ..FormatOpts::default()
             };
             let g = compute_geometry(4 * 1024 * 1024, &opts).unwrap();
-            assert_eq!(g.upcase_clusters, want, "spc_shift {spc_shift}");
+            assert_eq!(g.upcase_clusters(), want, "spc_shift {spc_shift}");
             assert_eq!(
                 g.first_cluster_of_root_directory,
-                2 + g.bitmap_clusters + g.upcase_clusters
+                2 + g.bitmap_clusters + g.upcase_clusters()
             );
         }
     }

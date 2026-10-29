@@ -28,14 +28,12 @@ use tempfile::NamedTempFile;
 fn ext4_clone_file_default_byte_copy() {
     use fstool::fs::ext::{Ext, FormatOpts, FsKind};
     let tmp = NamedTempFile::new().unwrap();
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        blocks_count: 8192,
-        inodes_count: 64,
-        journal_blocks: 1024,
-        sparse: true,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.blocks_count = 8192;
+    opts.inodes_count = 64;
+    opts.journal_blocks = 1024;
+    opts.sparse = true;
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let body: Vec<u8> = (0..4321).map(|i| (i & 0xFF) as u8).collect();
     {
@@ -94,14 +92,12 @@ fn ext4_clone_file_default_byte_copy() {
 fn clone_range_default_is_unsupported() {
     use fstool::fs::ext::{Ext, FormatOpts, FsKind};
     let tmp = NamedTempFile::new().unwrap();
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        blocks_count: 8192,
-        inodes_count: 64,
-        journal_blocks: 1024,
-        sparse: true,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.blocks_count = 8192;
+    opts.inodes_count = 64;
+    opts.journal_blocks = 1024;
+    opts.sparse = true;
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
     let mut fs: Box<dyn Filesystem> = Box::new(Ext::format_with(&mut dev, &opts).unwrap());
@@ -135,14 +131,12 @@ fn clone_range_default_is_unsupported() {
 fn anyfs_clone_file_routes_through_default_fallback() {
     use fstool::fs::ext::{Ext, FormatOpts, FsKind};
     let tmp = NamedTempFile::new().unwrap();
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        blocks_count: 8192,
-        inodes_count: 64,
-        journal_blocks: 1024,
-        sparse: true,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.blocks_count = 8192;
+    opts.inodes_count = 64;
+    opts.journal_blocks = 1024;
+    opts.sparse = true;
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let body = b"clone via AnyFs\n";
     {

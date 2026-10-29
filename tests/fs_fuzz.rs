@@ -717,16 +717,14 @@ const FUZZ_ITERS: usize = 200;
 #[test]
 fn fuzz_ext2() {
     use fstool::fs::ext::{Ext, FormatOpts, FsKind};
-    let opts = FormatOpts {
-        kind: FsKind::Ext2,
-        // Bump to keep enough free inodes/blocks for the fuzz's
-        // create-heavy phase. Defaults (1024 blocks * 1024) leave
-        // about 800 KiB of data; plenty for `max_size = 8 KiB` *
-        // `max_files = 8`.
-        inodes_count: 256,
-        blocks_count: 4096,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext2;
+    // Bump to keep enough free inodes/blocks for the fuzz's
+    // create-heavy phase. Defaults (1024 blocks * 1024) leave
+    // about 800 KiB of data; plenty for `max_size = 8 KiB` *
+    // `max_files = 8`.
+    opts.inodes_count = 256;
+    opts.blocks_count = 4096;
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = MemoryBackend::new(size);
     let mut ext = Ext::format_with(&mut dev, &opts).expect("format ext2");
@@ -743,12 +741,10 @@ fn fuzz_ext2() {
 #[test]
 fn fuzz_ext3() {
     use fstool::fs::ext::{Ext, FormatOpts, FsKind};
-    let opts = FormatOpts {
-        kind: FsKind::Ext3,
-        inodes_count: 256,
-        blocks_count: 4096,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext3;
+    opts.inodes_count = 256;
+    opts.blocks_count = 4096;
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = MemoryBackend::new(size);
     let mut ext = Ext::format_with(&mut dev, &opts).expect("format ext3");
@@ -765,12 +761,10 @@ fn fuzz_ext3() {
 #[test]
 fn fuzz_ext4() {
     use fstool::fs::ext::{Ext, FormatOpts, FsKind};
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        inodes_count: 256,
-        blocks_count: 4096,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.inodes_count = 256;
+    opts.blocks_count = 4096;
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = MemoryBackend::new(size);
     let mut ext = Ext::format_with(&mut dev, &opts).expect("format ext4");
@@ -807,14 +801,12 @@ const EXT_CORRUPT_DIR_CRASH_FIRST_INO_ZERO: &[u8] = &[
 fn replay_ext_corrupt_dir_input(data: &[u8]) {
     use fstool::fs::ext::{Ext, FormatOpts, FsKind};
     assert!(data.len() >= 32);
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        block_size: 1024,
-        blocks_count: 2048,
-        inodes_count: 16,
-        journal_blocks: 1024,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.block_size = 1024;
+    opts.blocks_count = 2048;
+    opts.inodes_count = 16;
+    opts.journal_blocks = 1024;
     let total = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = MemoryBackend::new(total);
     let Ok(_) = Ext::format_with(&mut dev, &opts) else {
@@ -849,10 +841,8 @@ fn fuzz_fat32() {
     let tmp = NamedTempFile::new().expect("tempfile");
     let mut dev =
         FileBackend::create(tmp.path(), TOTAL_SECTORS as u64 * 512).expect("FileBackend create");
-    let opts = FatFormatOpts {
-        total_sectors: TOTAL_SECTORS,
-        ..FatFormatOpts::default()
-    };
+    let mut opts = FatFormatOpts::default();
+    opts.total_sectors = TOTAL_SECTORS;
     let mut fs = Fat32::format(&mut dev, &opts).expect("format fat32");
     fuzz_filesystem(
         &mut fs,
@@ -981,10 +971,8 @@ fn fuzz_ntfs() {
     const SIZE: u64 = 16 * 1024 * 1024;
     let tmp = NamedTempFile::new().expect("tempfile");
     let mut dev = FileBackend::create(tmp.path(), SIZE).expect("FileBackend create");
-    let opts = FormatOpts {
-        volume_label: "FSTOOL-FUZZ".to_string(),
-        ..Default::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.volume_label = "FSTOOL-FUZZ".to_string();
     let mut fs = Ntfs::format(&mut dev, &opts).expect("format ntfs");
     fuzz_filesystem(
         &mut fs,

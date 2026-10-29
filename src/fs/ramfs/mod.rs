@@ -97,6 +97,7 @@ struct Inode {
 
 /// Format options for [`Ramfs`]. Empty: a ramfs has nothing to configure.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct RamfsFormatOpts {}
 
 /// An in-memory filesystem. See the [module docs](self).

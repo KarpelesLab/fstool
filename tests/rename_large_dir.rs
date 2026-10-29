@@ -17,16 +17,14 @@ fn rename_in_large_dir() {
     let block_size = 4096u32;
     let blocks_count = (size / u64::from(block_size)) as u32;
     let mut fs: Box<dyn Filesystem> = Box::new(
-        Ext::format(
-            &mut dev,
-            &FormatOpts {
-                kind: FsKind::Ext4,
-                block_size,
-                blocks_count,
-                inodes_count: (blocks_count / 4).max(16),
-                ..Default::default()
-            },
-        )
+        Ext::format(&mut dev, &{
+            let mut o = FormatOpts::default();
+            o.kind = FsKind::Ext4;
+            o.block_size = block_size;
+            o.blocks_count = blocks_count;
+            o.inodes_count = (blocks_count / 4).max(16);
+            o
+        })
         .unwrap(),
     );
 

@@ -33,6 +33,7 @@ const BM_EXT_PAGES: usize = BSIZE / 4 - 1;
 
 /// Options for formatting a fresh AFFS volume.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct AffsFormatOpts {
     /// Volume name (≤ 30 Latin-1 bytes).
     pub volume_name: String,

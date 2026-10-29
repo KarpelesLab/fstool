@@ -34,13 +34,11 @@ fn ext3_passes_e2fsck_and_advertises_journal() {
 
     let tmp = NamedTempFile::new().unwrap();
     // 8 MiB image; 1024-block journal at 1 KiB = 1 MiB (the JBD2 minimum).
-    let opts = FormatOpts {
-        kind: FsKind::Ext3,
-        blocks_count: 8192,
-        inodes_count: 64,
-        journal_blocks: 1024,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext3;
+    opts.blocks_count = 8192;
+    opts.inodes_count = 64;
+    opts.journal_blocks = 1024;
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
     Ext::format_with(&mut dev, &opts).unwrap();

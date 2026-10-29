@@ -199,12 +199,10 @@ fn fat_volumes_the_driver_formats_pass_fsck_vfat_before_and_after_use() {
         let img = tmp.path().join("vol.img");
         let sectors = bytes / ss as u64;
         let card = FileCard::create(&img, sectors, ss);
-        let opts = FatOpts {
-            kind,
-            label,
-            volume_id: 0x2026_0915,
-            ..Default::default()
-        };
+        let mut opts = FatOpts::default();
+        opts.kind = kind;
+        opts.label = label;
+        opts.volume_id = 0x2026_0915;
         let vol = Fat::<_, 4096>::format(card, &opts).unwrap_or_else(|e| panic!("{what}: {e:?}"));
         if let Some(k) = kind {
             assert_eq!(vol.kind(), k, "{what}");
@@ -403,11 +401,10 @@ fn exfat_volumes_the_driver_formats_pass_fsck_exfat_before_and_after_use() {
         let what = format!("{bytes} bytes, {cluster:?} clusters, {ss}-byte sectors");
         let img = tmp.path().join("vol.img");
         let card = FileCard::create(&img, bytes / ss as u64, ss);
-        let opts = ExfatOpts {
-            cluster_size: cluster,
-            label: "FSTOOL ÉTÉ",
-            volume_serial: 0x2026_0915,
-        };
+        let mut opts = ExfatOpts::default();
+        opts.cluster_size = cluster;
+        opts.label = "FSTOOL ÉTÉ";
+        opts.volume_serial = 0x2026_0915;
         let vol = Exfat::<_, 4096>::format(card, &opts).unwrap_or_else(|e| panic!("{what}: {e:?}"));
         drop(vol.unmount().unwrap());
         fsck_exfat(&img, &format!("a fresh volume ({what})"));
