@@ -54,7 +54,12 @@ use crate::Result;
 pub const MISH_MAGIC: u32 = 0x6D69_7368;
 
 /// Length of the fixed mish header before the variable-length chunk array.
-pub const MISH_HEADER_LEN: usize = 0x0CC + 4;
+///
+/// 4 (signature) + 4 (version) + 8 + 8 + 8 (sector_number / sector_count /
+/// data_offset) + 4 + 4 (buffers_needed / block_descriptor) + 24 (reserved)
+/// = 0x40, + 136 (UDIFChecksum) = 0xC8, + 4 (number_of_blocks) = 0xCC. The
+/// first 40-byte chunk descriptor starts immediately after the count.
+pub const MISH_HEADER_LEN: usize = 0x0CC;
 
 /// Length of a single chunk descriptor.
 pub const CHUNK_LEN: usize = 40;
@@ -333,6 +338,78 @@ mod tests {
         let buf = encode_mish_for_tests(0, 2, 0, &chunks);
         let m = decode_mish(&buf).unwrap();
         assert_eq!(m.chunks.len(), 2);
+    }
+
+    /// Lay a BLKXTable out byte-by-byte from the UDIF spec, independently
+    /// of [`encode_mish_for_tests`], so the reader can't just agree with a
+    /// helper that shares its mistakes. The first descriptor must be read
+    /// from 0xCC — directly after the 4-byte count at 0xC8.
+    #[test]
+    fn decodes_independently_laid_out_blkx() {
+        fn be32(v: &mut Vec<u8>, x: u32) {
+            v.extend_from_slice(&x.to_be_bytes());
+        }
+        fn be64(v: &mut Vec<u8>, x: u64) {
+            v.extend_from_slice(&x.to_be_bytes());
+        }
+        let mut b = Vec::new();
+        b.extend_from_slice(b"mish"); // signature
+        be32(&mut b, 1); // version
+        be64(&mut b, 100); // sectorNumber
+        be64(&mut b, 9); // sectorCount
+        be64(&mut b, 0); // dataOffset
+        be32(&mut b, 0x208); // buffersNeeded
+        be32(&mut b, 0); // blockDescriptors
+        b.extend_from_slice(&[0u8; 24]); // reserved[6]
+        be32(&mut b, 2); // checksum type (CRC32)
+        be32(&mut b, 32); // checksum size (bits)
+        b.extend_from_slice(&[0xEEu8; 128]); // checksum data[32]
+        assert_eq!(b.len(), 0xC8);
+        be32(&mut b, 4); // numberOfBlockChunks
+        assert_eq!(b.len(), 0xCC);
+        // (type, comment, sector, count, comp_off, comp_len)
+        let entries: [(u32, u32, u64, u64, u64, u64); 4] = [
+            (0x8000_0004, 0, 0, 8, 0x1000, 0x123),
+            (0x7FFF_FFFE, 0x2B62_6567, 8, 0, 0x1123, 0),
+            (0x0000_0002, 0, 8, 1, 0x1123, 0),
+            (0xFFFF_FFFF, 0, 9, 0, 0x1123, 0),
+        ];
+        for (t, c, sec, cnt, off, len) in entries {
+            be32(&mut b, t);
+            be32(&mut b, c);
+            be64(&mut b, sec);
+            be64(&mut b, cnt);
+            be64(&mut b, off);
+            be64(&mut b, len);
+        }
+        assert_eq!(b.len(), 0xCC + 4 * 40);
+
+        let m = decode_mish(&b).unwrap();
+        assert_eq!(m.first_sector, 100);
+        assert_eq!(m.sector_count, 9);
+        assert_eq!(m.chunks.len(), 2, "comment + terminator are dropped");
+        let c0 = m.chunks[0];
+        assert_eq!(c0.kind, ChunkType::Adc);
+        assert_eq!(c0.virtual_sector_start, 100);
+        assert_eq!(c0.sector_count, 8);
+        assert_eq!(c0.compressed_offset_in_fork, 0x1000);
+        assert_eq!(c0.compressed_length, 0x123);
+        let c1 = m.chunks[1];
+        assert_eq!(c1.kind, ChunkType::Ignored);
+        assert_eq!(c1.virtual_sector_start, 108);
+        assert_eq!(c1.sector_count, 1);
+
+        // A count that promises more descriptors than the buffer holds
+        // must be refused, not read past the end.
+        let mut short = b.clone();
+        short.truncate(0xCC + 3 * 40 + 39);
+        assert!(decode_mish(&short).is_err());
+        // An unknown descriptor type is malformed, not silent zero-fill.
+        let mut bad = b.clone();
+        bad[0xCC..0xD0].copy_from_slice(&0x1234_5678u32.to_be_bytes());
+        assert!(decode_mish(&bad).is_err());
+        // A header cut off before the count is refused.
+        assert!(decode_mish(&b[..0xCA]).is_err());
     }
 
     #[test]

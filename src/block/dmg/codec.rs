@@ -27,15 +27,20 @@ use crate::Result;
 ///
 /// ADC is a tiny LZ77 variant. The encoder emits one of three opcodes:
 ///
-/// - `0x00..=0x7F`: literal run. The opcode byte's value + 1 (1..=128)
-///   bytes follow directly in the stream and are copied verbatim.
-/// - `0x80..=0xBF`: short back-reference. One additional byte follows.
-///   - length = ((opcode >> 2) & 0x0F) + 3        →  3..=18
-///   - distance = (((opcode & 0x03) << 8) | next) + 1  →  1..=1024
-/// - `0xC0..=0xFF`: long back-reference. Two additional bytes follow
-///   (big-endian).
+/// - `0x80..=0xFF` (bit 7 set): literal run. `(opcode & 0x7F) + 1`
+///   (1..=128) bytes follow directly in the stream and are copied
+///   verbatim.
+/// - `0x40..=0x7F` (bit 7 clear, bit 6 set): long back-reference. Two
+///   additional bytes follow (big-endian).
 ///   - length = (opcode & 0x3F) + 4               →  4..=67
 ///   - distance = ((hi << 8) | lo) + 1            →  1..=65536
+/// - `0x00..=0x3F` (bits 7 and 6 clear): short back-reference. One
+///   additional byte follows.
+///   - length = ((opcode >> 2) & 0x0F) + 3        →  3..=18
+///   - distance = (((opcode & 0x03) << 8) | next) + 1  →  1..=1024
+///
+/// e.g. `81 41 42 00 01` is literal "AB" followed by a short reference
+/// of length 3 / distance 2, decoding to `ABABA`.
 ///
 /// The back-reference distance is measured from the **current write
 /// position**, looking backward into already-decoded bytes. Length and
@@ -54,9 +59,9 @@ pub fn decode_adc(src: &[u8], out: &mut [u8]) -> Result<usize> {
         let op = src[sp];
         sp += 1;
 
-        if op < 0x80 {
-            // Literal run of (op + 1) bytes.
-            let len = op as usize + 1;
+        if op & 0x80 != 0 {
+            // Literal run of ((op & 0x7F) + 1) bytes.
+            let len = (op & 0x7F) as usize + 1;
             if sp + len > src.len() {
                 return Err(crate::Error::InvalidImage(format!(
                     "dmg/adc: literal run of {len} bytes runs past source ({} of {} consumed)",
@@ -75,19 +80,7 @@ pub fn decode_adc(src: &[u8], out: &mut [u8]) -> Result<usize> {
             out[dp..dp + len].copy_from_slice(&src[sp..sp + len]);
             sp += len;
             dp += len;
-        } else if op < 0xC0 {
-            // Short reference: op + one trailing byte.
-            if sp >= src.len() {
-                return Err(crate::Error::InvalidImage(
-                    "dmg/adc: short reference truncated".into(),
-                ));
-            }
-            let b = src[sp];
-            sp += 1;
-            let len = (((op >> 2) & 0x0F) as usize) + 3;
-            let dist = ((((op & 0x03) as usize) << 8) | b as usize) + 1;
-            adc_copy(out, &mut dp, dist, len)?;
-        } else {
+        } else if op & 0x40 != 0 {
             // Long reference: op + two trailing big-endian bytes.
             if sp + 2 > src.len() {
                 return Err(crate::Error::InvalidImage(
@@ -99,6 +92,18 @@ pub fn decode_adc(src: &[u8], out: &mut [u8]) -> Result<usize> {
             sp += 2;
             let len = ((op & 0x3F) as usize) + 4;
             let dist = ((hi << 8) | lo) + 1;
+            adc_copy(out, &mut dp, dist, len)?;
+        } else {
+            // Short reference: op + one trailing byte.
+            if sp >= src.len() {
+                return Err(crate::Error::InvalidImage(
+                    "dmg/adc: short reference truncated".into(),
+                ));
+            }
+            let b = src[sp];
+            sp += 1;
+            let len = (((op >> 2) & 0x0F) as usize) + 3;
+            let dist = ((((op & 0x03) as usize) << 8) | b as usize) + 1;
             adc_copy(out, &mut dp, dist, len)?;
         }
     }
@@ -274,7 +279,7 @@ mod tests {
     fn adc_literal(data: &[u8]) -> Vec<u8> {
         assert!(!data.is_empty() && data.len() <= 128);
         let mut v = Vec::with_capacity(1 + data.len());
-        v.push((data.len() - 1) as u8);
+        v.push(0x80 | (data.len() - 1) as u8);
         v.extend_from_slice(data);
         v
     }
@@ -304,12 +309,12 @@ mod tests {
     fn adc_short_reference() {
         // First emit "ABCD" as a literal, then a short reference of
         // length 4 / distance 4 — should reproduce "ABCD" again.
-        // op = 0x80 | ((len-3) << 2) | ((dist-1) >> 8)
+        // op = ((len-3) << 2) | ((dist-1) >> 8)
         // len = 4 → (len-3) = 1
         // dist = 4 → (dist-1) = 3 → hi 0, lo 3
-        // op = 0x80 | (1 << 2) | 0 = 0x84, trailing byte = 3.
+        // op = (1 << 2) | 0 = 0x04, trailing byte = 3.
         let mut stream = adc_literal(b"ABCD");
-        stream.push(0x84);
+        stream.push(0x04);
         stream.push(0x03);
         let mut out = vec![0u8; 8];
         let n = decode_adc(&stream, &mut out).unwrap();
@@ -320,9 +325,9 @@ mod tests {
     #[test]
     fn adc_short_reference_overlap_run() {
         // Encode "a" then back-reference dist=1 len=3 — should give
-        // "aaaa". op = 0x80 | ((3-3)<<2) | 0 = 0x80, trailing = 0.
+        // "aaaa". op = ((3-3)<<2) | 0 = 0x00, trailing = 0.
         let mut stream = adc_literal(b"a");
-        stream.push(0x80);
+        stream.push(0x00);
         stream.push(0x00);
         let mut out = vec![0u8; 4];
         let n = decode_adc(&stream, &mut out).unwrap();
@@ -336,14 +341,14 @@ mod tests {
         // reference len=67 dist=200 reproducing the first 67 bytes.
         let mut stream = Vec::new();
         // Two 100-byte literal runs (literal opcode max length 128).
-        stream.push(99u8); // run of 100 bytes
+        stream.push(0x80 | 99u8); // run of 100 bytes
         stream.extend(std::iter::repeat_n(0xAA, 100));
-        stream.push(99u8);
+        stream.push(0x80 | 99u8);
         stream.extend(std::iter::repeat_n(0xBB, 100));
 
-        // Long reference: op = 0xC0 | (len-4) = 0xC0 | 63 = 0xFF.
+        // Long reference: op = 0x40 | (len-4) = 0x40 | 63 = 0x7F.
         // dist - 1 = 199 → 0x00C7.
-        stream.push(0xC0 | 63); // len = 67
+        stream.push(0x40 | 63); // len = 67
         stream.push(0x00);
         stream.push(0xC7);
 
@@ -364,7 +369,7 @@ mod tests {
         // to construct an actual zero-distance case. That requires
         // dp = 0 and any reference — pick a short ref at start of
         // stream which must fail since there's nothing to reference.
-        let stream = vec![0x80, 0x00];
+        let stream = vec![0x00, 0x00];
         let mut out = vec![0u8; 4];
         let err = decode_adc(&stream, &mut out).unwrap_err();
         match err {
@@ -375,9 +380,9 @@ mod tests {
 
     #[test]
     fn adc_rejects_truncated_short_reference() {
-        // Opcode 0x80 marks a short reference but the trailing byte is
+        // Opcode 0x00 marks a short reference but the trailing byte is
         // missing.
-        let stream = vec![0x80];
+        let stream = vec![0x81, b'A', b'B', 0x00];
         let mut out = vec![0u8; 4];
         assert!(decode_adc(&stream, &mut out).is_err());
     }
@@ -385,7 +390,7 @@ mod tests {
     #[test]
     fn adc_rejects_truncated_long_reference() {
         // Long reference opcode with only one trailing byte.
-        let stream = vec![0xC0, 0x00];
+        let stream = vec![0x81, b'A', b'B', 0x40, 0x00];
         let mut out = vec![0u8; 4];
         assert!(decode_adc(&stream, &mut out).is_err());
     }
@@ -393,9 +398,59 @@ mod tests {
     #[test]
     fn adc_rejects_literal_overrun() {
         // Literal opcode promises 5 bytes but only 2 are present.
-        let stream = vec![0x04, 0x01, 0x02];
+        let stream = vec![0x84, 0x01, 0x02];
         let mut out = vec![0u8; 8];
         assert!(decode_adc(&stream, &mut out).is_err());
+    }
+
+    /// The two vectors from issue #54, hand-written (no helper).
+    #[test]
+    fn adc_issue_54_vectors() {
+        // literal "AB", short ref len 3 dist 2.
+        let mut out = vec![0u8; 5];
+        let n = decode_adc(&[0x81, 0x41, 0x42, 0x00, 0x01], &mut out).unwrap();
+        assert_eq!(&out[..n], b"ABABA");
+        // literal "AB", long ref len 5 dist 2.
+        let mut out = vec![0u8; 7];
+        let n = decode_adc(&[0x81, 0x41, 0x42, 0x41, 0x00, 0x01], &mut out).unwrap();
+        assert_eq!(&out[..n], b"ABABABA");
+    }
+
+    /// Every opcode class with the bit-6 boundary exercised: 0x3F is the
+    /// longest short reference, 0x40 the shortest long reference, 0x80
+    /// the shortest literal and 0xFF the longest.
+    #[test]
+    fn adc_opcode_class_boundaries() {
+        // 0x3F: short, len ((0x3F>>2)&0xF)+3 = 18, dist ((3<<8)|0xFF)+1 = 1024.
+        let mut stream = vec![0xFF];
+        stream.extend((0..128u8).collect::<Vec<_>>());
+        for _ in 0..7 {
+            stream.push(0xFF);
+            stream.extend((0..128u8).collect::<Vec<_>>());
+        }
+        // 8 × 128 = 1024 bytes of output so far.
+        stream.extend_from_slice(&[0x3F, 0xFF]);
+        // 0x40: long, len 4, dist 0x0000+1 = 1.
+        stream.extend_from_slice(&[0x40, 0x00, 0x00]);
+        let mut out = vec![0u8; 1024 + 18 + 4];
+        let n = decode_adc(&stream, &mut out).unwrap();
+        assert_eq!(n, out.len());
+        assert_eq!(&out[1024..1042], &out[0..18]);
+        assert!(out[1042..].iter().all(|&b| b == out[1041]));
+    }
+
+    #[test]
+    fn adc_rejects_reference_before_output_start() {
+        // Short ref at dp=2 asking for distance 3.
+        let mut out = vec![0u8; 8];
+        assert!(decode_adc(&[0x81, b'A', b'B', 0x00, 0x02], &mut out).is_err());
+        // Long ref at dp=2 asking for distance 0x100.
+        assert!(decode_adc(&[0x81, b'A', b'B', 0x40, 0x00, 0xFF], &mut out).is_err());
+        // Reference that would run past the output buffer.
+        let mut small = vec![0u8; 4];
+        assert!(decode_adc(&[0x81, b'A', b'B', 0x00, 0x01], &mut small).is_err());
+        // Short output via decode_adc_chunk is also an error.
+        assert!(decode_adc_chunk(&[0x81, b'A', b'B'], 512).is_err());
     }
 
     #[cfg(feature = "dmg-bzip2")]

@@ -1127,16 +1127,17 @@ mod tests {
         // of dist=1, length=18, then a final short-ref for the
         // remainder.
         let mut stream: Vec<u8> = Vec::new();
-        // Literal: opcode 0x00 (length 1), data byte 0xAA.
-        stream.push(0x00);
+        // Literal: opcode 0x80 (bit 7 set, length 1), data byte 0xAA.
+        stream.push(0x80);
         stream.push(0xAA);
         let mut emitted: usize = 1;
         while emitted < 512 {
             let want = (512 - emitted).min(18);
-            // short-ref: op = 0x80 | ((want-3) << 2) | hi_of_dist0
-            //          = 0x80 | ((want-3) << 2)  (dist 1 ⇒ dist-1 = 0)
+            // short-ref (bits 7 and 6 clear):
+            //   op = ((want-3) << 2) | hi_of_dist0
+            //      = (want-3) << 2      (dist 1 ⇒ dist-1 = 0)
             // trailing byte = lo_of_dist0 = 0
-            let op = 0x80u8 | (((want - 3) as u8) << 2);
+            let op = ((want - 3) as u8) << 2;
             stream.push(op);
             stream.push(0x00);
             emitted += want;
