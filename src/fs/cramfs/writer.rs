@@ -13,8 +13,8 @@ use std::collections::BTreeMap;
 use std::io::Read;
 
 use super::{
-    CRAMFS_MAGIC, CRAMFS_SIGNATURE, FLAG_FSID_VERSION_2, FLAG_HOLES, FLAG_SORTED_DIRS, FormatOpts,
-    INODE_SIZE, MAX_FILE_SIZE, MAX_NAME_LEN, MAX_OFFSET, RawInode, SUPER_SIZE,
+    CRAMFS_MAGIC, CRAMFS_SIGNATURE, FLAG_FSID_VERSION_2, FLAG_SORTED_DIRS, FormatOpts, INODE_SIZE,
+    MAX_FILE_SIZE, MAX_NAME_LEN, MAX_OFFSET, RawInode, SUPER_SIZE,
 };
 use crate::Result;
 use crate::block::BlockDevice;
@@ -65,7 +65,6 @@ pub(super) struct WriteState {
     blobs: Vec<Blob>,
     /// Next free provisional offset.
     cursor: u64,
-    holes: bool,
 }
 
 const S_IFDIR: u16 = 0o040000;
@@ -116,7 +115,6 @@ impl WriteState {
             }],
             blobs: Vec::new(),
             cursor: 0,
-            holes: false,
         }
     }
 
@@ -385,7 +383,6 @@ impl WriteState {
             left -= n as u64;
             if buf[..n].iter().all(|&b| b == 0) {
                 block_lens.push(0);
-                self.holes = true;
                 continue;
             }
             let z = crate::compression::compress(Algo::Zlib, &buf[..n])?;
@@ -540,10 +537,10 @@ impl WriteState {
         dev.write_at(SUPER_SIZE, &dir_buf)?;
 
         // 6. Superblock, then the CRC over the whole image.
-        let mut flags = FLAG_FSID_VERSION_2 | FLAG_SORTED_DIRS;
-        if self.holes {
-            flags |= FLAG_HOLES;
-        }
+        // No FLAG_HOLES even when there are holes: the kernel reads any
+        // zero-length block as one regardless, and fsck.cramfs rejects
+        // every flag outside the low byte.
+        let flags = FLAG_FSID_VERSION_2 | FLAG_SORTED_DIRS;
         let mut sb = [0u8; SUPER_SIZE as usize];
         sb[0..4].copy_from_slice(&CRAMFS_MAGIC.to_le_bytes());
         sb[4..8].copy_from_slice(&(image_end as u32).to_le_bytes());

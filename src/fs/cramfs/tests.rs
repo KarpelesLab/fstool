@@ -221,7 +221,11 @@ fn round_trip() {
     assert_eq!(fs.file_count(), 15);
     assert_eq!(fs.total_bytes() % 4096, 0);
     assert_eq!(fs.image_len(), Some(fs.total_bytes()));
-    assert!(fs.superblock().flags & FLAG_HOLES != 0);
+    // Holes are written, but without FLAG_HOLES (fsck.cramfs rejects it).
+    assert_eq!(
+        fs.superblock().flags,
+        FLAG_FSID_VERSION_2 | FLAG_SORTED_DIRS
+    );
     check_tree(&mut fs, &mut dev, &fx);
     let _ = &mut fx.dev;
 }

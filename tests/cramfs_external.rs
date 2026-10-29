@@ -174,8 +174,9 @@ fn fstool_image_extracts_with_fsck_cramfs() {
     run(Command::new(&fsck)
         .arg("-b")
         .arg("4096")
-        .arg("-x")
-        .arg(&out)
+        // `--extract` takes its directory only in the `=` form; there is
+        // no short `-x` in current util-linux.
+        .arg(format!("--extract={}", out.display()))
         .arg(&img));
     for (p, data) in fixture_files() {
         assert_eq!(fs::read(out.join(p)).unwrap(), data, "{p}");
