@@ -631,7 +631,9 @@ codec_stream!(stream_xz, "xz", Compression::Xz, |level| {
     compcol::xz::Xz::encoder_with(compcol::xz::EncoderConfig { level })
 });
 codec_stream!(stream_zstd, "zstd", Compression::Zstd, |level| {
-    compcol::zstd::Zstd::encoder_with(compcol::zstd::EncoderConfig { level })
+    compcol::zstd::Zstd::encoder_with(compcol::zstd::EncoderConfig {
+        level: i32::from(level),
+    })
 });
 
 /// LZMA: compcol emits the `.lzma` "alone" framing (5 property bytes

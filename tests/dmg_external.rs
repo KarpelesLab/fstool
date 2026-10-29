@@ -263,12 +263,8 @@ fn dmg_udbz_bzip2_reads_every_sector() {
     dmg_read_every_sector("UDBZ");
 }
 
-// Native ULFO chunks (`bvx2` blocks) are rejected by compcol's LZFSE
-// decoder as "encoded stream is corrupt", although the reference
-// `lzfse_rust` decodes the same chunks. Tracked separately from the
-// Mish/ADC fix; un-ignore once LZFSE decoding is fixed.
+// Native ULFO chunks are LZFSE `bvx2` blocks (decoded since compcol 0.7.4).
 #[test]
-#[ignore = "native ULFO chunks fail compcol LZFSE decode (separate bug)"]
 fn dmg_ulfo_lzfse_reads_every_sector() {
     dmg_read_every_sector("ULFO");
 }
