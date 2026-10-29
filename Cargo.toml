@@ -254,7 +254,7 @@ ramfs = ["std"]
 # Disk-image containers — the `BlockDevice` layers between a host file
 # and the filesystem inside it. All `std`.
 # ---------------------------------------------------------------------
-containers = ["qcow2", "dmg", "diskcopy", "dmg-encrypted", "luks", "qcow2-crypto"]
+containers = ["qcow2", "dmg", "diskcopy", "dmg-encrypted", "dmg-encrypted-write", "luks", "qcow2-crypto"]
 # qcow2 (with backing files; encryption via `qcow2-crypto`).
 qcow2 = ["std"]
 # Apple UDIF `.dmg` (read-only; zero / raw / zlib / ADC always, the other
@@ -373,6 +373,11 @@ dmg-lzfse = ["dmg", "dep:compcol", "compcol/lzfse"]
 # `purecrypto` crate (AES-CBC, 3DES-EDE3-CBC via Cbc64, HMAC-SHA1, SHA-1,
 # PBKDF2) — pure-Rust, no foreign code. Gated so a slim build can drop it.
 dmg-encrypted = ["dmg", "dep:purecrypto"]
+# Create passphrase-protected `encrcdsa` v2 images (AES-128 / AES-256),
+# inspect their key records, change a passphrase in place and remove a
+# key record — library API only. Same `purecrypto` dependency, plus its
+# OS randomness source.
+dmg-encrypted-write = ["dmg-encrypted"]
 # LUKS1 / LUKS2 containers: unlock an existing volume with a passphrase,
 # read and write it in place, and format a fresh one. Served by
 # `purecrypto` (AES/Camellia/ARIA/SM4 in XTS/CBC/CTR/ECB, PBKDF2,

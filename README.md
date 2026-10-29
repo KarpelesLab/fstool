@@ -259,7 +259,7 @@ foreign code:
 | **LUKS1 / LUKS2** | ✅ | ✅ | ✅ |
 | **qcow2 `crypt_method = 2`** (embedded LUKS) | ✅ | ✅ | ✅ |
 | **qcow2 `crypt_method = 1`** (legacy AES) | ✅ | ✅ | ❌ by design |
-| **DMG `encrcdsa` v2** | ✅ | — | — |
+| **DMG `encrcdsa` v2** | ✅ | — | ✅ (library API) |
 
 ```sh
 # Put ext4 inside a fresh LUKS2 volume that `cryptsetup open` will unlock.
@@ -293,6 +293,50 @@ ciphertext that a filesystem probe would misreport.
 Cross-validated against `cryptsetup` (it recovers the same master key from
 volumes each side wrote) and `qemu-io` / `qemu-img` (plaintext written by
 one implementation reads back through the other).
+
+#### Encrypted DMG (`encrcdsa` v2) creation and passphrase management
+
+With the `dmg-encrypted-write` feature (part of `containers`), the library
+can wrap any payload — a raw image, a UDIF `.dmg`, a bare filesystem — in
+a passphrase-protected AES-128 or AES-256 `encrcdsa` v2 container that
+`hdiutil attach` opens, inspect an image's key records without a
+passphrase, change a passphrase in place (`hdiutil chpass`: only the key
+record is rewritten, the payload is not re-encrypted), and remove a key
+record. The API lives in `fstool::block::dmg::encrypted`
+(`create_encrypted_image`, `inspect_encrypted_image`, `change_passphrase`,
+`remove_key_record`); it takes passphrases, content keys and the
+randomness source as explicit arguments — no prompts, no keychain — and
+writes to a caller-owned `Write + Seek`. There is no CLI for it yet.
+
+```rust
+use fstool::block::dmg::encrypted::*;
+
+let keys = ContentKeys::generate(ContentCipher::Aes256, &mut OsRandom);
+create_encrypted_image(&mut out_file, &mut payload_file, payload_len,
+                       "passphrase", &keys, &CreateOptions::default(), &mut OsRandom)?;
+change_passphrase(&mut out_file, "passphrase", "new passphrase",
+                  &RekeyOptions::default(), &mut OsRandom)?;
+```
+
+Plainly, the format's limits:
+
+- **The payload is not authenticated.** `encrcdsa` v2 is legacy AES-CBC
+  with no MAC: corruption decrypts to garbage instead of failing, and
+  someone who can write the file can alter or swap chunks undetected.
+- **Changing or removing a key record is not secure erasure.** The
+  content key never changes (that is what makes rotation cheap), so any
+  earlier copy of the image — a backup, a snapshot, a copy-on-write or
+  flash-remapped block — still opens with the old passphrase.
+- KDF parameters read from an image are bounded (at most 10 000 000
+  PBKDF2 rounds per record, 8 passphrase records) so a hostile image
+  cannot pin the CPU, and key material is wiped on drop and kept out of
+  `Debug` output and errors.
+- Certificate / public-key recovery records are listed by inspection and
+  preserved byte-for-byte, but cannot be created or used yet.
+
+Cross-validated against `hdiutil`: images fstool creates (wrapping raw
+HFS+ and zlib UDIF payloads) attach with `hdiutil attach -stdinpass`, and
+passphrases rotated by either tool open in the other.
 
 ## TOML spec
 
@@ -649,7 +693,7 @@ none of the other 130 000 lines.
 | `tar` | tar (streaming reader / writer, tar-as-filesystem) | |
 | `archive` | zip / cpio / ar, plus the per-format readers | pulls `charcode`; `cab`, `lha`, `arc`, `sit`, `sevenz`, `rar`, `amiga-lzx` each imply it. On its own zip handles Stored members (and PKWARE-encrypted ones, and split sets); each compression method is a codec feature (`gzip` for Deflate, then `deflate64`, `bzip2`, `lzma`, `xz`, `zstd`, `zip-legacy`) and WinZip AES is `zip-aes` (pulls `purecrypto`), so `--features archive,gzip` is the slim everyday zip build |
 | `ramfs` | the in-memory scratch filesystem `repack` / `merge` / FUSE build on | |
-| `qcow2`, `dmg`, `diskcopy` | disk-image containers | `qcow2-crypto` implies `qcow2`; `dmg-encrypted` / `dmg-bzip2` / `dmg-lzfse` imply `dmg` |
+| `qcow2`, `dmg`, `diskcopy` | disk-image containers | `qcow2-crypto` implies `qcow2`; `dmg-encrypted` / `dmg-bzip2` / `dmg-lzfse` imply `dmg`, and `dmg-encrypted-write` implies `dmg-encrypted` |
 | `luks` | LUKS1 / LUKS2 | pulls `purecrypto`; implies `json` (LUKS2 metadata is JSON) |
 
 Every feature in the table except the three `no_std` ones implies
@@ -1093,13 +1137,14 @@ Not a codec but gated the same way: `zip-aes` adds WinZip AES-encrypted
 zip members (read and write) on top of the always-available traditional
 PKWARE scheme; it pulls `purecrypto` for AES-CTR, HMAC-SHA1 and PBKDF2.
 
-Crypto is feature-gated the same way, all three served by `purecrypto`:
+Crypto is feature-gated the same way, all served by `purecrypto`:
 
 | Feature | What it enables |
 |---------|-----------------|
 | `luks` | LUKS1 / LUKS2 volumes: unlock, read/write, format |
 | `qcow2-crypto` | qcow2 encryption, both `crypt_method` values (implies `luks`) |
 | `dmg-encrypted` | Password-protected DMG (`encrcdsa` v2), read-only |
+| `dmg-encrypted-write` | Create `encrcdsa` v2 images, inspect key records, change / remove passphrases (library API; implies `dmg-encrypted`) |
 
 A build without them refuses encrypted containers rather than silently
 handing back ciphertext.

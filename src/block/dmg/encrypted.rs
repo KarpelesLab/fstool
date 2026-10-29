@@ -1,4 +1,4 @@
-//! Encrypted DMG (`encrcdsa` v2) read-only backend.
+//! Encrypted DMG (`encrcdsa` v2) backend.
 //!
 //! ## Status
 //!
@@ -10,6 +10,40 @@
 //!   the keyblob (AES-192 on images `hdiutil` makes today, 3DES-EDE3 on
 //!   older ones) → per-chunk AES-CBC decryption with chunk-indexed
 //!   HMAC-SHA1 IVs.
+//! - Creation, inspection, passphrase rotation and key-record removal
+//!   (`dmg-encrypted-write` feature): see `create_encrypted_image`,
+//!   `inspect_encrypted_image`, `change_passphrase` and
+//!   `remove_key_record`.
+//!
+//! ## Security properties (read this before relying on it)
+//!
+//! - **The payload is not authenticated.** `encrcdsa` v2 encrypts each
+//!   chunk with plain AES-CBC and carries no MAC over the ciphertext. A
+//!   tampered or corrupted chunk decrypts to garbage instead of failing,
+//!   and an attacker who can write the file can flip bits in a chunk's
+//!   plaintext (at the cost of scrambling the previous 16 bytes) or
+//!   swap / replay whole chunks undetected. Treat the format as
+//!   confidentiality-only; layer an integrity check on top if you need
+//!   one.
+//! - **A wrong passphrase is detected only through PKCS#7 padding** on
+//!   the unwrapped keyblob. That rejects nearly every wrong passphrase,
+//!   but roughly one in 256 wrong keys produces valid-looking padding
+//!   (the reader then serves garbage). The in-place editors, for which a
+//!   false positive would be destructive, also require the
+//!   [`KEYBLOB_TRAILER`] `hdiutil` puts after the keys.
+//! - **Removing a key record is not secure erasure.** It drops the record
+//!   from the key table and overwrites that one on-disk copy, but any
+//!   earlier copy of the image (backups, snapshots, the file system's own
+//!   copy-on-write or journaling, flash remapping) still carries the old
+//!   record, and anyone holding it plus the old passphrase recovers the
+//!   content key — which is never changed, since the payload is not
+//!   re-encrypted.
+//! - **Untrusted KDF parameters are bounded.** A record asking for more
+//!   than [`MAX_PBKDF2_ITERATIONS`] PBKDF2 rounds is refused before any
+//!   work is done, as is a header with more than
+//!   [`MAX_PASSPHRASE_RECORDS`] passphrase records.
+//! - Key material is held in buffers that are zeroed on drop and kept out
+//!   of `Debug` output and error messages.
 //!
 //! ## Format recap (v2)
 //!
@@ -66,8 +100,17 @@
 //! `(KEK, IV)`. For AES the 8 live IV bytes are zero-extended to a
 //! 16-byte block IV. PKCS#7 padding is removed; the plaintext is the
 //! concatenation of the AES key (16 or 32 bytes) and the HMAC-SHA1 key
-//! (20 bytes), possibly followed by trailing bytes we ignore. The chunk
+//! (20 bytes), followed — in every image `hdiutil` writes — by the
+//! five-byte trailer `"CKIE" 0x00` (an Apple CDSA key-blob tag), which
+//! `hdiutil` requires on unwrap. The reader ignores what follows the
+//! keys; the in-place editors insist on the trailer (see
+//! [`KEYBLOB_TRAILER`]). The chunk
 //! IV is the first 16 bytes of `HMAC-SHA1(hmac_key, chunk_index_as_u32_be)`.
+//!
+//! `data_size` is the exact plaintext length and need not be a multiple
+//! of anything: the last chunk is stored padded to a whole chunk on disk
+//! (`hdiutil` does this for compressed UDIF payloads), and the reader
+//! decrypts the whole cipher blocks covering it, then truncates.
 //!
 //! The layout above was verified against images produced by
 //! `hdiutil create -encryption AES-128` on current macOS; one such image
@@ -94,6 +137,17 @@ use crate::Result;
 #[cfg(feature = "dmg-encrypted")]
 use crate::block::BlockDevice;
 
+#[cfg(feature = "dmg-encrypted-write")]
+mod write;
+#[cfg(feature = "dmg-encrypted-write")]
+pub use write::{
+    ContentCipher, ContentKeys, CreateOptions, CreatedImage, DEFAULT_CHUNK_SIZE,
+    DEFAULT_PBKDF2_ITERATIONS, ENCRYPTED_DATA_OFFSET, EncryptedImageInfo, KeyRecordInfo,
+    KeyRecordKind, OsRandom, PassphraseRecordInfo, RandomSource, RekeyOptions, change_passphrase,
+    create_encrypted_image, create_encrypted_image_from_device, inspect_encrypted_image,
+    remove_key_record,
+};
+
 /// Eight-byte v2 magic at file offset 0.
 pub const ENCRCDSA_MAGIC: &[u8; 8] = b"encrcdsa";
 
@@ -117,6 +171,19 @@ const MAX_KEY_ENTRIES: u32 = 64;
 /// Cap on a single key record's declared size (real ones are 0x268
 /// bytes); bounds the per-entry read.
 const MAX_KEY_RECORD_BYTES: u64 = 64 * 1024;
+
+/// Most PBKDF2 iterations a key record may ask for. The count comes from
+/// the (untrusted) image, and every attempt to unlock a record costs that
+/// many HMAC-SHA1 rounds, so a hostile header could otherwise pin a CPU
+/// for hours. `hdiutil` calibrates the count to the machine, landing in
+/// the high hundreds of thousands today; the cap leaves an order of
+/// magnitude of headroom.
+pub const MAX_PBKDF2_ITERATIONS: u32 = 10_000_000;
+
+/// Most passphrase records an unlock will try. Real images carry one;
+/// with the per-record [`MAX_PBKDF2_ITERATIONS`] cap this bounds the
+/// total KDF work a wrong passphrase can trigger.
+pub const MAX_PASSPHRASE_RECORDS: usize = 8;
 
 /// Apple CSSM algorithm identifiers as they appear in the header.
 pub mod algid {
@@ -474,10 +541,10 @@ fn u64_be(buf: &[u8], at: usize) -> u64 {
 
 /// Read up to `len` bytes from the start of `file`; a short file yields
 /// a short buffer, and the decoder reports what is missing.
-fn read_prefix(file: &mut File, len: usize) -> Result<Vec<u8>> {
+fn read_prefix<R: Read + Seek + ?Sized>(file: &mut R, len: usize) -> Result<Vec<u8>> {
     file.seek(SeekFrom::Start(0))?;
     let mut buf = Vec::with_capacity(len);
-    file.take(len as u64).read_to_end(&mut buf)?;
+    (&mut *file).take(len as u64).read_to_end(&mut buf)?;
     Ok(buf)
 }
 
@@ -485,6 +552,14 @@ fn read_prefix(file: &mut File, len: usize) -> Result<Vec<u8>> {
 /// file cursor is left at an unspecified position; callers should seek
 /// explicitly before the next read.
 pub fn read_header(file: &mut File) -> Result<EncryptedDmgHeader> {
+    read_header_from(file)
+}
+
+/// [`read_header`] over any seekable reader — an in-memory image, or a
+/// file opened read-write for `change_passphrase`. Reads are bounded:
+/// at most the capped key-entry table plus the capped records it points
+/// at.
+pub fn read_header_from<R: Read + Seek + ?Sized>(file: &mut R) -> Result<EncryptedDmgHeader> {
     // Two passes: the prefix and (capped) table tell us how far the key
     // records reach, then everything up to there is read and decoded.
     let table_max = ENCRCDSA_V2_HEADER_MIN_BYTES + MAX_KEY_ENTRIES as usize * KEY_ENTRY_BYTES;
@@ -512,12 +587,11 @@ pub fn read_header(file: &mut File) -> Result<EncryptedDmgHeader> {
 /// koly-trailer payload that lives inside, but we don't do that here —
 /// scope of this module is the encryption layer alone.
 #[cfg(feature = "dmg-encrypted")]
-#[derive(Debug)]
 pub struct EncryptedDmgBackend {
     file: File,
     header: EncryptedDmgHeader,
     /// AES key recovered from the keyblob — 16, 24 or 32 bytes.
-    aes_key: Vec<u8>,
+    aes_key: SecretBytes,
     /// HMAC-SHA1 key recovered from the keyblob — 20 bytes.
     hmac_key: [u8; 20],
     /// Cached plaintext size (`header.data_size`).
@@ -538,93 +612,16 @@ impl EncryptedDmgBackend {
         let mut file = File::open(path)?;
         let header = read_header(&mut file)?;
 
-        // Reject anything we don't actually implement.
-        if header.encryption_algorithm != algid::AES {
-            return Err(crate::Error::Unsupported(format!(
-                "encrcdsa: encryption_algorithm {:#x} not supported (only {:#x} = AES)",
-                header.encryption_algorithm,
-                algid::AES
-            )));
-        }
-        let aes_key_len = header.aes_key_len()?;
-        if header.block_size == 0 || !header.block_size.is_multiple_of(16) {
-            return Err(crate::Error::InvalidImage(format!(
-                "encrcdsa: block_size {} is not a positive multiple of the 16-byte AES block",
-                header.block_size
-            )));
-        }
-        // `block_size` is attacker-controlled and sizes a per-chunk
-        // `vec![0u8; block_size]` in `decrypt_chunk`. Real images use 512 B to
-        // a few tens of KiB; cap at 1 MiB so a hostile header can't request a
-        // ~4 GiB allocation per chunk read.
-        const MAX_BLOCK_SIZE: u32 = 1 << 20;
-        if header.block_size > MAX_BLOCK_SIZE {
-            return Err(crate::Error::InvalidImage(format!(
-                "encrcdsa: block_size {} exceeds maximum {MAX_BLOCK_SIZE}",
-                header.block_size
-            )));
-        }
-        // CBC without padding: a partial trailing chunk still has to be a
-        // whole number of cipher blocks.
-        if !header.data_size.is_multiple_of(16) {
-            return Err(crate::Error::InvalidImage(format!(
-                "encrcdsa: data_size {} is not a multiple of the 16-byte AES block",
-                header.data_size
-            )));
-        }
-        // The encrypted payload must physically fit between `data_offset`
-        // and end-of-file. Rejecting a `data_size` the file can't back
-        // stops a tiny image from advertising a huge virtual size.
         let file_len = file.metadata()?.len();
-        let data_end = header
-            .data_offset
-            .checked_add(header.data_size)
-            .ok_or_else(|| {
-                crate::Error::InvalidImage("encrcdsa: data_offset + data_size overflows u64".into())
-            })?;
-        if data_end > file_len {
-            return Err(crate::Error::InvalidImage(format!(
-                "encrcdsa: data extent (offset {} + size {} = {}) exceeds file length {}",
-                header.data_offset, header.data_size, data_end, file_len
-            )));
-        }
-        if header.passphrase_keys.is_empty() {
-            return Err(crate::Error::Unsupported(format!(
-                "encrcdsa: no passphrase key entry among {} key entries \
-                 (certificate-only images are not supported)",
-                header.key_entries.len()
-            )));
-        }
-
-        // Try each passphrase entry; the first that unwraps wins.
-        let needed = aes_key_len + 20;
-        let mut keyblob_plain = None;
-        let mut last_err = None;
-        for key in &header.passphrase_keys {
-            match unwrap_keyblob(key, password) {
-                Ok(plain) if plain.len() >= needed => {
-                    keyblob_plain = Some(plain);
-                    break;
-                }
-                Ok(plain) => {
-                    last_err = Some(crate::Error::InvalidImage(format!(
-                        "encrcdsa: unwrapped keyblob too short ({} bytes, need >= {needed})",
-                        plain.len()
-                    )));
-                }
-                Err(e) => last_err = Some(e),
-            }
-        }
-        let keyblob_plain = match keyblob_plain {
-            Some(p) => p,
-            None => return Err(last_err.expect("at least one passphrase key was tried")),
-        };
+        validate_for_decryption(&header, file_len)?;
+        let aes_key_len = header.aes_key_len()?;
+        let (_, keyblob_plain) = unlock_keyblob(&header, password, None, false)?;
 
         // The plaintext is `aes_key || hmac_sha1_key`, sometimes followed by
         // a few trailing bytes we don't need.
-        let aes_key = keyblob_plain[..aes_key_len].to_vec();
+        let aes_key = SecretBytes(keyblob_plain.0[..aes_key_len].to_vec());
         let mut hmac_key = [0u8; 20];
-        hmac_key.copy_from_slice(&keyblob_plain[aes_key_len..aes_key_len + 20]);
+        hmac_key.copy_from_slice(&keyblob_plain.0[aes_key_len..aes_key_len + 20]);
 
         let virtual_size = header.data_size;
         Ok(Self {
@@ -661,24 +658,219 @@ impl EncryptedDmgBackend {
         })?;
         let rel = chunk_index * self.header.block_size as u64;
         let len = self.chunk_len(rel) as usize;
+        // A short trailing chunk is stored padded; decrypt the whole
+        // cipher blocks that cover it (still within `block_size`, a
+        // multiple of 16) and keep the live prefix.
+        let ct_len = len.next_multiple_of(16);
         let abs_offset = self.header.data_offset.checked_add(rel).ok_or_else(|| {
             crate::Error::InvalidImage(
                 "encrcdsa: chunk absolute offset overflows the data fork".into(),
             )
         })?;
         self.file.seek(SeekFrom::Start(abs_offset))?;
-        let mut ciphertext = vec![0u8; len];
+        let mut ciphertext = vec![0u8; ct_len];
         self.file.read_exact(&mut ciphertext)?;
 
         // IV = first 16 bytes of HMAC-SHA1(hmac_key, chunk_index_as_u32_be).
         let iv = chunk_iv(&self.hmac_key, index32);
 
         // AES-CBC decrypt in place. No padding — the chunk's ciphertext
-        // is always a multiple of the AES block size (checked at open),
-        // and the plaintext is the chunk's literal contents.
-        aes_cbc_decrypt(&self.aes_key, &iv, &mut ciphertext)?;
+        // is always a multiple of the AES block size, and the plaintext is
+        // the chunk's literal contents.
+        aes_cbc_decrypt(&self.aes_key.0, &iv, &mut ciphertext)?;
+        ciphertext.truncate(len);
         Ok(ciphertext)
     }
+}
+
+#[cfg(feature = "dmg-encrypted")]
+impl std::fmt::Debug for EncryptedDmgBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Key material stays out of `Debug`.
+        f.debug_struct("EncryptedDmgBackend")
+            .field("header", &self.header)
+            .field("aes_key", &self.aes_key)
+            .field("hmac_key", &"<redacted>")
+            .field("virtual_size", &self.virtual_size)
+            .field("cursor", &self.cursor)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "dmg-encrypted")]
+impl Drop for EncryptedDmgBackend {
+    fn drop(&mut self) {
+        wipe(&mut self.hmac_key);
+    }
+}
+
+/// Overwrite `buf` with zeros. The crate forbids `unsafe`, so there is no
+/// `write_volatile`; a fill followed by a black-box read of the buffer is
+/// what safe Rust offers to keep the store from being elided.
+#[cfg(feature = "dmg-encrypted")]
+pub(crate) fn wipe(buf: &mut [u8]) {
+    buf.fill(0);
+    std::hint::black_box(&*buf);
+}
+
+/// Owned secret bytes (a key, a KEK, an unwrapped keyblob): zeroed on drop
+/// and redacted in `Debug`.
+#[cfg(feature = "dmg-encrypted")]
+pub(crate) struct SecretBytes(pub(crate) Vec<u8>);
+
+#[cfg(feature = "dmg-encrypted")]
+impl Drop for SecretBytes {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
+    }
+}
+
+#[cfg(feature = "dmg-encrypted")]
+impl std::fmt::Debug for SecretBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{} secret bytes redacted>", self.0.len())
+    }
+}
+
+/// Largest chunk (`block_size`) the reader accepts. `block_size` is
+/// attacker-controlled and sizes a per-chunk buffer; real images use
+/// 512 B to a few tens of KiB, so 1 MiB keeps a hostile header from
+/// requesting a ~4 GiB allocation per chunk read.
+pub const MAX_CHUNK_SIZE: u32 = 1 << 20;
+
+/// Check everything about the header that decryption relies on, against
+/// a container `file_len` bytes long: the cipher, the chunk geometry, and
+/// that the data fork physically fits.
+#[cfg(feature = "dmg-encrypted")]
+pub(crate) fn validate_for_decryption(header: &EncryptedDmgHeader, file_len: u64) -> Result<()> {
+    // Reject anything we don't actually implement.
+    if header.encryption_algorithm != algid::AES {
+        return Err(crate::Error::Unsupported(format!(
+            "encrcdsa: encryption_algorithm {:#x} not supported (only {:#x} = AES)",
+            header.encryption_algorithm,
+            algid::AES
+        )));
+    }
+    header.aes_key_len()?;
+    if header.block_size == 0 || !header.block_size.is_multiple_of(16) {
+        return Err(crate::Error::InvalidImage(format!(
+            "encrcdsa: block_size {} is not a positive multiple of the 16-byte AES block",
+            header.block_size
+        )));
+    }
+    if header.block_size > MAX_CHUNK_SIZE {
+        return Err(crate::Error::InvalidImage(format!(
+            "encrcdsa: block_size {} exceeds maximum {MAX_CHUNK_SIZE}",
+            header.block_size
+        )));
+    }
+    // The chunk IV counter is 32 bits wide.
+    if header.n_chunks() > u64::from(u32::MAX) + 1 {
+        return Err(crate::Error::InvalidImage(format!(
+            "encrcdsa: data_size {} needs more chunks than the 32-bit IV counter allows",
+            header.data_size
+        )));
+    }
+    // The encrypted payload — `data_size` rounded up to whole cipher
+    // blocks — must physically fit between `data_offset` and end-of-file.
+    // Rejecting a `data_size` the file can't back stops a tiny image from
+    // advertising a huge virtual size.
+    let data_end = header
+        .data_size
+        .checked_next_multiple_of(16)
+        .and_then(|n| header.data_offset.checked_add(n))
+        .ok_or_else(|| {
+            crate::Error::InvalidImage("encrcdsa: data_offset + data_size overflows u64".into())
+        })?;
+    if data_end > file_len {
+        return Err(crate::Error::InvalidImage(format!(
+            "encrcdsa: data extent (offset {} + size {} = {}) exceeds file length {}",
+            header.data_offset, header.data_size, data_end, file_len
+        )));
+    }
+    Ok(())
+}
+
+/// Trailer `hdiutil` writes after `aes_key || hmac_key` in every keyblob
+/// plaintext (an Apple CDSA key-blob tag) and requires on unwrap.
+///
+/// It doubles as a far stronger wrong-passphrase check than the PKCS#7
+/// padding, which a wrong key passes about once in 256 tries. Reading
+/// with a false positive only yields garbage, but re-wrapping one would
+/// destroy the image, so the in-place editors require the trailer.
+pub const KEYBLOB_TRAILER: &[u8; 5] = b"CKIE\0";
+
+/// Try `password` against the passphrase records, in table order, and
+/// return the key-entry index of the first that unwraps to a keyblob
+/// long enough for the header's AES key plus the 20-byte HMAC key,
+/// together with that keyblob's plaintext. `skip` excludes one key-entry
+/// index from the search. With `require_trailer`, a record only counts as
+/// unlocked when [`KEYBLOB_TRAILER`] follows the keys.
+///
+/// Fails with [`crate::Error::Unsupported`] when no record unlocks — the
+/// "wrong password" signal — and never says anything about the password
+/// itself.
+#[cfg(feature = "dmg-encrypted")]
+pub(crate) fn unlock_keyblob(
+    header: &EncryptedDmgHeader,
+    password: &str,
+    skip: Option<usize>,
+    require_trailer: bool,
+) -> Result<(usize, SecretBytes)> {
+    let aes_key_len = header.aes_key_len()?;
+    if header.passphrase_keys.is_empty() {
+        return Err(crate::Error::Unsupported(format!(
+            "encrcdsa: no passphrase key entry among {} key entries \
+             (certificate-only images are not supported)",
+            header.key_entries.len()
+        )));
+    }
+    if header.passphrase_keys.len() > MAX_PASSPHRASE_RECORDS {
+        return Err(crate::Error::InvalidImage(format!(
+            "encrcdsa: {} passphrase records exceed the maximum of {MAX_PASSPHRASE_RECORDS}",
+            header.passphrase_keys.len()
+        )));
+    }
+    // `passphrase_keys` holds the passphrase-typed entries in table order.
+    let entry_indices = header
+        .key_entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.kind == KEY_ENTRY_PASSPHRASE)
+        .map(|(i, _)| i);
+    let needed = aes_key_len + 20;
+    let mut last_err = None;
+    for (entry_index, key) in entry_indices.zip(&header.passphrase_keys) {
+        if Some(entry_index) == skip {
+            continue;
+        }
+        match unwrap_keyblob(key, password) {
+            Ok(plain)
+                if plain.0.len() >= needed
+                    && (!require_trailer
+                        || plain.0.get(needed..needed + KEYBLOB_TRAILER.len())
+                            == Some(&KEYBLOB_TRAILER[..])) =>
+            {
+                return Ok((entry_index, plain));
+            }
+            Ok(plain) => {
+                last_err = Some(crate::Error::Unsupported(format!(
+                    "encrcdsa: keyblob unwrap failed — wrong password \
+                     (unwrapped {} bytes, need >= {needed}{})",
+                    plain.0.len(),
+                    if require_trailer {
+                        " and the CKIE trailer"
+                    } else {
+                        ""
+                    }
+                )));
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        crate::Error::Unsupported("encrcdsa: no other passphrase record to unlock".into())
+    }))
 }
 
 /// AES-CBC decrypt `buf` in place under a 16-, 24- or 32-byte key.
@@ -703,7 +895,7 @@ fn aes_cbc_decrypt(key: &[u8], iv: &[u8; 16], buf: &mut [u8]) -> Result<()> {
 /// Derive the KEK from `password` and CBC-unwrap `key`'s keyblob with
 /// it, stripping the PKCS#7 padding. Returns the plaintext keyblob.
 #[cfg(feature = "dmg-encrypted")]
-fn unwrap_keyblob(key: &PassphraseKey, password: &str) -> Result<Vec<u8>> {
+pub(crate) fn unwrap_keyblob(key: &PassphraseKey, password: &str) -> Result<SecretBytes> {
     use purecrypto::cipher::{Cbc64, TdesEde3};
 
     if key.kdf_algorithm != algid::PKCS5_PBKDF2 {
@@ -719,6 +911,13 @@ fn unwrap_keyblob(key: &PassphraseKey, password: &str) -> Result<Vec<u8>> {
         return Err(crate::Error::InvalidImage(
             "encrcdsa: pbkdf2 iteration count is zero".into(),
         ));
+    }
+    // The count is untrusted: bound the work before doing any.
+    if key.pbkdf2_iteration_count > MAX_PBKDF2_ITERATIONS {
+        return Err(crate::Error::InvalidImage(format!(
+            "encrcdsa: pbkdf2 iteration count {} exceeds maximum {MAX_PBKDF2_ITERATIONS}",
+            key.pbkdf2_iteration_count
+        )));
     }
     let (block, kek_len) = match (key.blob_enc_algorithm, key.blob_enc_key_bits) {
         (algid::AES, 128) => (16usize, 16usize),
@@ -740,15 +939,16 @@ fn unwrap_keyblob(key: &PassphraseKey, password: &str) -> Result<Vec<u8>> {
         )));
     }
 
-    let mut kek = vec![0u8; kek_len];
+    let mut kek = SecretBytes(vec![0u8; kek_len]);
     purecrypto::kdf::pbkdf2::<purecrypto::hash::Sha1>(
         password.as_bytes(),
         key.salt(),
         key.pbkdf2_iteration_count,
-        &mut kek,
+        &mut kek.0,
     );
 
-    let mut buf = ct.clone();
+    let mut buf = SecretBytes(ct.clone());
+    let kek = &kek.0;
     let iv = key.blob_iv();
     if block == 16 {
         // The header stores 8 live IV bytes even for AES (CSSM's
@@ -756,23 +956,23 @@ fn unwrap_keyblob(key: &PassphraseKey, password: &str) -> Result<Vec<u8>> {
         let mut iv16 = [0u8; 16];
         let n = iv.len().min(16);
         iv16[..n].copy_from_slice(&iv[..n]);
-        aes_cbc_decrypt(&kek, &iv16, &mut buf)?;
+        aes_cbc_decrypt(kek, &iv16, &mut buf.0)?;
     } else {
         let iv8: [u8; 8] = iv[..8].try_into().unwrap();
         let kek24: &[u8; 24] = kek.as_slice().try_into().unwrap();
         Cbc64::new(TdesEde3::new(kek24), &iv8)
-            .decrypt(&mut buf)
+            .decrypt(&mut buf.0)
             .map_err(|e| crate::Error::InvalidImage(format!("encrcdsa: 3DES-CBC: {e}")))?;
     }
     // `purecrypto`'s CBC is raw-block (caller pads), so strip PKCS#7 here.
     // A bad password yields garbage plaintext whose trailer fails this
     // check — that's the "wrong password" signal.
-    let plain = strip_pkcs7(&buf, block).ok_or_else(|| {
+    let plain = strip_pkcs7(&buf.0, block).ok_or_else(|| {
         crate::Error::Unsupported(
             "encrcdsa: keyblob unwrap failed — wrong password, or unsupported padding".into(),
         )
     })?;
-    Ok(plain.to_vec())
+    Ok(SecretBytes(plain.to_vec()))
 }
 
 /// Strip PKCS#7 padding from `buf` (block size `block`, 1..=255). Returns
