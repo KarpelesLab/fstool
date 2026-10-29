@@ -53,11 +53,9 @@ fuzz_target!(|data: &[u8]| {
     // A valid volume to start from, with a file and a directory in it so
     // the walk has something to find.
     let mut dev = MemoryBackend::new(SECTORS as u64 * 512);
-    let opts = FatFormatOpts {
-        kind: FatKind::Fat16,
-        total_sectors: SECTORS,
-        ..Default::default()
-    };
+    let mut opts = FatFormatOpts::default();
+    opts.kind = FatKind::Fat16;
+    opts.total_sectors = SECTORS;
     let Ok(mut fs) = Fat32::format(&mut dev, &opts) else {
         return;
     };

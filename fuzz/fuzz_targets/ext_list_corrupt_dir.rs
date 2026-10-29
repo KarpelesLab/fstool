@@ -17,14 +17,12 @@ fuzz_target!(|data: &[u8]| {
     if data.len() < 32 {
         return;
     }
-    let opts = FormatOpts {
-        kind: FsKind::Ext4,
-        block_size: 1024,
-        blocks_count: 2048,
-        inodes_count: 16,
-        journal_blocks: 1024,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.kind = FsKind::Ext4;
+    opts.block_size = 1024;
+    opts.blocks_count = 2048;
+    opts.inodes_count = 16;
+    opts.journal_blocks = 1024;
     let total = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = MemoryBackend::new(total);
     let Ok(_) = Ext::format_with(&mut dev, &opts) else {

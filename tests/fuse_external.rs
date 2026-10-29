@@ -62,10 +62,8 @@ fn fuse_usable() -> bool {
 /// `(path, contents)` pairs we put in (relative to the mount
 /// point) so the test can assert on them without re-hardcoding.
 fn build_seed_image(path: &Path) -> Vec<(&'static str, &'static [u8])> {
-    let opts = FormatOpts {
-        inodes_count: 64,
-        ..FormatOpts::default()
-    };
+    let mut opts = FormatOpts::default();
+    opts.inodes_count = 64;
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = FileBackend::create(path, size).expect("create image");
     let mut ext = Ext::format_with(&mut dev, &opts).expect("format ext2");
