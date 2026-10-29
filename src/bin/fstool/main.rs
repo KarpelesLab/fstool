@@ -4125,7 +4125,10 @@ fn cut_volumes(output: &std::path::Path, ranges: &[(u64, u64)]) -> fstool::Resul
 /// files, and the provisioned sparse tail is only zeros.
 fn truncate_output_file(output: &std::path::Path, len: u64) -> fstool::Result<()> {
     use fstool::block::file::is_block_device;
-    if is_block_device(output) || fstool::block::is_qcow2_path(output) {
+    if is_block_device(output)
+        || fstool::block::is_qcow2_path(output)
+        || fstool::block::is_sparse_image_path(output)
+    {
         return Ok(());
     }
     let f = std::fs::OpenOptions::new().write(true).open(output)?;

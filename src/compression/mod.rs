@@ -717,7 +717,8 @@ pub fn detect_path(path: &std::path::Path) -> Result<Option<Algo>> {
         return Ok(Some(algo));
     }
     // No extension hint — sniff the magic bytes.
-    if !path.exists() {
+    // A directory (a `.sparsebundle`, say) is never a compressed stream.
+    if !path.exists() || path.is_dir() {
         return Ok(None);
     }
     let mut f = std::fs::File::open(path)?;

@@ -54,6 +54,8 @@ pub mod memory;
 pub mod qcow2;
 pub mod sector;
 pub mod sliced;
+#[cfg(feature = "sparse-image")]
+pub mod sparse;
 #[cfg(feature = "std")]
 pub mod split;
 
@@ -72,6 +74,8 @@ pub use memory::MemoryBackend;
 pub use qcow2::Qcow2Backend;
 pub use sector::{SectorDevice, SectorIo};
 pub use sliced::SlicedBackend;
+#[cfg(feature = "sparse-image")]
+pub use sparse::{ShrinkPolicy, SparseBundleBackend, SparseImageBackend};
 #[cfg(feature = "std")]
 pub use split::SplitBackend;
 
@@ -97,6 +101,8 @@ mod host {
     ///
     /// Detection order:
     ///
+    /// - a `.sparsebundle` directory, or `sprs` magic at offset 0 →
+    ///   [`SparseBundleBackend`] / [`SparseImageBackend`]
     /// - qcow2 magic `"QFI\xfb"` at offset 0   → [`Qcow2Backend`]
     /// - UDIF `koly` trailer at `file_size-512` → [`DmgBackend`] (scaffold:
     ///   parses the trailer; reads return `Unsupported` until the chunk
@@ -126,6 +132,11 @@ mod host {
         path: &Path,
         password: Option<&str>,
     ) -> crate::Result<Box<dyn BlockDevice>> {
+        #[cfg(feature = "sparse-image")]
+        if let Some(dev) = super::sparse::open_auto(path, false)? {
+            return Ok(dev);
+        }
+        reject_sparse_without_feature(path)?;
         // A split archive's volume set reads as one device; `path` may
         // name any volume of it.
         if let Some(set) = super::split::SplitBackend::open_volume_set(path, false)? {
@@ -149,6 +160,19 @@ mod host {
         }
         let file = FileBackend::open(path)?;
         open_maybe_luks(file, path, password, false)
+    }
+
+    /// Without the `sparse-image` feature, refuse a sparse image by name
+    /// rather than reading its band table as a raw disk.
+    fn reject_sparse_without_feature(path: &Path) -> crate::Result<()> {
+        #[cfg(not(feature = "sparse-image"))]
+        if is_sparse_image_path(path) {
+            return Err(crate::Error::Unsupported(
+                "Apple sparse images need the `sparse-image` feature".into(),
+            ));
+        }
+        let _ = path;
+        Ok(())
     }
 
     /// Open a qcow2 image, with or without a passphrase.
@@ -278,6 +302,11 @@ mod host {
         path: &Path,
         password: Option<&str>,
     ) -> crate::Result<Box<dyn BlockDevice>> {
+        #[cfg(feature = "sparse-image")]
+        if let Some(dev) = super::sparse::open_auto(path, true)? {
+            return Ok(dev);
+        }
+        reject_sparse_without_feature(path)?;
         if let Some(set) = super::split::SplitBackend::open_volume_set(path, true)? {
             return Ok(Box::new(set));
         }
@@ -351,6 +380,11 @@ mod host {
         /// probed. Ignored for a raw destination, which has nowhere to
         /// record it.
         pub backing: Option<(PathBuf, Option<String>)>,
+        /// Band size in bytes for a `.sparseimage` / `.sparsebundle`
+        /// destination (a multiple of 512). `0` — the default — picks
+        /// hdiutil's: 1 MiB for a sparseimage, 8 MiB for a sparsebundle.
+        /// Ignored for other destinations.
+        pub sparse_band_size: u64,
     }
 
     /// How [`create_image`] should encrypt a new image.
@@ -371,6 +405,7 @@ mod host {
                 cluster_size: 65_536,
                 encrypt: None,
                 backing: None,
+                sparse_band_size: 0,
             }
         }
     }
@@ -387,8 +422,9 @@ mod host {
 
     /// Create a new image at `path` of capacity `virtual_size` bytes. The
     /// backend is chosen by the path's extension: `.qcow2` (or `.qcow` /
-    /// `.q2`) → [`Qcow2Backend`], everything else → [`FileBackend`] (sparse
-    /// raw file or block device).
+    /// `.q2`) → [`Qcow2Backend`], `.sparseimage` / `.sparsebundle` → the
+    /// Apple sparse backends (feature `sparse-image`), everything else →
+    /// [`FileBackend`] (sparse raw file or block device).
     ///
     /// With [`CreateOpts::encrypt`] set, the returned device is the
     /// *plaintext* view: writes to it land encrypted, and offset 0 is the
@@ -400,6 +436,9 @@ mod host {
         virtual_size: u64,
         opts: &CreateOpts,
     ) -> crate::Result<Box<dyn BlockDevice>> {
+        if is_sparse_image_path(path) {
+            return create_sparse(path, virtual_size, opts);
+        }
         #[cfg(not(feature = "qcow2"))]
         if is_qcow2_path(path) {
             return Err(crate::Error::Unsupported(
@@ -472,6 +511,52 @@ mod host {
         Ok(Box::new(FileBackend::create(path, virtual_size)?))
     }
 
+    /// The `.sparseimage` / `.sparsebundle` arm of [`create_image`].
+    fn create_sparse(
+        path: &Path,
+        virtual_size: u64,
+        opts: &CreateOpts,
+    ) -> crate::Result<Box<dyn BlockDevice>> {
+        if opts.encrypt.is_some() || opts.backing.is_some() {
+            return Err(crate::Error::Unsupported(
+                "Apple sparse images: encryption and backing files are not supported".into(),
+            ));
+        }
+        #[cfg(feature = "sparse-image")]
+        {
+            let bundle = super::sparse::is_sparsebundle_path(path);
+            let band = match opts.sparse_band_size {
+                0 if bundle => super::sparse::DEFAULT_BUNDLE_BAND_SIZE,
+                0 => super::sparse::DEFAULT_IMAGE_BAND_SIZE,
+                n => n,
+            };
+            Ok(if bundle {
+                Box::new(SparseBundleBackend::create(path, virtual_size, band)?)
+            } else {
+                Box::new(SparseImageBackend::create(path, virtual_size, band)?)
+            })
+        }
+        #[cfg(not(feature = "sparse-image"))]
+        {
+            let _ = (path, virtual_size);
+            Err(crate::Error::Unsupported(
+                "Apple sparse images need the `sparse-image` feature".into(),
+            ))
+        }
+    }
+
+    /// True when `path`'s extension marks it as an Apple sparse image
+    /// (`.sparseimage` or `.sparsebundle`), whether or not the
+    /// `sparse-image` feature is compiled in. A sparsebundle is a
+    /// directory, so callers that would treat the output as a plain file
+    /// (truncating it, say) check this first.
+    pub fn is_sparse_image_path(path: &Path) -> bool {
+        let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+            return false;
+        };
+        ext.eq_ignore_ascii_case("sparseimage") || ext.eq_ignore_ascii_case("sparsebundle")
+    }
+
     /// True when `path`'s extension marks it as a qcow2 image (`.qcow2` /
     /// `.qcow` / `.q2`). Used by the create/finalize paths to decide the backend.
     pub fn is_qcow2_path(path: &Path) -> bool {
@@ -484,10 +569,10 @@ mod host {
 
 #[cfg(feature = "std")]
 pub use host::{
-    CreateOpts, EncryptOpts, create_image, is_qcow2_path, open_image, open_image_maybe_compressed,
-    open_image_maybe_compressed_read_only, open_image_maybe_compressed_read_only_with_password,
-    open_image_maybe_compressed_with_password, open_image_read_only,
-    open_image_read_only_with_password, open_image_with_password,
+    CreateOpts, EncryptOpts, create_image, is_qcow2_path, is_sparse_image_path, open_image,
+    open_image_maybe_compressed, open_image_maybe_compressed_read_only,
+    open_image_maybe_compressed_read_only_with_password, open_image_maybe_compressed_with_password,
+    open_image_read_only, open_image_read_only_with_password, open_image_with_password,
 };
 
 /// A seekable byte-addressable store of fixed capacity.

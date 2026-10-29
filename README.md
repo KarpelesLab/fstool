@@ -102,7 +102,7 @@ means an already-flushed image can be re-opened for `add` / `rm` /
 through a real transaction so a crash mid-write leaves an image the
 host's `fsck` can replay.
 
-`qcow2`, `LUKS` and `dmg` are **not** in the table above: they aren't
+`qcow2`, `LUKS`, `dmg` and Apple's sparse images are **not** in the table above: they aren't
 filesystems but *disk-image containers*. They live one layer down, as
 `BlockDevice` backends (see the architecture diagram and "Partitions,
 block devices, qcow2, LUKS"), presenting a flat byte-addressable device that
@@ -114,7 +114,8 @@ transparently (writing to a compressed cluster copies it out to a plain one)
 read/write and can be created; dmg reads UDIF v4 mish chunks (zero /
 raw / zlib / ADC / bzip2 / LZFSE / LZMA, plus encrypted v2 `encrcdsa`)
 and *writes* read-only UDRO / UDCO / UDZO / UDBZ / ULMO images (see
-"DMG writing").
+"DMG writing"); `.sparseimage` and `.sparsebundle` are read/write and can
+be created, allocating bands only as they are written.
 
 The reader for each FS streams: file contents are never fully resident in
 memory regardless of size. The writers do the same, two-pass: scan to size
@@ -226,6 +227,20 @@ through the TOML spec — see "[filesystem.options]" below.
   above can live inside one. Read/write in place, and `luks::format` (or
   `fstool create --encrypt`) writes a fresh volume that `cryptsetup` opens.
   See "Encryption".
+- **Apple sparse images** — `SparseImageBackend` (`.sparseimage`, a single
+  `sprs` v3 file, including the chained extension headers past the first
+  1,008 bands) and `SparseBundleBackend` (`.sparsebundle`, a directory of
+  `bands/<hex>` files) read and write what `hdiutil create -type SPARSE` /
+  `SPARSEBUNDLE` makes: unwritten bands read as zeros and the first write to
+  one allocates it. `create_image` / `open_image` dispatch on the extension
+  and on content, so `fstool create -t hfsplus src -o out.sparseimage` works.
+  Writers take the same `flock` hdiutil does (an attached image can't be
+  opened, and vice versa); band data is flushed before the table entry that
+  points at it; nothing inside a bundle may be a symlink. `resize` (grow, or
+  shrink — refused over nonzero data unless `ShrinkPolicy::Discard`) and
+  `compact` (drop all-zero bands) are explicit and leave the image intact on
+  failure. Cross-checked against `hdiutil attach` + `fsck_hfs` both ways.
+  Encrypted sparse images are not supported.
 
 ### DMG writing
 
@@ -731,6 +746,7 @@ none of the other 130 000 lines.
 | `archive` | zip / cpio / ar, plus the per-format readers | pulls `charcode`; `cab`, `lha`, `arc`, `sit`, `sevenz`, `rar`, `amiga-lzx` each imply it. On its own zip handles Stored members (and PKWARE-encrypted ones, and split sets); each compression method is a codec feature (`gzip` for Deflate, then `deflate64`, `bzip2`, `lzma`, `xz`, `zstd`, `zip-legacy`) and WinZip AES is `zip-aes` (pulls `purecrypto`), so `--features archive,gzip` is the slim everyday zip build |
 | `ramfs` | the in-memory scratch filesystem `repack` / `merge` / FUSE build on | |
 | `qcow2`, `dmg`, `diskcopy` | disk-image containers | `qcow2-crypto` implies `qcow2`; `dmg-encrypted` / `dmg-bzip2` / `dmg-lzfse` / `dmg-write` imply `dmg`; `dmg-write-zlib` / `-bzip2` / `-lzma` add one write codec each to `dmg-write`; `dmg-encrypted-write` implies `dmg-encrypted` |
+| `sparse-image` | Apple `.sparseimage` / `.sparsebundle` | |
 | `luks` | LUKS1 / LUKS2 | pulls `purecrypto`; implies `json` (LUKS2 metadata is JSON) |
 
 Every feature in the table except the three `no_std` ones implies
