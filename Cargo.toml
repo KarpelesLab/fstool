@@ -131,7 +131,7 @@ alloc = []
 #
 # which drops `clap` and `rustyline` (and their ~30 transitive crates)
 # while keeping every format.
-codecs = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "bzip2", "deflate64", "zip-legacy", "zip-aes", "cab", "amiga-lzx", "lha", "arc", "sit", "sevenz", "rar", "dmg-bzip2", "dmg-lzfse"]
+codecs = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "bzip2", "deflate64", "zip-legacy", "zip-aes", "cab", "amiga-lzx", "lha", "arc", "sit", "sevenz", "rar", "dmg-bzip2", "dmg-lzfse", "dmg-write-zlib", "dmg-write-bzip2", "dmg-write-lzma"]
 
 # ---------------------------------------------------------------------
 # Filesystems. One feature per backend, every one on by default through
@@ -254,7 +254,7 @@ ramfs = ["std"]
 # Disk-image containers — the `BlockDevice` layers between a host file
 # and the filesystem inside it. All `std`.
 # ---------------------------------------------------------------------
-containers = ["qcow2", "dmg", "diskcopy", "dmg-encrypted", "dmg-encrypted-write", "luks", "qcow2-crypto"]
+containers = ["qcow2", "dmg", "dmg-write", "diskcopy", "dmg-encrypted", "dmg-encrypted-write", "luks", "qcow2-crypto"]
 # qcow2 (with backing files; encryption via `qcow2-crypto`).
 qcow2 = ["std"]
 # Apple UDIF `.dmg` (read-only; zero / raw / zlib / ADC always, the other
@@ -369,6 +369,17 @@ zip-aes = ["archive", "dep:purecrypto"]
 # lzfse test vector — compcol's LZFSE is decode-only.)
 dmg-bzip2 = ["dmg", "dep:compcol", "compcol/bzip2"]
 dmg-lzfse = ["dmg", "dep:compcol", "compcol/lzfse"]
+# UDIF (.dmg) writing: `block::dmg::UdifWriter` encodes a sector stream
+# (a `BlockDevice` or a `Read` of known length) into a caller-owned
+# `Write + Seek` sink. The base feature carries UDRO (raw) and UDCO (ADC,
+# built in, no dependency); each compressed format adds its own codec and
+# the matching read-side decoder, so the writer's output always re-opens:
+# UDZO (zlib), UDBZ (bzip2), ULMO (LZMA, XZ-framed). ULFO is not offered:
+# compcol's LZFSE is decode-only.
+dmg-write = ["dmg"]
+dmg-write-zlib = ["dmg-write", "gzip"]
+dmg-write-bzip2 = ["dmg-write", "dmg-bzip2"]
+dmg-write-lzma = ["dmg-write", "xz"]
 # Password-protected DMG read support (`encrcdsa` v2). Served by the
 # `purecrypto` crate (AES-CBC, 3DES-EDE3-CBC via Cbc64, HMAC-SHA1, SHA-1,
 # PBKDF2) — pure-Rust, no foreign code. Gated so a slim build can drop it.

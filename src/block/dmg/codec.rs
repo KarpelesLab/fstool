@@ -135,6 +135,100 @@ fn adc_copy(out: &mut [u8], dp: &mut usize, dist: usize, len: usize) -> Result<(
     Ok(())
 }
 
+/// Encode `src` as an ADC stream that [`decode_adc`] (and Apple's own
+/// decoder) expands back to exactly `src`.
+///
+/// A greedy single-candidate LZ77: a hash of the next three bytes names
+/// the most recent position with the same prefix; if it is within the
+/// 64 KiB window the match is extended (up to the 67-byte long-form
+/// cap) and emitted in the cheapest opcode that can carry it — the
+/// two-byte short form for distance ≤ 1024 and length ≤ 18, the
+/// three-byte long form otherwise (which needs length ≥ 4). Everything
+/// else goes out as literal runs of at most 128 bytes. The output is at
+/// worst `src.len() + ceil(src.len() / 128)` bytes.
+#[cfg(feature = "dmg-write")]
+pub fn encode_adc(src: &[u8]) -> Vec<u8> {
+    const HASH_BITS: u32 = 14;
+    const NONE: u32 = u32::MAX;
+    const MAX_DIST: usize = 65_536;
+    const SHORT_MAX_DIST: usize = 1024;
+    const SHORT_MAX_LEN: usize = 18;
+    const LONG_MAX_LEN: usize = 67;
+    const MAX_LITERAL: usize = 128;
+
+    fn hash(b: &[u8]) -> usize {
+        let v = u32::from(b[0]) | (u32::from(b[1]) << 8) | (u32::from(b[2]) << 16);
+        (v.wrapping_mul(0x9E37_79B1) >> (32 - HASH_BITS)) as usize
+    }
+    fn literals(out: &mut Vec<u8>, mut lit: &[u8]) {
+        while !lit.is_empty() {
+            let take = lit.len().min(MAX_LITERAL);
+            out.push(0x80 | (take - 1) as u8);
+            out.extend_from_slice(&lit[..take]);
+            lit = &lit[take..];
+        }
+    }
+
+    let n = src.len();
+    // Positions are stored as u32; a DMG chunk is far below 4 GiB (the
+    // writer caps it), but fall back to all-literal output rather than
+    // mis-encode if someone hands us more.
+    if n >= NONE as usize {
+        let mut out = Vec::with_capacity(n + n.div_ceil(MAX_LITERAL));
+        literals(&mut out, src);
+        return out;
+    }
+    let mut table = vec![NONE; 1 << HASH_BITS];
+    let mut out = Vec::with_capacity(n / 2 + 16);
+    let mut lit_start = 0usize;
+    let mut i = 0usize;
+    while i + 3 <= n {
+        let h = hash(&src[i..]);
+        let cand = table[h];
+        table[h] = i as u32;
+        let mut best = None;
+        if cand != NONE {
+            let c = cand as usize;
+            let dist = i - c;
+            if dist <= MAX_DIST && src[c..c + 3] == src[i..i + 3] {
+                let max = (n - i).min(LONG_MAX_LEN);
+                let mut len = 3;
+                while len < max && src[c + len] == src[i + len] {
+                    len += 1;
+                }
+                // A 3-byte match only fits the short form (distance ≤ 1024).
+                if dist <= SHORT_MAX_DIST || len >= 4 {
+                    best = Some((dist, len));
+                }
+            }
+        }
+        let Some((dist, len)) = best else {
+            i += 1;
+            continue;
+        };
+        literals(&mut out, &src[lit_start..i]);
+        let d = dist - 1;
+        if dist <= SHORT_MAX_DIST && len <= SHORT_MAX_LEN {
+            out.push((((len - 3) as u8) << 2) | (d >> 8) as u8);
+            out.push(d as u8);
+        } else {
+            out.push(0x40 | (len - 4) as u8);
+            out.push((d >> 8) as u8);
+            out.push(d as u8);
+        }
+        // Index the positions the match skipped over so later data can
+        // refer back into it.
+        let end = i + len;
+        for j in i + 1..end.min(n - 2) {
+            table[hash(&src[j..])] = j as u32;
+        }
+        i = end;
+        lit_start = i;
+    }
+    literals(&mut out, &src[lit_start..]);
+    out
+}
+
 /// Decode an in-memory compcol-codec chunk into a `Vec`, refusing to expand
 /// past `plain_len` (a decompression-bomb guard for the bounded per-chunk
 /// case). A manual `decode`/`finish` loop with an explicit size check —
@@ -494,5 +588,59 @@ mod tests {
             crate::compression::compress(crate::compression::Algo::Lzma, &plain).unwrap();
         let out = decode_lzma(&compressed, plain.len()).unwrap();
         assert_eq!(out, plain);
+    }
+
+    /// Deterministic mixed corpus: runs, text, short/long distances and
+    /// incompressible noise, so every ADC opcode class is exercised.
+    #[cfg(feature = "dmg-write")]
+    fn adc_corpus() -> Vec<Vec<u8>> {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut noise = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                })
+                .collect()
+        };
+        let mut far = noise(3000);
+        far.extend_from_slice(&noise(2000));
+        let head = far[..3000].to_vec();
+        far.extend_from_slice(&head); // match at distance 5000 (long form)
+        let mut text = Vec::new();
+        for i in 0..2000 {
+            text.extend_from_slice(format!("line {i}: the quick brown fox\n").as_bytes());
+        }
+        vec![
+            Vec::new(),
+            vec![7],
+            vec![1, 2],
+            b"abc".to_vec(),
+            vec![0u8; 1 << 20],
+            vec![0xAA; 70_000],
+            b"ABABABABABABABABABABABABAB".to_vec(),
+            text,
+            noise(100_000),
+            far,
+            (0..200_000u32).map(|i| (i / 300) as u8).collect(),
+        ]
+    }
+
+    #[cfg(feature = "dmg-write")]
+    #[test]
+    fn adc_encoder_roundtrips_through_decoder() {
+        for plain in adc_corpus() {
+            let enc = encode_adc(&plain);
+            assert!(
+                enc.len() <= plain.len() + plain.len().div_ceil(128),
+                "ADC expansion bound violated"
+            );
+            let dec = decode_adc_chunk(&enc, plain.len()).unwrap();
+            assert_eq!(dec, plain, "ADC round trip of {} bytes", plain.len());
+        }
+        // Compressible input must actually shrink.
+        assert!(encode_adc(&vec![0u8; 4096]).len() < 4096 / 16);
     }
 }

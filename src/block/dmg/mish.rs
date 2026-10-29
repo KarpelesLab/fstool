@@ -113,6 +113,23 @@ impl ChunkType {
             }
         })
     }
+
+    /// The on-disk `entry_type` code for this kind — the inverse of
+    /// [`ChunkType::from_u32`].
+    pub fn to_u32(self) -> u32 {
+        match self {
+            Self::Zero => 0x0000_0000,
+            Self::Raw => 0x0000_0001,
+            Self::Ignored => 0x0000_0002,
+            Self::Adc => 0x8000_0004,
+            Self::Zlib => 0x8000_0005,
+            Self::Bz2 => 0x8000_0006,
+            Self::Lzfse => 0x8000_0007,
+            Self::Lzma => 0x8000_0008,
+            Self::Comment => 0x7FFF_FFFE,
+            Self::Terminator => 0xFFFF_FFFF,
+        }
+    }
 }
 
 /// One chunk inside a mish block. All sector / byte counts come straight
@@ -242,18 +259,7 @@ pub fn encode_mish_for_tests(
     buf[0x0C8..0x0CC].copy_from_slice(&(chunks.len() as u32).to_be_bytes());
     for (i, c) in chunks.iter().enumerate() {
         let off = MISH_HEADER_LEN + i * CHUNK_LEN;
-        let etype: u32 = match c.kind {
-            ChunkType::Zero => 0x0000_0000,
-            ChunkType::Raw => 0x0000_0001,
-            ChunkType::Ignored => 0x0000_0002,
-            ChunkType::Adc => 0x8000_0004,
-            ChunkType::Zlib => 0x8000_0005,
-            ChunkType::Bz2 => 0x8000_0006,
-            ChunkType::Lzfse => 0x8000_0007,
-            ChunkType::Lzma => 0x8000_0008,
-            ChunkType::Comment => 0x7FFF_FFFE,
-            ChunkType::Terminator => 0xFFFF_FFFF,
-        };
+        let etype = c.kind.to_u32();
         buf[off..off + 4].copy_from_slice(&etype.to_be_bytes());
         // comment field stays zero
         // sector_number is encoded **relative** to first_sector — the
@@ -410,6 +416,24 @@ mod tests {
         assert!(decode_mish(&bad).is_err());
         // A header cut off before the count is refused.
         assert!(decode_mish(&b[..0xCA]).is_err());
+    }
+
+    #[test]
+    fn chunk_type_codes_roundtrip() {
+        for v in [
+            0x0000_0000,
+            0x0000_0001,
+            0x0000_0002,
+            0x8000_0004,
+            0x8000_0005,
+            0x8000_0006,
+            0x8000_0007,
+            0x8000_0008,
+            0x7FFF_FFFE,
+            0xFFFF_FFFF,
+        ] {
+            assert_eq!(ChunkType::from_u32(v).unwrap().to_u32(), v);
+        }
     }
 
     #[test]

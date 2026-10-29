@@ -111,9 +111,10 @@ and writes through them transparently. qcow2 is read/write (v2 + v3,
 allocate-on-write), including **compressed** clusters — reads zlib and zstd
 transparently (writing to a compressed cluster copies it out to a plain one)
 — plus **backing files** and **encryption**; LUKS1 / LUKS2 volumes are
-read/write and can be created; dmg is read-only (UDIF v4 mish chunks:
-zero / raw / zlib / ADC / bzip2 / LZFSE / LZMA, plus encrypted v2
-`encrcdsa`).
+read/write and can be created; dmg reads UDIF v4 mish chunks (zero /
+raw / zlib / ADC / bzip2 / LZFSE / LZMA, plus encrypted v2 `encrcdsa`)
+and *writes* read-only UDRO / UDCO / UDZO / UDBZ / ULMO images (see
+"DMG writing").
 
 The reader for each FS streams: file contents are never fully resident in
 memory regardless of size. The writers do the same, two-pass: scan to size
@@ -225,6 +226,42 @@ through the TOML spec — see "[filesystem.options]" below.
   above can live inside one. Read/write in place, and `luks::format` (or
   `fstool create --encrypt`) writes a fresh volume that `cryptsetup` opens.
   See "Encryption".
+
+### DMG writing
+
+`block::dmg::UdifWriter` (feature `dmg-write`) encodes any sector stream —
+a `BlockDevice`, or a `Read` of known length — into a single-segment,
+read-only UDIF image in a caller-owned `Write + Seek` sink. It only
+encodes: it never creates, renames or publishes files, so a caller can
+finish into a temp file, close it, sign it and move it into place itself.
+`finish()` writes the `blkx` plist (one whole-device entry, as `hdiutil`
+does for an unpartitioned volume) and the koly trailer with CRC-32
+partition, data-fork and master checksums; all-zero sectors become
+zero-fill (or, optionally, "ignore") entries instead of being compressed.
+
+| Format | Chunk codec | Feature |
+|--------|-------------|---------|
+| `UDRO` | raw | `dmg-write` |
+| `UDCO` | ADC (built in) | `dmg-write` |
+| `UDZO` | zlib, level 1–9 | `dmg-write-zlib` |
+| `UDBZ` | bzip2, level 1–9 | `dmg-write-bzip2` |
+| `ULMO` | LZMA (XZ-framed, as `hdiutil`), level 0–9 | `dmg-write-lzma` |
+| `ULFO` | LZFSE | not writable — compcol's LZFSE only decodes |
+
+Every format passes `hdiutil verify`, attach + raw readback and a real
+mount on macOS (`tests/dmg_write_external.rs`). From the CLI:
+`fstool convert disk.img out.dmg [--dmg-format UDBZ] [--dmg-level 9]`.
+
+```rust
+use fstool::block::dmg::{UdifFormat, UdifWriteOptions, write_udif};
+
+let mut opts = UdifWriteOptions::default(); // UDZO, 1 MiB chunks, CRC-32
+opts.format = UdifFormat::Udzo;
+opts.level = Some(9);
+let tmp = std::fs::File::create("out.dmg.partial")?;
+let (tmp, summary) = write_udif(&mut volume, tmp, &opts)?;
+tmp.sync_all()?; // then sign / rename — the caller's call
+```
 
 ### Backing files
 
@@ -693,7 +730,7 @@ none of the other 130 000 lines.
 | `tar` | tar (streaming reader / writer, tar-as-filesystem) | |
 | `archive` | zip / cpio / ar, plus the per-format readers | pulls `charcode`; `cab`, `lha`, `arc`, `sit`, `sevenz`, `rar`, `amiga-lzx` each imply it. On its own zip handles Stored members (and PKWARE-encrypted ones, and split sets); each compression method is a codec feature (`gzip` for Deflate, then `deflate64`, `bzip2`, `lzma`, `xz`, `zstd`, `zip-legacy`) and WinZip AES is `zip-aes` (pulls `purecrypto`), so `--features archive,gzip` is the slim everyday zip build |
 | `ramfs` | the in-memory scratch filesystem `repack` / `merge` / FUSE build on | |
-| `qcow2`, `dmg`, `diskcopy` | disk-image containers | `qcow2-crypto` implies `qcow2`; `dmg-encrypted` / `dmg-bzip2` / `dmg-lzfse` imply `dmg`, and `dmg-encrypted-write` implies `dmg-encrypted` |
+| `qcow2`, `dmg`, `diskcopy` | disk-image containers | `qcow2-crypto` implies `qcow2`; `dmg-encrypted` / `dmg-bzip2` / `dmg-lzfse` / `dmg-write` imply `dmg`; `dmg-write-zlib` / `-bzip2` / `-lzma` add one write codec each to `dmg-write`; `dmg-encrypted-write` implies `dmg-encrypted` |
 | `luks` | LUKS1 / LUKS2 | pulls `purecrypto`; implies `json` (LUKS2 metadata is JSON) |
 
 Every feature in the table except the three `no_std` ones implies
@@ -1203,9 +1240,11 @@ Things explicitly out of scope today, in rough order of likely-to-change:
 - **HFS+ decmpfs**: type 3 (zlib inline) + type 4 (zlib resource
   fork) work. LZVN (types 7/8) and LZFSE (types 11/12) return
   `Unsupported`.
-- **DMG**: read-only — no DMG writer / `convert` path. Encrypted v1
-  (`cdsaencr` legacy 3DES) chunks return `Unsupported`; v2 is
-  covered.
+- **DMG**: encrypted v1 (`cdsaencr` legacy 3DES) chunks return
+  `Unsupported`; v2 is covered. The writer emits one whole-device
+  `blkx` entry (no per-partition maps), single-segment read-only images
+  only — no ULFO (no LZFSE encoder), UDRW / sparse, encryption or
+  segmented output.
 - **Partial-file rewrites** on the trait surface — `open_file_rw`
   exists everywhere it's safe, but a typed "patch this byte range
   on a known-large file" API is not surfaced beyond `Read + Write +

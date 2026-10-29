@@ -13,7 +13,12 @@
 //! [`DmgBackend`] satisfies the [`BlockDevice`] trait, so dropping it
 //! into the existing [`crate::inspect::detect_fs`] / [`crate::inspect::AnyFs`]
 //! pipeline transparently exposes whatever filesystem lives inside the
-//! image (HFS+, APFS, ISO 9660, …). Writers are out of scope for v1.
+//! image (HFS+, APFS, ISO 9660, …).
+//!
+//! Writing is a separate, feature-gated encoder (`dmg-write`, plus
+//! `dmg-write-zlib` / `dmg-write-bzip2` / `dmg-write-lzma` for the
+//! compressed formats): [`UdifWriter`] turns a sector stream into a
+//! UDRO / UDCO / UDZO / UDBZ / ULMO image in a caller-owned sink.
 //!
 //! ## File layout (recap)
 //!
@@ -43,6 +48,8 @@ mod codec;
 pub mod encrypted;
 mod mish;
 mod plist;
+#[cfg(feature = "dmg-write")]
+mod writer;
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -57,6 +64,11 @@ pub use encrypted::{
     probe as probe_encrypted,
 };
 pub use mish::{Chunk, ChunkType, Mish};
+#[cfg(feature = "dmg-write")]
+pub use writer::{
+    MAX_WRITE_CHUNK_SECTORS, UdifChecksum, UdifFormat, UdifSummary, UdifWriteOptions, UdifWriter,
+    ZeroRunEncoding, write_udif, write_udif_from_reader,
+};
 
 /// `koly` magic — first four bytes of the 512-byte UDIF trailer.
 pub const KOLY_MAGIC: u32 = 0x6B6F_6C79; // "koly"
@@ -171,6 +183,36 @@ impl KolyTrailer {
             image_variant: u32::from_be_bytes(buf[0x1E8..0x1EC].try_into().unwrap()),
             sector_count: u64::from_be_bytes(buf[0x1EC..0x1F4].try_into().unwrap()),
         })
+    }
+
+    /// Serialise the trailer back into its 512-byte on-disk form — the
+    /// inverse of [`KolyTrailer::decode`]. Fields are written verbatim
+    /// (no validation); reserved bytes are zero.
+    pub fn encode(&self) -> [u8; KOLY_SIZE as usize] {
+        let mut b = [0u8; KOLY_SIZE as usize];
+        b[0x000..0x004].copy_from_slice(&self.signature.to_be_bytes());
+        b[0x004..0x008].copy_from_slice(&self.version.to_be_bytes());
+        b[0x008..0x00C].copy_from_slice(&self.header_size.to_be_bytes());
+        b[0x00C..0x010].copy_from_slice(&self.flags.to_be_bytes());
+        b[0x010..0x018].copy_from_slice(&self.running_data_fork_offset.to_be_bytes());
+        b[0x018..0x020].copy_from_slice(&self.data_fork_offset.to_be_bytes());
+        b[0x020..0x028].copy_from_slice(&self.data_fork_length.to_be_bytes());
+        b[0x028..0x030].copy_from_slice(&self.rsrc_fork_offset.to_be_bytes());
+        b[0x030..0x038].copy_from_slice(&self.rsrc_fork_length.to_be_bytes());
+        b[0x038..0x03C].copy_from_slice(&self.segment_number.to_be_bytes());
+        b[0x03C..0x040].copy_from_slice(&self.segment_count.to_be_bytes());
+        b[0x040..0x050].copy_from_slice(&self.segment_id);
+        b[0x050..0x054].copy_from_slice(&self.data_checksum_type.to_be_bytes());
+        b[0x054..0x058].copy_from_slice(&self.data_checksum_size.to_be_bytes());
+        b[0x058..0x0D8].copy_from_slice(&self.data_checksum);
+        b[0x0D8..0x0E0].copy_from_slice(&self.xml_offset.to_be_bytes());
+        b[0x0E0..0x0E8].copy_from_slice(&self.xml_length.to_be_bytes());
+        b[0x160..0x164].copy_from_slice(&self.master_checksum_type.to_be_bytes());
+        b[0x164..0x168].copy_from_slice(&self.master_checksum_size.to_be_bytes());
+        b[0x168..0x1E8].copy_from_slice(&self.master_checksum);
+        b[0x1E8..0x1EC].copy_from_slice(&self.image_variant.to_be_bytes());
+        b[0x1EC..0x1F4].copy_from_slice(&self.sector_count.to_be_bytes());
+        b
     }
 }
 
@@ -805,6 +847,21 @@ mod tests {
         buf.extend_from_slice(&trailer);
         std::fs::write(&p, &buf).unwrap();
         p
+    }
+
+    #[test]
+    fn trailer_encode_is_decode_inverse() {
+        let mut buf = vec![0u8; KOLY_SIZE as usize];
+        // Fill every field (and the reserved gaps stay zero).
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(1);
+        }
+        buf[0..4].copy_from_slice(&KOLY_MAGIC.to_be_bytes());
+        buf[4..8].copy_from_slice(&4u32.to_be_bytes());
+        buf[0x0E8..0x160].fill(0);
+        buf[0x1F4..].fill(0);
+        let t = KolyTrailer::decode(&buf).unwrap();
+        assert_eq!(t.encode().as_slice(), buf.as_slice());
     }
 
     #[test]

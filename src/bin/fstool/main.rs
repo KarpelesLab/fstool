@@ -392,19 +392,31 @@ enum Command {
         with_cache: bool,
     },
 
-    /// Convert an image between container formats (raw ↔ qcow2). Streams
-    /// every byte from SRC to DST; no filesystem awareness, so this
-    /// works on partitioned disks just as well as bare filesystems. Use
-    /// `repack` instead if you want to shrink the image — `convert` can
-    /// only grow it.
+    /// Convert an image between container formats (raw ↔ qcow2, or to a
+    /// read-only UDIF `.dmg`). Streams every byte from SRC to DST; no
+    /// filesystem awareness, so this works on partitioned disks just as
+    /// well as bare filesystems. Use `repack` instead if you want to
+    /// shrink the image — `convert` can only grow it.
     Convert {
-        /// Source image (raw, qcow2, or block device).
+        /// Source image (raw, qcow2, dmg, or block device).
         #[arg(value_name = "SRC")]
         src: PathBuf,
         /// Destination image. Format is picked from the extension
-        /// (`.qcow2` / `.qcow` / `.q2` → qcow2; otherwise raw).
+        /// (`.qcow2` / `.qcow` / `.q2` → qcow2; `.dmg` → UDIF, with the
+        /// `dmg-write` feature; otherwise raw).
         #[arg(value_name = "DST")]
         dst: PathBuf,
+        /// UDIF chunk encoding for a `.dmg` destination: UDRO (raw),
+        /// UDCO (ADC), UDZO (zlib, the default), UDBZ (bzip2) or ULMO
+        /// (LZMA). Implies a UDIF destination whatever DST's extension.
+        #[cfg(feature = "dmg-write")]
+        #[arg(long, value_name = "FORMAT")]
+        dmg_format: Option<String>,
+        /// Compression level for a UDIF destination (zlib / bzip2 1-9,
+        /// LZMA 0-9). Defaults to the codec's own default.
+        #[cfg(feature = "dmg-write")]
+        #[arg(long, value_name = "N")]
+        dmg_level: Option<u8>,
         /// Destination size. Defaults to the source's virtual size. May
         /// be larger (grows the image with all-zero tail) but not smaller.
         #[arg(long, value_name = "SIZE")]
@@ -930,6 +942,10 @@ fn run(cli: Cli) -> fstool::Result<()> {
         Command::Convert {
             src,
             dst,
+            #[cfg(feature = "dmg-write")]
+            dmg_format,
+            #[cfg(feature = "dmg-write")]
+            dmg_level,
             size,
             force,
             #[cfg(feature = "qcow2")]
@@ -937,6 +953,30 @@ fn run(cli: Cli) -> fstool::Result<()> {
             #[cfg(feature = "qcow2")]
             compress,
         } => {
+            #[cfg(feature = "dmg-write")]
+            if dmg_format.is_some() || is_dmg_path(&dst) {
+                #[cfg(feature = "qcow2")]
+                if compress.is_some() {
+                    return Err(fstool::Error::InvalidArgument(
+                        "convert: --compress applies to qcow2; use --dmg-format / --dmg-level \
+                         for a .dmg destination"
+                            .into(),
+                    ));
+                }
+                #[cfg(feature = "qcow2")]
+                let create_opts = container.create_opts(&cluster_size)?;
+                #[cfg(not(feature = "qcow2"))]
+                let create_opts = container.create_opts()?;
+                return convert_to_dmg(DmgConvertArgs {
+                    src: &src,
+                    dst: &dst,
+                    size_arg: size.as_deref(),
+                    password: password.as_deref(),
+                    format: dmg_format.as_deref(),
+                    level: dmg_level,
+                    create_opts: &create_opts,
+                });
+            }
             #[cfg(feature = "qcow2")]
             let comp = parse_compress(compress.as_deref())?;
             #[cfg(feature = "qcow2")]
@@ -1386,6 +1426,112 @@ fn convert_cmd(
         dst.display(),
         src_size,
         dst_size
+    );
+    Ok(())
+}
+
+/// `.dmg` (any case) — the extension `convert` maps to a UDIF destination.
+#[cfg(feature = "dmg-write")]
+fn is_dmg_path(p: &std::path::Path) -> bool {
+    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dmg"))
+}
+
+/// What `fstool convert` needs to write a UDIF destination.
+#[cfg(feature = "dmg-write")]
+struct DmgConvertArgs<'a> {
+    src: &'a std::path::Path,
+    dst: &'a std::path::Path,
+    size_arg: Option<&'a str>,
+    password: Option<&'a str>,
+    format: Option<&'a str>,
+    level: Option<u8>,
+    create_opts: &'a fstool::block::CreateOpts,
+}
+
+/// `convert SRC out.dmg`: encode SRC's sectors as a read-only UDIF image.
+///
+/// The library encoder only fills a caller-owned file; publishing is the
+/// CLI's job. It writes a hidden sibling temp file, syncs it, and moves
+/// it over DST only once the image is complete, so a failure never leaves
+/// a truncated `.dmg` behind.
+#[cfg(feature = "dmg-write")]
+fn convert_to_dmg(args: DmgConvertArgs<'_>) -> fstool::Result<()> {
+    use fstool::block::dmg::{UdifFormat, UdifWriteOptions, write_udif};
+    let DmgConvertArgs {
+        src,
+        dst,
+        size_arg,
+        password,
+        format,
+        level,
+        create_opts,
+    } = args;
+    if safety::same_file(src, dst) {
+        return Err(fstool::Error::InvalidArgument(
+            "convert: source and destination are the same file".into(),
+        ));
+    }
+    if fstool::block::file::is_block_device(dst) {
+        return Err(fstool::Error::InvalidArgument(
+            "convert: a .dmg destination must be a regular file, not a block device".into(),
+        ));
+    }
+    if create_opts.encrypt.is_some() || create_opts.backing.is_some() {
+        return Err(fstool::Error::Unsupported(
+            "convert: encrypted or backed .dmg output is not supported".into(),
+        ));
+    }
+    let mut opts = UdifWriteOptions::default();
+    if let Some(f) = format {
+        opts.format = UdifFormat::from_name(f).ok_or_else(|| {
+            fstool::Error::InvalidArgument(format!(
+                "convert: unknown --dmg-format {f:?} (expected UDRO, UDCO, UDZO, UDBZ or ULMO)"
+            ))
+        })?;
+    }
+    opts.level = level;
+    opts.validate()?;
+
+    let mut src_dev = fstool::block::open_image_with_password(src, password)?;
+    let src_size = src_dev.total_size();
+    if let Some(s) = size_arg
+        && fstool::spec::parse_size(s)? != src_size
+    {
+        return Err(fstool::Error::Unsupported(
+            "convert: --size is not supported for a .dmg destination".into(),
+        ));
+    }
+
+    let name = dst
+        .file_name()
+        .ok_or_else(|| fstool::Error::InvalidArgument("convert: DST has no file name".into()))?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(name);
+    tmp_name.push(format!(".{}.partial", std::process::id()));
+    let tmp = dst.with_file_name(tmp_name);
+    let result = (|| {
+        let file = std::fs::File::create(&tmp)?;
+        let (file, summary) = write_udif(src_dev.as_mut(), file, &opts)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, dst)?;
+        Ok(summary)
+    })();
+    let summary = match result {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
+    eprintln!(
+        "converted {} → {} ({}, {} → {} bytes, {} chunks)",
+        src.display(),
+        dst.display(),
+        opts.format.name(),
+        src_size,
+        summary.bytes_written,
+        summary.chunk_count
     );
     Ok(())
 }
