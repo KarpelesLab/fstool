@@ -219,6 +219,7 @@ fn build_bare_fs(fs: &FilesystemSpec, output: &Path) -> Result<()> {
         feature = "littlefs",
         feature = "ntfs",
         feature = "f2fs",
+        feature = "cramfs",
         feature = "squashfs",
         feature = "xfs",
         feature = "iso9660",
@@ -259,6 +260,10 @@ fn build_bare_fs(fs: &FilesystemSpec, output: &Path) -> Result<()> {
             output,
             squashfs_format_opts(fs)?,
         ),
+        #[cfg(feature = "cramfs")]
+        "cramfs" => {
+            build_bare_via_trait::<crate::fs::cramfs::Cramfs>(fs, output, cramfs_format_opts(fs)?)
+        }
         #[cfg(feature = "xfs")]
         "xfs" => build_bare_via_trait::<crate::fs::xfs::Xfs>(fs, output, xfs_format_opts(fs)?),
         #[cfg(feature = "iso9660")]
@@ -310,6 +315,8 @@ const COMPILED_OUT_FS: &[(&[&str], &str)] = &[
     (&["f2fs"], "f2fs"),
     #[cfg(not(feature = "squashfs"))]
     (&["squashfs"], "squashfs"),
+    #[cfg(not(feature = "cramfs"))]
+    (&["cramfs"], "cramfs"),
     #[cfg(not(feature = "xfs"))]
     (&["xfs"], "xfs"),
     #[cfg(not(feature = "iso9660"))]
@@ -384,6 +391,7 @@ fn ar_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::archive::ar::ArForma
         feature = "littlefs",
         feature = "ntfs",
         feature = "f2fs",
+        feature = "cramfs",
         feature = "squashfs",
         feature = "xfs",
         feature = "iso9660",
@@ -437,6 +445,7 @@ fn iso9660_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::iso9660::Format
         feature = "littlefs",
         feature = "ntfs",
         feature = "f2fs",
+        feature = "cramfs",
         feature = "squashfs",
         feature = "xfs",
         feature = "iso9660",
@@ -484,6 +493,7 @@ fn build_bare_via_trait<F: crate::fs::FilesystemFactory>(
         feature = "littlefs",
         feature = "ntfs",
         feature = "f2fs",
+        feature = "cramfs",
         feature = "squashfs",
         feature = "xfs",
         feature = "iso9660",
@@ -517,6 +527,7 @@ fn truncate_archive_file(output: &Path, len: u64) -> Result<()> {
         feature = "littlefs",
         feature = "ntfs",
         feature = "f2fs",
+        feature = "cramfs",
         feature = "squashfs",
         feature = "xfs"
     )
@@ -673,6 +684,18 @@ fn squashfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::squashfs::Form
     Ok(opts)
 }
 
+#[cfg(all(feature = "spec", feature = "cramfs"))]
+fn cramfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::cramfs::FormatOpts> {
+    let mut bag = options_bag_for(fs)?;
+    let mut opts = crate::fs::cramfs::FormatOpts::default();
+    if let Some(bs) = fs.block_size {
+        opts.block_size = bs;
+    }
+    opts.apply_options(&mut bag)?;
+    bag.check_empty("cramfs")?;
+    Ok(opts)
+}
+
 #[cfg(all(feature = "spec", feature = "xfs"))]
 fn xfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::xfs::format::FormatOpts> {
     let mut bag = options_bag_for(fs)?;
@@ -778,6 +801,7 @@ fn format_fat_into(
         feature = "littlefs",
         feature = "ntfs",
         feature = "f2fs",
+        feature = "cramfs",
         feature = "squashfs",
         feature = "xfs",
         feature = "iso9660",
@@ -916,6 +940,7 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
         feature = "littlefs",
         feature = "ntfs",
         feature = "f2fs",
+        feature = "cramfs",
         feature = "squashfs",
         feature = "xfs"
     ))]
@@ -1021,6 +1046,7 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
         feature = "littlefs",
         feature = "ntfs",
         feature = "f2fs",
+        feature = "cramfs",
         feature = "squashfs",
         feature = "xfs"
     ))]
@@ -1040,6 +1066,7 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
         feature = "littlefs",
         feature = "ntfs",
         feature = "f2fs",
+        feature = "cramfs",
         feature = "squashfs",
         feature = "xfs"
     ))]
@@ -1134,6 +1161,14 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
                     squashfs_format_opts(fs)?,
                 )?;
             }
+            #[cfg(feature = "cramfs")]
+            "cramfs" => {
+                format_in_partition_via_trait::<crate::fs::cramfs::Cramfs>(
+                    &mut slice,
+                    fs,
+                    cramfs_format_opts(fs)?,
+                )?;
+            }
             #[cfg(feature = "xfs")]
             "xfs" => {
                 format_in_partition_via_trait::<crate::fs::xfs::Xfs>(
@@ -1156,6 +1191,7 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
         feature = "littlefs",
         feature = "ntfs",
         feature = "f2fs",
+        feature = "cramfs",
         feature = "squashfs",
         feature = "xfs"
     )))]

@@ -36,6 +36,8 @@ use crate::fs::archive::sevenz::SevenZFs;
 use crate::fs::archive::sit::SitFs;
 #[cfg(feature = "archive")]
 use crate::fs::archive::zip::ZipFs;
+#[cfg(feature = "cramfs")]
+use crate::fs::cramfs::Cramfs;
 #[cfg(feature = "exfat")]
 use crate::fs::exfat::Exfat;
 #[cfg(feature = "ext")]
@@ -114,6 +116,9 @@ pub enum FsKind {
     /// SquashFS — read + write via `repack` (compressed, repack-only).
     #[cfg(feature = "squashfs")]
     Squashfs,
+    /// cramfs — read + write via `create` / `repack` (zlib, build-once).
+    #[cfg(feature = "cramfs")]
+    Cramfs,
     /// ISO 9660 (optical media). Read-only on this trait surface;
     /// writing happens through `repack` to a fresh image.
     #[cfg(feature = "iso9660")]
@@ -231,6 +236,12 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
     // SquashFS: little-endian "hsqs" at offset 0.
     if &bs[0..4] == b"hsqs" {
         detected!("squashfs", Squashfs, "SquashFS");
+    }
+
+    // cramfs: magic 0x28CD3D45 (either byte order — a big-endian host's
+    // mkcramfs writes it swapped) plus the "Compressed ROMFS" signature.
+    if is_cramfs_super(&bs[..48]) {
+        detected!("cramfs", Cramfs, "cramfs");
     }
 
     // GRF: "Master of Magic\0" at offset 0 (16-byte magic header).
@@ -352,6 +363,16 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
         }
     }
 
+    // cramfs padded for a boot sector: the same superblock at byte 512.
+    // Checked late, since sector 0 then holds someone else's boot code.
+    if dev.total_size() >= 512 + 48 {
+        let mut cr = [0u8; 48];
+        dev.read_at(512, &mut cr)?;
+        if is_cramfs_super(&cr) {
+            detected!("cramfs", Cramfs, "cramfs");
+        }
+    }
+
     // SEA ARC: no string magic — first byte 0x1A then a method byte in
     // 1..=11. Heuristic, so it is checked last to avoid shadowing a real
     // filesystem whose sector 0 happens to start with 0x1A.
@@ -362,6 +383,14 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
     Err(crate::Error::InvalidImage(
         "inspect: no recognised filesystem or archive on this image".into(),
     ))
+}
+
+/// True when `head` (at least 32 bytes) opens with a cramfs superblock:
+/// the magic in either byte order and the `"Compressed ROMFS"` signature.
+fn is_cramfs_super(head: &[u8]) -> bool {
+    head.len() >= 32
+        && (head[0..4] == [0x45, 0x3D, 0xCD, 0x28] || head[0..4] == [0x28, 0xCD, 0x3D, 0x45])
+        && &head[16..32] == b"Compressed ROMFS"
 }
 
 /// A unified read-side handle. Hides whether the underlying filesystem
@@ -410,6 +439,9 @@ pub enum AnyFs {
     /// SquashFS — read + write via `repack` (compressed, repack-only).
     #[cfg(feature = "squashfs")]
     Squashfs(Box<Squashfs>),
+    /// cramfs — read + write via `create` / `repack` (zlib, build-once).
+    #[cfg(feature = "cramfs")]
+    Cramfs(Box<Cramfs>),
     /// ISO 9660 — read-only (PVD + Joliet + Rock Ridge + El Torito).
     #[cfg(feature = "iso9660")]
     Iso9660(Box<crate::fs::iso9660::Iso9660>),
@@ -502,6 +534,8 @@ impl AnyFs {
             FsKind::Ntfs => Ok(Self::Ntfs(Box::new(Ntfs::open(dev)?))),
             #[cfg(feature = "f2fs")]
             FsKind::F2fs => Ok(Self::F2fs(Box::new(F2fs::open(dev)?))),
+            #[cfg(feature = "cramfs")]
+            FsKind::Cramfs => Ok(Self::Cramfs(Box::new(Cramfs::open(dev)?))),
             #[cfg(feature = "squashfs")]
             FsKind::Squashfs => Ok(Self::Squashfs(Box::new(Squashfs::open(dev)?))),
             #[cfg(feature = "iso9660")]
@@ -635,6 +669,8 @@ impl AnyFs {
             Self::Ntfs(_) => FsKind::Ntfs,
             #[cfg(feature = "f2fs")]
             Self::F2fs(_) => FsKind::F2fs,
+            #[cfg(feature = "cramfs")]
+            Self::Cramfs(_) => FsKind::Cramfs,
             #[cfg(feature = "squashfs")]
             Self::Squashfs(_) => FsKind::Squashfs,
             #[cfg(feature = "iso9660")]
@@ -692,6 +728,8 @@ impl AnyFs {
             Self::Ntfs(ntfs) => ntfs.list_path(dev, path),
             #[cfg(feature = "f2fs")]
             Self::F2fs(f2) => f2.list_path(dev, path),
+            #[cfg(feature = "cramfs")]
+            Self::Cramfs(cr) => cr.list_path(dev, path),
             #[cfg(feature = "squashfs")]
             Self::Squashfs(sq) => sq.list_path(dev, path),
             #[cfg(feature = "iso9660")]
@@ -838,6 +876,11 @@ impl AnyFs {
                 let mut r = sq.open_file_reader(dev, path)?;
                 pump(&mut r, out, &mut buf)
             }
+            #[cfg(feature = "cramfs")]
+            Self::Cramfs(cr) => {
+                let mut r = cr.open_file_reader(dev, path)?;
+                pump(&mut r, out, &mut buf)
+            }
             #[cfg(feature = "iso9660")]
             Self::Iso9660(iso) => {
                 let mut r = iso.open_file_reader(dev, path)?;
@@ -914,6 +957,8 @@ impl AnyFs {
             Self::Ntfs(ntfs) => Ok(Box::new(ntfs.open_file_reader(dev, path)?)),
             #[cfg(feature = "f2fs")]
             Self::F2fs(f2) => Ok(Box::new(f2.open_file_reader(dev, path)?)),
+            #[cfg(feature = "cramfs")]
+            Self::Cramfs(cr) => Ok(Box::new(cr.open_file_reader(dev, path)?)),
             #[cfg(feature = "squashfs")]
             Self::Squashfs(sq) => Ok(Box::new(sq.open_file_reader(dev, path)?)),
             #[cfg(feature = "iso9660")]
@@ -965,6 +1010,7 @@ impl AnyFs {
                 feature = "apfs",
                 feature = "ntfs",
                 feature = "f2fs",
+                feature = "cramfs",
                 feature = "squashfs",
                 feature = "iso9660",
                 feature = "grf",
@@ -1064,7 +1110,7 @@ impl AnyFs {
 
     /// How this filesystem can be mutated. Delegates to the inner
     /// [`crate::fs::Filesystem::mutation_capability`]. Tar reports
-    /// `Streaming`; ISO 9660 and SquashFS report `Immutable`;
+    /// `Streaming`; ISO 9660, SquashFS and cramfs report `Immutable`;
     /// everything else (including APFS / exFAT whose writers aren't
     /// implemented yet — those return `Unsupported` per-call from
     /// individual methods) reports `Mutable`.
@@ -1090,6 +1136,8 @@ impl AnyFs {
             Self::Ntfs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
             #[cfg(feature = "f2fs")]
             Self::F2fs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            #[cfg(feature = "cramfs")]
+            Self::Cramfs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
             #[cfg(feature = "squashfs")]
             Self::Squashfs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
             #[cfg(feature = "xfs")]
@@ -1129,6 +1177,8 @@ impl AnyFs {
             Self::Ntfs(n) => crate::fs::Filesystem::mutation_capability(n.as_ref()),
             #[cfg(feature = "f2fs")]
             Self::F2fs(fs2) => crate::fs::Filesystem::mutation_capability(fs2.as_ref()),
+            #[cfg(feature = "cramfs")]
+            Self::Cramfs(cr) => crate::fs::Filesystem::mutation_capability(cr.as_ref()),
             #[cfg(feature = "squashfs")]
             Self::Squashfs(sq) => crate::fs::Filesystem::mutation_capability(sq.as_ref()),
             #[cfg(feature = "xfs")]
@@ -1175,6 +1225,8 @@ impl AnyFs {
             Self::Ntfs(n) => crate::fs::Filesystem::clone_capability(n.as_ref()),
             #[cfg(feature = "f2fs")]
             Self::F2fs(fs2) => crate::fs::Filesystem::clone_capability(fs2.as_ref()),
+            #[cfg(feature = "cramfs")]
+            Self::Cramfs(cr) => crate::fs::Filesystem::clone_capability(cr.as_ref()),
             #[cfg(feature = "squashfs")]
             Self::Squashfs(sq) => crate::fs::Filesystem::clone_capability(sq.as_ref()),
             #[cfg(feature = "xfs")]
@@ -1275,6 +1327,8 @@ impl AnyFs {
             Self::Ntfs(n) => f(n.as_mut()),
             #[cfg(feature = "f2fs")]
             Self::F2fs(fs2) => f(fs2.as_mut()),
+            #[cfg(feature = "cramfs")]
+            Self::Cramfs(cr) => f(cr.as_mut()),
             #[cfg(feature = "squashfs")]
             Self::Squashfs(sq) => f(sq.as_mut()),
             #[cfg(feature = "xfs")]
@@ -1382,6 +1436,8 @@ impl AnyFs {
             Self::Ntfs(_) => "ntfs",
             #[cfg(feature = "f2fs")]
             Self::F2fs(_) => "f2fs",
+            #[cfg(feature = "cramfs")]
+            Self::Cramfs(_) => "cramfs",
             #[cfg(feature = "squashfs")]
             Self::Squashfs(_) => "squashfs",
             #[cfg(feature = "iso9660")]
@@ -1496,6 +1552,8 @@ impl AnyFs {
             Self::Ntfs(b) => b,
             #[cfg(feature = "f2fs")]
             Self::F2fs(b) => b,
+            #[cfg(feature = "cramfs")]
+            Self::Cramfs(b) => b,
             #[cfg(feature = "squashfs")]
             Self::Squashfs(b) => b,
             #[cfg(feature = "iso9660")]

@@ -76,6 +76,7 @@ See [web/README.md](web/README.md) for the build and local-dev steps.
 | F2FS       | ✅    | ✅     | —              | CP / NAT / dnodes / inline data + dentries; writer passes `fsck.f2fs`; **build-once** — the writer serializes the whole FS from memory at flush, so a re-opened image is read-only (reports `Immutable`) |
 | littlefs   | ✅    | ✅     | ✅              | The embedded-flash filesystem (`lfs2`, disk versions 2.0 + 2.1): metadata pairs with CRC-committed logs, CTZ skip-list files, inline small files, user attributes (surfaced as `user.littlefs.<type>` xattrs). Every mutation is a real littlefs commit, so `create` / `repack` / `add` / `rm` / `open_file_rw` all write images the reference C implementation mounts and keeps writing to — cross-validated both directions against `littlefs-python` (upstream `lfs.c`), including block-for-block agreement on which blocks are live. No symlinks, device nodes or POSIX metadata: the format has none |
 | SquashFS   | ✅    | ✅     | —              | gzip / xz / lz4 / zstd / lzo / lzma via Cargo features; writer round-trips via `unsquashfs`; repack-only           |
+| cramfs     | ✅    | ✅     | —              | Linux compressed ROM FS: zlib blocks, either byte order on read, superblock at byte 0 or 512; `create -t cramfs` / `repack` write little-endian v2 images (sorted dirs, CRC). Format limits: 16 MiB per file, every file must start within the first 256 MiB, uid 16-bit / gid 8-bit (truncated like `mkfs.cramfs`), device major/minor ≤ 255, no timestamps; repack-only |
 | ISO 9660   | ✅    | ✅     | —              | PVD + Joliet (UCS-2) + Rock Ridge (PX/NM/SL/TF) + El Torito boot catalog; repack-only                              |
 | GRF        | ✅    | ✅     | ✅              | Gravity Ragnarok Online archive — v0x102 / v0x103 / v0x200; permutation cipher (`MIXCRYPT` / `DES`); CP949 filenames |
 | zip        | ✅    | ✅     | —              | central-directory index, ZIP64, Unix mode/symlinks, uid/gid + Unix timestamps (`UT` / `ux` / NTFS extras), UTF-8/Shift-JIS/EUC-JP filename detection (+ Unicode-path extra); every method id recognised — Stored always, Deflate / Deflate64 / bzip2 / LZMA / XZ / Zstandard read **and** written, the PKZIP 1.x methods (Shrink / Reduce / Implode) read, each behind its codec feature; PPMd lists but has no decoder; encrypted members (traditional PKWARE, WinZip AES) read and written with `--password`; split archives (`.z01`…, `.001`…) read as a set and written with `-O split=`; repack-only writer |
@@ -91,7 +92,7 @@ See [web/README.md](web/README.md) for the build and local-dev steps.
 
 `🚧` marks writers / mutation paths with known gaps (see Limitations).
 All writable filesystems — ext2/3/4, FAT12/16/32, exFAT, XFS, HFS+, NTFS,
-APFS, F2FS, littlefs, SquashFS, ISO 9660, GRF — implement a single
+APFS, F2FS, littlefs, SquashFS, cramfs, ISO 9660, GRF — implement a single
 `Filesystem` trait, so the CLI (`build`, `repack`, `add`, `rm`) and
 the TOML `[filesystem] type = "…"` spec dispatch through one
 codepath; pick a target FS by setting `--fs-type` on `repack` or
@@ -126,7 +127,7 @@ through xattrs under `user.ntfs.*` and `system.ntfs_security`.
 
 | Command       | What it does                                                            |
 |---------------|-------------------------------------------------------------------------|
-| `create`      | Build a bare image of any supported FS (`-t ext4` / `fat12` / `fat16` / `fat32` / `xfs` / `hfs+` / `ntfs` / `f2fs` / `littlefs` / `squashfs` / `iso` / `apfs` / `exfat` / `grf` / `zip` / `cpio` / `ar`) from a host directory tree. FS-specific knobs go through `-O key=val,key=val`. |
+| `create`      | Build a bare image of any supported FS (`-t ext4` / `fat12` / `fat16` / `fat32` / `xfs` / `hfs+` / `ntfs` / `f2fs` / `littlefs` / `squashfs` / `cramfs` / `iso` / `apfs` / `exfat` / `grf` / `zip` / `cpio` / `ar`) from a host directory tree. FS-specific knobs go through `-O key=val,key=val`. |
 | `build`       | Build from a TOML spec — bare FS or a partitioned disk image.           |
 | `info`        | Print partition table (whole-disk) or FS summary + root listing.        |
 | `ls`          | List a directory inside an image; `-R` walks subdirectories recursively. |
@@ -352,7 +353,7 @@ Recognised tar extensions: `.tar`, `.tar.gz`, `.tgz`, `.tar.xz`, `.txz`, `.tar.b
 matching Cargo feature). For images, the `:N` suffix selects partition
 *N* (1-indexed); without it, the source is opened as a bare filesystem.
 The source FS may be any readable type — `ext{2,3,4}`, FAT12/16/32, exFAT,
-XFS, HFS+, APFS, NTFS, F2FS, littlefs, SquashFS, ISO 9660, tar, or GRF — and the
+XFS, HFS+, APFS, NTFS, F2FS, littlefs, SquashFS, cramfs, ISO 9660, tar, or GRF — and the
 destination is sized automatically to fit unless `size` is set
 explicitly.
 
@@ -457,6 +458,7 @@ Every reader surfaces the metadata its format actually stores:
 ext, tar, the archive formats, F2FS, XFS, SquashFS, APFS, and HFS+ carry
 full POSIX mode/uid/gid + timestamps (HFS+ converts its 1904 epoch);
 ISO 9660 does too when Rock Ridge is present (plain/Joliet have none);
+cramfs carries mode + uid/gid (16-bit / 8-bit on disk) but no timestamps;
 littlefs stores none at all — no mode, owner, timestamps, symlinks or
 device nodes — so it reports synthesised modes on read and refuses
 symlink / device creation on write, and its user attributes ride through
@@ -468,11 +470,11 @@ synthesised from its DOS attributes, and carries its native metadata
 
 `fstool repack` writes any destination implementing the `Filesystem`
 trait — `ext2/3/4`, FAT12/16/32, exFAT, tar, XFS, HFS+, APFS, NTFS, F2FS,
-littlefs, SquashFS, ISO 9660, GRF. `add` / `rm` go through the same trait,
+littlefs, SquashFS, cramfs, ISO 9660, GRF. `add` / `rm` go through the same trait,
 which means they work on any FS whose writer can re-open an existing
 image; today that's all of the mutable backends — ext, FAT12/16/32, exFAT,
 XFS, HFS+, NTFS, APFS, littlefs, and GRF (F2FS is build-once: a re-opened
-image is read-only). SquashFS, ISO 9660, and tar
+image is read-only). SquashFS, cramfs, ISO 9660, and tar
 are repack-only (their `MutationCapability` is `Immutable` or
 `Streaming`, so `add` / `rm` fail fast with an actionable error and
 the user is steered to `repack`).
@@ -640,6 +642,7 @@ none of the other 130 000 lines.
 | `littlefs` | littlefs 2.0 / 2.1 | needs neither `std` nor `alloc`: on its own it is the heapless flash driver ([below](#no-allocator-at-all)), and `alloc` adds the hosted one beside it |
 | `ext` | ext2 / ext3 / ext4 | |
 | `xfs`, `ntfs`, `f2fs`, `affs`, `iso9660`, `squashfs` | as named | |
+| `cramfs` | cramfs | implies `gzip` (every block is zlib-compressed) |
 | `hfs`, `hfs-plus` | classic HFS, HFS+ / HFSX | |
 | `apfs` | APFS | pulls `intl` for the directory-record hash |
 | `grf` | GRF | pulls `charcode` for CP949 names; implies `gzip` (every member is zlib-compressed) |
@@ -1076,7 +1079,7 @@ are served by the pure-Rust `compcol` crate:
 
 | Codec | Feature | Used for |
 |-------|---------|----------|
-| gzip  | `gzip`  | SquashFS, `.tar.gz` / `.tgz`, zip Deflate (method 8), DMG zlib, HFS+ decmpfs |
+| gzip  | `gzip`  | SquashFS, cramfs, `.tar.gz` / `.tgz`, zip Deflate (method 8), DMG zlib, HFS+ decmpfs |
 | xz    | `xz`    | SquashFS, `.tar.xz` / `.txz`, zip method 95 |
 | lzma  | `lzma`  | SquashFS, `.tar.lzma`, zip method 14 |
 | lz4   | `lz4`   | SquashFS, `.tar.lz4` |

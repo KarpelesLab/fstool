@@ -52,13 +52,13 @@ pub enum Error {
 
     /// The operation tried to modify a **write-once** filesystem whose
     /// on-disk layout has no in-place mutation hooks (no free-block
-    /// tracking, no journal). ISO 9660 and SquashFS today. The
+    /// tracking, no journal). ISO 9660, SquashFS and cramfs today. The
     /// writer can seek, but re-opening the image as writable isn't
     /// part of the format's design — modifications go through
     /// `fstool repack` to rebuild the image from scratch.
     Immutable {
         /// The filesystem kind that refused (today: `"iso9660"`,
-        /// `"squashfs"`).
+        /// `"squashfs"`, `"cramfs"`).
         kind: &'static str,
         /// Short verb describing the attempted op.
         op: &'static str,

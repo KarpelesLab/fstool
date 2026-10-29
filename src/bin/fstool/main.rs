@@ -177,13 +177,14 @@ enum Command {
         feature = "iso9660",
         feature = "littlefs",
         feature = "ntfs",
+        feature = "cramfs",
         feature = "squashfs",
         feature = "xfs"
     ))]
     Create {
         /// Filesystem type to format: ext2 / ext3 / ext4 / fat12 / fat16 /
         /// fat32 / vfat / exfat / hfs+ / hfsplus / ntfs / f2fs / squashfs /
-        /// xfs / iso / iso9660 / grf / apfs.
+        /// cramfs / xfs / iso / iso9660 / grf / apfs.
         #[arg(short = 't', long = "type", value_name = "TYPE")]
         fs_type: String,
         /// Optional source directory on the host. Omit to create an
@@ -218,7 +219,8 @@ enum Command {
         /// FS-specific options as `key=val[,key=val]…`. Repeatable.
         /// Examples: `-O block_size=4096,sparse=true` (ext),
         /// `-O volume_id=0xCAFEBABE,root_entries=512` (fat),
-        /// `-O compression=zstd,block_size=128KiB` (squashfs).
+        /// `-O compression=zstd,block_size=128KiB` (squashfs),
+        /// `-O name=rootfs,edition=1` (cramfs).
         #[arg(short = 'O', long = "options", value_name = "KEY=VAL", action = clap::ArgAction::Append)]
         options: Vec<String>,
         /// Compress the qcow2 output. `--compress` = zlib level 6;
@@ -655,6 +657,7 @@ fn output_path_of(cmd: &Command) -> &std::path::Path {
             feature = "iso9660",
             feature = "littlefs",
             feature = "ntfs",
+            feature = "cramfs",
             feature = "squashfs",
             feature = "xfs"
         ))]
@@ -729,6 +732,7 @@ fn missing_fs_feature(name: &str) -> Option<&'static str> {
         "ntfs" => ("ntfs", cfg!(feature = "ntfs")),
         "f2fs" => ("f2fs", cfg!(feature = "f2fs")),
         "squashfs" => ("squashfs", cfg!(feature = "squashfs")),
+        "cramfs" => ("cramfs", cfg!(feature = "cramfs")),
         "xfs" => ("xfs", cfg!(feature = "xfs")),
         "iso" | "iso9660" => ("iso9660", cfg!(feature = "iso9660")),
         "grf" => ("grf", cfg!(feature = "grf")),
@@ -788,6 +792,7 @@ fn run(cli: Cli) -> fstool::Result<()> {
             feature = "iso9660",
             feature = "littlefs",
             feature = "ntfs",
+            feature = "cramfs",
             feature = "squashfs",
             feature = "xfs"
         ))]
@@ -1163,6 +1168,11 @@ fn mount_cmd(image: Option<&str>, mountpoint: Option<&std::path::Path>) -> fstoo
         fstool::inspect::FsKind::Squashfs => (
             Box::new(fstool::fs::squashfs::Squashfs::open(dev.as_mut())?),
             "squashfs",
+        ),
+        #[cfg(feature = "cramfs")]
+        fstool::inspect::FsKind::Cramfs => (
+            Box::new(fstool::fs::cramfs::Cramfs::open(dev.as_mut())?),
+            "cramfs",
         ),
         #[cfg(feature = "iso9660")]
         fstool::inspect::FsKind::Iso9660 => (
@@ -1832,6 +1842,14 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
                 src_dev,
                 false,
             )?,
+            #[cfg(feature = "cramfs")]
+            "cramfs" => repack_via_trait::<fstool::fs::cramfs::Cramfs>(
+                dst_dev.as_mut(),
+                &fstool::fs::cramfs::FormatOpts::default(),
+                src_fs,
+                src_dev,
+                false,
+            )?,
             #[cfg(feature = "xfs")]
             "xfs" => repack_via_trait::<fstool::fs::xfs::Xfs>(
                 dst_dev.as_mut(),
@@ -1923,6 +1941,7 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
     feature = "ntfs",
     feature = "f2fs",
     feature = "littlefs",
+    feature = "cramfs",
     feature = "squashfs",
     feature = "xfs",
     feature = "iso9660",
@@ -1959,6 +1978,7 @@ fn repack_via_trait<F: fstool::fs::FilesystemFactory>(
         feature = "ntfs",
         feature = "f2fs",
         feature = "littlefs",
+        feature = "cramfs",
         feature = "squashfs",
         feature = "xfs",
         feature = "iso9660",
@@ -2224,6 +2244,14 @@ fn repack_layered_to_dst(
             &layers,
             false,
         )?,
+        #[cfg(feature = "cramfs")]
+        "cramfs" => repack_layered_via_trait::<fstool::fs::cramfs::Cramfs>(
+            dst_dev.as_mut(),
+            &fstool::fs::cramfs::FormatOpts::default(),
+            &model,
+            &layers,
+            false,
+        )?,
         #[cfg(feature = "littlefs")]
         "littlefs" | "lfs" => repack_layered_via_trait::<fstool::fs::littlefs::LittleFs>(
             dst_dev.as_mut(),
@@ -2305,6 +2333,7 @@ fn repack_layered_to_dst(
     feature = "ntfs",
     feature = "f2fs",
     feature = "littlefs",
+    feature = "cramfs",
     feature = "squashfs",
     feature = "xfs",
     feature = "iso9660",
@@ -2517,6 +2546,14 @@ fn repack_tar_stream_to_fs(
             codec,
             false,
         )?,
+        #[cfg(feature = "cramfs")]
+        "cramfs" => repack_stream_via_trait::<fstool::fs::cramfs::Cramfs>(
+            dst_dev.as_mut(),
+            &fstool::fs::cramfs::FormatOpts::default(),
+            tar_path,
+            codec,
+            false,
+        )?,
         #[cfg(feature = "iso9660")]
         "iso" | "iso9660" => {
             let opts = fstool::fs::iso9660::FormatOpts {
@@ -2604,6 +2641,8 @@ fn is_stream_repack_target(fs: &str) -> bool {
         "f2fs" => true,
         #[cfg(feature = "squashfs")]
         "squashfs" => true,
+        #[cfg(feature = "cramfs")]
+        "cramfs" => true,
         #[cfg(feature = "iso9660")]
         "iso" | "iso9660" => true,
         #[cfg(feature = "grf")]
@@ -3172,6 +3211,7 @@ fn build(spec_path: &std::path::Path, output: &std::path::Path) -> fstool::Resul
     feature = "iso9660",
     feature = "littlefs",
     feature = "ntfs",
+    feature = "cramfs",
     feature = "squashfs",
     feature = "xfs"
 ))]
@@ -3210,6 +3250,7 @@ struct CreateArgs<'a> {
     feature = "iso9660",
     feature = "littlefs",
     feature = "ntfs",
+    feature = "cramfs",
     feature = "squashfs",
     feature = "xfs"
 ))]
@@ -3430,6 +3471,19 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             |o, m| o.apply_options(m),
             DEFAULT_MIN_SIZE,
         )?,
+        #[cfg(feature = "cramfs")]
+        "cramfs" => create_via_factory::<fstool::fs::cramfs::Cramfs>(
+            "cramfs",
+            source.as_ref(),
+            args.output,
+            args.size,
+            opts,
+            is_device,
+            create_opts,
+            fstool::fs::cramfs::FormatOpts::default(),
+            |o, m| o.apply_options(m),
+            DEFAULT_MIN_SIZE,
+        )?,
         #[cfg(feature = "xfs")]
         "xfs" => create_via_factory::<fstool::fs::xfs::Xfs>(
             "xfs",
@@ -3528,7 +3582,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
         // compile every arm above out, and the code below must stay reachable.
         other => Err(fstool::Error::InvalidArgument(format!(
             "create: unknown --type {other:?} (try ext4, fat32, exfat, hfs+, ntfs, \
-             f2fs, littlefs, squashfs, xfs, iso, grf, apfs, zip, cpio, ar)"
+             f2fs, littlefs, squashfs, cramfs, xfs, iso, grf, apfs, zip, cpio, ar)"
         )))?,
     }
     Ok(())
@@ -3546,6 +3600,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
     feature = "hfs-plus",
     feature = "iso9660",
     feature = "littlefs",
+    feature = "cramfs",
     feature = "squashfs"
 ))]
 const DEFAULT_MIN_SIZE: u64 = 1024 * 1024;
@@ -3763,6 +3818,7 @@ fn create_exfat(
     feature = "iso9660",
     feature = "littlefs",
     feature = "ntfs",
+    feature = "cramfs",
     feature = "squashfs",
     feature = "xfs"
 ))]
@@ -3889,6 +3945,7 @@ where
     feature = "iso9660",
     feature = "littlefs",
     feature = "ntfs",
+    feature = "cramfs",
     feature = "squashfs",
     feature = "xfs"
 ))]
@@ -3962,6 +4019,7 @@ fn truncate_output_file(output: &std::path::Path, len: u64) -> fstool::Result<()
     feature = "iso9660",
     feature = "littlefs",
     feature = "ntfs",
+    feature = "cramfs",
     feature = "squashfs",
     feature = "xfs"
 ))]
@@ -4031,6 +4089,7 @@ fn parse_cluster_size(s: &str) -> fstool::Result<u32> {
     feature = "iso9660",
     feature = "littlefs",
     feature = "ntfs",
+    feature = "cramfs",
     feature = "squashfs",
     feature = "xfs"
 ))]
@@ -4554,6 +4613,7 @@ fn print_fs_info(dev: &mut dyn fstool::block::BlockDevice, fs: &mut fstool::insp
         feature = "littlefs",
         feature = "ntfs",
         feature = "ramfs",
+        feature = "cramfs",
         feature = "squashfs",
         feature = "tar",
         feature = "xfs"
@@ -4583,6 +4643,8 @@ fn print_fs_info(dev: &mut dyn fstool::block::BlockDevice, fs: &mut fstool::insp
         fstool::inspect::AnyFs::Ntfs(ntfs) => print_ntfs_info(ntfs),
         #[cfg(feature = "f2fs")]
         fstool::inspect::AnyFs::F2fs(f2) => print_f2fs_info(f2),
+        #[cfg(feature = "cramfs")]
+        fstool::inspect::AnyFs::Cramfs(cr) => print_cramfs_info(cr),
         #[cfg(feature = "squashfs")]
         fstool::inspect::AnyFs::Squashfs(sq) => print_squashfs_info(sq),
         #[cfg(feature = "iso9660")]
@@ -4797,6 +4859,24 @@ fn print_squashfs_info(sq: &fstool::fs::squashfs::Squashfs) {
     println!("version:           {}.{}", sb.major, sb.minor);
     println!("inode count:       {}", sb.inode_count);
     println!("note:              write via `repack` only (no in-place mutation)");
+}
+
+#[cfg(feature = "cramfs")]
+fn print_cramfs_info(cr: &fstool::fs::cramfs::Cramfs) {
+    println!("total bytes:       {}", cr.total_bytes());
+    println!("block size:        {}", cr.block_size());
+    println!("volume name:       {}", cr.volume_name());
+    println!("edition:           {}", cr.edition());
+    println!("files:             {}", cr.file_count());
+    println!(
+        "byte order:        {}",
+        if cr.big_endian() {
+            "big-endian"
+        } else {
+            "little-endian"
+        }
+    );
+    println!("note:              write via `create` / `repack` only (no in-place mutation)");
 }
 
 #[cfg(feature = "iso9660")]

@@ -39,6 +39,7 @@ use crate::repack::TarStreamSink;
     feature = "affs",
     feature = "littlefs",
     feature = "apfs",
+    feature = "cramfs",
     feature = "squashfs",
     feature = "iso9660",
     feature = "grf",
@@ -55,6 +56,7 @@ use crate::{Error, Result};
     feature = "affs",
     feature = "littlefs",
     feature = "apfs",
+    feature = "cramfs",
     feature = "squashfs",
     feature = "iso9660",
     feature = "grf",
@@ -77,6 +79,7 @@ use crate::{
     feature = "affs",
     feature = "littlefs",
     feature = "apfs",
+    feature = "cramfs",
     feature = "squashfs",
     feature = "iso9660",
     feature = "grf",
@@ -434,6 +437,14 @@ impl MemImage {
                     sz,
                 )
             }
+            #[cfg(feature = "cramfs")]
+            "cramfs" => {
+                let sz = self.geometry_size()?;
+                self.build_generic::<crate::fs::cramfs::Cramfs>(
+                    &crate::fs::cramfs::FormatOpts::default(),
+                    sz,
+                )
+            }
             #[cfg(feature = "iso9660")]
             "iso" | "iso9660" => {
                 let opts = crate::fs::iso9660::FormatOpts {
@@ -565,6 +576,7 @@ impl MemImage {
         feature = "affs",
         feature = "littlefs",
         feature = "apfs",
+        feature = "cramfs",
         feature = "squashfs",
         feature = "iso9660",
         feature = "grf",
@@ -605,6 +617,7 @@ impl MemImage {
         feature = "affs",
         feature = "littlefs",
         feature = "apfs",
+        feature = "cramfs",
         feature = "squashfs"
     ))]
     fn geometry_size(&mut self) -> Result<u64> {
@@ -635,6 +648,7 @@ impl MemImage {
         feature = "affs",
         feature = "littlefs",
         feature = "apfs",
+        feature = "cramfs",
         feature = "squashfs",
         feature = "iso9660",
         feature = "grf",
@@ -821,6 +835,13 @@ pub fn supported_targets() -> Vec<TargetInfo> {
             ext: "sqsh",
             streaming: true,
         },
+        #[cfg(feature = "cramfs")]
+        TargetInfo {
+            id: "cramfs",
+            label: "cramfs",
+            ext: "cramfs",
+            streaming: true,
+        },
         #[cfg(feature = "iso9660")]
         TargetInfo {
             id: "iso",
@@ -890,6 +911,7 @@ fn target_feature(id: &str) -> Option<&'static str> {
         "littlefs" | "lfs" => "littlefs",
         "apfs" => "apfs",
         "squashfs" => "squashfs",
+        "cramfs" => "cramfs",
         "iso" | "iso9660" => "iso9660",
         "grf" => "grf",
         "zip" | "cpio" | "ar" => "archive",
@@ -934,6 +956,7 @@ fn tar_codec(name: &str) -> Option<Algo> {
     feature = "affs",
     feature = "littlefs",
     feature = "apfs",
+    feature = "cramfs",
     feature = "squashfs",
     feature = "iso9660",
     feature = "grf",
@@ -1047,6 +1070,16 @@ mod tests {
                 "{target} lost readme.txt; got {names:?}"
             );
         }
+    }
+
+    #[test]
+    #[cfg(all(feature = "ramfs", feature = "cramfs"))]
+    fn convert_tar_to_cramfs_roundtrips() {
+        let mut img = MemImage::open(tar_fixture()).unwrap();
+        let out = img.convert("cramfs").unwrap();
+        let mut re = MemImage::open(out).unwrap();
+        let body = re.read_file("/readme.txt").unwrap();
+        assert_eq!(body, b"hello from fstool");
     }
 
     #[test]

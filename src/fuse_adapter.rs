@@ -8,7 +8,7 @@
 //! ## Backend-agnostic
 //!
 //! The adapter takes a [`Box<dyn Filesystem>`](crate::fs::Filesystem) —
-//! ext{2,3,4}, FAT32, SquashFS, ISO 9660, GRF, anything that implements
+//! ext{2,3,4}, FAT32, SquashFS, cramfs, ISO 9660, GRF, anything that implements
 //! the trait. Write capability follows from
 //! [`Filesystem::mutation_capability`] — backends that report
 //! [`Streaming`](crate::fs::MutationCapability::Streaming) or

@@ -145,6 +145,7 @@ filesystems = [
     "affs",
     "apfs",
     "archive",
+    "cramfs",
     "exfat",
     "ext",
     "f2fs",
@@ -223,6 +224,9 @@ affs = ["std"]
 iso9660 = ["std"]
 # SquashFS (reads decode through the codec features).
 squashfs = ["std"]
+# cramfs (Linux compressed ROM filesystem). Every block is zlib, so it
+# needs the `gzip` codec.
+cramfs = ["std", "gzip"]
 # GRF (Gravity Ragnarok Online archive). `charcode` decodes its CP949 names;
 # every member is zlib-compressed, so the writer needs the `gzip` codec.
 grf = ["std", "dep:charcode", "gzip"]

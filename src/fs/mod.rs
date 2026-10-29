@@ -32,6 +32,8 @@ pub mod affs;
 pub mod apfs;
 #[cfg(all(feature = "alloc", feature = "archive"))]
 pub mod archive;
+#[cfg(all(feature = "alloc", feature = "cramfs"))]
+pub mod cramfs;
 #[cfg(feature = "alloc")]
 pub mod devnum;
 #[cfg(feature = "alloc")]

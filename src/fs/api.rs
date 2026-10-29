@@ -381,7 +381,7 @@ pub enum MutationCapability {
     /// On-disk layout is laid down at format time and the format has
     /// no in-place mutation hooks (no free-list, no journal). The
     /// writer can seek, but the image isn't re-openable as writable.
-    /// ISO 9660 and SquashFS today, plus a *reopened* F2FS handle
+    /// ISO 9660, SquashFS and cramfs today, plus a *reopened* F2FS handle
     /// (build-once: its writer serializes the whole FS from in-memory
     /// state at flush and isn't reconstructed on `open`).
     Immutable,

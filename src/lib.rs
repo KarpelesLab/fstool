@@ -13,7 +13,7 @@
 //! - [`part`] — `PartitionTable`: MBR, GPT and APM.
 //! - [`fs`] — `Filesystem`: one trait over every backend — ext2/3/4,
 //!   FAT12/16/32, exFAT, XFS, HFS+, HFS, AFFS, APFS, NTFS, F2FS, littlefs,
-//!   SquashFS, ISO 9660, GRF, tar and the archive formats.
+//!   SquashFS, cramfs, ISO 9660, GRF, tar and the archive formats.
 //!
 //! High-level entry points: [`spec::build`] builds an image from a TOML
 //! spec, [`inspect`] opens and walks an existing one, [`repack`] converts
@@ -75,6 +75,7 @@ compile_error!(
         feature = "littlefs",
         feature = "ntfs",
         feature = "ramfs",
+        feature = "cramfs",
         feature = "squashfs",
         feature = "tar",
         feature = "xfs",
