@@ -4,51 +4,74 @@
 //! - [`create_encrypted_image`] / [`create_encrypted_image_from_device`]
 //!   wrap a payload — any image: raw, UDIF, a bare filesystem — in a
 //!   passphrase-protected container that `hdiutil attach` opens.
+//!   [`create_encrypted_image_with`] / [`create_encrypted_image_from_device_with`]
+//!   take a list of [`Protector`]s instead: several passphrases and (with
+//!   `dmg-encrypted-recovery`) recipient certificates, each becoming one
+//!   key record.
 //! - [`inspect_encrypted_image`] reports the header and every key record
-//!   without deriving any key, including record types this crate cannot
-//!   unlock (certificate / public-key recovery records), which are listed
-//!   as opaque.
+//!   without deriving any key: passphrase records with their KDF cost,
+//!   public-key (certificate) records with their recipient key id and wrap
+//!   parameters, unknown record types as opaque.
 //! - [`change_passphrase`] re-wraps the content key under a new
 //!   passphrase in place — the same operation as `hdiutil chpass`. Only
 //!   the one key record is rewritten; the payload is not touched.
-//! - [`remove_key_record`] drops a key record from the table and
-//!   overwrites its bytes.
+//! - [`add_passphrase`] and `add_recipient` add a passphrase or
+//!   recovery-certificate record, given a [`Credential`] that already
+//!   opens the image.
+//! - [`remove_key_record`] / [`remove_key_record_with`] drop a key record
+//!   from the table and overwrite its bytes.
 //!
-//! Nothing here prompts or touches a keychain: passphrases, content keys
-//! and the randomness source are all explicit arguments. Output goes to a
-//! caller-owned `Write + Seek`; publishing it (renaming a temporary file
-//! into place, say) is the caller's business, and a failed call leaves
-//! the destination in an unspecified state that must be discarded.
+//! Nothing here prompts or touches a keychain: passphrases, private keys,
+//! certificates, content keys and the randomness source are all explicit
+//! arguments. Output goes to a caller-owned `Write + Seek`; publishing it
+//! (renaming a temporary file into place, say) is the caller's business,
+//! and a failed call leaves the destination in an unspecified state that
+//! must be discarded. The in-place editors verify the credential and build
+//! every new byte before writing any, so a wrong passphrase or key, or a
+//! damaged header, leaves the image untouched; an I/O error part-way
+//! through the final write can still leave it inconsistent, so edit a copy
+//! when that matters.
 //!
 //! ## What gets written
 //!
 //! The same layout `hdiutil create -encryption` produces on current
-//! macOS: a one-entry key table at 0x4C pointing at a 0x268-byte
-//! passphrase record at 0x60, the keyblob (`aes_key || hmac_key`) wrapped
-//! with AES-192-CBC under a PBKDF2-HMAC-SHA1 key (20-byte salt, 8-byte
-//! IV), and the payload starting at 0x1DE00 in 512-byte chunks, each
-//! AES-CBC encrypted with the IV `HMAC-SHA1(hmac_key, chunk_index)[..16]`.
-//! The last chunk is zero-padded to a whole chunk on disk; `data_size`
-//! records the exact payload length.
+//! macOS: a key table at 0x4C with one row per record, the records packed
+//! right after it in table order — 0x268-byte passphrase records, 0x234-byte
+//! public-key records — and the payload starting at 0x1DE00 in 512-byte
+//! chunks, each AES-CBC encrypted with the IV
+//! `HMAC-SHA1(hmac_key, chunk_index)[..16]`. A passphrase record wraps the
+//! keyblob (`aes_key || hmac_key || "CKIE" 0x00`) with AES-192-CBC under a
+//! PBKDF2-HMAC-SHA1 key (20-byte salt, 8-byte IV); a public-key record
+//! encrypts the same keyblob with RSAES-PKCS1-v1_5. With one passphrase
+//! and one certificate, `hdiutil` puts the certificate record first; the
+//! functions here keep the caller's order. The last chunk is zero-padded
+//! to a whole chunk on disk; `data_size` records the exact payload length.
+//!
+//! Adding a record rewrites the key table and moves the existing records
+//! (byte-for-byte) to keep them packed after the grown table.
 //!
 //! ## Limitations
 //!
 //! See the parent module's *Security properties*: the payload is **not
 //! authenticated** (legacy CBC, no MAC), and removing or replacing a key
-//! record is **not secure erasure** of earlier copies of it. Certificate /
-//! public-key recovery records are preserved byte-for-byte by the
-//! operations here but cannot be created or used.
+//! record is **not secure erasure** of earlier copies of it — nor does it
+//! change the content key, so whoever saw the keyblob once keeps access.
+//! Without `dmg-encrypted-recovery`, public-key records are reported and
+//! preserved byte-for-byte but cannot be created or used.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::Result;
 use crate::block::BlockDevice;
 
+#[cfg(feature = "dmg-encrypted-recovery")]
+use super::RecipientKey;
 use super::{
-    ENCRCDSA_MAGIC, ENCRCDSA_V2_HEADER_MIN_BYTES, EncryptedDmgHeader, KEY_ENTRY_BYTES,
-    KEY_ENTRY_PASSPHRASE, KEYBLOB_TRAILER, MAX_CHUNK_SIZE, MAX_PASSPHRASE_RECORDS,
-    MAX_PBKDF2_ITERATIONS, PASSPHRASE_RECORD_FIXED_BYTES, PassphraseKey, SecretBytes, algid,
-    chunk_iv, read_header_from, unlock_keyblob, validate_for_decryption, wipe,
+    Credential, ENCRCDSA_MAGIC, ENCRCDSA_V2_HEADER_MIN_BYTES, EncryptedDmgHeader, KEY_ENTRY_BYTES,
+    KEY_ENTRY_PASSPHRASE, KEY_ENTRY_PUBLIC_KEY, KEYBLOB_TRAILER, MAX_CHUNK_SIZE, MAX_KEY_ENTRIES,
+    MAX_PASSPHRASE_RECORDS, MAX_PBKDF2_ITERATIONS, PASSPHRASE_RECORD_FIXED_BYTES, PassphraseKey,
+    PublicKeyRecord, SecretBytes, algid, chunk_iv, read_header_buf, record_bytes,
+    validate_for_decryption, wipe,
 };
 
 /// PBKDF2 iteration count [`CreateOptions`] and [`RekeyOptions`] default
@@ -65,9 +88,118 @@ pub const DEFAULT_CHUNK_SIZE: u32 = 512;
 /// record zeroed for further records.
 pub const ENCRYPTED_DATA_OFFSET: u64 = 0x1DE00;
 
-/// Offset of the single passphrase record [`create_encrypted_image`]
-/// writes: right after a one-row key table.
-const RECORD_OFFSET: usize = ENCRCDSA_V2_HEADER_MIN_BYTES + KEY_ENTRY_BYTES;
+/// Most key records [`create_encrypted_image_with`] writes and
+/// [`add_passphrase`] / `add_recipient` grow an image to. Of these at
+/// most [`MAX_PASSPHRASE_RECORDS`](super::MAX_PASSPHRASE_RECORDS) may be
+/// passphrase records — the most an unlock will try.
+pub const MAX_PROTECTORS: usize = 16;
+
+/// One way to open an image being created: each becomes one key record,
+/// in the order given.
+///
+/// `Debug` never shows a passphrase.
+#[derive(Clone, Copy)]
+#[non_exhaustive]
+pub enum Protector<'a> {
+    /// A passphrase record, PBKDF2-HMAC-SHA1 with
+    /// [`CreateOptions::pbkdf2_iterations`].
+    Passphrase(&'a str),
+    /// A public-key (certificate) recovery record for this recipient —
+    /// `hdiutil create -certificate`.
+    #[cfg(feature = "dmg-encrypted-recovery")]
+    Recipient(&'a RecipientKey),
+}
+
+impl std::fmt::Debug for Protector<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Passphrase(_) => f.write_str("Passphrase(<redacted>)"),
+            #[cfg(feature = "dmg-encrypted-recovery")]
+            Self::Recipient(r) => f.debug_tuple("Recipient").field(r).finish(),
+        }
+    }
+}
+
+impl Protector<'_> {
+    fn kind(&self) -> u32 {
+        match self {
+            Self::Passphrase(_) => KEY_ENTRY_PASSPHRASE,
+            #[cfg(feature = "dmg-encrypted-recovery")]
+            Self::Recipient(_) => KEY_ENTRY_PUBLIC_KEY,
+        }
+    }
+
+    /// Build this protector's key record around `keyblob`.
+    fn build(
+        &self,
+        keyblob: &[u8],
+        iterations: u32,
+        rng: &mut dyn RandomSource,
+    ) -> Result<Vec<u8>> {
+        match self {
+            Self::Passphrase(p) => {
+                build_passphrase_record(p, keyblob, iterations, PASSPHRASE_RECORD_BYTES, rng)
+            }
+            #[cfg(feature = "dmg-encrypted-recovery")]
+            Self::Recipient(r) => r.build_record(keyblob, rng),
+        }
+    }
+}
+
+/// Check a set of key-record kinds against the limits: at least one
+/// record, at most [`MAX_PROTECTORS`], at most
+/// [`MAX_PASSPHRASE_RECORDS`] of them passphrase records.
+fn check_record_kinds(kinds: impl Iterator<Item = u32>) -> Result<()> {
+    let (mut total, mut pass) = (0usize, 0usize);
+    for k in kinds {
+        total += 1;
+        pass += usize::from(k == KEY_ENTRY_PASSPHRASE);
+    }
+    if total == 0 {
+        return Err(crate::Error::InvalidArgument(
+            "encrcdsa: an image needs at least one passphrase or recipient".into(),
+        ));
+    }
+    if total > MAX_PROTECTORS {
+        return Err(crate::Error::InvalidArgument(format!(
+            "encrcdsa: {total} key records exceed the maximum of {MAX_PROTECTORS}"
+        )));
+    }
+    if pass > MAX_PASSPHRASE_RECORDS {
+        return Err(crate::Error::InvalidArgument(format!(
+            "encrcdsa: {pass} passphrase records exceed the maximum of {MAX_PASSPHRASE_RECORDS}"
+        )));
+    }
+    Ok(())
+}
+
+/// Lay out a key area: the `key_count` field at 0x48, one table row per
+/// `(kind, record)`, then the records packed right after the table in the
+/// same order. Returns the bytes from 0x48 on.
+fn build_key_area(records: &[(u32, Vec<u8>)], data_offset: u64) -> Result<Vec<u8>> {
+    let base = ENCRCDSA_V2_HEADER_MIN_BYTES - 4;
+    let table_end = ENCRCDSA_V2_HEADER_MIN_BYTES + records.len() * KEY_ENTRY_BYTES;
+    let end = table_end + records.iter().map(|(_, r)| r.len()).sum::<usize>();
+    if end as u64 > data_offset {
+        return Err(crate::Error::InvalidArgument(format!(
+            "encrcdsa: {} key records need {end} bytes of header, past the payload at \
+             {data_offset:#x}",
+            records.len()
+        )));
+    }
+    let mut area = vec![0u8; end - base];
+    area[..4].copy_from_slice(&(records.len() as u32).to_be_bytes());
+    let mut at = table_end;
+    for (i, (kind, rec)) in records.iter().enumerate() {
+        let row = 4 + i * KEY_ENTRY_BYTES;
+        area[row..row + 4].copy_from_slice(&kind.to_be_bytes());
+        area[row + 4..row + 12].copy_from_slice(&(at as u64).to_be_bytes());
+        area[row + 12..row + 20].copy_from_slice(&(rec.len() as u64).to_be_bytes());
+        area[at - base..at - base + rec.len()].copy_from_slice(rec);
+        at += rec.len();
+    }
+    Ok(area)
+}
 
 /// Size of a passphrase record as `hdiutil` lays it out: the fixed part
 /// plus a 512-byte keyblob buffer.
@@ -314,8 +446,10 @@ pub struct CreatedImage {
 pub enum KeyRecordKind {
     /// Type 1: a passphrase (PBKDF2) record.
     Passphrase,
-    /// Type 2: a public-key / certificate recovery record. Listed and
-    /// preserved, but opaque — this crate cannot create or unlock one.
+    /// Type 2: a public-key / certificate recovery record (see
+    /// [`PublicKeyRecord`](super::PublicKeyRecord)). Created and unlocked
+    /// with the `dmg-encrypted-recovery` feature; always decoded by
+    /// [`inspect_encrypted_image`] and preserved by the editors.
     PublicKey,
     /// Any other type, preserved byte-for-byte and reported as-is.
     Other(u32),
@@ -325,7 +459,7 @@ impl KeyRecordKind {
     fn from_raw(kind: u32) -> Self {
         match kind {
             KEY_ENTRY_PASSPHRASE => Self::Passphrase,
-            2 => Self::PublicKey,
+            KEY_ENTRY_PUBLIC_KEY => Self::PublicKey,
             other => Self::Other(other),
         }
     }
@@ -367,6 +501,34 @@ pub struct KeyRecordInfo {
     pub size: u64,
     /// Decoded parameters, for passphrase records.
     pub passphrase: Option<PassphraseRecordInfo>,
+    /// Decoded parameters, for public-key (certificate) records.
+    pub public_key: Option<PublicKeyRecordInfo>,
+}
+
+/// Non-secret parameters of a public-key (certificate) recovery record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PublicKeyRecordInfo {
+    /// The recipient key id the record names: SHA-1 of the recipient's
+    /// PKCS#1 `RSAPublicKey` DER (compare with `RecipientKey::key_id` /
+    /// `RecoveryKey::key_id`; it is also the hash `hdiutil -pubkey` takes).
+    pub key_id: Vec<u8>,
+    /// Wrap algorithm ([`algid::RSA`] in every image seen).
+    pub wrap_algorithm: u32,
+    /// Wrap padding
+    /// ([`PUBLIC_KEY_PADDING_PKCS1`](super::PUBLIC_KEY_PADDING_PKCS1) in
+    /// every image seen).
+    pub wrap_padding: u32,
+    /// Raw CSSM mode field (0 in every image seen).
+    pub wrap_mode: u32,
+    /// Length of the RSA ciphertext — the recipient's modulus length — in
+    /// bytes.
+    pub wrapped_keyblob_len: usize,
+    /// `true` when this crate can unlock the record given the private key:
+    /// RSA with PKCS#1 v1.5 padding, and a ciphertext length matching a
+    /// 1024- to 4096-bit modulus. (Unlocking needs the
+    /// `dmg-encrypted-recovery` feature.)
+    pub supported: bool,
 }
 
 /// Everything [`inspect_encrypted_image`] can tell without a passphrase.
@@ -519,7 +681,45 @@ where
     W: Write + Seek + ?Sized,
     R: Read + ?Sized,
 {
-    let plan = Plan::new(payload_len, passphrase, keys, opts, rng)?;
+    create_encrypted_image_with(
+        out,
+        payload,
+        payload_len,
+        &[Protector::Passphrase(passphrase)],
+        keys,
+        opts,
+        rng,
+    )
+}
+
+/// [`create_encrypted_image`] protected by any number of
+/// [`Protector`]s — passphrases and recipient certificates — each
+/// written as one key record, in order.
+///
+/// `hdiutil` itself makes images with one passphrase plus, optionally, one
+/// certificate (`-certificate`), and lists the certificate record first;
+/// it opens images with several passphrase records too, trying each. An
+/// image protected only by certificates opens with
+/// `hdiutil attach -recover <keychain>` or
+/// [`EncryptedDmgBackend::open_with_recovery_key`](super::EncryptedDmgBackend).
+///
+/// Between 1 and [`MAX_PROTECTORS`] protectors, at most
+/// [`MAX_PASSPHRASE_RECORDS`](super::MAX_PASSPHRASE_RECORDS) of them
+/// passphrases. Everything else is as for [`create_encrypted_image`].
+pub fn create_encrypted_image_with<W, R>(
+    out: &mut W,
+    payload: &mut R,
+    payload_len: u64,
+    protectors: &[Protector<'_>],
+    keys: &ContentKeys,
+    opts: &CreateOptions,
+    rng: &mut dyn RandomSource,
+) -> Result<CreatedImage>
+where
+    W: Write + Seek + ?Sized,
+    R: Read + ?Sized,
+{
+    let plan = Plan::new(payload_len, protectors, keys, opts, rng)?;
     plan.write(out, keys, |buf| {
         payload.read_exact(buf).map_err(|e| match e.kind() {
             std::io::ErrorKind::UnexpectedEof => crate::Error::InvalidArgument(format!(
@@ -543,8 +743,31 @@ pub fn create_encrypted_image_from_device<W>(
 where
     W: Write + Seek + ?Sized,
 {
+    create_encrypted_image_from_device_with(
+        out,
+        payload,
+        &[Protector::Passphrase(passphrase)],
+        keys,
+        opts,
+        rng,
+    )
+}
+
+/// [`create_encrypted_image_with`] with the payload read from a
+/// [`BlockDevice`] — its whole [`total_size`](BlockDevice::total_size).
+pub fn create_encrypted_image_from_device_with<W>(
+    out: &mut W,
+    payload: &mut dyn BlockDevice,
+    protectors: &[Protector<'_>],
+    keys: &ContentKeys,
+    opts: &CreateOptions,
+    rng: &mut dyn RandomSource,
+) -> Result<CreatedImage>
+where
+    W: Write + Seek + ?Sized,
+{
     let payload_len = payload.total_size();
-    let plan = Plan::new(payload_len, passphrase, keys, opts, rng)?;
+    let plan = Plan::new(payload_len, protectors, keys, opts, rng)?;
     let mut pos = 0u64;
     plan.write(out, keys, |buf| {
         payload.read_at(pos, buf)?;
@@ -566,11 +789,12 @@ struct Plan {
 impl Plan {
     fn new(
         payload_len: u64,
-        passphrase: &str,
+        protectors: &[Protector<'_>],
         keys: &ContentKeys,
         opts: &CreateOptions,
         rng: &mut dyn RandomSource,
     ) -> Result<Self> {
+        check_record_kinds(protectors.iter().map(Protector::kind))?;
         check_iterations(opts.pbkdf2_iterations)?;
         let cs = opts.chunk_size;
         if cs == 0 || !cs.is_multiple_of(16) || cs > MAX_CHUNK_SIZE {
@@ -603,13 +827,12 @@ impl Plan {
                 u
             }
         };
-        let record = build_passphrase_record(
-            passphrase,
-            &keys.keyblob().0,
-            opts.pbkdf2_iterations,
-            PASSPHRASE_RECORD_BYTES,
-            rng,
-        )?;
+        let keyblob = keys.keyblob();
+        let records = protectors
+            .iter()
+            .map(|p| Ok((p.kind(), p.build(&keyblob.0, opts.pbkdf2_iterations, rng)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let area = build_key_area(&records, ENCRYPTED_DATA_OFFSET)?;
 
         let mut h = vec![0u8; ENCRYPTED_DATA_OFFSET as usize];
         let put32 =
@@ -628,15 +851,12 @@ impl Plan {
         put32(&mut h, 0x34, cs);
         put64(&mut h, 0x38, payload_len);
         put64(&mut h, 0x40, ENCRYPTED_DATA_OFFSET);
-        put32(&mut h, 0x48, 1);
-        put32(&mut h, 0x4C, KEY_ENTRY_PASSPHRASE);
-        put64(&mut h, 0x50, RECORD_OFFSET as u64);
-        put64(&mut h, 0x58, PASSPHRASE_RECORD_BYTES as u64);
-        h[RECORD_OFFSET..RECORD_OFFSET + PASSPHRASE_RECORD_BYTES].copy_from_slice(&record);
+        let base = ENCRCDSA_V2_HEADER_MIN_BYTES - 4;
+        h[base..base + area.len()].copy_from_slice(&area);
 
         // Self-check: the header we built must decode back to what we meant.
         let back = EncryptedDmgHeader::decode(&h)?;
-        debug_assert_eq!(back.passphrase_keys.len(), 1);
+        debug_assert_eq!(back.key_entries.len(), protectors.len());
         debug_assert_eq!(back.data_size, payload_len);
 
         Ok(Self {
@@ -688,12 +908,14 @@ impl Plan {
 ///
 /// Bounded like the reader: at most 64 key entries and 64 KiB per record
 /// are read. Passphrase records are decoded and their KDF cost reported
-/// ([`PassphraseRecordInfo::within_limits`]); other record types are
-/// listed as opaque. Malformed headers and records are errors.
+/// ([`PassphraseRecordInfo::within_limits`]); public-key records are
+/// decoded down to their recipient key id
+/// ([`PublicKeyRecordInfo`]); other record types are listed as opaque.
+/// Malformed headers and records are errors.
 pub fn inspect_encrypted_image<R: Read + Seek + ?Sized>(
     image: &mut R,
 ) -> Result<EncryptedImageInfo> {
-    let h = read_header_from(image)?;
+    let (h, buf) = read_header_buf(image)?;
     let mut pass = h.passphrase_keys.iter();
     let key_records = h
         .key_entries
@@ -705,15 +927,23 @@ pub fn inspect_encrypted_image<R: Read + Seek + ?Sized>(
                 .then(|| pass.next())
                 .flatten()
                 .map(passphrase_info);
-            KeyRecordInfo {
+            let public_key = if kind == KeyRecordKind::PublicKey {
+                Some(public_key_info(&PublicKeyRecord::decode(record_bytes(
+                    &h, &buf, index,
+                ))?))
+            } else {
+                None
+            };
+            Ok(KeyRecordInfo {
                 index,
                 kind,
                 offset: e.offset,
                 size: e.size,
                 passphrase,
-            }
+                public_key,
+            })
         })
-        .collect();
+        .collect::<Result<_>>()?;
     Ok(EncryptedImageInfo {
         version: h.version,
         cipher: (h.encryption_algorithm == algid::AES)
@@ -740,16 +970,33 @@ fn passphrase_info(k: &PassphraseKey) -> PassphraseRecordInfo {
     }
 }
 
+fn public_key_info(r: &PublicKeyRecord) -> PublicKeyRecordInfo {
+    let n = r.wrapped_keyblob.len();
+    PublicKeyRecordInfo {
+        key_id: r.key_id().to_vec(),
+        wrap_algorithm: r.wrap_algorithm,
+        wrap_padding: r.wrap_padding,
+        wrap_mode: r.wrap_mode,
+        wrapped_keyblob_len: n,
+        supported: r.wrap_algorithm == algid::RSA
+            && r.wrap_padding == super::PUBLIC_KEY_PADDING_PKCS1
+            && (128..=512).contains(&n),
+    }
+}
+
 /// Read and check a header for an in-place key-table edit: decodable,
 /// decryptable, and with every key record lying between the key table and
 /// the payload, so rewriting one can never touch the table or the data.
-fn header_for_edit<F: Read + Seek + ?Sized>(image: &mut F) -> Result<EncryptedDmgHeader> {
-    let h = read_header_from(image)?;
+/// Also returns the header buffer (see [`read_header_buf`]).
+fn header_for_edit<F: Read + Seek + ?Sized>(
+    image: &mut F,
+) -> Result<(EncryptedDmgHeader, Vec<u8>)> {
+    let (h, buf) = read_header_buf(image)?;
     let file_len = image.seek(SeekFrom::End(0))?;
     validate_for_decryption(&h, file_len)?;
     let table_end = (ENCRCDSA_V2_HEADER_MIN_BYTES + h.key_entries.len() * KEY_ENTRY_BYTES) as u64;
     for (i, e) in h.key_entries.iter().enumerate() {
-        // `read_header_from` proved `offset + size` does not overflow.
+        // `read_header_buf` proved `offset + size` does not overflow.
         if e.offset < table_end || e.offset + e.size > h.data_offset {
             return Err(crate::Error::InvalidImage(format!(
                 "encrcdsa: key record {i} ({} bytes at {:#x}) is not between the key table and \
@@ -758,7 +1005,7 @@ fn header_for_edit<F: Read + Seek + ?Sized>(image: &mut F) -> Result<EncryptedDm
             )));
         }
     }
-    Ok(h)
+    Ok((h, buf))
 }
 
 /// Change the passphrase of an image in place — `hdiutil chpass`.
@@ -791,8 +1038,8 @@ pub fn change_passphrase<F: Read + Write + Seek + ?Sized>(
     rng: &mut dyn RandomSource,
 ) -> Result<usize> {
     check_iterations(opts.pbkdf2_iterations)?;
-    let h = header_for_edit(image)?;
-    let (index, keyblob) = unlock_keyblob(&h, old, None, true)?;
+    let (h, buf) = header_for_edit(image)?;
+    let (index, keyblob) = super::unlock_with(&h, &buf, Credential::Passphrase(old), None, true)?;
     let entry = &h.key_entries[index];
     let record = build_passphrase_record(
         new,
@@ -811,12 +1058,128 @@ pub fn change_passphrase<F: Read + Write + Seek + ?Sized>(
     Ok(index)
 }
 
-/// Remove key-table entry `index` and overwrite the record it points at
-/// with zeros.
+/// Add a key record built around the image's keyblob, after `credential`
+/// unlocked it: the table grows by one row, existing records are moved
+/// (byte-for-byte, in table order) to stay packed after it, and the new
+/// record goes last. Returns the new record's key-table index.
+fn add_record<F: Read + Write + Seek + ?Sized>(
+    image: &mut F,
+    credential: Credential<'_>,
+    kind: u32,
+    build: impl FnOnce(&[u8]) -> Result<Vec<u8>>,
+) -> Result<usize> {
+    let (h, buf) = header_for_edit(image)?;
+    let n = h.key_entries.len();
+    check_record_kinds(
+        h.key_entries
+            .iter()
+            .map(|e| e.kind)
+            .chain(std::iter::once(kind)),
+    )?;
+    debug_assert!(n < MAX_KEY_ENTRIES as usize);
+    let (_, keyblob) = super::unlock_with(&h, &buf, credential, None, true)?;
+    let new = build(&keyblob.0)?;
+    let mut records: Vec<(u32, Vec<u8>)> = h
+        .key_entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.kind, record_bytes(&h, &buf, i).to_vec()))
+        .collect();
+    records.push((kind, new));
+    let mut area = build_key_area(&records, h.data_offset)?;
+    // Zero whatever the old layout used beyond the new one, so no stale
+    // copy of a moved record lingers in this file.
+    let base = ENCRCDSA_V2_HEADER_MIN_BYTES - 4;
+    let old_end = buf.len().min(h.data_offset as usize);
+    if old_end > base + area.len() {
+        area.resize(old_end - base, 0);
+    }
+    // Self-check before committing: the new header decodes, with the
+    // records where we put them.
+    let mut check = buf[..base].to_vec();
+    check.extend_from_slice(&area);
+    let back = EncryptedDmgHeader::decode(&check)?;
+    if back.key_entries.len() != n + 1 || back.key_entries[n].kind != kind {
+        return Err(crate::Error::InvalidImage(
+            "encrcdsa: rebuilt key table failed its self-check".into(),
+        ));
+    }
+    image.seek(SeekFrom::Start(base as u64))?;
+    image.write_all(&area)?;
+    image.flush()?;
+    Ok(n)
+}
+
+/// Add a passphrase record for `new` to an image in place, given a
+/// `credential` that already opens it — something `hdiutil chpass`
+/// cannot do, though `hdiutil attach` accepts each passphrase record of
+/// an image that has several.
 ///
-/// To keep the image openable, `passphrase` must unlock a passphrase
-/// record **other than** `index`; otherwise nothing is written. The entry
-/// is dropped from the table first (later entries shift down one slot,
+/// The new record wraps the **same** content keys (fresh salt and IV,
+/// [`RekeyOptions::pbkdf2_iterations`]); the payload is untouched. Up to
+/// [`MAX_PASSPHRASE_RECORDS`](super::MAX_PASSPHRASE_RECORDS) passphrase
+/// records and [`MAX_PROTECTORS`] records in all. As for
+/// [`change_passphrase`], the credential must unwrap to a keyblob carrying
+/// the `CKIE` trailer, and a wrong credential or a damaged header fails
+/// before anything is written. Returns the new record's key-table index
+/// (the last).
+pub fn add_passphrase<F: Read + Write + Seek + ?Sized>(
+    image: &mut F,
+    credential: Credential<'_>,
+    new: &str,
+    opts: &RekeyOptions,
+    rng: &mut dyn RandomSource,
+) -> Result<usize> {
+    check_iterations(opts.pbkdf2_iterations)?;
+    add_record(image, credential, KEY_ENTRY_PASSPHRASE, |keyblob| {
+        build_passphrase_record(
+            new,
+            keyblob,
+            opts.pbkdf2_iterations,
+            PASSPHRASE_RECORD_BYTES,
+            rng,
+        )
+    })
+}
+
+/// Add a public-key (certificate) recovery record for `recipient` to an
+/// image in place, given a `credential` that already opens it — what
+/// `hdiutil create -certificate` sets up at creation time. The holder of
+/// the matching private key can then open the image without a passphrase
+/// (`hdiutil attach -recover`,
+/// [`EncryptedDmgBackend::open_with_recovery_key`](super::EncryptedDmgBackend::open_with_recovery_key)).
+///
+/// Same rules and guarantees as [`add_passphrase`].
+#[cfg(feature = "dmg-encrypted-recovery")]
+pub fn add_recipient<F: Read + Write + Seek + ?Sized>(
+    image: &mut F,
+    credential: Credential<'_>,
+    recipient: &RecipientKey,
+    rng: &mut dyn RandomSource,
+) -> Result<usize> {
+    add_record(image, credential, KEY_ENTRY_PUBLIC_KEY, |keyblob| {
+        recipient.build_record(keyblob, rng)
+    })
+}
+
+/// Remove key-table entry `index` and overwrite the record it points at
+/// with zeros, proving with `passphrase` that the image stays openable.
+/// See [`remove_key_record_with`].
+pub fn remove_key_record<F: Read + Write + Seek + ?Sized>(
+    image: &mut F,
+    index: usize,
+    passphrase: &str,
+) -> Result<()> {
+    remove_key_record_with(image, index, Credential::Passphrase(passphrase))
+}
+
+/// Remove key-table entry `index` and overwrite the record it points at
+/// with zeros — `hdiutil erasekeys` for a single record.
+///
+/// To keep the image openable, `credential` must unlock a record **other
+/// than** `index` (a passphrase record for a passphrase, a public-key
+/// record for a recovery key); otherwise nothing is written. The entry is
+/// dropped from the table first (later entries shift down one slot,
 /// `key_count` shrinks), then the record's bytes are zeroed — unless
 /// another entry's record overlaps them, in which case they are left
 /// alone.
@@ -824,13 +1187,14 @@ pub fn change_passphrase<F: Read + Write + Seek + ?Sized>(
 /// This invalidates the record in this file. It is **not** secure
 /// erasure: copies of the image made before, file-system snapshots,
 /// journaling and flash remapping can all retain it, and the content key
-/// it wraps is unchanged.
-pub fn remove_key_record<F: Read + Write + Seek + ?Sized>(
+/// it wraps is unchanged — anyone who ever unwrapped it can still read the
+/// payload.
+pub fn remove_key_record_with<F: Read + Write + Seek + ?Sized>(
     image: &mut F,
     index: usize,
-    passphrase: &str,
+    credential: Credential<'_>,
 ) -> Result<()> {
-    let h = header_for_edit(image)?;
+    let (h, buf) = header_for_edit(image)?;
     let n = h.key_entries.len();
     if index >= n {
         return Err(crate::Error::InvalidArgument(format!(
@@ -843,22 +1207,13 @@ pub fn remove_key_record<F: Read + Write + Seek + ?Sized>(
             h.passphrase_keys.len()
         )));
     }
-    // Lock-out guard: some other record must still open the image.
-    let has_other = h
-        .key_entries
-        .iter()
-        .enumerate()
-        .any(|(i, e)| i != index && e.kind == KEY_ENTRY_PASSPHRASE);
-    if !has_other {
-        return Err(crate::Error::InvalidArgument(format!(
-            "encrcdsa: removing key record {index} would leave no passphrase record"
-        )));
-    }
-    match unlock_keyblob(&h, passphrase, Some(index), true) {
+    // Lock-out guard: the credential must still open the image through
+    // some other record.
+    match super::unlock_with(&h, &buf, credential, Some(index), true) {
         Ok(_) => {}
         Err(crate::Error::Unsupported(_)) => {
             return Err(crate::Error::InvalidArgument(format!(
-                "encrcdsa: the passphrase does not unlock any record other than {index}; \
+                "encrcdsa: the credential does not unlock any record other than {index}; \
                  refusing to remove it"
             )));
         }
@@ -1191,7 +1546,7 @@ mod tests {
     }
 
     /// An image with two passphrase records (passphrases "a" and "b")
-    /// plus an opaque type-2 record.
+    /// plus an opaque record of unknown type 7.
     fn three_record_image(payload: &[u8]) -> Vec<u8> {
         let mut rng = test_rng(4);
         let keys = ContentKeys::generate(ContentCipher::Aes128, &mut rng);
@@ -1209,7 +1564,7 @@ mod tests {
         let mut img = out.into_inner();
         let rec_b = build_passphrase_record("b", &keys.keyblob().0, 100, 0x268, &mut rng).unwrap();
         add_entry(&mut img, KEY_ENTRY_PASSPHRASE, 0x2000, &rec_b);
-        add_entry(&mut img, 2, 0x3000, &[0xC5; 0x300]);
+        add_entry(&mut img, 7, 0x3000, &[0xC5; 0x300]);
         img
     }
 
@@ -1224,7 +1579,7 @@ mod tests {
             [
                 KeyRecordKind::Passphrase,
                 KeyRecordKind::Passphrase,
-                KeyRecordKind::PublicKey
+                KeyRecordKind::Other(7)
             ]
         );
         assert!(info.key_records[2].passphrase.is_none());
@@ -1275,7 +1630,7 @@ mod tests {
         );
         let info = inspect_encrypted_image(&mut Cursor::new(&out)).unwrap();
         let kinds: Vec<_> = info.key_records.iter().map(|r| r.kind).collect();
-        assert_eq!(kinds, [KeyRecordKind::Passphrase, KeyRecordKind::PublicKey]);
+        assert_eq!(kinds, [KeyRecordKind::Passphrase, KeyRecordKind::Other(7)]);
         assert_eq!(
             &out[0x3000..0x3300],
             &[0xC5; 0x300][..],
@@ -1426,5 +1781,260 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, crate::Error::Unsupported(_)), "{err:?}");
         assert_eq!(cur.into_inner(), img);
+    }
+
+    fn rekey(iters: u32) -> RekeyOptions {
+        RekeyOptions {
+            pbkdf2_iterations: iters,
+        }
+    }
+
+    fn create_with(payload: &[u8], protectors: &[Protector<'_>]) -> Result<Vec<u8>> {
+        let mut rng = test_rng(11);
+        let keys = ContentKeys::generate(ContentCipher::Aes256, &mut rng);
+        let mut out = Cursor::new(Vec::new());
+        create_encrypted_image_with(
+            &mut out,
+            &mut Cursor::new(payload),
+            payload.len() as u64,
+            protectors,
+            &keys,
+            &opts(100),
+            &mut rng,
+        )?;
+        Ok(out.into_inner())
+    }
+
+    #[test]
+    fn several_passphrases_at_creation_and_added_later() {
+        let payload = pattern(2048);
+        let img = create_with(
+            &payload,
+            &[Protector::Passphrase("one"), Protector::Passphrase("two")],
+        )
+        .unwrap();
+        let info = inspect_encrypted_image(&mut Cursor::new(&img)).unwrap();
+        assert_eq!(info.key_records.len(), 2);
+        // Packed after a two-row table, as hdiutil lays out its records.
+        assert_eq!(info.key_records[0].offset, 0x74);
+        assert_eq!(info.key_records[1].offset, 0x74 + 0x268);
+        assert_eq!(decrypt(&img, "one").unwrap(), payload);
+        assert_eq!(decrypt(&img, "two").unwrap(), payload);
+
+        // Add a third with the second.
+        let mut cur = Cursor::new(img.clone());
+        let idx = add_passphrase(
+            &mut cur,
+            Credential::Passphrase("two"),
+            "three",
+            &rekey(100),
+            &mut test_rng(3),
+        )
+        .unwrap();
+        assert_eq!(idx, 2);
+        let grown = cur.into_inner();
+        assert_eq!(grown.len(), img.len());
+        assert_eq!(
+            &grown[ENCRYPTED_DATA_OFFSET as usize..],
+            &img[ENCRYPTED_DATA_OFFSET as usize..],
+            "payload untouched"
+        );
+        let info = inspect_encrypted_image(&mut Cursor::new(&grown)).unwrap();
+        let offs: Vec<_> = info.key_records.iter().map(|r| r.offset).collect();
+        assert_eq!(offs, [0x88, 0x88 + 0x268, 0x88 + 2 * 0x268]);
+        // Existing records moved byte-for-byte.
+        assert_eq!(&grown[0x88..0x88 + 2 * 0x268], &img[0x74..0x74 + 2 * 0x268]);
+        for pw in ["one", "two", "three"] {
+            assert_eq!(decrypt(&grown, pw).unwrap(), payload, "{pw}");
+        }
+
+        // Wrong credential: nothing written.
+        let mut cur = Cursor::new(img.clone());
+        let err = add_passphrase(
+            &mut cur,
+            Credential::Passphrase("nope"),
+            "x",
+            &rekey(100),
+            &mut test_rng(3),
+        )
+        .unwrap_err();
+        assert!(matches!(err, crate::Error::Unsupported(_)), "{err:?}");
+        assert_eq!(cur.into_inner(), img);
+    }
+
+    #[test]
+    fn protector_limits_enforced_before_writing() {
+        let payload = pattern(512);
+        let nine = [Protector::Passphrase("p"); MAX_PASSPHRASE_RECORDS + 1];
+        assert!(matches!(
+            create_with(&payload, &nine).unwrap_err(),
+            crate::Error::InvalidArgument(_)
+        ));
+        assert!(matches!(
+            create_with(&payload, &[]).unwrap_err(),
+            crate::Error::InvalidArgument(_)
+        ));
+        // A full image takes no further passphrase.
+        let eight = [Protector::Passphrase("p"); MAX_PASSPHRASE_RECORDS];
+        let img = create_with(&payload, &eight).unwrap();
+        let mut cur = Cursor::new(img.clone());
+        let err = add_passphrase(
+            &mut cur,
+            Credential::Passphrase("p"),
+            "q",
+            &rekey(100),
+            &mut test_rng(1),
+        )
+        .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidArgument(_)), "{err:?}");
+        assert_eq!(cur.into_inner(), img);
+    }
+
+    #[cfg(feature = "dmg-encrypted-recovery")]
+    mod recovery {
+        use super::super::super::{RecipientKey, RecoveryKey};
+        use super::*;
+
+        const CERT: &[u8] = include_bytes!("../testdata/recovery_cert.der");
+        const KEY: &[u8] = include_bytes!("../testdata/recovery_key_pkcs1.der");
+        const OTHER: &[u8] = include_bytes!("../testdata/other_key_pkcs1.der");
+
+        fn decrypt_with_key(bytes: &[u8], key: &RecoveryKey) -> Result<Vec<u8>> {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("e.dmg");
+            std::fs::write(&p, bytes).unwrap();
+            let mut be = EncryptedDmgBackend::open_with_recovery_key(&p, key)?;
+            let mut out = vec![0u8; be.total_size() as usize];
+            be.read_at(0, &mut out)?;
+            Ok(out)
+        }
+
+        #[test]
+        fn create_with_certificate_and_passphrase() {
+            let payload = pattern(3000);
+            let cert = RecipientKey::from_certificate_der(CERT).unwrap();
+            let key = RecoveryKey::from_der(KEY).unwrap();
+            // hdiutil's order: certificate record first.
+            let img = create_with(
+                &payload,
+                &[Protector::Recipient(&cert), Protector::Passphrase("pw")],
+            )
+            .unwrap();
+            let info = inspect_encrypted_image(&mut Cursor::new(&img)).unwrap();
+            assert_eq!(info.key_records.len(), 2);
+            let r0 = &info.key_records[0];
+            assert_eq!(r0.kind, KeyRecordKind::PublicKey);
+            assert_eq!((r0.offset, r0.size), (0x74, 0x234));
+            let pk = r0.public_key.as_ref().unwrap();
+            assert_eq!(pk.key_id, cert.key_id());
+            assert_eq!(pk.wrapped_keyblob_len, 256);
+            assert!(pk.supported);
+            assert_eq!(info.key_records[1].offset, 0x2A8);
+            assert_eq!(decrypt(&img, "pw").unwrap(), payload);
+            assert_eq!(decrypt_with_key(&img, &key).unwrap(), payload);
+            let other = RecoveryKey::from_der(OTHER).unwrap();
+            assert!(matches!(
+                decrypt_with_key(&img, &other).unwrap_err(),
+                crate::Error::Unsupported(_)
+            ));
+        }
+
+        #[test]
+        fn certificate_only_image_and_management_with_the_key() {
+            let payload = pattern(1500);
+            let cert = RecipientKey::from_certificate_der(CERT).unwrap();
+            let key = RecoveryKey::from_der(KEY).unwrap();
+            let img = create_with(&payload, &[Protector::Recipient(&cert)]).unwrap();
+            assert_eq!(decrypt_with_key(&img, &key).unwrap(), payload);
+            assert!(decrypt(&img, "").is_err());
+
+            // The private key adds a passphrase…
+            let mut cur = Cursor::new(img.clone());
+            let idx = add_passphrase(
+                &mut cur,
+                Credential::RecoveryKey(&key),
+                "late",
+                &rekey(100),
+                &mut test_rng(5),
+            )
+            .unwrap();
+            assert_eq!(idx, 1);
+            let img2 = cur.into_inner();
+            assert_eq!(decrypt(&img2, "late").unwrap(), payload);
+            assert_eq!(decrypt_with_key(&img2, &key).unwrap(), payload);
+
+            // …which can then remove the certificate record (not the
+            // other way round: the key can't remove its only record).
+            let mut cur = Cursor::new(img2.clone());
+            let err =
+                remove_key_record_with(&mut cur, 0, Credential::RecoveryKey(&key)).unwrap_err();
+            assert!(matches!(err, crate::Error::InvalidArgument(_)), "{err:?}");
+            assert_eq!(cur.get_ref(), &img2);
+            remove_key_record_with(&mut cur, 0, Credential::Passphrase("late")).unwrap();
+            let img3 = cur.into_inner();
+            assert!(matches!(
+                decrypt_with_key(&img3, &key).unwrap_err(),
+                crate::Error::Unsupported(_)
+            ));
+            assert_eq!(decrypt(&img3, "late").unwrap(), payload);
+        }
+
+        #[test]
+        fn add_recipient_to_passphrase_image() {
+            let payload = pattern(4096);
+            let img = make(ContentCipher::Aes128, &payload, "pw");
+            let cert = RecipientKey::from_certificate_der(CERT).unwrap();
+            let key = RecoveryKey::from_der(KEY).unwrap();
+
+            // Wrong passphrase: refused, nothing written.
+            let mut cur = Cursor::new(img.clone());
+            let err = add_recipient(
+                &mut cur,
+                Credential::Passphrase("no"),
+                &cert,
+                &mut test_rng(2),
+            )
+            .unwrap_err();
+            assert!(matches!(err, crate::Error::Unsupported(_)), "{err:?}");
+            assert_eq!(cur.get_ref(), &img);
+
+            let idx = add_recipient(
+                &mut cur,
+                Credential::Passphrase("pw"),
+                &cert,
+                &mut test_rng(2),
+            )
+            .unwrap();
+            assert_eq!(idx, 1);
+            let out = cur.into_inner();
+            assert_eq!(decrypt(&out, "pw").unwrap(), payload);
+            assert_eq!(decrypt_with_key(&out, &key).unwrap(), payload);
+            // The passphrase record moved from 0x60 to 0x74; nothing of it
+            // is left behind past the new layout.
+            let info = inspect_encrypted_image(&mut Cursor::new(&out)).unwrap();
+            assert_eq!(info.key_records[0].offset, 0x74);
+            assert_eq!(info.key_records[1].offset, 0x74 + 0x268);
+            assert_eq!(&out[0x74..0x74 + 0x268], &img[0x60..0x60 + 0x268]);
+            assert!(
+                out[0x74 + 0x268 + 0x234..ENCRYPTED_DATA_OFFSET as usize]
+                    .iter()
+                    .all(|&b| b == 0)
+            );
+
+            // A second recipient, added with the first's private key.
+            let other = RecoveryKey::from_der(OTHER).unwrap();
+            let mut cur = Cursor::new(out);
+            add_recipient(
+                &mut cur,
+                Credential::RecoveryKey(&key),
+                &other.recipient(),
+                &mut test_rng(4),
+            )
+            .unwrap();
+            let out = cur.into_inner();
+            assert_eq!(decrypt_with_key(&out, &other).unwrap(), payload);
+            assert_eq!(decrypt_with_key(&out, &key).unwrap(), payload);
+            assert_eq!(decrypt(&out, "pw").unwrap(), payload);
+        }
     }
 }

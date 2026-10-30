@@ -370,20 +370,33 @@ a passphrase-protected AES-128 or AES-256 `encrcdsa` v2 container that
 `hdiutil attach` opens, inspect an image's key records without a
 passphrase, change a passphrase in place (`hdiutil chpass`: only the key
 record is rewritten, the payload is not re-encrypted), and remove a key
-record. The API lives in `fstool::block::dmg::encrypted`
-(`create_encrypted_image`, `inspect_encrypted_image`, `change_passphrase`,
-`remove_key_record`); it takes passphrases, content keys and the
-randomness source as explicit arguments — no prompts, no keychain — and
-writes to a caller-owned `Write + Seek`. There is no CLI for it yet.
+record or add another passphrase (`hdiutil` opens images with several).
+The `dmg-encrypted-recovery` feature (also in `containers`) adds
+certificate recovery: an image can be created for — or given later — a
+recipient certificate, as `hdiutil create -certificate` does, and opened
+with that certificate's RSA private key alone, as `hdiutil attach
+-recover` does. The API lives in `fstool::block::dmg::encrypted`
+(`create_encrypted_image[_with]`, `inspect_encrypted_image`,
+`change_passphrase`, `add_passphrase`, `add_recipient`,
+`remove_key_record[_with]`, `EncryptedDmgBackend::open_with_recovery_key`);
+it takes passphrases, certificates, private keys (DER/PEM), content keys
+and the randomness source as explicit arguments — no prompts, no
+keychain — and writes to a caller-owned `Write + Seek`. There is no CLI
+for it yet.
 
 ```rust
 use fstool::block::dmg::encrypted::*;
 
+let cert = RecipientKey::from_certificate_der(&std::fs::read("recovery.cer")?)?;
 let keys = ContentKeys::generate(ContentCipher::Aes256, &mut OsRandom);
-create_encrypted_image(&mut out_file, &mut payload_file, payload_len,
-                       "passphrase", &keys, &CreateOptions::default(), &mut OsRandom)?;
+create_encrypted_image_with(&mut out_file, &mut payload_file, payload_len,
+                            &[Protector::Recipient(&cert), Protector::Passphrase("passphrase")],
+                            &keys, &CreateOptions::default(), &mut OsRandom)?;
 change_passphrase(&mut out_file, "passphrase", "new passphrase",
                   &RekeyOptions::default(), &mut OsRandom)?;
+// Later, without the passphrase:
+let key = RecoveryKey::from_der(&std::fs::read("recovery-key.der")?)?;
+let image = EncryptedDmgBackend::open_with_recovery_key(path, &key)?;
 ```
 
 Plainly, the format's limits:
@@ -394,17 +407,23 @@ Plainly, the format's limits:
 - **Changing or removing a key record is not secure erasure.** The
   content key never changes (that is what makes rotation cheap), so any
   earlier copy of the image — a backup, a snapshot, a copy-on-write or
-  flash-remapped block — still opens with the old passphrase.
-- KDF parameters read from an image are bounded (at most 10 000 000
-  PBKDF2 rounds per record, 8 passphrase records) so a hostile image
-  cannot pin the CPU, and key material is wiped on drop and kept out of
-  `Debug` output and errors.
-- Certificate / public-key recovery records are listed by inspection and
-  preserved byte-for-byte, but cannot be created or used yet.
+  flash-remapped block — still opens with the old passphrase (or
+  recovery key).
+- Work requested by an image is bounded (at most 10 000 000 PBKDF2
+  rounds per record, 8 passphrase records, 8 RSA attempts per recovery
+  key, 1024–4096-bit RSA keys, 64 key records of at most 64 KiB) so a
+  hostile image cannot pin the CPU, and key material — private keys
+  included — is wiped on drop and kept out of `Debug` output and errors.
+- A wrong passphrase or key, or a damaged record, fails before an
+  in-place edit writes anything.
 
 Cross-validated against `hdiutil`: images fstool creates (wrapping raw
 HFS+ and zlib UDIF payloads) attach with `hdiutil attach -stdinpass`, and
-passphrases rotated by either tool open in the other.
+passphrases rotated by either tool open in the other; fstool-made
+certificate images (and certificates fstool adds to `hdiutil` images)
+recover with `hdiutil attach -recover`, `hdiutil create -certificate`
+images open in fstool with the private key, and every passphrase of a
+multi-passphrase image attaches.
 
 ## TOML spec
 
@@ -762,7 +781,7 @@ none of the other 130 000 lines.
 | `tar` | tar (streaming reader / writer, tar-as-filesystem) | |
 | `archive` | zip / cpio / ar, plus the per-format readers | pulls `charcode`; `cab`, `lha`, `arc`, `sit`, `sevenz`, `rar`, `amiga-lzx` each imply it. On its own zip handles Stored members (and PKWARE-encrypted ones, and split sets); each compression method is a codec feature (`gzip` for Deflate, then `deflate64`, `bzip2`, `lzma`, `xz`, `zstd`, `zip-legacy`) and WinZip AES is `zip-aes` (pulls `purecrypto`), so `--features archive,gzip` is the slim everyday zip build |
 | `ramfs` | the in-memory scratch filesystem `repack` / `merge` / FUSE build on | |
-| `qcow2`, `dmg`, `diskcopy` | disk-image containers | `qcow2-crypto` implies `qcow2`; `dmg-encrypted` / `dmg-bzip2` / `dmg-lzfse` / `dmg-write` imply `dmg`; `dmg-write-zlib` / `-bzip2` / `-lzma` / `-lzfse` add one write codec each to `dmg-write` (`-lzfse` is a reserved hook for now); `dmg-encrypted-write` implies `dmg-encrypted` |
+| `qcow2`, `dmg`, `diskcopy` | disk-image containers | `qcow2-crypto` implies `qcow2`; `dmg-encrypted` / `dmg-bzip2` / `dmg-lzfse` / `dmg-write` imply `dmg`; `dmg-write-zlib` / `-bzip2` / `-lzma` / `-lzfse` add one write codec each to `dmg-write` (`-lzfse` is a reserved hook for now); `dmg-encrypted-write` and `dmg-encrypted-recovery` imply `dmg-encrypted` |
 | `sparse-image` | Apple `.sparseimage` / `.sparsebundle` | |
 | `luks` | LUKS1 / LUKS2 | pulls `purecrypto`; implies `json` (LUKS2 metadata is JSON) |
 
@@ -1215,6 +1234,7 @@ Crypto is feature-gated the same way, all served by `purecrypto`:
 | `qcow2-crypto` | qcow2 encryption, both `crypt_method` values (implies `luks`) |
 | `dmg-encrypted` | Password-protected DMG (`encrcdsa` v2), read-only |
 | `dmg-encrypted-write` | Create `encrcdsa` v2 images, inspect key records, change / remove passphrases (library API; implies `dmg-encrypted`) |
+| `dmg-encrypted-recovery` | Certificate / public-key recovery records for `encrcdsa` images: open with an RSA private key, add recipient certificates (library API; implies `dmg-encrypted`) |
 
 A build without them refuses encrypted containers rather than silently
 handing back ciphertext.

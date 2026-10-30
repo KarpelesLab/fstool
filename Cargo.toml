@@ -255,7 +255,7 @@ ramfs = ["std"]
 # Disk-image containers — the `BlockDevice` layers between a host file
 # and the filesystem inside it. All `std`.
 # ---------------------------------------------------------------------
-containers = ["qcow2", "dmg", "dmg-write", "diskcopy", "dmg-encrypted", "dmg-encrypted-write", "luks", "qcow2-crypto", "sparse-image"]
+containers = ["qcow2", "dmg", "dmg-write", "diskcopy", "dmg-encrypted", "dmg-encrypted-write", "dmg-encrypted-recovery", "luks", "qcow2-crypto", "sparse-image"]
 # qcow2 (with backing files; encryption via `qcow2-crypto`).
 qcow2 = ["std"]
 # Apple UDIF `.dmg` (read-only; zero / raw / zlib / ADC always, the other
@@ -395,6 +395,13 @@ dmg-encrypted = ["dmg", "dep:purecrypto"]
 # key record — library API only. Same `purecrypto` dependency, plus its
 # OS randomness source.
 dmg-encrypted-write = ["dmg-encrypted"]
+# Certificate / public-key recovery records for `encrcdsa` images: open
+# one with the RSA private key of its recovery certificate (`hdiutil
+# attach -recover`), decode those records in `inspect_encrypted_image`,
+# and — with `dmg-encrypted-write` — create images for, or add, recipient
+# certificates. Pulls `purecrypto`'s RSA, bignum and DER modules, which
+# the passphrase-only features don't need.
+dmg-encrypted-recovery = ["dmg-encrypted", "purecrypto/rsa", "purecrypto/der"]
 # LUKS1 / LUKS2 containers: unlock an existing volume with a passphrase,
 # read and write it in place, and format a fresh one. Served by
 # `purecrypto` (AES/Camellia/ARIA/SM4 in XTS/CBC/CTR/ECB, PBKDF2,
@@ -471,9 +478,10 @@ rustyline = { version = "15", optional = true }
 # encryption — `purecrypto`, a pure-Rust no_std toolkit (KarpelesLab,
 # MIT). Opt-in via the `dmg-encrypted` / `luks` / `qcow2-crypto`
 # features; we pull only the symmetric/hash/kdf/rng modules (`kdf`
-# re-enables `hash` + `cipher`), not its TLS/PQC/RSA surface.
+# re-enables `hash` + `cipher`), not its TLS/PQC surface; RSA + DER come
+# in only with `dmg-encrypted-recovery`.
 # LUKS formatting draws its salts and master key from `rng` (OsRng).
-purecrypto = { version = "0.6.29", optional = true, default-features = false, features = ["std", "cipher", "hash", "kdf", "rng"] }
+purecrypto = { version = "0.10.3", optional = true, default-features = false, features = ["std", "cipher", "hash", "kdf", "rng"] }
 
 # FUSE adapter — Linux uses libfuse, macOS uses macFUSE. Off by default
 # (see the `fuse` feature). `fuser` is the maintained successor to

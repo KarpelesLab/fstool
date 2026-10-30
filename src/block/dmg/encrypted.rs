@@ -10,10 +10,18 @@
 //!   the keyblob (AES-192 on images `hdiutil` makes today, 3DES-EDE3 on
 //!   older ones) → per-chunk AES-CBC decryption with chunk-indexed
 //!   HMAC-SHA1 IVs.
-//! - Creation, inspection, passphrase rotation and key-record removal
-//!   (`dmg-encrypted-write` feature): see `create_encrypted_image`,
-//!   `inspect_encrypted_image`, `change_passphrase` and
-//!   `remove_key_record`.
+//! - Creation, inspection, passphrase rotation, adding a passphrase and
+//!   key-record removal (`dmg-encrypted-write` feature): see
+//!   `create_encrypted_image[_with]`, `inspect_encrypted_image`,
+//!   `change_passphrase`, `add_passphrase` and `remove_key_record[_with]`.
+//! - Certificate / public-key recovery records (`dmg-encrypted-recovery`
+//!   feature): [`PublicKeyRecord`] decodes them without it; with it,
+//!   `EncryptedDmgBackend::open_with_recovery_key` opens an image with the
+//!   RSA private key of its recovery certificate (`hdiutil attach
+//!   -recover`), and — together with `dmg-encrypted-write` — images can be
+//!   created for recipient certificates and `add_recipient` adds one to an
+//!   existing image. Keys and certificates are caller-supplied DER/PEM;
+//!   nothing reads a keychain or prompts.
 //!
 //! ## Security properties (read this before relying on it)
 //!
@@ -38,12 +46,25 @@
 //!   record, and anyone holding it plus the old passphrase recovers the
 //!   content key — which is never changed, since the payload is not
 //!   re-encrypted.
-//! - **Untrusted KDF parameters are bounded.** A record asking for more
+//! - **A recovery-certificate record is as strong as its RSA key**, and
+//!   anyone holding that private key opens the image without the
+//!   passphrase. The record is PKCS#1 v1.5 encryption (the format's
+//!   choice); this crate decrypts it with implicit rejection, so a forged
+//!   record yields no padding oracle, and accepts the result only when the
+//!   keyblob trailer checks out.
+//! - **Untrusted parameters are bounded.** A record asking for more
 //!   than [`MAX_PBKDF2_ITERATIONS`] PBKDF2 rounds is refused before any
 //!   work is done, as is a header with more than
-//!   [`MAX_PASSPHRASE_RECORDS`] passphrase records.
-//! - Key material is held in buffers that are zeroed on drop and kept out
-//!   of `Debug` output and error messages.
+//!   [`MAX_PASSPHRASE_RECORDS`] passphrase records or more than 64 key
+//!   entries, a record over 64 KiB, or a public-key record whose blob
+//!   overruns it. A recovery key is tried only against records naming its
+//!   key id, at most [`MAX_PUBLIC_KEY_RECORDS`] of them, and RSA keys are
+//!   limited to 1024–4096 bits.
+//! - Key material — content keys, KEKs, unwrapped keyblobs, RSA private
+//!   keys — is held in buffers that are zeroed on drop and kept out of
+//!   `Debug` output and error messages, as are passphrases.
+//! - A wrong passphrase or key, or a damaged record, fails before any
+//!   in-place editor writes a byte.
 //!
 //! ## Format recap (v2)
 //!
@@ -107,14 +128,23 @@
 //! [`KEYBLOB_TRAILER`]). The chunk
 //! IV is the first 16 bytes of `HMAC-SHA1(hmac_key, chunk_index_as_u32_be)`.
 //!
+//! Type 2 is a public-key (recovery certificate) record: the same keyblob
+//! plaintext, RSAES-PKCS1-v1_5-encrypted to the certificate's RSA key and
+//! tagged with that key's SHA-1 id — layout under [`PublicKeyRecord`].
+//! `hdiutil create -certificate` lists it first, before the passphrase
+//! record.
+//!
 //! `data_size` is the exact plaintext length and need not be a multiple
 //! of anything: the last chunk is stored padded to a whole chunk on disk
 //! (`hdiutil` does this for compressed UDIF payloads), and the reader
 //! decrypts the whole cipher blocks covering it, then truncates.
 //!
 //! The layout above was verified against images produced by
-//! `hdiutil create -encryption AES-128` on current macOS; one such image
-//! is checked in under `testdata/` and read by the unit tests.
+//! `hdiutil create -encryption AES-128` / `AES-256` (with and without
+//! `-certificate`, 2048- and 4096-bit keys, certificates with and without
+//! a Subject Key Identifier) on current macOS; one passphrase image and
+//! one certificate image are checked in under `testdata/` and read by the
+//! unit tests, with the certificate's test key.
 //!
 //! References (public reverse-engineering write-ups):
 //!
@@ -137,15 +167,23 @@ use crate::Result;
 #[cfg(feature = "dmg-encrypted")]
 use crate::block::BlockDevice;
 
+#[cfg(feature = "dmg-encrypted-recovery")]
+mod recovery;
 #[cfg(feature = "dmg-encrypted-write")]
 mod write;
+#[cfg(feature = "dmg-encrypted-recovery")]
+pub use recovery::{MAX_RECOVERY_KEY_BITS, MIN_RECOVERY_KEY_BITS, RecipientKey, RecoveryKey};
+#[cfg(all(feature = "dmg-encrypted-write", feature = "dmg-encrypted-recovery"))]
+pub use write::add_recipient;
 #[cfg(feature = "dmg-encrypted-write")]
 pub use write::{
     ContentCipher, ContentKeys, CreateOptions, CreatedImage, DEFAULT_CHUNK_SIZE,
     DEFAULT_PBKDF2_ITERATIONS, ENCRYPTED_DATA_OFFSET, EncryptedImageInfo, KeyRecordInfo,
-    KeyRecordKind, OsRandom, PassphraseRecordInfo, RandomSource, RekeyOptions, change_passphrase,
-    create_encrypted_image, create_encrypted_image_from_device, inspect_encrypted_image,
-    remove_key_record,
+    KeyRecordKind, MAX_PROTECTORS, OsRandom, PassphraseRecordInfo, Protector, PublicKeyRecordInfo,
+    RandomSource, RekeyOptions, add_passphrase, change_passphrase, create_encrypted_image,
+    create_encrypted_image_from_device, create_encrypted_image_from_device_with,
+    create_encrypted_image_with, inspect_encrypted_image, remove_key_record,
+    remove_key_record_with,
 };
 
 /// Eight-byte v2 magic at file offset 0.
@@ -193,10 +231,30 @@ pub mod algid {
     pub const TDES_3KEY_EDE: u32 = 17;
     /// `CSSM_ALGID_PKCS5_PBKDF2`.
     pub const PKCS5_PBKDF2: u32 = 0x67;
+    /// `CSSM_ALGID_RSA` — the wrap algorithm of public-key records.
+    pub const RSA: u32 = 42;
 }
 
 /// Key-entry type for a passphrase-protected keyblob.
 pub const KEY_ENTRY_PASSPHRASE: u32 = 1;
+
+/// Key-entry type for a public-key (certificate) recovery record: the
+/// keyblob RSA-encrypted to a recipient's public key — what
+/// `hdiutil create -certificate` adds. See [`PublicKeyRecord`].
+pub const KEY_ENTRY_PUBLIC_KEY: u32 = 2;
+
+/// CSSM padding id `CSSM_PADDING_PKCS1` (RSAES-PKCS1-v1_5), the only
+/// keyblob padding seen in public-key records.
+pub const PUBLIC_KEY_PADDING_PKCS1: u32 = 10;
+
+/// Fixed part of a public-key record, up to and including
+/// `wrapped_keyblob_size`.
+pub(crate) const PUBLIC_KEY_RECORD_FIXED_BYTES: usize = 0x34;
+
+/// Most public-key records an unlock with a recovery key will attempt to
+/// decrypt (only records naming that key's id are attempted at all). Each
+/// attempt is one RSA private-key operation; real images carry one.
+pub const MAX_PUBLIC_KEY_RECORDS: usize = 8;
 
 /// Cheap detector — peeks at the first 8 bytes of `path` and returns
 /// `Ok(true)` when they match [`ENCRCDSA_MAGIC`]. Any I/O failure or
@@ -217,7 +275,8 @@ pub fn probe(path: &Path) -> Result<bool> {
 /// One row of the key-entry table at offset 0x4C.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyEntry {
-    /// Entry type; [`KEY_ENTRY_PASSPHRASE`] is the only one we unwrap.
+    /// Entry type: [`KEY_ENTRY_PASSPHRASE`] or [`KEY_ENTRY_PUBLIC_KEY`] in
+    /// the images seen.
     pub kind: u32,
     /// Absolute file offset of the record.
     pub offset: u64,
@@ -346,6 +405,92 @@ impl PassphraseKey {
     }
 }
 
+/// A decoded public-key (type 2, [`KEY_ENTRY_PUBLIC_KEY`]) recovery
+/// record: the image's keyblob encrypted to one recipient's RSA public key.
+///
+/// Layout, as `hdiutil create -certificate` writes it (a 0x234-byte
+/// record: the fixed part plus a 512-byte blob buffer, room for a 4096-bit
+/// modulus):
+///
+/// ```text
+///   0x00  u32 BE   key_id_size (20)
+///   0x04  32 bytes key_id buffer (first key_id_size bytes are live):
+///                  SHA-1 of the recipient's DER `RSAPublicKey` (PKCS#1)
+///                  — the "public key hash" `hdiutil -pubkey` takes and
+///                  the keychain's label for the key
+///   0x24  u32 BE   wrap_algorithm (42 = CSSM_ALGID_RSA)
+///   0x28  u32 BE   wrap_padding (10 = CSSM_PADDING_PKCS1)
+///   0x2C  u32 BE   wrap_mode (0 in every image seen)
+///   0x30  u32 BE   wrapped_keyblob_size (the modulus length in bytes)
+///   0x34  ...      wrapped_keyblob: RSAES-PKCS1-v1_5 encryption of the
+///                  same plaintext a passphrase record wraps,
+///                  `aes_key || hmac_key || "CKIE" 0x00`
+/// ```
+///
+/// Decoding needs no key and no crypto feature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PublicKeyRecord {
+    /// Number of live bytes in `key_id`.
+    pub key_id_size: u32,
+    /// Recipient key-id buffer (32 bytes on disk; first `key_id_size` are
+    /// live): SHA-1 of the recipient's PKCS#1 `RSAPublicKey` DER.
+    pub key_id: [u8; 32],
+    /// Wrap algorithm; [`algid::RSA`] in every image seen.
+    pub wrap_algorithm: u32,
+    /// Wrap padding; [`PUBLIC_KEY_PADDING_PKCS1`] in every image seen.
+    pub wrap_padding: u32,
+    /// CSSM mode field; 0 in every image seen. Informational.
+    pub wrap_mode: u32,
+    /// The RSA ciphertext, exactly `wrapped_keyblob_size` bytes long.
+    pub wrapped_keyblob: Vec<u8>,
+}
+
+impl PublicKeyRecord {
+    /// Decode a public-key record from `rec`, which starts at the record's
+    /// first byte and spans its declared size.
+    pub fn decode(rec: &[u8]) -> Result<Self> {
+        if rec.len() < PUBLIC_KEY_RECORD_FIXED_BYTES {
+            return Err(crate::Error::InvalidImage(format!(
+                "encrcdsa: public-key record is {} bytes, need >= {PUBLIC_KEY_RECORD_FIXED_BYTES}",
+                rec.len()
+            )));
+        }
+        let key_id_size = u32_be(rec, 0x00);
+        if key_id_size > 32 {
+            return Err(crate::Error::InvalidImage(format!(
+                "encrcdsa: public-key record key id size {key_id_size} exceeds its 32-byte buffer"
+            )));
+        }
+        let mut key_id = [0u8; 32];
+        key_id.copy_from_slice(&rec[0x04..0x24]);
+        let wrapped_size = u32_be(rec, 0x30);
+        let end = PUBLIC_KEY_RECORD_FIXED_BYTES
+            .checked_add(wrapped_size as usize)
+            .filter(|&end| end <= rec.len())
+            .ok_or_else(|| {
+                crate::Error::InvalidImage(format!(
+                    "encrcdsa: wrapped keyblob ({wrapped_size} bytes) overruns its {}-byte \
+                     public-key record",
+                    rec.len()
+                ))
+            })?;
+        Ok(Self {
+            key_id_size,
+            key_id,
+            wrap_algorithm: u32_be(rec, 0x24),
+            wrap_padding: u32_be(rec, 0x28),
+            wrap_mode: u32_be(rec, 0x2C),
+            wrapped_keyblob: rec[PUBLIC_KEY_RECORD_FIXED_BYTES..end].to_vec(),
+        })
+    }
+
+    /// The live key-id bytes.
+    pub fn key_id(&self) -> &[u8] {
+        &self.key_id[..self.key_id_size as usize]
+    }
+}
+
 /// Decoded header for an `encrcdsa` v2 image: the fixed prefix, the
 /// key-entry table, and every passphrase record the table points at.
 #[derive(Debug, Clone)]
@@ -377,7 +522,8 @@ pub struct EncryptedDmgHeader {
     /// The key-entry table, in on-disk order.
     pub key_entries: Vec<KeyEntry>,
     /// Decoded passphrase records, in table order. Entries of other
-    /// types (certificates) are listed in `key_entries` but not decoded.
+    /// types are listed in `key_entries` only; decode certificate records
+    /// with [`PublicKeyRecord::decode`].
     pub passphrase_keys: Vec<PassphraseKey>,
 }
 
@@ -560,18 +706,54 @@ pub fn read_header(file: &mut File) -> Result<EncryptedDmgHeader> {
 /// at most the capped key-entry table plus the capped records it points
 /// at.
 pub fn read_header_from<R: Read + Seek + ?Sized>(file: &mut R) -> Result<EncryptedDmgHeader> {
+    Ok(read_header_buf(file)?.0)
+}
+
+/// [`read_header_from`], also returning the raw bytes it decoded (from
+/// offset 0 through the farthest key record), so records the header does
+/// not decode — public-key ones — can be read without another trip to the
+/// file.
+pub(crate) fn read_header_buf<R: Read + Seek + ?Sized>(
+    file: &mut R,
+) -> Result<(EncryptedDmgHeader, Vec<u8>)> {
     // Two passes: the prefix and (capped) table tell us how far the key
     // records reach, then everything up to there is read and decoded.
     let table_max = ENCRCDSA_V2_HEADER_MIN_BYTES + MAX_KEY_ENTRIES as usize * KEY_ENTRY_BYTES;
     let head = read_prefix(file, table_max)?;
     let prefix = EncryptedDmgHeader::decode_prefix(&head)?;
     let need = prefix.required_len()?;
-    let buf = if need <= head.len() {
+    let mut buf = if need <= head.len() {
         head
     } else {
         read_prefix(file, need)?
     };
-    EncryptedDmgHeader::decode(&buf)
+    let h = EncryptedDmgHeader::decode(&buf)?;
+    // `decode` proved the buffer reaches `need`.
+    buf.truncate(need);
+    Ok((h, buf))
+}
+
+/// The bytes of key record `index`, out of a buffer from
+/// [`read_header_buf`] (which bounds-checked every record against it).
+#[cfg(any(feature = "dmg-encrypted-write", feature = "dmg-encrypted-recovery"))]
+pub(crate) fn record_bytes<'a>(h: &EncryptedDmgHeader, buf: &'a [u8], index: usize) -> &'a [u8] {
+    let e = &h.key_entries[index];
+    &buf[e.offset as usize..(e.offset + e.size) as usize]
+}
+
+/// Every public-key record in the table, decoded, with its key-table
+/// index.
+#[cfg(feature = "dmg-encrypted-recovery")]
+pub(crate) fn public_key_records(
+    h: &EncryptedDmgHeader,
+    buf: &[u8],
+) -> Vec<(usize, Result<PublicKeyRecord>)> {
+    h.key_entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.kind == KEY_ENTRY_PUBLIC_KEY)
+        .map(|(i, _)| (i, PublicKeyRecord::decode(record_bytes(h, buf, i))))
+        .collect()
 }
 
 /// Read-only backend for password-protected DMGs (`encrcdsa` v2). Open
@@ -609,13 +791,30 @@ impl EncryptedDmgBackend {
     /// valid PKCS#7 padding — that's how CBC fails when the KEK is
     /// wrong, so the error variant doubles as a "wrong password" signal.
     pub fn open_with_password(path: &Path, password: &str) -> Result<Self> {
+        Self::open_with_credential(path, Credential::Passphrase(password))
+    }
+
+    /// Open `path`, unlocking it with the private half of a recipient
+    /// certificate — `hdiutil attach -recover`, with the key supplied by
+    /// the caller instead of a keychain.
+    ///
+    /// Only public-key records naming `key`'s id are attempted (at most
+    /// [`MAX_PUBLIC_KEY_RECORDS`]). Fails with
+    /// [`crate::Error::Unsupported`] when none unlocks.
+    #[cfg(feature = "dmg-encrypted-recovery")]
+    pub fn open_with_recovery_key(path: &Path, key: &RecoveryKey) -> Result<Self> {
+        Self::open_with_credential(path, Credential::RecoveryKey(key))
+    }
+
+    /// Open `path` with any [`Credential`].
+    pub fn open_with_credential(path: &Path, credential: Credential<'_>) -> Result<Self> {
         let mut file = File::open(path)?;
-        let header = read_header(&mut file)?;
+        let (header, buf) = read_header_buf(&mut file)?;
 
         let file_len = file.metadata()?.len();
         validate_for_decryption(&header, file_len)?;
         let aes_key_len = header.aes_key_len()?;
-        let (_, keyblob_plain) = unlock_keyblob(&header, password, None, false)?;
+        let (_, keyblob_plain) = unlock_with(&header, &buf, credential, None, false)?;
 
         // The plaintext is `aes_key || hmac_sha1_key`, sometimes followed by
         // a few trailing bytes we don't need.
@@ -800,6 +999,55 @@ pub(crate) fn validate_for_decryption(header: &EncryptedDmgHeader, file_len: u64
 /// destroy the image, so the in-place editors require the trailer.
 pub const KEYBLOB_TRAILER: &[u8; 5] = b"CKIE\0";
 
+/// Something that unlocks an `encrcdsa` image's key records.
+///
+/// `Debug` never shows the passphrase or the private key.
+#[cfg(feature = "dmg-encrypted")]
+#[derive(Clone, Copy)]
+#[non_exhaustive]
+pub enum Credential<'a> {
+    /// A passphrase, tried against every passphrase (type 1) record.
+    Passphrase(&'a str),
+    /// The private key of a recovery certificate, tried against the
+    /// public-key (type 2) records that name its key id.
+    #[cfg(feature = "dmg-encrypted-recovery")]
+    RecoveryKey(&'a RecoveryKey),
+}
+
+#[cfg(feature = "dmg-encrypted")]
+impl std::fmt::Debug for Credential<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Passphrase(_) => f.write_str("Passphrase(<redacted>)"),
+            #[cfg(feature = "dmg-encrypted-recovery")]
+            Self::RecoveryKey(k) => f.debug_tuple("RecoveryKey").field(k).finish(),
+        }
+    }
+}
+
+/// Unlock the image's keyblob with `credential`: [`unlock_keyblob`] for a
+/// passphrase, the public-key records for a recovery key. `buf` is the
+/// header buffer from [`read_header_buf`].
+#[cfg(feature = "dmg-encrypted")]
+pub(crate) fn unlock_with(
+    header: &EncryptedDmgHeader,
+    buf: &[u8],
+    credential: Credential<'_>,
+    skip: Option<usize>,
+    require_trailer: bool,
+) -> Result<(usize, SecretBytes)> {
+    match credential {
+        Credential::Passphrase(p) => {
+            let _ = buf;
+            unlock_keyblob(header, p, skip, require_trailer)
+        }
+        // RSA unwraps always insist on the trailer: it is their only
+        // integrity check (the padding check is implicit-rejection).
+        #[cfg(feature = "dmg-encrypted-recovery")]
+        Credential::RecoveryKey(k) => recovery::unlock_public_key(header, buf, k, skip),
+    }
+}
+
 /// Try `password` against the passphrase records, in table order, and
 /// return the key-entry index of the first that unwraps to a keyblob
 /// long enough for the header's AES key plus the 20-byte HMAC key,
@@ -821,7 +1069,7 @@ pub(crate) fn unlock_keyblob(
     if header.passphrase_keys.is_empty() {
         return Err(crate::Error::Unsupported(format!(
             "encrcdsa: no passphrase key entry among {} key entries \
-             (certificate-only images are not supported)",
+             (a certificate-only image opens with its recovery key)",
             header.key_entries.len()
         )));
     }
