@@ -387,10 +387,19 @@ fn copy_image(src: &Path, dst: &Path) {
     }
 }
 
+/// hdiutil can hold its lock for a moment after `detach` / `compact`
+/// return, so retry a busy image briefly.
 fn allocated_bands(img: &Path) -> u64 {
-    fstool::block::sparse::SparseBackend::open_read_only(img)
-        .unwrap()
-        .allocated_bands()
+    for _ in 0..50 {
+        match fstool::block::sparse::SparseBackend::open_read_only(img) {
+            Ok(dev) => return dev.allocated_bands(),
+            Err(fstool::Error::Io(e)) if e.kind() == std::io::ErrorKind::ResourceBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => panic!("{}: {e}", img.display()),
+        }
+    }
+    panic!("{}: still busy after 10 s", img.display());
 }
 
 /// `fsck_<fs> -n` (`-fn` for HFS+, which otherwise skips a journaled
@@ -509,13 +518,26 @@ fn reclaim_releases_deleted_files_like_hdiutil_compact() {
         fsck_image(&img, "fsck_hfs");
         read_back(&img, d.path(), &keep);
 
-        // hdiutil compact on the twin, for comparison.
-        run(Command::new("hdiutil")
+        // hdiutil compact on the twin, for comparison. Some macOS hosts
+        // refuse it outright ("Function not implemented"), so only compare
+        // when it ran.
+        let out = Command::new("hdiutil")
             .args(["compact", "-quiet"])
-            .arg(&twin));
-        let theirs = allocated_bands(&twin);
-        eprintln!("{name}: {before} bands; fstool reclaim → {after}, hdiutil compact → {theirs}");
-        assert!(after <= theirs, "{name}: fstool {after} > hdiutil {theirs}");
+            .arg(&twin)
+            .output()
+            .expect("spawn");
+        if out.status.success() {
+            let theirs = allocated_bands(&twin);
+            eprintln!(
+                "{name}: {before} bands; fstool reclaim → {after}, hdiutil compact → {theirs}"
+            );
+            assert!(after <= theirs, "{name}: fstool {after} > hdiutil {theirs}");
+        } else {
+            eprintln!(
+                "{name}: hdiutil compact unavailable here ({}); skipping the comparison",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
 
         // Zeroing the free parts of kept bands leaves the volume intact.
         opts.partial = PartialBandPolicy::ZeroFree;

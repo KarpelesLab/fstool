@@ -861,7 +861,16 @@ mod tests {
     }
 
     /// Count 512-byte sectors inside `ranges` filled entirely with `b`.
-    #[cfg(feature = "std")]
+    #[cfg(all(
+        feature = "std",
+        any(
+            feature = "fat",
+            feature = "ext",
+            feature = "hfs-plus",
+            feature = "hfs",
+            feature = "exfat"
+        )
+    ))]
     fn sectors_of(dev: &mut dyn BlockDevice, ranges: &[Range<u64>], b: u8) -> u64 {
         let mut n = 0;
         for r in ranges {
@@ -880,7 +889,16 @@ mod tests {
     /// Format, add a file to keep and one to delete, delete it, flush:
     /// the deleted file's bytes must (almost all) be in free ranges, the
     /// kept one's never.
-    #[cfg(feature = "std")]
+    #[cfg(all(
+        feature = "std",
+        any(
+            feature = "fat",
+            feature = "ext",
+            feature = "hfs-plus",
+            feature = "hfs",
+            feature = "exfat"
+        )
+    ))]
     fn keep_and_delete(dev: &mut dyn BlockDevice, want_fs: &str) {
         use crate::inspect::AnyFs;
         let d = tempfile::tempdir().unwrap();
