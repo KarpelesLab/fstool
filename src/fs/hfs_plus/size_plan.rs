@@ -52,6 +52,11 @@
 //! them up front and nothing has to be carved out of free space later;
 //! [`total_size`](crate::fs::FsSizePlan::total_size) then covers metadata
 //! *and* data. Names count at their HFS+-normalised length.
+//!
+//! Generic sizing (`fstool create` / `repack` onto HFS+) drives the same
+//! accounting through [`FsSizePlan::add_entry_xattr`](crate::fs::FsSizePlan::add_entry_xattr):
+//! every source xattr — a resource fork arrives as `com.apple.ResourceFork`
+//! — is charged exactly as [`HfsPlusSizePlan::add_xattr`] charges it.
 
 use super::writer::{DEFAULT_JOURNAL_BUFFER_BLOCKS, FormatOpts, attr_node_size_for};
 
@@ -299,6 +304,12 @@ impl crate::fs::FsSizePlan for HfsPlusSizePlan {
         let name = path.rsplit('/').next().unwrap_or("");
         self.add_catalog_entry(Self::name_units(name), FILE_BODY);
     }
+    /// Generic repack / `create` sizing reaches [`Self::add_xattr`] through
+    /// this hook, so resource forks and attributes-B-tree records of the
+    /// source tree are budgeted without HFS+-specific calls.
+    fn add_entry_xattr(&mut self, _path: &str, name: &str, len: u64) {
+        self.add_xattr(name, len);
+    }
 
     fn total_size(&self) -> u64 {
         let cat_nodes = self.catalog_nodes().max(self.catalog_nodes_min);
@@ -376,6 +387,21 @@ mod tests {
             p.add_file(&format!("/file_{i:05}.txt"), 0);
         }
         assert!(p.catalog_nodes() > base);
+    }
+
+    #[test]
+    fn generic_hook_charges_xattrs_and_forks() {
+        let opts = FormatOpts::default();
+        let mut p: Box<dyn FsSizePlan> = Box::new(HfsPlusSizePlan::new(&opts));
+        p.add_file("/a", 10);
+        let base = p.total_size();
+        p.add_entry_xattr("/a", "com.apple.FinderInfo", 32);
+        assert_eq!(p.total_size(), base);
+        p.add_entry_xattr("/a", "com.apple.ResourceFork", 40_000);
+        assert!(p.total_size() >= base + 40_000);
+        let before = p.total_size();
+        p.add_entry_xattr("/a", "user.big", 200_000);
+        assert!(p.total_size() >= before + 200_000);
     }
 
     #[test]

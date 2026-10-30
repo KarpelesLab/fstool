@@ -215,9 +215,9 @@ f2fs = ["std"]
 apfs = ["std", "dep:intl"]
 # Classic HFS (Mac OS ≤ 8) — also the resource-fork + MacRoman helpers.
 hfs = ["std"]
-# HFS+ / HFSX. `intl` supplies the canonical decomposition behind the
-# HFS+ name normalisation (Unicode NFD with Apple's exclusions).
-hfs-plus = ["std", "dep:intl"]
+# HFS+ / HFSX. Name normalisation uses the kernel's own Unicode 3.2 tables
+# (src/fs/hfs_plus/unicode_tables.rs), so no Unicode dependency.
+hfs-plus = ["std"]
 # Amiga OFS / FFS.
 affs = ["std"]
 # ISO 9660 (+ Joliet, Rock Ridge, El Torito).

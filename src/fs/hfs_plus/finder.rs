@@ -258,9 +258,227 @@ impl From<FinderInfo> for [u8; 32] {
     }
 }
 
+/// The 32-byte `finderInfo` of the volume header (TN1150, "Volume
+/// Header"): eight big-endian words the Finder and the boot loader use.
+///
+/// | word | meaning (as `bless --info` reports it) |
+/// |------|----------------------------------------|
+/// | 0    | blessed system folder CNID |
+/// | 1    | blessed startup file / application CNID |
+/// | 2    | first folder to open when the volume is mounted (`bless --openfolder`) |
+/// | 3    | Mac OS 8/9 system folder CNID (alternate blessed) |
+/// | 4    | reserved |
+/// | 5    | Mac OS X system folder CNID |
+/// | 6‥7  | 64-bit volume identifier, from which macOS derives the volume UUID |
+///
+/// Read and replace it with [`super::HfsPlus::volume_finder_info`] /
+/// [`super::HfsPlus::set_volume_finder_info`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct VolumeFinderInfo {
+    bytes: [u8; 32],
+}
+
+/// `HFS_UUID_NAMESPACE_ID` (xnu `hfs_vfsutils.c`): the MD5 namespace
+/// macOS hashes the 64-bit volume identifier under to get the volume UUID.
+const HFS_UUID_NAMESPACE: [u8; 16] = [
+    0xB3, 0xE2, 0x0F, 0x39, 0xF2, 0x92, 0x11, 0xD6, 0x97, 0xA4, 0x00, 0x30, 0x65, 0x43, 0xEC, 0xAC,
+];
+
+impl VolumeFinderInfo {
+    /// Size of the on-disk structure.
+    pub const SIZE: usize = 32;
+
+    /// Wrap the 32 raw bytes (big-endian words, as on disk).
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self { bytes }
+    }
+
+    /// The raw bytes.
+    pub const fn to_bytes(&self) -> [u8; 32] {
+        self.bytes
+    }
+
+    /// Word `i` (0‥7). Panics when `i > 7`.
+    pub fn word(&self, i: usize) -> u32 {
+        u32::from_be_bytes(self.bytes[4 * i..4 * i + 4].try_into().unwrap())
+    }
+
+    /// Set word `i` (0‥7). Panics when `i > 7`.
+    pub fn set_word(&mut self, i: usize, v: u32) {
+        self.bytes[4 * i..4 * i + 4].copy_from_slice(&v.to_be_bytes());
+    }
+
+    /// Word 0: CNID of the blessed system folder (0 = none).
+    pub fn blessed_folder(&self) -> u32 {
+        self.word(0)
+    }
+
+    /// Set the blessed system folder CNID (e.g. from
+    /// [`super::HfsPlus::entry_info`]).
+    pub fn set_blessed_folder(&mut self, cnid: u32) {
+        self.set_word(0, cnid)
+    }
+
+    /// Word 1: CNID of the blessed startup file / application.
+    pub fn startup_file(&self) -> u32 {
+        self.word(1)
+    }
+
+    /// Set the blessed startup file CNID.
+    pub fn set_startup_file(&mut self, cnid: u32) {
+        self.set_word(1, cnid)
+    }
+
+    /// Word 2: CNID of the folder the Finder opens a window for when
+    /// the volume mounts (what `bless --openfolder` sets; how a disk
+    /// image opens its window on attach).
+    pub fn open_folder(&self) -> u32 {
+        self.word(2)
+    }
+
+    /// Set the folder to open on mount.
+    pub fn set_open_folder(&mut self, cnid: u32) {
+        self.set_word(2, cnid)
+    }
+
+    /// Word 3: CNID of the Mac OS 8/9 system folder.
+    pub fn mac_os_9_system_folder(&self) -> u32 {
+        self.word(3)
+    }
+
+    /// Set the Mac OS 8/9 system folder CNID.
+    pub fn set_mac_os_9_system_folder(&mut self, cnid: u32) {
+        self.set_word(3, cnid)
+    }
+
+    /// Word 5: CNID of the Mac OS X system folder.
+    pub fn mac_os_x_system_folder(&self) -> u32 {
+        self.word(5)
+    }
+
+    /// Set the Mac OS X system folder CNID.
+    pub fn set_mac_os_x_system_folder(&mut self, cnid: u32) {
+        self.set_word(5, cnid)
+    }
+
+    /// Words 6‥7: the 64-bit volume identifier (`bless --info`'s "64-bit
+    /// VSDB volume id"). Zero means "not set".
+    pub fn volume_identifier(&self) -> u64 {
+        u64::from_be_bytes(self.bytes[24..32].try_into().unwrap())
+    }
+
+    /// Set the 64-bit volume identifier. Pick a random value for a
+    /// unique volume, or a fixed one for a reproducible image.
+    pub fn set_volume_identifier(&mut self, id: u64) {
+        self.bytes[24..32].copy_from_slice(&id.to_be_bytes());
+    }
+
+    /// The volume UUID macOS derives from [`volume_identifier`]
+    /// (`diskutil info`'s "Volume UUID"): an MD5 name-based (version 3)
+    /// UUID of the identifier's eight bytes under Apple's HFS namespace,
+    /// as xnu's `hfs_getvoluuid` computes it. `None` when the identifier
+    /// is zero.
+    ///
+    /// [`volume_identifier`]: Self::volume_identifier
+    pub fn volume_uuid(&self) -> Option<[u8; 16]> {
+        if self.volume_identifier() == 0 {
+            return None;
+        }
+        let mut input = [0u8; 24];
+        input[..16].copy_from_slice(&HFS_UUID_NAMESPACE);
+        input[16..].copy_from_slice(&self.bytes[24..32]);
+        let mut u = md5(&input);
+        u[6] = 0x30 | (u[6] & 0x0F);
+        u[8] = 0x80 | (u[8] & 0x3F);
+        Some(u)
+    }
+}
+
+impl From<[u8; 32]> for VolumeFinderInfo {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self::from_bytes(bytes)
+    }
+}
+
+/// MD5 (RFC 1321) of a short message — only used for the volume UUID.
+fn md5(msg: &[u8]) -> [u8; 16] {
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    let k: [u32; 64] =
+        core::array::from_fn(|i| ((i as f64 + 1.0).sin().abs() * 4_294_967_296.0) as u32);
+    let mut data = msg.to_vec();
+    data.push(0x80);
+    while !(data.len() + 8).is_multiple_of(64) {
+        data.push(0);
+    }
+    data.extend_from_slice(&((msg.len() as u64).wrapping_mul(8)).to_le_bytes());
+    let mut h: [u32; 4] = [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476];
+    for chunk in data.as_chunks::<64>().0 {
+        let m: [u32; 16] = core::array::from_fn(|i| {
+            u32::from_le_bytes(chunk[4 * i..4 * i + 4].try_into().unwrap())
+        });
+        let [mut a, mut b, mut c, mut d] = h;
+        for i in 0..64 {
+            let (f, g) = match i / 16 {
+                0 => ((b & c) | (!b & d), i),
+                1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                2 => (b ^ c ^ d, (3 * i + 5) % 16),
+                _ => (c ^ (b | !d), (7 * i) % 16),
+            };
+            let f = f.wrapping_add(a).wrapping_add(k[i]).wrapping_add(m[g]);
+            a = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(f.rotate_left(S[i]));
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+    }
+    let mut out = [0u8; 16];
+    for (i, w) in h.iter().enumerate() {
+        out[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn md5_known_vectors() {
+        let hex = |b: [u8; 16]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        assert_eq!(hex(md5(b"")), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(
+            hex(md5(b"The quick brown fox jumps over the lazy dog")),
+            "9e107d9d372bb6826bd81d3542a419d6"
+        );
+    }
+
+    #[test]
+    fn volume_finder_info_words() {
+        let mut v = VolumeFinderInfo::default();
+        assert_eq!(v.volume_uuid(), None);
+        v.set_blessed_folder(2);
+        v.set_open_folder(17);
+        v.set_volume_identifier(0x0123_4567_89AB_CDEF);
+        let b = v.to_bytes();
+        assert_eq!(&b[0..4], &[0, 0, 0, 2]);
+        assert_eq!(&b[8..12], &[0, 0, 0, 17]);
+        assert_eq!(
+            &b[24..32],
+            &[0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]
+        );
+        let u = v.volume_uuid().unwrap();
+        assert_eq!(u[6] >> 4, 3, "version 3 UUID");
+        assert_eq!(u[8] >> 6, 2, "RFC 4122 variant");
+    }
 
     #[test]
     fn accessors_hit_the_documented_offsets() {

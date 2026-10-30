@@ -7,8 +7,10 @@
 //! * Single contiguous extent for every special file: allocation bitmap,
 //!   extents-overflow, catalog, attributes (empty unless
 //!   reserved via `FormatOpts::attributes_nodes`), startup (empty).
-//! * Plain HFS+ (signature `"H+"`, version 4); HFSX volumes are
-//!   rewritten in place when re-opened.
+//! * Plain HFS+ (signature `"H+"`, version 4), or case-sensitive HFSX
+//!   (`"HX"`, version 5, binary key compare) with
+//!   `FormatOpts::case_sensitive`; existing HFSX volumes are rewritten
+//!   in place when re-opened.
 //! * No iCloud/Spotlight/HFS+ private data directories — these only
 //!   appear on volumes with hard links.
 //!
@@ -113,8 +115,17 @@ pub struct FormatOpts {
     pub catalog_nodes: u32,
     /// UTF-8 volume name. Stored on the root folder's thread record.
     pub volume_name: String,
-    /// Seconds since 1904-01-01 used for createDate / modifyDate.
-    /// HFS+ uses a 1904 epoch; supply `0` to leave dates zeroed.
+    /// Seconds since 1904-01-01 (UTC) stamped as the createDate /
+    /// modifyDate of the volume, the root folder and every entry created
+    /// afterwards (see [`super::hfs_date_from_unix`]).
+    ///
+    /// The default is `0` (1904-01-01) on purpose: it keeps images
+    /// byte-for-byte reproducible, and nothing in a build reads the wall
+    /// clock. Callers that want "now" (a volume dated 1904 looks odd in
+    /// the Finder, and a Finder alias records the volume's creation date)
+    /// set it explicitly — from `SOURCE_DATE_EPOCH` or the system clock.
+    /// Per-entry dates can be changed later with
+    /// [`super::HfsPlus::set_create_date`].
     pub create_date: u32,
     /// Emit a journal stub: reserve a journal-info block + journal
     /// buffer, set the `kHFSVolumeJournaledMask` bit, and lay down a
@@ -130,6 +141,13 @@ pub struct FormatOpts {
     /// (see [`super::size_plan::HfsPlusSizePlan`]). Nodes are
     /// `max(node_size, 4096)` bytes.
     pub attributes_nodes: u32,
+    /// Format HFSX (signature `HX`, version 5) with a case-sensitive
+    /// catalog (`keyCompareType` 0xBC, `kHFSBinaryCompare`): names are
+    /// compared as raw UTF-16 code units after HFS+ normalisation, so
+    /// `README` and `readme` coexist (names that normalise to the same
+    /// form still collide). Default `false`: plain, case-insensitive
+    /// HFS+. Option key `case_sensitive` (alias `hfsx`).
+    pub case_sensitive: bool,
 }
 
 impl Default for FormatOpts {
@@ -147,6 +165,7 @@ impl Default for FormatOpts {
             create_date: 0,
             journaled: false,
             attributes_nodes: 0,
+            case_sensitive: false,
         }
     }
 }
@@ -191,6 +210,12 @@ impl FormatOpts {
         }
         if let Some(n) = map.take_u32("attributes_nodes")? {
             self.attributes_nodes = n;
+        }
+        if let Some(b) = map.take_bool("case_sensitive")? {
+            self.case_sensitive = b;
+        }
+        if let Some(b) = map.take_bool("hfsx")? {
+            self.case_sensitive = b;
         }
         Ok(())
     }
@@ -338,8 +363,8 @@ pub struct Writer {
     pub(crate) catalog: CatalogMap,
     /// Volume key ordering: `false` = plain HFS+ case folding
     /// (`keyCompareType` 0xCF), `true` = HFSX binary compare (0xBC).
-    /// Read off the volume at `open_writable`; `format` only produces
-    /// plain HFS+.
+    /// Read off the volume at `open_writable`; `format` takes it from
+    /// [`FormatOpts::case_sensitive`].
     pub(crate) case_sensitive: bool,
     /// Volume signature is `HX` (HFSX). Independent of
     /// `case_sensitive` — an HFSX volume may still fold case — and it
@@ -392,6 +417,10 @@ pub struct Writer {
     /// re-opened volume keeps its header date — which macOS writes in
     /// *local* time, unlike every catalog date.
     pub(crate) volume_create_date: u32,
+    /// `HFSPlusVolumeHeader.finderInfo` (32 bytes at offset 0x50):
+    /// blessed folders, the folder to open on mount, the 64-bit volume
+    /// identifier. Zero on a fresh volume, read back verbatim on re-open.
+    pub(crate) volume_finder_info: [u8; 32],
 }
 
 /// Key of [`Writer::attrs`]: `(fileID, attribute name as UTF-16, startBlock)`.
@@ -859,6 +888,7 @@ pub(crate) fn encode_volume_header(
     folder_count: u32,
     create_date: u32,
     journal_info_block: u32,
+    finder_info: &[u8; 32],
 ) -> [u8; VolumeHeader::ENCODED_SIZE] {
     let mut b = [0u8; VolumeHeader::ENCODED_SIZE];
     b[0..2].copy_from_slice(&vh.signature);
@@ -900,7 +930,7 @@ pub(crate) fn encode_volume_header(
     b[64..68].copy_from_slice(&vh.next_catalog_id.to_be_bytes());
     b[68..72].copy_from_slice(&0u32.to_be_bytes()); // writeCount
     b[72..80].copy_from_slice(&1u64.to_be_bytes()); // encodingsBitmap (MacRoman bit)
-    // finderInfo[8]: zero.
+    b[0x50..0x70].copy_from_slice(finder_info); // finderInfo[8]
 
     let forks: [(usize, &ForkData); 5] = [
         (0x070, &vh.allocation_file),
@@ -1503,9 +1533,9 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
         bitmap,
         next_alloc: cursor,
         free_blocks,
-        catalog: CatalogMap::new(false),
-        case_sensitive: false,
-        hfsx: false,
+        catalog: CatalogMap::new(opts.case_sensitive),
+        case_sensitive: opts.case_sensitive,
+        hfsx: opts.case_sensitive,
         overflow_extents: BTreeMap::new(),
         allocation_file,
         extents_file,
@@ -1520,6 +1550,7 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
         attrs: BTreeMap::new(),
         attr_node_size,
         volume_create_date: opts.create_date,
+        volume_finder_info: [0; 32],
     };
 
     // Seed the root folder + thread.
@@ -1565,9 +1596,14 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
     }
 
     // Build the in-memory VolumeHeader we'll keep alongside the writer.
+    let (signature, version) = if opts.case_sensitive {
+        (super::volume_header::SIG_HFSX, 5)
+    } else {
+        (SIG_HFS_PLUS, 4)
+    };
     let vh = VolumeHeader {
-        signature: SIG_HFS_PLUS,
-        version: 4,
+        signature,
+        version,
         attributes: VOL_ATTR_UNMOUNTED,
         journal_info_block: writer.journal_info_block,
         block_size: bs,
@@ -3366,6 +3402,7 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
         folder_count,
         writer.volume_create_date,
         jib,
+        &writer.volume_finder_info,
     );
     sink.write_at(VOLUME_HEADER_OFFSET, &buf)?;
 
@@ -3727,6 +3764,9 @@ pub fn open_writable(
     let mut raw_vh = [0u8; 4];
     dev.read_at(VOLUME_HEADER_OFFSET + 16, &mut raw_vh)?;
     let volume_create_date = u32::from_be_bytes(raw_vh);
+    // Likewise the volume Finder info (blessed folders, volume UUID).
+    let mut volume_finder_info = [0u8; 32];
+    dev.read_at(VOLUME_HEADER_OFFSET + 0x50, &mut volume_finder_info)?;
 
     // next_cnid: per TN1150, vh.nextCatalogID always names the next
     // unused CNID. Fall back to 16 (the first user CNID) if the header
@@ -3771,6 +3811,7 @@ pub fn open_writable(
         attrs,
         attr_node_size,
         volume_create_date,
+        volume_finder_info,
     })
 }
 
@@ -3875,7 +3916,7 @@ mod tests {
             attributes_file: ForkData::default(),
             startup_file: ForkData::default(),
         };
-        let buf = encode_volume_header(&vh, 24, 0, 0, 0, 0);
+        let buf = encode_volume_header(&vh, 24, 0, 0, 0, 0, &[0; 32]);
         let decoded = VolumeHeader::decode(&buf).unwrap();
         assert_eq!(decoded.signature, SIG_HFS_PLUS);
         assert_eq!(decoded.version, 4);

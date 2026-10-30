@@ -190,7 +190,7 @@ pub fn creatable_filesystems() -> Vec<FsTypeInfo> {
             min_size: 4 << 20,
             default_size: 64 << 20,
             editable: true,
-            options: "volume_name,journaled",
+            options: "volume_name,journaled,case_sensitive",
         },
         #[cfg(feature = "hfs")]
         FsTypeInfo {

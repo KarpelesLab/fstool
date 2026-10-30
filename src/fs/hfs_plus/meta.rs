@@ -22,6 +22,14 @@
 //!   (3802 bytes with 8 KiB nodes) are stored inline, larger ones in
 //!   their own extents — the same split xnu makes.
 //!
+//! * **Volume Finder info** — the volume header's own 32 bytes
+//!   ([`VolumeFinderInfo`]: blessed / open folder, volume identifier),
+//!   separate from the root folder's Finder info.
+//!
+//! The root (`"/"`) takes every per-entry call: its Finder info, xattrs
+//! and creation date are the root folder record's (CNID 2), and its
+//! creation date is the volume's (see [`HfsPlus::volume_create_date`]).
+//!
 //! Hard links: metadata calls on a hard-link path act on the shared
 //! indirect-node (`iNode<N>`) record, which is where macOS keeps a
 //! linked file's Finder info, xattrs, forks and dates.
@@ -37,7 +45,7 @@ use super::catalog::{
     REC_FILE, REC_FOLDER, REC_FOLDER_THREAD, ROOT_FOLDER_ID, ROOT_PARENT_ID, UniStr, mode,
 };
 use super::extents::FORK_RESOURCE;
-use super::finder::FinderInfo;
+use super::finder::{FinderInfo, VolumeFinderInfo};
 use super::volume_header::{FORK_DATA_SIZE, ForkData};
 use super::writer::{self, OwnedKey, RSRC_FORK_OFF, Writer};
 
@@ -239,10 +247,19 @@ impl HfsPlus {
     }
 
     /// The volume's creation date as macOS reports it to applications
-    /// (`getattrlist` `ATTR_VOL_CRTIME`, which is what a Finder alias
-    /// records): the root folder's `createDate`, in HFS+ seconds (UTC).
+    /// (`getattrlist` `ATTR_VOL_CRTIME`, `NSURLVolumeCreationDateKey`):
+    /// the root folder's `createDate`, in HFS+ seconds (UTC). The volume
+    /// header's own `createDate` plays no part in it.
     /// Set it with [`set_create_date`](Self::set_create_date) on `"/"`,
     /// or up front with [`FormatOpts::create_date`](super::FormatOpts).
+    ///
+    /// A classic Finder alias (`AliasRecord`) identifies its volume by
+    /// name and this date **in local time**: macOS resolves an alias by
+    /// comparing its volume date with this value shifted by the
+    /// resolving machine's UTC offset. An alias written for this volume
+    /// therefore stores `volume_create_date() + offset` for the time zone
+    /// it will be resolved in (verified natively by
+    /// `tests/hfs_plus_authoring_external.rs`).
     pub fn volume_create_date(&self) -> Result<u32> {
         Ok(self.entry_info("/")?.create_date)
     }
@@ -262,6 +279,22 @@ impl HfsPlus {
         if is_root {
             self.meta_writer_mut()?.volume_create_date = date;
         }
+        Ok(())
+    }
+
+    /// The volume header's Finder info: blessed folders, the folder to
+    /// open on mount and the 64-bit volume identifier (the volume UUID).
+    pub fn volume_finder_info(&self) -> Result<VolumeFinderInfo> {
+        Ok(VolumeFinderInfo::from_bytes(
+            self.meta_writer()?.volume_finder_info,
+        ))
+    }
+
+    /// Replace the volume header's Finder info, written at the next
+    /// [`flush`](Self::flush). CNIDs stored here (blessed / open folder)
+    /// are not checked; take them from [`entry_info`](Self::entry_info).
+    pub fn set_volume_finder_info(&mut self, info: &VolumeFinderInfo) -> Result<()> {
+        self.meta_writer_mut()?.volume_finder_info = info.to_bytes();
         Ok(())
     }
 

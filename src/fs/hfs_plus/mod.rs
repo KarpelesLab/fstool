@@ -24,9 +24,13 @@
 //! ([`HfsPlus::write_resource_fork`]), extended attributes in the
 //! attributes B-tree, inline or extent-based ([`HfsPlus::set_xattr`]),
 //! stable CNIDs and creation dates readable before the final flush
-//! ([`HfsPlus::entry_info`], [`HfsPlus::set_create_date`]). Names are
-//! stored in the HFS+ decomposed form ([`unicode`]) and collide under
-//! the catalog comparator. [`size_plan`] budgets all of it.
+//! ([`HfsPlus::entry_info`], [`HfsPlus::set_create_date`]), the volume
+//! header's Finder info ([`HfsPlus::set_volume_finder_info`]: blessed and
+//! open folders, volume UUID). Names are stored in exactly the decomposed
+//! form the macOS kernel produces ([`unicode`]) and collide under the
+//! catalog comparator — case-insensitive on HFS+, binary on HFSX
+//! ([`writer::FormatOpts::case_sensitive`]). [`size_plan`] budgets all of
+//! it.
 //!
 //! Implementation is based on Apple Technical Note TN1150, the
 //! canonical public reference for HFS+ on-disk structures.
@@ -35,7 +39,7 @@
 //!
 //! * No journal replay on read — the on-disk catalog is read as-is.
 //! * HFSX case-sensitive comparison is honoured at the catalog-key
-//!   level; non-ASCII case folding follows a simplified table.
+//!   level, on read and write; HFS+ case folding uses Apple's tables.
 //! * Extended-attribute B-tree (`attributesFile`) is read (xattrs,
 //!   HFSCompression's `com.apple.decmpfs`) and rewritten on flush;
 //!   the writer creates it on demand or at format time
@@ -44,9 +48,8 @@
 //!   for compression types 1, 3, and 4 (uncompressed inline, zlib
 //!   inline, zlib in the resource fork); LZVN (7, 8) and LZFSE
 //!   (11, 12) return [`crate::Error::Unsupported`].
-//! * HFS+ name decomposition uses current Unicode data with Apple's
-//!   exclusions; names with several combining marks unassigned in
-//!   Unicode 3.2 may order differently from the kernel (see [`unicode`]).
+//! * HFS+ name decomposition is a port of the macOS kernel's, on its own
+//!   Unicode 3.2 tables (see [`unicode`]).
 //!
 //! ## Module layout
 //!
@@ -69,10 +72,11 @@ pub(crate) mod journal;
 mod meta;
 pub mod size_plan;
 pub mod unicode;
+mod unicode_tables;
 pub mod volume_header;
 pub mod writer;
 
-pub use finder::FinderInfo;
+pub use finder::{FinderInfo, VolumeFinderInfo};
 pub use meta::{EntryInfo, hfs_date_from_unix, unix_from_hfs_date};
 pub use writer::FormatOpts;
 
@@ -3637,5 +3641,78 @@ mod tests {
             matches!(err, crate::Error::Unsupported(_)),
             "LZVN should surface as Unsupported, got {err:?}"
         );
+    }
+
+    fn touch(hfs: &mut HfsPlus, dev: &mut dyn BlockDevice, path: &str) -> Result<()> {
+        hfs.create_file(dev, path, &mut std::io::empty(), 0, 0o644, 0, 0, 0)
+            .map(|_| ())
+    }
+
+    #[test]
+    fn hfsx_names_compare_binary() {
+        let mut dev = crate::block::MemoryBackend::new(8 * 1024 * 1024);
+        let opts = writer::FormatOpts {
+            case_sensitive: true,
+            ..writer::FormatOpts::default()
+        };
+        let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+        touch(&mut hfs, &mut dev, "/README").unwrap();
+        touch(&mut hfs, &mut dev, "/readme").unwrap();
+        // Normalisation-equivalent spellings are the same name on HFSX too.
+        touch(&mut hfs, &mut dev, "/caf\u{e9}").unwrap();
+        assert!(touch(&mut hfs, &mut dev, "/cafe\u{301}").is_err());
+        hfs.flush(&mut dev).unwrap();
+
+        let mut raw = [0u8; 4];
+        dev.read_at(1024, &mut raw).unwrap();
+        assert_eq!(&raw, b"HX\0\x05");
+        let mut hfs = HfsPlus::open(&mut dev).unwrap();
+        assert!(hfs.catalog.case_sensitive);
+        let mut names: Vec<String> = hfs
+            .list_path(&mut dev, "/")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["README", "cafe\u{301}", "readme"]);
+        // Still binary after a writable re-open.
+        touch(&mut hfs, &mut dev, "/Readme").unwrap();
+        assert!(touch(&mut hfs, &mut dev, "/readme").is_err());
+    }
+
+    #[test]
+    fn hfs_plus_names_fold_case() {
+        let mut dev = crate::block::MemoryBackend::new(8 * 1024 * 1024);
+        let mut hfs = HfsPlus::format(&mut dev, &writer::FormatOpts::default()).unwrap();
+        touch(&mut hfs, &mut dev, "/README").unwrap();
+        assert!(touch(&mut hfs, &mut dev, "/readme").is_err());
+        touch(&mut hfs, &mut dev, "/caf\u{e9}").unwrap();
+        assert!(touch(&mut hfs, &mut dev, "/CAFE\u{301}").is_err());
+    }
+
+    #[test]
+    fn volume_finder_info_survives_flush_and_reopen() {
+        let mut dev = crate::block::MemoryBackend::new(8 * 1024 * 1024);
+        let mut hfs = HfsPlus::format(&mut dev, &writer::FormatOpts::default()).unwrap();
+        hfs.create_dir(&mut dev, "/open", 0o755, 0, 0, 0).unwrap();
+        let cnid = hfs.entry_info("/open").unwrap().cnid;
+        let mut v = hfs.volume_finder_info().unwrap();
+        assert_eq!(v, VolumeFinderInfo::default());
+        v.set_blessed_folder(2);
+        v.set_open_folder(cnid);
+        v.set_volume_identifier(0xFEED_FACE_CAFE_BEEF);
+        hfs.set_volume_finder_info(&v).unwrap();
+        hfs.flush(&mut dev).unwrap();
+        let mut raw = [0u8; 32];
+        dev.read_at(1024 + 0x50, &mut raw).unwrap();
+        assert_eq!(raw, v.to_bytes());
+        let mut hfs = HfsPlus::open(&mut dev).unwrap();
+        assert_eq!(hfs.volume_finder_info().unwrap(), v);
+        // A rewrite keeps it.
+        touch(&mut hfs, &mut dev, "/x").unwrap();
+        hfs.flush(&mut dev).unwrap();
+        dev.read_at(1024 + 0x50, &mut raw).unwrap();
+        assert_eq!(raw, v.to_bytes());
     }
 }

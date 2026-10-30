@@ -9,74 +9,228 @@
 //! * U+F900 – U+FAFF (CJK compatibility ideographs),
 //! * U+2F800 – U+2FAFF (CJK compatibility ideographs supplement).
 //!
-//! The macOS kernel (`utf8_decodestr` with `UTF_DECOMPOSED`) works on
-//! UTF-16 code units, so it never decomposes anything outside the BMP —
-//! which covers the third range and every supplementary character that
-//! later Unicode versions gave a decomposition. Inside the BMP the only
-//! characters that gained a canonical decomposition after Unicode 3.2 and
-//! fall outside the excluded ranges are the Balinese vowel signs
-//! (U+1B00 – U+1B7F, Unicode 5.0), so those are held back too. Hangul
-//! syllables *are* decomposed (algorithmically), and runs of combining
-//! marks are put in canonical order.
+//! What macOS actually stores is whatever the kernel's
+//! `utf8_decodestr(…, UTF_DECOMPOSED)` (xnu `bsd/vfs/vfs_utfconv.c`)
+//! produces, and it normalises every name it is handed — on create *and*
+//! on lookup — so a name stored in any other form lists fine but is
+//! unreachable through the VFS. This module is a line-for-line port of
+//! that routine, driven by the kernel's own data tables
+//! (`vfs_utfconvdata.h`, transcribed by `tools/gen_hfs_unicode.py`).
+//! Consequently:
 //!
-//! The kernel normalises every name it is handed — on create *and* on
-//! lookup — so a name written in any other form is unreachable through
-//! the VFS even though it lists fine. [`normalize_name`] produces the
-//! exact form a name must be stored in.
+//! * Only BMP characters are decomposed; supplementary characters are
+//!   surrogate pairs to the kernel and pass through untouched.
+//! * The decomposable set is exactly Unicode 3.2's canonical
+//!   decompositions minus the ranges above (the generator cross-checks
+//!   this against `UnicodeData-3.2.0.txt`). Characters unassigned in 3.2
+//!   — including those that later gained a decomposition, such as the
+//!   Balinese vowel signs — pass through unchanged.
+//! * Hangul syllables are decomposed algorithmically.
+//! * Runs of *combining* characters (the kernel's 3.2-era combining set,
+//!   which also counts the Hangul medial/final jamo) are put in canonical
+//!   order by combining class. The class table is the kernel's: Unicode
+//!   3.2 plus the 25 marks Unicode 4.0 added (U+0350 – U+0357, …). A
+//!   mark outside the combining set (anything added after 3.2) ends a
+//!   run, so `a` U+0351 U+0323 is stored as typed, where today's NFD
+//!   would swap the two marks.
+//! * U+2400 (SYMBOL FOR NULL) is stored as U+0000 — the kernel's
+//!   `UCS_ALT_NULL` mapping (it is how the hard-link directory
+//!   `\0\0\0\0HFS+ Private Data` is named from user space).
 //!
-//! Known gap: canonical-ordering uses today's combining classes, so a
-//! name with *several* combining marks that were unassigned in Unicode
-//! 3.2 may be ordered differently from the kernel. Such names are
-//! vanishingly rare in practice.
+//! [`normalize_name`] / [`normalize_units`] produce the exact form a name
+//! must be stored in.
 
 use super::catalog::UniStr;
+use super::unicode_tables::{
+    COMBINING_BITMAP, COMBINING_PROPERTY_BITMAP, DECOMPOSABLE_BITMAP, DECOMPOSITION_TABLE,
+    MULTIPLE_DECOMPOSITION_TABLE,
+};
 
 /// Longest catalog name HFS+ can hold, in UTF-16 code units
 /// (`HFSUniStr255`).
 pub const MAX_NAME_UNITS: usize = 255;
 
-/// `true` when `c` must be passed through undecomposed (see module docs).
-fn is_excluded(c: char) -> bool {
-    let u = c as u32;
-    u > 0xFFFF
-        || (0x2000..=0x2FFF).contains(&u)
-        || (0xF900..=0xFAFF).contains(&u)
-        || (0x1B00..=0x1B7F).contains(&u)
+/// The kernel's `UCS_ALT_NULL`: U+2400 in a name stands for a NUL.
+const UCS_ALT_NULL: u16 = 0x2400;
+
+const HANGUL_SBASE: u16 = 0xAC00;
+const HANGUL_LBASE: u16 = 0x1100;
+const HANGUL_VBASE: u16 = 0x1161;
+const HANGUL_TBASE: u16 = 0x11A7;
+const HANGUL_SCOUNT: u16 = 11172;
+const HANGUL_TCOUNT: u16 = 28;
+const HANGUL_NCOUNT: u16 = 21 * HANGUL_TCOUNT;
+
+/// Look `c` up in one of the kernel's two-level bitmaps
+/// (`unicode_combinable` / `unicode_decomposeable`). `floor` is the
+/// first code point the kernel tests at all.
+fn bitmap_test(bitmap: &[u8], floor: u16, c: u16) -> bool {
+    if c < floor {
+        return false;
+    }
+    match bitmap[usize::from(c >> 8)] {
+        0 => false,
+        0xFF => true,
+        v => {
+            let sub = 256 + (usize::from(v) - 1) * 32;
+            bitmap[sub + usize::from(c & 0xFF) / 8] & (1 << (c % 8)) != 0
+        }
+    }
 }
 
-/// Canonical combining class as the kernel sees it: supplementary
-/// characters are surrogate pairs to it, which never reorder.
-fn ccc(c: char) -> u8 {
-    if (c as u32) > 0xFFFF {
+/// `unicode_combinable`: does `c` continue a combining run?
+fn is_combinable(c: u16) -> bool {
+    bitmap_test(&COMBINING_BITMAP, 0x0300, c)
+}
+
+/// `unicode_decomposeable`: does the kernel decompose `c`?
+fn is_decomposable(c: u16) -> bool {
+    bitmap_test(&DECOMPOSABLE_BITMAP, 0x00C0, c)
+}
+
+/// `get_combining_class`.
+fn combining_class(c: u16) -> u8 {
+    let page = COMBINING_PROPERTY_BITMAP[usize::from(c >> 8)];
+    if page == 0 {
         0
     } else {
-        intl::unicode::normalize::canonical_combining_class(c)
+        COMBINING_PROPERTY_BITMAP[usize::from(page) * 256 + usize::from(c & 0xFF)]
     }
 }
 
-/// Decompose `s` into the HFS+ variant of NFD, returning Unicode scalars.
-fn decompose_chars(s: &str) -> Vec<char> {
-    let mut out: Vec<char> = Vec::with_capacity(s.len());
-    for c in s.chars() {
-        if is_excluded(c) {
-            out.push(c);
-        } else {
-            out.extend(intl::unicode::normalize::nfd(core::iter::once(c)));
+/// `getmappedvalue16` over the `(key, value)` pairs of
+/// `DECOMPOSITION_TABLE`; 0 when `c` is not in it.
+fn decomposition_value(c: u16) -> u16 {
+    let (mut lo, mut hi) = (0usize, DECOMPOSITION_TABLE.len() / 2);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        match DECOMPOSITION_TABLE[2 * mid].cmp(&c) {
+            core::cmp::Ordering::Less => lo = mid + 1,
+            core::cmp::Ordering::Greater => hi = mid,
+            core::cmp::Ordering::Equal => return DECOMPOSITION_TABLE[2 * mid + 1],
         }
     }
-    // Canonical ordering: stable-sort every maximal run of non-starters
-    // by combining class (UAX #15 §3.11). Starters (class 0) delimit runs.
-    let mut i = 0;
-    while i < out.len() {
-        if ccc(out[i]) == 0 {
-            i += 1;
+    0
+}
+
+/// `unicode_recursive_decompose`: append the decomposition of `c` to
+/// `out`, returning how many units it produced (0 when `c` has none).
+fn recursive_decompose(c: u16, out: &mut Vec<u16>) -> usize {
+    const RECURSIVE: u16 = 1 << 15;
+    let value = decomposition_value(c);
+    let mut length = usize::from((value >> 12) & 0x7);
+    let first = value & 0x0FFF;
+    let single = [first];
+    let mut mappings: &[u16] = if length == 1 {
+        &single
+    } else {
+        &MULTIPLE_DECOMPOSITION_TABLE[usize::from(first)..]
+    };
+    let mut used = 0;
+    if value & RECURSIVE != 0 {
+        used = recursive_decompose(mappings[0], out);
+        length -= 1;
+        if used == 0 {
+            return 0;
+        }
+        mappings = &mappings[1..];
+    }
+    out.extend_from_slice(&mappings[..length]);
+    used + length
+}
+
+/// `unicode_decompose`: the decomposition of a decomposable `c`.
+fn decompose(c: u16, out: &mut Vec<u16>) {
+    // The kernel's bound is inclusive (`<= SBASE + SCOUNT`); that extra
+    // code point is not in the decomposable bitmap, so never gets here.
+    if (HANGUL_SBASE..=HANGUL_SBASE + HANGUL_SCOUNT).contains(&c) {
+        let s = c - HANGUL_SBASE;
+        out.push(s / HANGUL_NCOUNT + HANGUL_LBASE);
+        out.push((s % HANGUL_NCOUNT) / HANGUL_TCOUNT + HANGUL_VBASE);
+        if !s.is_multiple_of(HANGUL_TCOUNT) {
+            out.push(s % HANGUL_TCOUNT + HANGUL_TBASE);
+        }
+    } else {
+        recursive_decompose(c, out);
+    }
+}
+
+/// `prioritysort`: bubble-sort a combining run by combining class,
+/// never moving a class-0 character.
+fn priority_sort(run: &mut [u16]) {
+    if run.len() < 2 {
+        return;
+    }
+    loop {
+        let mut changed = false;
+        let mut p2 = combining_class(run[0]);
+        for i in 1..run.len() {
+            let p1 = p2;
+            p2 = combining_class(run[i]);
+            if p1 > p2 && p2 != 0 {
+                run.swap(i - 1, i);
+                changed = true;
+                p2 = p1;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// The kernel's `push`: append `c`, tracking (and canonically ordering)
+/// runs of combining characters.
+fn push(out: &mut Vec<u16>, run: &mut usize, c: u16) {
+    if is_combinable(c) {
+        *run += 1;
+    } else {
+        if *run > 1 {
+            let n = out.len();
+            priority_sort(&mut out[n - *run..]);
+        }
+        *run = 0;
+    }
+    out.push(c);
+}
+
+/// Normalise `name` into the UTF-16 code units HFS+ stores — a port of
+/// xnu's `utf8_decodestr` with `UTF_DECOMPOSED` (and no `altslash`: the
+/// `:` ↔ `/` swap is done by the callers that deal in path components).
+pub fn normalize_units(name: &str) -> Vec<u16> {
+    let mut out: Vec<u16> = Vec::with_capacity(name.len());
+    let mut run = 0usize;
+    let mut scratch: Vec<u16> = Vec::with_capacity(8);
+    for ch in name.chars() {
+        let u = ch as u32;
+        if u >= 0x1_0000 {
+            // Surrogate pair: the high half goes through `push` (ending
+            // any combining run), the low half is appended raw.
+            let mut pair = [0u16; 2];
+            ch.encode_utf16(&mut pair);
+            push(&mut out, &mut run, pair[0]);
+            out.push(pair[1]);
             continue;
         }
-        let start = i;
-        while i < out.len() && ccc(out[i]) != 0 {
-            i += 1;
+        let mut c = u as u16;
+        if u >= 0x80 {
+            if is_decomposable(c) {
+                scratch.clear();
+                decompose(c, &mut scratch);
+                for &d in &scratch {
+                    push(&mut out, &mut run, d);
+                }
+                continue;
+            }
+            if c == UCS_ALT_NULL {
+                c = 0;
+            }
         }
-        out[start..i].sort_by_key(|&c| ccc(c));
+        push(&mut out, &mut run, c);
+    }
+    if run > 1 {
+        let n = out.len();
+        priority_sort(&mut out[n - run..]);
     }
     out
 }
@@ -89,7 +243,7 @@ fn decompose_chars(s: &str) -> Vec<char> {
 /// aliases, `.DS_Store` records — should record this form. Validation
 /// (length, emptiness) is not done here; see [`validate_name`].
 pub fn normalize_name(name: &str) -> String {
-    decompose_chars(name).into_iter().collect()
+    String::from_utf16_lossy(&normalize_units(name))
 }
 
 /// Normalise `name` and check it is a storable HFS+ catalog name:
@@ -107,7 +261,7 @@ pub fn validate_name(name: &str) -> crate::Result<Vec<u16>> {
             "hfs+: file name {name:?} contains NUL"
         )));
     }
-    let units: Vec<u16> = normalize_name(name).encode_utf16().collect();
+    let units = normalize_units(name);
     if units.len() > MAX_NAME_UNITS {
         return Err(crate::Error::InvalidArgument(format!(
             "hfs+: file name {name:?} is {} UTF-16 code units after HFS+ \
@@ -147,6 +301,11 @@ mod tests {
     fn hangul_decomposes_algorithmically() {
         // U+AC01 GAG = U+1100 U+1161 U+11A8
         assert_eq!(units("\u{AC01}"), vec![0x1100, 0x1161, 0x11A8]);
+        // U+AC00 GA (no final) = U+1100 U+1161; last syllable U+D7A3.
+        assert_eq!(units("\u{AC00}"), vec![0x1100, 0x1161]);
+        assert_eq!(units("\u{D7A3}"), vec![0x1112, 0x1175, 0x11C2]);
+        // U+D7A4 is past the syllable block: untouched.
+        assert_eq!(units("\u{D7A4}"), vec![0xD7A4]);
     }
 
     #[test]
@@ -170,6 +329,8 @@ mod tests {
         assert_eq!(units("\u{C5}"), vec![0x41, 0x30A]);
         // U+0344 COMBINING GREEK DIALYTIKA TONOS → U+0308 U+0301.
         assert_eq!(units("a\u{344}"), vec![0x61, 0x308, 0x301]);
+        // U+1E09 (ḉ) decomposes recursively: C-cedilla + acute.
+        assert_eq!(units("\u{1E09}"), vec![0x63, 0x327, 0x301]);
     }
 
     #[test]
@@ -178,6 +339,23 @@ mod tests {
         assert_eq!(units("a\u{301}\u{323}"), vec![0x61, 0x323, 0x301]);
         // ệ (U+1EC7) = e + dot below + circumflex.
         assert_eq!(units("\u{1EC7}"), vec![0x65, 0x323, 0x302]);
+    }
+
+    #[test]
+    fn post_3_2_marks_follow_the_kernel() {
+        // U+0351 (Unicode 4.0, class 230) is not in the kernel's 3.2-era
+        // combining set: it ends the run, so nothing is reordered.
+        assert_eq!(units("a\u{351}\u{323}"), vec![0x61, 0x351, 0x323]);
+        // U+1DC0 (Unicode 5.0, class 230): same — today's NFD would
+        // move the dot below first.
+        assert_eq!(units("a\u{1DC0}\u{323}"), vec![0x61, 0x1DC0, 0x323]);
+        // Unassigned in 3.2 and later given a decomposition: untouched.
+        assert_eq!(units("\u{1B3B}"), vec![0x1B3B]);
+    }
+
+    #[test]
+    fn alt_null_becomes_nul() {
+        assert_eq!(normalize_units("a\u{2400}b"), vec![0x61, 0, 0x62]);
     }
 
     #[test]

@@ -227,6 +227,20 @@ pub trait FsSizePlan {
     fn add_symlink(&mut self, path: &str, target: &str);
     /// Record a device / special node at `path`.
     fn add_device(&mut self, path: &str);
+    /// Record an extended attribute `name` holding `len` bytes on the
+    /// entry just added at `path` — called once per xattr, after the
+    /// entry's `add_*` call (never for an extra hard link, whose xattrs
+    /// are its target's). Metadata a backend surfaces as xattrs counts
+    /// here too: an HFS+ resource fork arrives as `com.apple.ResourceFork`
+    /// and Finder info as `com.apple.FinderInfo`.
+    ///
+    /// The default ignores it, which is right for backends whose plan
+    /// already covers xattr storage or that cannot store xattrs; backends
+    /// that keep them in space of their own (HFS+'s attributes B-tree and
+    /// resource forks) override it.
+    fn add_entry_xattr(&mut self, path: &str, name: &str, len: u64) {
+        let _ = (path, name, len);
+    }
     /// Minimal image size in bytes that holds everything added so far.
     fn total_size(&self) -> u64;
 }
@@ -971,6 +985,13 @@ pub trait Filesystem {
 
     /// Remove the xattr `name` from `path`. Returns `Unsupported`
     /// when the backend can't store xattrs.
+    ///
+    /// Removing an attribute that is not there is not an error on APFS,
+    /// HFS+ or littlefs (the call is idempotent); ramfs reports it as
+    /// `InvalidArgument`. Callers that need to know whether something was
+    /// removed check with [`list_xattrs`](Self::list_xattrs) first, or use
+    /// a backend's inherent API (`HfsPlus::remove_xattr` returns whether
+    /// the attribute existed).
     fn remove_xattr(
         &mut self,
         _dev: &mut dyn crate::block::BlockDevice,

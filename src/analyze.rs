@@ -282,9 +282,19 @@ struct SizingSink<'p> {
     plan: &'p mut dyn FsSizePlan,
 }
 
+impl SizingSink<'_> {
+    fn xattrs(&mut self, path: &str, xattrs: &[XattrPair]) {
+        for x in xattrs {
+            self.plan
+                .add_entry_xattr(path, &x.name, x.value.len() as u64);
+        }
+    }
+}
+
 impl RepackSink for SizingSink<'_> {
-    fn put_dir(&mut self, path: &str, _m: RepackMeta, _x: &[XattrPair]) -> Result<()> {
+    fn put_dir(&mut self, path: &str, _m: RepackMeta, x: &[XattrPair]) -> Result<()> {
         self.plan.add_dir(path);
+        self.xattrs(path, x);
         Ok(())
     }
     fn put_file(
@@ -293,9 +303,10 @@ impl RepackSink for SizingSink<'_> {
         _body: &mut dyn Read,
         len: u64,
         _m: RepackMeta,
-        _x: &[XattrPair],
+        x: &[XattrPair],
     ) -> Result<()> {
         self.plan.add_file(path, len);
+        self.xattrs(path, x);
         Ok(())
     }
     fn put_symlink(
@@ -303,9 +314,10 @@ impl RepackSink for SizingSink<'_> {
         path: &str,
         target: &str,
         _m: RepackMeta,
-        _x: &[XattrPair],
+        x: &[XattrPair],
     ) -> Result<()> {
         self.plan.add_symlink(path, target);
+        self.xattrs(path, x);
         Ok(())
     }
     fn put_device(
@@ -315,9 +327,10 @@ impl RepackSink for SizingSink<'_> {
         _major: u32,
         _minor: u32,
         _m: RepackMeta,
-        _x: &[XattrPair],
+        x: &[XattrPair],
     ) -> Result<()> {
         self.plan.add_device(path);
+        self.xattrs(path, x);
         Ok(())
     }
     fn put_hardlink(
