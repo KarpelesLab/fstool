@@ -192,12 +192,30 @@ fn check_band_size(band_size: u64) -> crate::Result<()> {
     Ok(())
 }
 
+/// How long [`lock`] retries a contended lock.
+const LOCK_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Take the advisory lock: exclusive for a writer, shared for a reader.
+///
+/// Contention is retried for up to [`LOCK_GRACE`] before giving up. A
+/// child process spawned by another thread shares our open files until
+/// its `exec` closes them, so an image this process just closed can look
+/// locked for a few milliseconds; an image attached in hdiutil or held by
+/// another fstool stays locked and still fails.
 fn lock(file: &File, exclusive: bool, what: &Path) -> crate::Result<()> {
-    let r = if exclusive {
-        file.try_lock()
-    } else {
-        file.try_lock_shared()
+    let deadline = std::time::Instant::now() + LOCK_GRACE;
+    let r = loop {
+        let r = if exclusive {
+            file.try_lock()
+        } else {
+            file.try_lock_shared()
+        };
+        match r {
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            r => break r,
+        }
     };
     match r {
         Ok(()) => Ok(()),
