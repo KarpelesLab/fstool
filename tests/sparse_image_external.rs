@@ -31,12 +31,17 @@ fn hdiutil_ok() -> bool {
             .unwrap_or(false)
 }
 
+/// The tests attach images and spawn hdiutil; a child forked by one test
+/// can briefly hold another test's image lock, so run them one at a time.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 macro_rules! need_hdiutil {
     () => {
         if !hdiutil_ok() {
             eprintln!("skipping: needs macOS hdiutil");
             return;
         }
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     };
 }
 
@@ -51,9 +56,11 @@ fn run(cmd: &mut Command) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// An attached image; detached on drop.
+/// An attached image; detached on drop, which then waits until hdiutil's
+/// helper has really let go of the image file.
 struct Attached {
     dev: String,
+    image: PathBuf,
 }
 
 impl Attached {
@@ -64,7 +71,10 @@ impl Attached {
             .args(args)
             .arg(image));
         let dev = whole_disk(&plist).expect("no /dev/diskN in hdiutil attach output");
-        Self { dev }
+        Self {
+            dev,
+            image: image.to_path_buf(),
+        }
     }
 }
 
@@ -80,7 +90,22 @@ impl Drop for Attached {
                 .args(["detach", "-force", &self.dev])
                 .output();
         }
+        wait_unlocked(&self.image);
     }
+}
+
+/// hdiutil's helper can keep an image locked for a while after `detach`
+/// or `compact` return (seconds, on CI runners). Wait until it opens.
+fn wait_unlocked(img: &Path) {
+    for _ in 0..300 {
+        match fstool::block::sparse::SparseBackend::open_read_only(img) {
+            Err(fstool::Error::Io(e)) if e.kind() == std::io::ErrorKind::ResourceBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            _ => return,
+        }
+    }
+    panic!("{}: still locked 60 s after detach", img.display());
 }
 
 fn whole_disk(plist: &str) -> Option<String> {
@@ -387,19 +412,11 @@ fn copy_image(src: &Path, dst: &Path) {
     }
 }
 
-/// hdiutil can hold its lock for a moment after `detach` / `compact`
-/// return, so retry a busy image briefly.
 fn allocated_bands(img: &Path) -> u64 {
-    for _ in 0..50 {
-        match fstool::block::sparse::SparseBackend::open_read_only(img) {
-            Ok(dev) => return dev.allocated_bands(),
-            Err(fstool::Error::Io(e)) if e.kind() == std::io::ErrorKind::ResourceBusy => {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-            Err(e) => panic!("{}: {e}", img.display()),
-        }
-    }
-    panic!("{}: still busy after 10 s", img.display());
+    wait_unlocked(img);
+    fstool::block::sparse::SparseBackend::open_read_only(img)
+        .unwrap()
+        .allocated_bands()
 }
 
 /// `fsck_<fs> -n` (`-fn` for HFS+, which otherwise skips a journaled
@@ -414,7 +431,10 @@ fn fsck_image(img: &Path, fsck: &str) {
         .args(["attach", "-plist", "-nobrowse", "-readonly", "-nomount"])
         .arg(img));
     let whole = whole_disk(&plist).expect("attached disk");
-    let _a = Attached { dev: whole.clone() };
+    let _a = Attached {
+        dev: whole.clone(),
+        image: img.to_path_buf(),
+    };
     // The data partition is the last /dev/diskNsM listed.
     let prefix = format!("{whole}s");
     let part = plist
