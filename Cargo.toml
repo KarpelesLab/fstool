@@ -375,15 +375,17 @@ dmg-bzip2 = ["dmg", "dep:compcol", "compcol/bzip2"]
 dmg-lzfse = ["dmg", "dep:compcol", "compcol/lzfse"]
 # UDIF (.dmg) writing: `block::dmg::UdifWriter` encodes a sector stream
 # (a `BlockDevice` or a `Read` of known length) into a caller-owned
-# `Write + Seek` sink. The base feature carries UDRO (raw) and UDCO (ADC,
-# built in, no dependency); each compressed format adds its own codec and
-# the matching read-side decoder, so the writer's output always re-opens:
-# UDZO (zlib), UDBZ (bzip2), ULMO (LZMA, XZ-framed). ULFO is not offered:
-# compcol's LZFSE is decode-only.
+# `Write + Seek` sink. The base feature carries UDRO (raw), UDCO (ADC,
+# built in, no dependency), UFBI (raw + MD5) and UDRW (bare sectors);
+# each compressed format adds its own codec and the matching read-side
+# decoder, so the writer's output always re-opens: UDZO (zlib), UDBZ
+# (bzip2), ULMO (LZMA, XZ-framed). `dmg-write-lzfse` reserves ULFO's
+# encode hook; ULFO stays unwritable until compcol ships an LZFSE encoder.
 dmg-write = ["dmg"]
 dmg-write-zlib = ["dmg-write", "gzip"]
 dmg-write-bzip2 = ["dmg-write", "dmg-bzip2"]
 dmg-write-lzma = ["dmg-write", "xz"]
+dmg-write-lzfse = ["dmg-write", "dmg-lzfse"]
 # Password-protected DMG read support (`encrcdsa` v2). Served by the
 # `purecrypto` crate (AES-CBC, 3DES-EDE3-CBC via Cbc64, HMAC-SHA1, SHA-1,
 # PBKDF2) — pure-Rust, no foreign code. Gated so a slim build can drop it.

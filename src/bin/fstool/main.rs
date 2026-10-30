@@ -406,9 +406,10 @@ enum Command {
         /// `dmg-write` feature; otherwise raw).
         #[arg(value_name = "DST")]
         dst: PathBuf,
-        /// UDIF chunk encoding for a `.dmg` destination: UDRO (raw),
-        /// UDCO (ADC), UDZO (zlib, the default), UDBZ (bzip2) or ULMO
-        /// (LZMA). Implies a UDIF destination whatever DST's extension.
+        /// UDIF format for a `.dmg` destination: UDRO (raw), UDCO (ADC),
+        /// UDZO (zlib, the default), UDBZ (bzip2), ULMO (LZMA), UFBI
+        /// (raw + MD5) or UDRW (bare sectors). Implies a UDIF destination
+        /// whatever DST's extension.
         #[cfg(feature = "dmg-write")]
         #[arg(long, value_name = "FORMAT")]
         dmg_format: Option<String>,
@@ -417,6 +418,16 @@ enum Command {
         #[cfg(feature = "dmg-write")]
         #[arg(long, value_name = "N")]
         dmg_level: Option<u8>,
+        /// UDIF checksums: crc32 (the default; MD5 for UFBI), md5 or none.
+        #[cfg(feature = "dmg-write")]
+        #[arg(long, value_name = "KIND")]
+        dmg_checksum: Option<String>,
+        /// UDIF blkx map: `auto` (the default — one entry per partition
+        /// region when SRC has a GPT / APM / MBR, as hdiutil does) or
+        /// `whole` (one whole-device entry).
+        #[cfg(feature = "dmg-write")]
+        #[arg(long, value_name = "LAYOUT")]
+        dmg_layout: Option<String>,
         /// Destination size. Defaults to the source's virtual size. May
         /// be larger (grows the image with all-zero tail) but not smaller.
         #[arg(long, value_name = "SIZE")]
@@ -946,6 +957,10 @@ fn run(cli: Cli) -> fstool::Result<()> {
             dmg_format,
             #[cfg(feature = "dmg-write")]
             dmg_level,
+            #[cfg(feature = "dmg-write")]
+            dmg_checksum,
+            #[cfg(feature = "dmg-write")]
+            dmg_layout,
             size,
             force,
             #[cfg(feature = "qcow2")]
@@ -954,7 +969,11 @@ fn run(cli: Cli) -> fstool::Result<()> {
             compress,
         } => {
             #[cfg(feature = "dmg-write")]
-            if dmg_format.is_some() || is_dmg_path(&dst) {
+            if dmg_format.is_some()
+                || dmg_checksum.is_some()
+                || dmg_layout.is_some()
+                || is_dmg_path(&dst)
+            {
                 #[cfg(feature = "qcow2")]
                 if compress.is_some() {
                     return Err(fstool::Error::InvalidArgument(
@@ -974,6 +993,8 @@ fn run(cli: Cli) -> fstool::Result<()> {
                     password: password.as_deref(),
                     format: dmg_format.as_deref(),
                     level: dmg_level,
+                    checksum: dmg_checksum.as_deref(),
+                    layout: dmg_layout.as_deref(),
                     create_opts: &create_opts,
                 });
             }
@@ -1445,6 +1466,8 @@ struct DmgConvertArgs<'a> {
     password: Option<&'a str>,
     format: Option<&'a str>,
     level: Option<u8>,
+    checksum: Option<&'a str>,
+    layout: Option<&'a str>,
     create_opts: &'a fstool::block::CreateOpts,
 }
 
@@ -1456,7 +1479,7 @@ struct DmgConvertArgs<'a> {
 /// a truncated `.dmg` behind.
 #[cfg(feature = "dmg-write")]
 fn convert_to_dmg(args: DmgConvertArgs<'_>) -> fstool::Result<()> {
-    use fstool::block::dmg::{UdifFormat, UdifWriteOptions, write_udif};
+    use fstool::block::dmg::{UdifChecksum, UdifFormat, UdifLayout, UdifWriteOptions, write_udif};
     let DmgConvertArgs {
         src,
         dst,
@@ -1464,6 +1487,8 @@ fn convert_to_dmg(args: DmgConvertArgs<'_>) -> fstool::Result<()> {
         password,
         format,
         level,
+        checksum,
+        layout,
         create_opts,
     } = args;
     if safety::same_file(src, dst) {
@@ -1485,11 +1510,33 @@ fn convert_to_dmg(args: DmgConvertArgs<'_>) -> fstool::Result<()> {
     if let Some(f) = format {
         opts.format = UdifFormat::from_name(f).ok_or_else(|| {
             fstool::Error::InvalidArgument(format!(
-                "convert: unknown --dmg-format {f:?} (expected UDRO, UDCO, UDZO, UDBZ or ULMO)"
+                "convert: unknown --dmg-format {f:?} \
+                 (expected UDRO, UDCO, UDZO, UDBZ, ULMO, UFBI or UDRW)"
             ))
         })?;
     }
     opts.level = level;
+    if let Some(c) = checksum {
+        opts.checksum = match c.to_ascii_lowercase().as_str() {
+            "crc32" | "crc" => UdifChecksum::Crc32,
+            "md5" => UdifChecksum::Md5,
+            "none" => UdifChecksum::None,
+            _ => {
+                return Err(fstool::Error::InvalidArgument(format!(
+                    "convert: unknown --dmg-checksum {c:?} (expected crc32, md5 or none)"
+                )));
+            }
+        };
+    }
+    opts.layout = match layout.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("auto") => UdifLayout::Auto,
+        Some("whole") | Some("none") => UdifLayout::WholeDevice,
+        Some(other) => {
+            return Err(fstool::Error::InvalidArgument(format!(
+                "convert: unknown --dmg-layout {other:?} (expected auto or whole)"
+            )));
+        }
+    };
     opts.validate()?;
 
     let mut src_dev = fstool::block::open_image_with_password(src, password)?;

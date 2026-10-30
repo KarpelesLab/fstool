@@ -1,27 +1,33 @@
 #![cfg(all(unix, feature = "dmg-write"))]
 //! Native validation of fstool's UDIF writer against macOS' `hdiutil`.
 //!
-//! Each test builds a reference HFS+ volume with `hdiutil` (a populated
-//! `UDRW` image converted to a raw `UDTO` sector dump), re-encodes that
-//! raw dump with [`fstool::block::dmg::write_udif_from_reader`] in one
-//! format, and then asks Apple's own engine to accept it:
+//! Each test builds a reference HFS+ disk with `hdiutil` (a populated
+//! `UDRW` image — bare, or with a GPT / APM / MBR partition table —
+//! converted to a raw `UDTO` sector dump), re-encodes that raw dump with
+//! fstool's writer in one format, and then asks Apple's own engine to
+//! accept it:
 //!
-//! - `hdiutil verify` — checks the partition and master CRC-32s;
+//! - `hdiutil verify` — checks the partition and master checksums;
 //! - `hdiutil imageinfo` — the format code it reports must match;
 //! - `hdiutil convert -format UDTO` — the decoded sectors must equal the
 //!   raw dump byte for byte;
 //! - `hdiutil attach -readonly -nomount` — the attached device's raw
-//!   bytes must equal the raw dump too (detached afterwards);
-//! - for UDZO, a real read-only mount, comparing the files.
+//!   bytes must equal the raw dump too, and a partitioned image must show
+//!   its HFS+ partition (`diskutil list`);
+//! - a real read-only mount, comparing the files;
+//! - for partitioned images, the `blkx` names and IDs must equal the ones
+//!   `hdiutil convert` itself writes for the same disk.
 //!
-//! macOS-only: elsewhere (or without `hdiutil`) every test prints
-//! `skipping: …` and passes, matching `tests/dmg_external.rs`.
+//! Everything attached is detached again. macOS-only: elsewhere (or
+//! without `hdiutil`) every test prints `skipping: …` and passes,
+//! matching `tests/dmg_external.rs`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use fstool::block::dmg::{
-    UdifChecksum, UdifFormat, UdifWriteOptions, ZeroRunEncoding, write_udif_from_reader,
+    UdifChecksum, UdifFormat, UdifLayout, UdifWriteOptions, ZeroRunEncoding, write_udif,
+    write_udif_from_reader,
 };
 
 fn skip_unless_macos_hdiutil() -> bool {
@@ -81,8 +87,37 @@ fn populate(dir: &Path) {
     std::fs::write(dir.join("noise.bin"), noise).unwrap();
 }
 
-/// A raw HFS+ volume made by `hdiutil`, plus the folder it was made from.
-fn reference_volume(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+/// Partition scheme of a reference disk, as `hdiutil create -layout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scheme {
+    /// Bare HFS+ volume (`NONE`).
+    None,
+    /// GUID partition table (`GPTSPUD`).
+    Gpt,
+    /// Apple Partition Map (`SPUD`).
+    Apm,
+    /// Master Boot Record (`MBRSPUD`).
+    Mbr,
+}
+
+impl Scheme {
+    fn layout(self) -> &'static str {
+        match self {
+            Self::None => "NONE",
+            Self::Gpt => "GPTSPUD",
+            Self::Apm => "SPUD",
+            Self::Mbr => "MBRSPUD",
+        }
+    }
+}
+
+/// A raw HFS+ disk made by `hdiutil`, and the folder it was made from.
+struct Reference {
+    raw: PathBuf,
+    src: PathBuf,
+}
+
+fn reference_disk(dir: &Path, scheme: Scheme) -> Option<Reference> {
     let src = dir.join("src");
     populate(&src);
     let base = dir.join("base.dmg");
@@ -93,7 +128,7 @@ fn reference_volume(dir: &Path) -> Option<(PathBuf, PathBuf)> {
         "-fs".as_ref(),
         "HFS+".as_ref(),
         "-layout".as_ref(),
-        "NONE".as_ref(),
+        scheme.layout().as_ref(),
         "-volname".as_ref(),
         "FstoolUdif".as_ref(),
         "-format".as_ref(),
@@ -111,9 +146,15 @@ fn reference_volume(dir: &Path) -> Option<(PathBuf, PathBuf)> {
         "-o".as_ref(),
         raw.as_os_str(),
     ])?;
-    Some((raw, src))
+    Some(Reference { raw, src })
 }
 
+/// A raw HFS+ volume made by `hdiutil`, plus the folder it was made from.
+fn reference_volume(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    reference_disk(dir, Scheme::None).map(|r| (r.raw, r.src))
+}
+
+/// Encode through the `Read` entry point.
 fn encode(raw: &Path, out: &Path, opts: &UdifWriteOptions) {
     let len = std::fs::metadata(raw).unwrap().len();
     let src = std::io::BufReader::new(std::fs::File::open(raw).unwrap());
@@ -125,6 +166,19 @@ fn encode(raw: &Path, out: &Path, opts: &UdifWriteOptions) {
     file.sync_all().unwrap();
     drop(file);
     assert_eq!(std::fs::metadata(out).unwrap().len(), summary.bytes_written);
+}
+
+/// Encode through the `BlockDevice` entry point (which resolves
+/// [`UdifLayout::Auto`]).
+fn encode_device(raw: &Path, out: &Path, opts: &UdifWriteOptions) -> usize {
+    let mut dev = fstool::block::open_image_read_only(raw).unwrap();
+    let file = std::fs::File::create(out).unwrap();
+    let (file, summary) = write_udif(dev.as_mut(), file, opts)
+        .unwrap_or_else(|e| panic!("{}: {e}", opts.format.name()));
+    file.sync_all().unwrap();
+    drop(file);
+    assert_eq!(std::fs::metadata(out).unwrap().len(), summary.bytes_written);
+    summary.blkx_count
 }
 
 /// `/dev/diskN` from `hdiutil attach` output (the first line naming one;
@@ -156,7 +210,53 @@ impl Drop for Detach {
     }
 }
 
+/// `(Name, ID)` of every `blkx` entry in a UDIF image, in order.
+fn blkx_names(dmg: &Path) -> Vec<(String, String)> {
+    let img = std::fs::read(dmg).unwrap();
+    let k = &img[img.len() - 512..];
+    assert_eq!(&k[..4], b"koly");
+    let off = u64::from_be_bytes(k[0xD8..0xE0].try_into().unwrap()) as usize;
+    let len = u64::from_be_bytes(k[0xE0..0xE8].try_into().unwrap()) as usize;
+    let plist = std::str::from_utf8(&img[off..off + len]).unwrap();
+    let blkx = &plist[..plist.find("<key>plst</key>").unwrap_or(plist.len())];
+    let field = |dict: &str, key: &str| {
+        let s = &dict[dict.find(&format!("<key>{key}</key>")).unwrap()..];
+        let s = &s[s.find("<string>").unwrap() + 8..];
+        s[..s.find("</string>").unwrap()].to_owned()
+    };
+    blkx.split("<dict>")
+        .filter(|d| d.contains("<key>Data</key>"))
+        .map(|d| (field(d, "Name"), field(d, "ID")))
+        .collect()
+}
+
+/// Mount `dmg` read-only and compare its files with `src`.
+fn mount_and_compare(dir: &Path, dmg: &Path, src: &Path, name: &str) {
+    let mnt = dir.join("mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let out = hdiutil(&[
+        "attach".as_ref(),
+        "-readonly".as_ref(),
+        "-nobrowse".as_ref(),
+        "-mountpoint".as_ref(),
+        mnt.as_os_str(),
+        dmg.as_os_str(),
+    ])
+    .unwrap_or_else(|| panic!("{name}: hdiutil attach (mount) rejected the image"));
+    let _guard = Detach(attached_device(&out).unwrap());
+    for f in ["text.txt", "noise.bin"] {
+        assert!(
+            std::fs::read(mnt.join(f)).unwrap() == std::fs::read(src.join(f)).unwrap(),
+            "{name}: {f} differs on the mounted image"
+        );
+    }
+}
+
 fn check_native(format: UdifFormat, tweak: impl Fn(&mut UdifWriteOptions)) {
+    check_native_scheme(format, Scheme::None, tweak);
+}
+
+fn check_native_scheme(format: UdifFormat, scheme: Scheme, tweak: impl Fn(&mut UdifWriteOptions)) {
     if skip_unless_macos_hdiutil() {
         return;
     }
@@ -165,19 +265,45 @@ fn check_native(format: UdifFormat, tweak: impl Fn(&mut UdifWriteOptions)) {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let Some((raw, _)) = reference_volume(dir.path()) else {
-        eprintln!("skipping: hdiutil could not build the reference volume");
+    let Some(reference) = reference_disk(dir.path(), scheme) else {
+        eprintln!("skipping: hdiutil could not build the reference disk");
         return;
     };
-    let expected = std::fs::read(&raw).unwrap();
+    let raw = &reference.raw;
+    let expected = std::fs::read(raw).unwrap();
     let mut opts = UdifWriteOptions::default();
     opts.format = format;
+    if scheme != Scheme::None {
+        opts.layout = UdifLayout::Auto;
+    }
     tweak(&mut opts);
     let dmg = dir.path().join("out.dmg");
-    encode(&raw, &dmg, &opts);
-    let name = format.name();
+    let name = format!("{} ({scheme:?})", format.name());
+    if scheme == Scheme::None {
+        encode(raw, &dmg, &opts);
+    } else {
+        let blkx = encode_device(raw, &dmg, &opts);
+        if format != UdifFormat::Udrw {
+            // At least the table plus the HFS+ partition (MBRSPUD has
+            // nothing else).
+            assert!(blkx >= 2, "{name}: expected a partition-oriented map");
+            // Same map, names and IDs as hdiutil's own conversion.
+            let native = dir.path().join("native.dmg");
+            hdiutil(&[
+                "convert".as_ref(),
+                raw.as_os_str(),
+                "-format".as_ref(),
+                "UDRO".as_ref(),
+                "-ov".as_ref(),
+                "-o".as_ref(),
+                native.as_os_str(),
+            ])
+            .expect("hdiutil convert of the reference disk");
+            assert_eq!(blkx_names(&dmg), blkx_names(&native), "{name}: blkx map");
+        }
+    }
 
-    if opts.checksum == UdifChecksum::None {
+    if opts.checksum == UdifChecksum::None || format == UdifFormat::Udrw {
         // Nothing to verify: hdiutil refuses with "has no checksum".
         assert!(hdiutil(&["verify".as_ref(), dmg.as_os_str()]).is_none());
     } else {
@@ -194,9 +320,25 @@ fn check_native(format: UdifFormat, tweak: impl Fn(&mut UdifWriteOptions)) {
         .unwrap_or_default()
         .trim()
         .to_owned();
+    // hdiutil reports a UFBI image — its own included — as UDRO; what
+    // sets it apart is the MD5 checksum.
+    let want = match format {
+        UdifFormat::Ufbi => "UDRO",
+        f => f.name(),
+    };
     assert_eq!(
-        reported, name,
-        "hdiutil imageinfo reports format {reported}"
+        reported, want,
+        "{name}: hdiutil imageinfo reports format {reported}"
+    );
+    let want_checksum = match (format, opts.checksum) {
+        (UdifFormat::Udrw, _) | (_, UdifChecksum::None) => "none",
+        (UdifFormat::Ufbi, _) | (_, UdifChecksum::Md5) => "MD5",
+        _ => "CRC32",
+    };
+    assert!(
+        info.lines()
+            .any(|l| l == format!("Checksum Type: {want_checksum}")),
+        "{name}: expected checksum type {want_checksum}:\n{info}"
     );
 
     // Decode through Apple's engine back to raw sectors.
@@ -217,26 +359,41 @@ fn check_native(format: UdifFormat, tweak: impl Fn(&mut UdifWriteOptions)) {
     );
 
     // Attach without mounting and read the raw device back.
-    let Some(out) = hdiutil(&[
-        "attach".as_ref(),
-        "-readonly".as_ref(),
-        "-nomount".as_ref(),
-        "-nobrowse".as_ref(),
-        dmg.as_os_str(),
-    ]) else {
-        panic!("{name}: hdiutil attach rejected the image");
-    };
-    let dev = attached_device(&out).unwrap_or_else(|| panic!("no device in {out:?}"));
-    let _guard = Detach(dev.clone());
-    // Raw character devices want sector-aligned transfers; read the
-    // expected length in 1 MiB pieces.
-    let rdev = dev.replacen("/dev/disk", "/dev/rdisk", 1);
-    let bytes = read_device(&rdev, expected.len())
-        .unwrap_or_else(|e| panic!("{name}: reading {rdev}: {e}"));
-    assert!(
-        bytes == expected,
-        "{name}: attached device bytes differ from the source sectors"
-    );
+    {
+        let Some(out) = hdiutil(&[
+            "attach".as_ref(),
+            "-readonly".as_ref(),
+            "-nomount".as_ref(),
+            "-nobrowse".as_ref(),
+            dmg.as_os_str(),
+        ]) else {
+            panic!("{name}: hdiutil attach rejected the image");
+        };
+        let dev = attached_device(&out).unwrap_or_else(|| panic!("no device in {out:?}"));
+        let _guard = Detach(dev.clone());
+        if scheme != Scheme::None {
+            let list = Command::new("diskutil")
+                .args(["list", &dev])
+                .output()
+                .unwrap();
+            let list = String::from_utf8_lossy(&list.stdout);
+            assert!(
+                out.contains("Apple_HFS") && list.contains("Apple_HFS"),
+                "{name}: the HFS+ partition is missing:\n{out}\n{list}"
+            );
+        }
+        // Raw character devices want sector-aligned transfers; read the
+        // expected length in 1 MiB pieces.
+        let rdev = dev.replacen("/dev/disk", "/dev/rdisk", 1);
+        let bytes = read_device(&rdev, expected.len())
+            .unwrap_or_else(|e| panic!("{name}: reading {rdev}: {e}"));
+        assert!(
+            bytes == expected,
+            "{name}: attached device bytes differ from the source sectors"
+        );
+    }
+
+    mount_and_compare(dir.path(), &dmg, &reference.src, &name);
 }
 
 #[test]
@@ -269,6 +426,11 @@ fn udzo_without_checksums_passes_hdiutil() {
 }
 
 #[test]
+fn udzo_md5_passes_hdiutil() {
+    check_native(UdifFormat::Udzo, |o| o.checksum = UdifChecksum::Md5);
+}
+
+#[test]
 fn udbz_passes_hdiutil() {
     check_native(UdifFormat::Udbz, |_| {});
 }
@@ -276,6 +438,58 @@ fn udbz_passes_hdiutil() {
 #[test]
 fn ulmo_passes_hdiutil() {
     check_native(UdifFormat::Ulmo, |_| {});
+}
+
+#[test]
+fn ufbi_passes_hdiutil() {
+    check_native(UdifFormat::Ufbi, |_| {});
+}
+
+#[test]
+fn udrw_passes_hdiutil() {
+    check_native(UdifFormat::Udrw, |_| {});
+}
+
+/// Every format over a GPT disk, with `hdiutil`'s partition-oriented map.
+#[test]
+fn gpt_partitioned_every_format_passes_hdiutil() {
+    for f in [
+        UdifFormat::Udzo,
+        UdifFormat::Udro,
+        UdifFormat::Udco,
+        UdifFormat::Udbz,
+        UdifFormat::Ulmo,
+        UdifFormat::Ufbi,
+        UdifFormat::Udrw,
+    ] {
+        check_native_scheme(f, Scheme::Gpt, |_| {});
+    }
+}
+
+#[test]
+fn apm_partitioned_udzo_passes_hdiutil() {
+    check_native_scheme(UdifFormat::Udzo, Scheme::Apm, |_| {});
+}
+
+#[test]
+fn mbr_partitioned_udzo_passes_hdiutil() {
+    check_native_scheme(UdifFormat::Udzo, Scheme::Mbr, |_| {});
+}
+
+/// A GPT disk forced into a whole-device map still works.
+#[test]
+fn gpt_disk_whole_device_map_passes_hdiutil() {
+    if skip_unless_macos_hdiutil() || !UdifFormat::Udzo.writable() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let Some(r) = reference_disk(dir.path(), Scheme::Gpt) else {
+        return;
+    };
+    let dmg = dir.path().join("whole.dmg");
+    assert_eq!(encode_device(&r.raw, &dmg, &UdifWriteOptions::default()), 1);
+    hdiutil(&["verify".as_ref(), dmg.as_os_str()]).expect("hdiutil verify");
+    mount_and_compare(dir.path(), &dmg, &r.src, "UDZO whole-device GPT");
 }
 
 /// The largest chunk the writer allows, for the codecs Apple's engine
@@ -375,6 +589,85 @@ fn fstool_hfs_plus_volume_to_udzo_mounts() {
     ])
     .expect("hdiutil attach (mount)");
     let _guard = Detach(attached_device(&out).unwrap());
+    assert!(std::fs::read(mnt.join("App/payload.bin")).unwrap() == body);
+}
+
+/// cargo-bundle's path with a partition table: a GPT disk built with
+/// fstool's partition API, an fstool-authored HFS+ volume in its one
+/// partition, encoded as UDZO with the partition-oriented map
+/// (`UdifLayout::Auto`), then verified, attached and mounted by macOS.
+#[cfg(feature = "hfs-plus")]
+#[test]
+fn fstool_gpt_hfs_plus_disk_to_udzo_mounts() {
+    use fstool::block::MemoryBackend;
+    use fstool::fs::hfs_plus::{FormatOpts, HfsPlus};
+    use fstool::part::{Gpt, Partition, PartitionKind, PartitionTable, slice_partition};
+
+    if skip_unless_macos_hdiutil() || !UdifFormat::Udzo.writable() {
+        return;
+    }
+    const SECTORS: u64 = 32 * 2048; // 32 MiB
+    let mut disk = MemoryBackend::new(SECTORS * 512);
+    let hfs_type = uuid::Uuid::parse_str("48465300-0000-11AA-AA11-00306543ECAC").unwrap();
+    let mut p = Partition::new(40, SECTORS - 40 - 40, PartitionKind::Gpt(hfs_type));
+    p.name = Some("disk image".into());
+    let gpt = Gpt::build(vec![p]).unwrap();
+    gpt.write(&mut disk).unwrap();
+    let body: Vec<u8> = (0..300_000u32).map(|i| (i % 253) as u8).collect();
+    {
+        let mut part = slice_partition(&gpt, &mut disk, 0).unwrap();
+        let mut fo = FormatOpts::default();
+        fo.volume_name = "FstoolGpt".into();
+        let mut hfs = HfsPlus::format(&mut part, &fo).unwrap();
+        hfs.create_dir(&mut part, "/App", 0o755, 0, 0, 0).unwrap();
+        hfs.create_file(
+            &mut part,
+            "/App/payload.bin",
+            &mut std::io::Cursor::new(&body),
+            body.len() as u64,
+            0o644,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        hfs.flush(&mut part).unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let dmg = dir.path().join("bundle-gpt.dmg");
+    let mut opts = UdifWriteOptions::default();
+    opts.layout = UdifLayout::Auto;
+    let file = std::fs::File::create(&dmg).unwrap();
+    let (file, summary) = write_udif(&mut disk, file, &opts).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    // MBR, 2 headers, 2 tables, the partition and its two free gaps.
+    assert_eq!(summary.blkx_count, 8);
+    let names: Vec<String> = blkx_names(&dmg).into_iter().map(|(n, _)| n).collect();
+    assert!(
+        names.contains(&"disk image (Apple_HFS : 4)".to_owned()),
+        "{names:?}"
+    );
+
+    hdiutil(&["verify".as_ref(), dmg.as_os_str()]).expect("hdiutil verify");
+    let mnt = dir.path().join("mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let out = hdiutil(&[
+        "attach".as_ref(),
+        "-readonly".as_ref(),
+        "-nobrowse".as_ref(),
+        "-mountpoint".as_ref(),
+        mnt.as_os_str(),
+        dmg.as_os_str(),
+    ])
+    .expect("hdiutil attach (mount)");
+    let dev = attached_device(&out).unwrap();
+    let _guard = Detach(dev.clone());
+    assert!(
+        out.contains("GUID_partition_scheme") && out.contains("Apple_HFS"),
+        "{out}"
+    );
     assert!(std::fs::read(mnt.join("App/payload.bin")).unwrap() == body);
 }
 

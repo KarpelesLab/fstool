@@ -113,7 +113,7 @@ transparently (writing to a compressed cluster copies it out to a plain one)
 — plus **backing files** and **encryption**; LUKS1 / LUKS2 volumes are
 read/write and can be created; dmg reads UDIF v4 mish chunks (zero /
 raw / zlib / ADC / bzip2 / LZFSE / LZMA, plus encrypted v2 `encrcdsa`)
-and *writes* read-only UDRO / UDCO / UDZO / UDBZ / ULMO images (see
+and *writes* UDRO / UDCO / UDZO / UDBZ / ULMO / UFBI / UDRW images (see
 "DMG writing"); `.sparseimage` and `.sparsebundle` are read/write and can
 be created, allocating bands only as they are written.
 
@@ -245,14 +245,19 @@ through the TOML spec — see "[filesystem.options]" below.
 ### DMG writing
 
 `block::dmg::UdifWriter` (feature `dmg-write`) encodes any sector stream —
-a `BlockDevice`, or a `Read` of known length — into a single-segment,
-read-only UDIF image in a caller-owned `Write + Seek` sink. It only
-encodes: it never creates, renames or publishes files, so a caller can
-finish into a temp file, close it, sign it and move it into place itself.
-`finish()` writes the `blkx` plist (one whole-device entry, as `hdiutil`
-does for an unpartitioned volume) and the koly trailer with CRC-32
-partition, data-fork and master checksums; all-zero sectors become
-zero-fill (or, optionally, "ignore") entries instead of being compressed.
+a `BlockDevice`, or a `Read` of known length — into a single-segment
+UDIF image in a caller-owned `Write + Seek` sink. It only encodes: it
+never creates, renames or publishes files, so a caller can finish into a
+temp file, close it, sign it and move it into place itself. `finish()`
+writes the `blkx` plist, `hdiutil`'s `plst` resource and the koly
+trailer with CRC-32 (or MD5) partition, data-fork and master checksums;
+all-zero sectors become zero-fill (or "ignore") entries instead of being
+compressed. The `blkx` map is either one whole-device entry
+(`UdifLayout::WholeDevice`, the default) or, for a disk with a GPT / APM /
+MBR, one entry per region with `hdiutil`'s names and IDs
+(`Protective Master Boot Record (MBR : 0)`, `disk image (Apple_HFS : 4)`,
+` (Apple_Free : 5)` …) — `UdifLayout::Auto` picks it from the source, or
+`udif_partition_map` builds it for `UdifLayout::Map`.
 
 | Format | Chunk codec | Feature |
 |--------|-------------|---------|
@@ -261,11 +266,15 @@ zero-fill (or, optionally, "ignore") entries instead of being compressed.
 | `UDZO` | zlib, level 1–9 | `dmg-write-zlib` |
 | `UDBZ` | bzip2, level 1–9 | `dmg-write-bzip2` |
 | `ULMO` | LZMA (XZ-framed, as `hdiutil`), level 0–9 | `dmg-write-lzma` |
-| `ULFO` | LZFSE | not writable — compcol's LZFSE only decodes |
+| `UFBI` | raw, every sector, MD5 checksums | `dmg-write` |
+| `UDRW` | bare sectors, no trailer (as current `hdiutil`) | `dmg-write` |
+| `ULFO` | LZFSE | not writable yet — compcol's LZFSE only decodes; `dmg-write-lzfse` reserves the encoder hook |
 
 Every format passes `hdiutil verify`, attach + raw readback and a real
-mount on macOS (`tests/dmg_write_external.rs`). From the CLI:
-`fstool convert disk.img out.dmg [--dmg-format UDBZ] [--dmg-level 9]`.
+mount on macOS, whole-device and over GPT / APM / MBR disks, with the
+same `blkx` map `hdiutil convert` writes (`tests/dmg_write_external.rs`).
+From the CLI: `fstool convert disk.img out.dmg [--dmg-format UDBZ]
+[--dmg-level 9] [--dmg-checksum md5] [--dmg-layout auto|whole]`.
 
 ```rust
 use fstool::block::dmg::{UdifFormat, UdifWriteOptions, write_udif};
@@ -746,7 +755,7 @@ none of the other 130 000 lines.
 | `tar` | tar (streaming reader / writer, tar-as-filesystem) | |
 | `archive` | zip / cpio / ar, plus the per-format readers | pulls `charcode`; `cab`, `lha`, `arc`, `sit`, `sevenz`, `rar`, `amiga-lzx` each imply it. On its own zip handles Stored members (and PKWARE-encrypted ones, and split sets); each compression method is a codec feature (`gzip` for Deflate, then `deflate64`, `bzip2`, `lzma`, `xz`, `zstd`, `zip-legacy`) and WinZip AES is `zip-aes` (pulls `purecrypto`), so `--features archive,gzip` is the slim everyday zip build |
 | `ramfs` | the in-memory scratch filesystem `repack` / `merge` / FUSE build on | |
-| `qcow2`, `dmg`, `diskcopy` | disk-image containers | `qcow2-crypto` implies `qcow2`; `dmg-encrypted` / `dmg-bzip2` / `dmg-lzfse` / `dmg-write` imply `dmg`; `dmg-write-zlib` / `-bzip2` / `-lzma` add one write codec each to `dmg-write`; `dmg-encrypted-write` implies `dmg-encrypted` |
+| `qcow2`, `dmg`, `diskcopy` | disk-image containers | `qcow2-crypto` implies `qcow2`; `dmg-encrypted` / `dmg-bzip2` / `dmg-lzfse` / `dmg-write` imply `dmg`; `dmg-write-zlib` / `-bzip2` / `-lzma` / `-lzfse` add one write codec each to `dmg-write` (`-lzfse` is a reserved hook for now); `dmg-encrypted-write` implies `dmg-encrypted` |
 | `sparse-image` | Apple `.sparseimage` / `.sparsebundle` | |
 | `luks` | LUKS1 / LUKS2 | pulls `purecrypto`; implies `json` (LUKS2 metadata is JSON) |
 
@@ -1258,10 +1267,9 @@ Things explicitly out of scope today, in rough order of likely-to-change:
   fork) work. LZVN (types 7/8) and LZFSE (types 11/12) return
   `Unsupported`.
 - **DMG**: encrypted v1 (`cdsaencr` legacy 3DES) chunks return
-  `Unsupported`; v2 is covered. The writer emits one whole-device
-  `blkx` entry (no per-partition maps), single-segment read-only images
-  only — no ULFO (no LZFSE encoder), UDRW / sparse, encryption or
-  segmented output.
+  `Unsupported`; v2 is covered. The writer emits single-segment images
+  only — no ULFO yet (no LZFSE encoder), encryption or segmented
+  output (sparse images are the separate `sparse-image` backends).
 - **Partial-file rewrites** on the trait surface — `open_file_rw`
   exists everywhere it's safe, but a typed "patch this byte range
   on a known-large file" API is not surfaced beyond `Read + Write +

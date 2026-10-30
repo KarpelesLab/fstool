@@ -18,7 +18,9 @@
 //! Writing is a separate, feature-gated encoder (`dmg-write`, plus
 //! `dmg-write-zlib` / `dmg-write-bzip2` / `dmg-write-lzma` for the
 //! compressed formats): [`UdifWriter`] turns a sector stream into a
-//! UDRO / UDCO / UDZO / UDBZ / ULMO image in a caller-owned sink.
+//! UDRO / UDCO / UDZO / UDBZ / ULMO / UFBI / UDRW image in a caller-owned
+//! sink, with a whole-device or partition-oriented (GPT / APM / MBR)
+//! `blkx` map.
 //!
 //! ## File layout (recap)
 //!
@@ -46,6 +48,10 @@
 
 mod codec;
 pub mod encrypted;
+#[cfg(feature = "dmg-write")]
+mod layout;
+#[cfg(feature = "dmg-write")]
+mod md5;
 mod mish;
 mod plist;
 #[cfg(feature = "dmg-write")]
@@ -66,8 +72,9 @@ pub use encrypted::{
 pub use mish::{Chunk, ChunkType, Mish};
 #[cfg(feature = "dmg-write")]
 pub use writer::{
-    MAX_WRITE_CHUNK_SECTORS, UdifChecksum, UdifFormat, UdifSummary, UdifWriteOptions, UdifWriter,
-    ZeroRunEncoding, write_udif, write_udif_from_reader,
+    MAX_MAP_ENTRIES, MAX_WRITE_CHUNK_SECTORS, UdifChecksum, UdifFormat, UdifLayout, UdifMapEntry,
+    UdifSummary, UdifWriteOptions, UdifWriter, ZeroRunEncoding, udif_partition_map, write_udif,
+    write_udif_from_reader,
 };
 
 /// `koly` magic — first four bytes of the 512-byte UDIF trailer.
