@@ -117,6 +117,8 @@ pub mod inspect;
 pub mod io;
 #[cfg(feature = "std")]
 pub mod macroman;
+#[cfg(any(feature = "dmg-write", feature = "hfs-plus"))]
+pub(crate) mod md5;
 #[cfg(feature = "std")]
 pub mod memconv;
 #[cfg(feature = "std")]

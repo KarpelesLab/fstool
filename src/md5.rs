@@ -1,9 +1,9 @@
-//! Streaming MD5 (RFC 1321), for the UDIF writer's `kUDIFChecksumMD5`
-//! (type 4) checksums — the ones `hdiutil` records in UFBI images.
+//! Streaming MD5 (RFC 1321), for formats that define it: the UDIF
+//! writer's `kUDIFChecksumMD5` (type 4) checksums and the HFS+ volume
+//! UUID (an MD5 name-based UUID).
 //!
-//! MD5 is used here only as the integrity checksum the format defines,
-//! not for anything security-sensitive. Kept local so the writer needs no
-//! crypto dependency.
+//! Not used for anything security-sensitive. Kept local so neither
+//! feature needs a crypto dependency.
 
 /// Per-round left-rotation amounts.
 const S: [u32; 64] = [
@@ -172,7 +172,7 @@ impl Md5 {
 }
 
 /// One-shot MD5.
-#[cfg(test)]
+#[cfg(any(test, feature = "hfs-plus"))]
 pub(crate) fn md5(data: &[u8]) -> [u8; 16] {
     let mut h = Md5::new();
     h.update(data);

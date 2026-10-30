@@ -76,11 +76,11 @@
 use std::io::{Read, Seek, Write};
 
 pub use super::layout::udif_partition_map;
-use super::md5::Md5;
 use super::mish::{CHUNK_LEN, ChunkType, MISH_HEADER_LEN, MISH_MAGIC};
 use super::{KOLY_MAGIC, KOLY_SIZE, KolyTrailer, MAX_CHUNK_SECTORS};
 use crate::Result;
 use crate::block::BlockDevice;
+use crate::md5::Md5;
 
 /// Sector size UDIF counts in. Fixed by the format.
 const SECTOR: usize = 512;
@@ -1863,7 +1863,7 @@ mod tests {
 
     #[test]
     fn md5_checksums_match_hdiutil_definitions() {
-        use super::super::md5::md5;
+        use crate::md5::md5;
         let disk = sample_disk();
         for f in [UdifFormat::Udro, UdifFormat::Udco, UdifFormat::Ufbi] {
             let mut o = opts(f);

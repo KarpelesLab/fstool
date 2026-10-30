@@ -50,8 +50,6 @@ mod codec;
 pub mod encrypted;
 #[cfg(feature = "dmg-write")]
 mod layout;
-#[cfg(feature = "dmg-write")]
-mod md5;
 mod mish;
 mod plist;
 #[cfg(feature = "dmg-write")]
