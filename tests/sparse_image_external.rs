@@ -373,3 +373,294 @@ fn attached_images_are_locked() {
         drop(dev);
     }
 }
+
+/// Copy a sparseimage file or a sparsebundle directory.
+fn copy_image(src: &Path, dst: &Path) {
+    if src.is_dir() {
+        std::fs::create_dir_all(dst).unwrap();
+        for e in std::fs::read_dir(src).unwrap() {
+            let e = e.unwrap();
+            copy_image(&e.path(), &dst.join(e.file_name()));
+        }
+    } else {
+        std::fs::copy(src, dst).unwrap();
+    }
+}
+
+fn allocated_bands(img: &Path) -> u64 {
+    fstool::block::sparse::SparseBackend::open_read_only(img)
+        .unwrap()
+        .allocated_bands()
+}
+
+/// `fsck_<fs> -n` (`-fn` for HFS+, which otherwise skips a journaled
+/// volume) on the data partition of `img`.
+fn fsck_image(img: &Path, fsck: &str) {
+    let tool = format!("/sbin/{fsck}");
+    if !Path::new(&tool).exists() {
+        eprintln!("no {tool}: not checking");
+        return;
+    }
+    let plist = run(Command::new("hdiutil")
+        .args(["attach", "-plist", "-nobrowse", "-readonly", "-nomount"])
+        .arg(img));
+    let whole = whole_disk(&plist).expect("attached disk");
+    let _a = Attached { dev: whole.clone() };
+    // The data partition is the last /dev/diskNsM listed.
+    let prefix = format!("{whole}s");
+    let part = plist
+        .split("<string>")
+        .filter_map(|s| s.split("</string>").next())
+        .filter(|s| s.starts_with(&prefix))
+        .last()
+        .unwrap_or(&whole)
+        .to_string();
+    let flags = if fsck == "fsck_hfs" { "-fn" } else { "-n" };
+    let out = Command::new(&tool).args([flags, &part]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{fsck} {part} ({}):\n{}{}",
+        img.display(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Make an image with hdiutil (1 MiB bands), fill a volume in a GPT
+/// partition through a real mount, delete most of it, and detach: free
+/// space full of nonzero bytes that compaction can't touch. Returns the
+/// files that stay.
+fn image_with_deleted_files(img: &Path, kind: &str, fs: &str, seed: u64) -> Vec<(String, Vec<u8>)> {
+    run(Command::new("hdiutil")
+        .args(["create", "-quiet", "-size", "96m", "-type", kind])
+        .args(["-fs", fs, "-layout", "GPTSPUD", "-volname", "RECLAIM"])
+        .args(["-imagekey", "sparse-band-size=2048"])
+        .arg(img));
+    let mnt = img.with_extension("mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let keep = vec![
+        ("keep.bin".to_string(), noise(6 << 20, seed)),
+        ("small.txt".to_string(), b"still here\n".to_vec()),
+    ];
+    {
+        let _a = Attached::new(img, &["-mountpoint", mnt.to_str().unwrap()]);
+        std::fs::write(mnt.join("gone1.bin"), noise(30 << 20, seed + 1)).unwrap();
+        for (n, data) in &keep {
+            std::fs::write(mnt.join(n), data).unwrap();
+        }
+        std::fs::write(mnt.join("gone2.bin"), noise(24 << 20, seed + 2)).unwrap();
+        std::fs::remove_file(mnt.join("gone1.bin")).unwrap();
+        std::fs::remove_file(mnt.join("gone2.bin")).unwrap();
+    }
+    keep
+}
+
+fn read_back(img: &Path, dir: &Path, files: &[(String, Vec<u8>)]) {
+    let mnt = dir.join("readback.mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let _a = Attached::new(img, &["-readonly", "-mountpoint", mnt.to_str().unwrap()]);
+    for (n, data) in files {
+        let got = std::fs::read(mnt.join(n)).unwrap();
+        assert!(got == *data, "{n}: different bytes after reclaim");
+    }
+}
+
+/// Filesystem-aware reclamation on a journaled HFS+ volume inside a GPT
+/// partition: the bands of deleted files go, fsck stays clean, kept files
+/// read back, and the result is at least as small as `hdiutil compact`
+/// makes it.
+#[test]
+fn reclaim_releases_deleted_files_like_hdiutil_compact() {
+    need_hdiutil!();
+    use fstool::block::sparse::{PartialBandPolicy, ReclaimOpts, SparseBackend, reclaim};
+    let d = tempfile::tempdir().unwrap();
+    for (name, kind) in [
+        ("r.sparseimage", "SPARSE"),
+        ("r.sparsebundle", "SPARSEBUNDLE"),
+    ] {
+        let img = d.path().join(name);
+        let keep = image_with_deleted_files(&img, kind, "JHFS+", 40);
+        let twin = d.path().join(format!("twin-{name}"));
+        copy_image(&img, &twin);
+        let before = allocated_bands(&img);
+        // Zero-band compaction finds (almost) nothing: the deleted files'
+        // bytes are still there.
+        let compacted = SparseBackend::open(&img).unwrap().compact().unwrap();
+        assert!(compacted <= 2, "{name}: compact dropped {compacted}");
+        let before = before - compacted;
+
+        let mut opts = ReclaimOpts::default();
+        opts.dry_run = true;
+        let dry = reclaim(&img, &opts).unwrap();
+        assert_eq!(allocated_bands(&img), before, "{name}: dry run changed it");
+        opts.dry_run = false;
+        let rep = reclaim(&img, &opts).unwrap();
+        assert_eq!(rep.stats.bands_released, dry.stats.bands_released);
+        assert_eq!(rep.volumes.len(), 1, "{name}");
+        assert_eq!(rep.volumes[0].fs, "hfs+");
+        assert!(rep.volumes[0].offset > 0, "{name}: volume in a partition");
+        let after = allocated_bands(&img);
+        assert_eq!(rep.stats.bands_after(), after);
+        // 54 MiB deleted, in 1 MiB bands.
+        assert!(
+            after + 45 <= before,
+            "{name}: {before} → {after} bands only"
+        );
+        fsck_image(&img, "fsck_hfs");
+        read_back(&img, d.path(), &keep);
+
+        // hdiutil compact on the twin, for comparison.
+        run(Command::new("hdiutil")
+            .args(["compact", "-quiet"])
+            .arg(&twin));
+        let theirs = allocated_bands(&twin);
+        eprintln!("{name}: {before} bands; fstool reclaim → {after}, hdiutil compact → {theirs}");
+        assert!(after <= theirs, "{name}: fstool {after} > hdiutil {theirs}");
+
+        // Zeroing the free parts of kept bands leaves the volume intact.
+        opts.partial = PartialBandPolicy::ZeroFree;
+        let rep = reclaim(&img, &opts).unwrap();
+        assert!(rep.stats.bands_zeroed > 0, "{name}: nothing to zero");
+        fsck_image(&img, "fsck_hfs");
+        read_back(&img, d.path(), &keep);
+    }
+}
+
+/// The same for the FAT32 and exFAT volumes hdiutil makes, which
+/// `hdiutil compact` does not reclaim at all.
+#[test]
+fn reclaim_handles_fat32_and_exfat() {
+    need_hdiutil!();
+    let d = tempfile::tempdir().unwrap();
+    for (fs, fsck) in [("MS-DOS FAT32", "fsck_msdos"), ("ExFAT", "fsck_exfat")] {
+        let img = d.path().join(format!("{fsck}.sparseimage"));
+        let keep = image_with_deleted_files(&img, "SPARSE", fs, 50);
+        let before = allocated_bands(&img);
+        let rep = fstool::block::sparse::reclaim(&img, &Default::default()).unwrap();
+        let after = allocated_bands(&img);
+        eprintln!("{fs}: {before} → {after} bands");
+        assert!(after + 45 <= before, "{fs}: {before} → {after} bands only");
+        assert_eq!(rep.stats.bands_after(), after);
+        fsck_image(&img, fsck);
+        read_back(&img, d.path(), &keep);
+    }
+}
+
+/// A volume that was not cleanly unmounted is refused, image untouched.
+#[test]
+fn reclaim_refuses_a_mounted_volume() {
+    need_hdiutil!();
+    let d = tempfile::tempdir().unwrap();
+    let img = d.path().join("m.sparseimage");
+    image_with_deleted_files(&img, "SPARSE", "HFS+", 60);
+    let mnt = d.path().join("live.mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let copy = d.path().join("snap.sparseimage");
+    {
+        let _a = Attached::new(&img, &["-mountpoint", mnt.to_str().unwrap()]);
+        std::fs::write(mnt.join("x"), b"x").unwrap();
+        // Attached: the image itself is locked.
+        assert!(fstool::block::sparse::reclaim(&img, &Default::default()).is_err());
+        // A copy taken while mounted holds a volume marked mounted.
+        std::fs::copy(&img, &copy).unwrap();
+    }
+    let raw = std::fs::read(&copy).unwrap();
+    let err = fstool::block::sparse::reclaim(&copy, &Default::default()).unwrap_err();
+    assert!(matches!(err, fstool::Error::InvalidImage(_)), "{err}");
+    assert!(
+        std::fs::read(&copy).unwrap() == raw,
+        "refusal changed the image"
+    );
+}
+
+/// `fstool compact` / `reclaim` / `resize` end to end on images fstool
+/// makes itself — no hdiutil needed, so this runs on every Unix host.
+#[cfg(feature = "cli")]
+#[test]
+fn cli_compact_reclaim_resize() {
+    let fstool = env!("CARGO_BIN_EXE_fstool");
+    let d = tempfile::tempdir().unwrap();
+    let cli = |args: &[&str]| -> (bool, String) {
+        let out = Command::new(fstool).args(args).output().unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.success(), text)
+    };
+    let ok = |args: &[&str]| -> String {
+        let (good, text) = cli(args);
+        assert!(good, "fstool {args:?}:\n{text}");
+        text
+    };
+    let big = d.path().join("big.bin");
+    let keep = d.path().join("keep.bin");
+    std::fs::write(&big, noise(30 << 20, 70)).unwrap();
+    let kept = noise(1 << 20, 71);
+    std::fs::write(&keep, &kept).unwrap();
+    for name in ["c.sparseimage", "c.sparsebundle"] {
+        let img = d.path().join(name);
+        let img_s = img.to_str().unwrap();
+        ok(&["create", "-t", "hfs+", "-o", img_s, "--size", "64MiB"]);
+        ok(&["add", img_s, big.to_str().unwrap(), "/big.bin"]);
+        ok(&["add", img_s, keep.to_str().unwrap(), "/keep.bin"]);
+        ok(&["rm", img_s, "/big.bin"]);
+        let before = allocated_bands(&img);
+
+        // Zero-band compaction can't see the deleted file.
+        let out = ok(&["compact", img_s]);
+        assert!(out.contains("bands"), "{out}");
+        let after_compact = allocated_bands(&img);
+        assert!(
+            after_compact + 2 >= before,
+            "{name}: compact {before} → {after_compact}"
+        );
+
+        let dry = ok(&["reclaim", "--dry-run", img_s]);
+        assert!(dry.contains("would release"), "{dry}");
+        assert_eq!(allocated_bands(&img), after_compact);
+        let out = ok(&["reclaim", img_s]);
+        assert!(out.contains("hfs+"), "{out}");
+        let after = allocated_bands(&img);
+        let band = fstool::block::sparse::SparseBackend::open_read_only(&img)
+            .unwrap()
+            .band_size();
+        let freed = (after_compact - after) * band;
+        assert!(
+            freed >= 10 << 20,
+            "{name}: only {freed} bytes released\n{out}"
+        );
+        let (good, cat) = {
+            let out = Command::new(fstool)
+                .args(["cat", img_s, "/keep.bin"])
+                .output()
+                .unwrap();
+            (out.status.success(), out.stdout)
+        };
+        assert!(good && cat == kept, "{name}: kept file changed");
+
+        // Shrinking over the volume's tail (its alternate header) is
+        // refused without --discard and leaves the image as it was.
+        let (good, text) = cli(&["resize", img_s, "32MiB"]);
+        assert!(!good && text.contains("--discard"), "{text}");
+        assert_eq!(
+            fstool::block::open_image_read_only(&img)
+                .unwrap()
+                .total_size(),
+            64 << 20
+        );
+        ok(&["resize", img_s, "96MiB"]);
+        assert_eq!(
+            fstool::block::open_image_read_only(&img)
+                .unwrap()
+                .total_size(),
+            96 << 20
+        );
+        // A non-sparse file is refused.
+        let raw = d.path().join("plain.img");
+        std::fs::write(&raw, vec![0u8; 4096]).unwrap();
+        let (good, _) = cli(&["compact", raw.to_str().unwrap()]);
+        assert!(!good);
+    }
+}

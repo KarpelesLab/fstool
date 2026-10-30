@@ -447,6 +447,57 @@ enum Command {
         compress: Option<String>,
     },
 
+    /// Drop the bands of an Apple `.sparseimage` / `.sparsebundle` whose
+    /// contents are entirely zero, giving their space back to the host.
+    /// Not filesystem-aware: a deleted file's bytes are still there, so
+    /// use `reclaim` to free space a filesystem no longer uses.
+    #[cfg(feature = "sparse-image")]
+    Compact {
+        /// The `.sparseimage` file or `.sparsebundle` directory.
+        #[arg(value_name = "IMAGE")]
+        image: PathBuf,
+    },
+
+    /// Give back the space of every band of an Apple `.sparseimage` /
+    /// `.sparsebundle` that holds only free space, as the filesystems in
+    /// it report it (HFS+, HFS, FAT12/16/32, exFAT, ext2/3/4) — what
+    /// `hdiutil compact` does, without attaching the image. Each
+    /// filesystem must be cleanly unmounted (the image detached); a dirty
+    /// or journal-pending volume is refused. Partitions are honoured:
+    /// `IMAGE:N` limits it to partition N, otherwise every partition with
+    /// a supported filesystem is used and the rest left alone.
+    #[cfg(feature = "sparse-image")]
+    Reclaim {
+        /// The image, optionally with `:N` to select partition N.
+        #[arg(value_name = "IMAGE[:N]")]
+        image: String,
+        /// Also overwrite with zeros the free bytes inside bands that
+        /// stay allocated (live data in them is not touched). Off by
+        /// default: only whole free bands are released.
+        #[arg(long)]
+        zero_free: bool,
+        /// Report what would be released, changing nothing.
+        #[arg(long, short = 'n')]
+        dry_run: bool,
+    },
+
+    /// Change the virtual size of an Apple `.sparseimage` /
+    /// `.sparsebundle` (the disk, not the filesystem on it). Shrinking is
+    /// refused when any byte past the new end is nonzero, unless
+    /// `--discard` says to drop it.
+    #[cfg(feature = "sparse-image")]
+    Resize {
+        /// The `.sparseimage` file or `.sparsebundle` directory.
+        #[arg(value_name = "IMAGE")]
+        image: PathBuf,
+        /// New size, e.g. "2GiB" — a multiple of 512 bytes.
+        #[arg(value_name = "SIZE")]
+        size: String,
+        /// Allow a shrink to discard nonzero data past the new end.
+        #[arg(long)]
+        discard: bool,
+    },
+
     /// Repack an image into a fresh filesystem at a (possibly different)
     /// size. Walks SRC's filesystem, stages each file into a host
     /// tempdir, then formats DST from scratch. Use this when you need to
@@ -1075,6 +1126,20 @@ fn run(cli: Cli) -> fstool::Result<()> {
             }
             Ok(())
         }
+        #[cfg(feature = "sparse-image")]
+        Command::Compact { image } => sparse_compact_cmd(&image),
+        #[cfg(feature = "sparse-image")]
+        Command::Reclaim {
+            image,
+            zero_free,
+            dry_run,
+        } => sparse_reclaim_cmd(&image, zero_free, dry_run),
+        #[cfg(feature = "sparse-image")]
+        Command::Resize {
+            image,
+            size,
+            discard,
+        } => sparse_resize_cmd(&image, &size, discard),
         Command::Dd {
             src,
             dst,
@@ -1394,6 +1459,104 @@ fn finalize_compress_qcow2(path: &std::path::Path, ctype: u8, level: u8) -> fsto
         } else {
             100.0
         }
+    );
+    Ok(())
+}
+
+/// `fstool compact`: drop all-zero bands of a sparse image.
+#[cfg(feature = "sparse-image")]
+fn sparse_compact_cmd(image: &std::path::Path) -> fstool::Result<()> {
+    let mut dev = fstool::block::sparse::SparseBackend::open(image)?;
+    let before = dev.allocated_bands();
+    let dropped = dev.compact()?;
+    dev.as_block_device().sync()?;
+    println!(
+        "{}: {} bands → {} ({dropped} all-zero band{} dropped, {} each)",
+        image.display(),
+        before,
+        dev.allocated_bands(),
+        if dropped == 1 { "" } else { "s" },
+        human_size(dev.band_size()),
+    );
+    Ok(())
+}
+
+/// `fstool reclaim`: release bands holding only filesystem free space.
+#[cfg(feature = "sparse-image")]
+fn sparse_reclaim_cmd(image: &str, zero_free: bool, dry_run: bool) -> fstool::Result<()> {
+    use fstool::block::sparse::{PartialBandPolicy, ReclaimOpts};
+    let target = fstool::inspect::Target::parse(image);
+    let mut opts = ReclaimOpts::default();
+    opts.partition = target.partition;
+    opts.dry_run = dry_run;
+    if zero_free {
+        opts.partial = PartialBandPolicy::ZeroFree;
+    }
+    let report = fstool::block::sparse::reclaim(&target.path, &opts)?;
+    for v in &report.volumes {
+        let part = v.partition.map_or_else(
+            || "whole image".to_string(),
+            |i| format!("partition {}", i + 1),
+        );
+        println!(
+            "{part}: {} at offset {}, {} free",
+            v.fs,
+            v.offset,
+            human_size(v.free_bytes)
+        );
+    }
+    for s in &report.skipped {
+        println!("partition {}: skipped ({})", s.partition + 1, s.reason);
+    }
+    let st = &report.stats;
+    let verb = if dry_run { "would release" } else { "released" };
+    println!(
+        "{}: {} bands → {} ({verb} {}{})",
+        target.path.display(),
+        st.bands_before,
+        st.bands_after(),
+        st.bands_released,
+        if st.bands_zeroed > 0 {
+            format!(
+                "; zeroed {} free in {} kept band{}",
+                human_size(st.bytes_zeroed),
+                st.bands_zeroed,
+                if st.bands_zeroed == 1 { "" } else { "s" }
+            )
+        } else {
+            String::new()
+        },
+    );
+    Ok(())
+}
+
+/// `fstool resize`: change a sparse image's virtual size.
+#[cfg(feature = "sparse-image")]
+fn sparse_resize_cmd(image: &std::path::Path, size: &str, discard: bool) -> fstool::Result<()> {
+    use fstool::block::ShrinkPolicy;
+    let new_size = fstool::spec::parse_size(size)?;
+    let mut dev = fstool::block::sparse::SparseBackend::open(image)?;
+    let old = dev.as_block_device().total_size();
+    let policy = if discard {
+        ShrinkPolicy::Discard
+    } else {
+        ShrinkPolicy::RequireZero
+    };
+    dev.resize(new_size, policy).map_err(|e| match e {
+        fstool::Error::InvalidArgument(m) if !discard && m.contains("nonzero") => {
+            fstool::Error::InvalidArgument(format!(
+                "{m} (pass --discard to drop it — a filesystem living there will be truncated)"
+            ))
+        }
+        e => e,
+    })?;
+    dev.as_block_device().sync()?;
+    println!(
+        "{}: {} → {} ({} bands allocated)",
+        image.display(),
+        human_size(old),
+        human_size(new_size),
+        dev.allocated_bands()
     );
     Ok(())
 }

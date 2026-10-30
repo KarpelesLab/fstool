@@ -37,8 +37,12 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+use super::reclaim::{
+    PartialBandPolicy, ReclaimOpts, ReclaimStats, check_ranges, complement, free_within,
+};
 use super::{
     ShrinkPolicy, band_pieces, check_band_size, lock, range_is_zero, read_full_at, write_all_at,
     write_zeros_at,
@@ -303,6 +307,10 @@ pub struct SparseImageBackend {
     /// The first header's size / flags fields changed and are unwritten.
     header_dirty: bool,
     cursor: u64,
+    /// Every write / truncate / flush made to the file, for the crash
+    /// tests to replay in any order the disk could have persisted them.
+    #[cfg(test)]
+    oplog: Option<Vec<tests::Op>>,
 }
 
 impl std::fmt::Debug for SparseImageBackend {
@@ -369,9 +377,48 @@ impl SparseImageBackend {
             file_len: 0,
             header_dirty: false,
             cursor: 0,
+            #[cfg(test)]
+            oplog: None,
         };
         me.install(st);
         me
+    }
+
+    // Every change to the image file after it is open goes through these
+    // four, which the crash tests record.
+
+    fn pwrite(&mut self, off: u64, buf: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(log) = &mut self.oplog {
+            log.push(tests::Op::Write(off, buf.to_vec()));
+        }
+        write_all_at(&mut self.file, off, buf)
+    }
+
+    fn pzero(&mut self, off: u64, len: u64) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(log) = &mut self.oplog {
+            log.push(tests::Op::Write(off, vec![0; len as usize]));
+        }
+        write_zeros_at(&mut self.file, off, len)
+    }
+
+    fn pset_len(&mut self, len: u64) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(log) = &mut self.oplog {
+            log.push(tests::Op::SetLen(len));
+        }
+        self.file.set_len(len)
+    }
+
+    /// A write barrier: everything before it is durable before anything
+    /// after it is issued.
+    fn barrier(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(log) = &mut self.oplog {
+            log.push(tests::Op::Barrier);
+        }
+        self.file.sync_data()
     }
 
     fn install(&mut self, st: State) {
@@ -399,8 +446,8 @@ impl SparseImageBackend {
         last.raw[from..to].fill(0);
         let off = last.off;
         let bytes = last.raw[from..to].to_vec();
-        write_all_at(&mut self.file, off + from as u64, &bytes)?;
-        self.file.sync_data()?;
+        self.pwrite(off + from as u64, &bytes)?;
+        self.barrier()?;
         Ok(())
     }
 
@@ -497,7 +544,7 @@ impl SparseImageBackend {
                 None if piece.iter().all(|&b| b == 0) => continue,
                 None => self.alloc_slot(band)?,
             };
-            write_all_at(&mut self.file, slot + inner, piece)?;
+            self.pwrite(slot + inner, piece)?;
             self.file_len = self.file_len.max(slot + inner + n as u64);
         }
         Ok(())
@@ -539,10 +586,10 @@ impl SparseImageBackend {
         let span_end = slot + band_size;
         if span_start < self.file_len {
             let n = span_end.min(self.file_len) - span_start;
-            write_zeros_at(&mut self.file, span_start, n)?;
+            self.pzero(span_start, n)?;
         }
         if span_end > self.file_len {
-            self.file.set_len(span_end)?;
+            self.pset_len(span_end)?;
             self.file_len = span_end;
         }
         self.map.insert(band, slot);
@@ -567,43 +614,46 @@ impl SparseImageBackend {
             return Ok(());
         }
         // 1. Make the band data the new entries will point at durable.
-        self.file.sync_data()?;
+        self.barrier()?;
         // 2. Headers and entries, each next-pointer still at its old value.
-        for k in 0..self.nodes.len() {
-            let node = &self.nodes[k];
+        let mut writes: Vec<(u64, Vec<u8>)> = Vec::new();
+        for (k, node) in self.nodes.iter().enumerate() {
             let nf = node.next_field();
             let mut raw = node.raw.clone();
             put64(&mut raw, nf, node.persisted_next);
             if node.fresh {
-                write_all_at(&mut self.file, node.off, &raw)?;
+                writes.push((node.off, raw));
             } else {
                 if k == 0 && self.header_dirty {
                     // Size and flags share sector 0 with the next pointer
                     // and the first entries: one sector, one write.
-                    write_all_at(&mut self.file, 0, &raw[..512])?;
+                    writes.push((0, raw[..512].to_vec()));
                 }
                 if node.entries.len() != node.persisted_entries {
                     let from = node.table() + 4 * node.persisted_entries;
                     let to = node.table() + 4 * node.entries.len();
-                    write_all_at(&mut self.file, node.off + from as u64, &raw[from..to])?;
+                    writes.push((node.off + from as u64, raw[from..to].to_vec()));
                 }
             }
         }
-        self.file.sync_data()?;
+        for (off, bytes) in writes {
+            self.pwrite(off, &bytes)?;
+        }
+        self.barrier()?;
         // 3. Link new headers in.
-        let mut linked = false;
+        let mut links = Vec::new();
         for node in &mut self.nodes {
             if node.next != node.persisted_next {
                 let nf = node.next_field();
                 put64(&mut node.raw, nf, node.next);
-                let off = node.off + nf as u64;
-                let bytes = node.next.to_be_bytes();
-                write_all_at(&mut self.file, off, &bytes)?;
-                linked = true;
+                links.push((node.off + nf as u64, node.next.to_be_bytes()));
             }
         }
-        if linked {
-            self.file.sync_data()?;
+        if !links.is_empty() {
+            for (off, bytes) in links {
+                self.pwrite(off, &bytes)?;
+            }
+            self.barrier()?;
         }
         for node in &mut self.nodes {
             node.fresh = false;
@@ -674,14 +724,14 @@ impl SparseImageBackend {
                 .into_iter()
                 .filter(|&b| (b as u64) < new_bands)
                 .collect();
-            return self.rewrite(new_size, &keep);
+            return self.rewrite(new_size, &keep, &HashMap::new());
         }
         // Only the straddling band is affected: zero its tail, then shrink.
         for &(b, slot) in &affected {
             let inner = new_size - b as u64 * band_size;
-            write_zeros_at(&mut self.file, slot + inner, band_size - inner)?;
+            self.pzero(slot + inner, band_size - inner)?;
         }
-        self.file.sync_data()?;
+        self.barrier()?;
         set_size(&mut self.nodes[0].raw, new_size);
         self.header_dirty = true;
         self.size = new_size;
@@ -709,9 +759,67 @@ impl SparseImageBackend {
             }
         }
         if dropped > 0 {
-            self.rewrite(self.size, &keep)?;
+            self.rewrite(self.size, &keep, &HashMap::new())?;
         }
         Ok(dropped)
+    }
+
+    /// Release every band whose bytes are all either in `free` or zero,
+    /// and — under [`PartialBandPolicy::ZeroFree`] — zero the `free` bytes
+    /// of the bands that stay. Bands with no free byte are left alone.
+    ///
+    /// `free` holds virtual byte ranges, sorted and non-overlapping, that
+    /// the caller guarantees nothing needs: normally a filesystem's free
+    /// space from [`crate::fs::free_space`], as [`reclaim`](super::reclaim)
+    /// gathers it. Their contents are discarded, nonzero or not.
+    ///
+    /// Like [`compact`](Self::compact), the image is rewritten into a new
+    /// file renamed over this one, so a failure leaves it unchanged.
+    /// `opts.partition` is ignored here.
+    pub fn reclaim(&mut self, free: &[Range<u64>], opts: &ReclaimOpts) -> Result<ReclaimStats> {
+        if !opts.dry_run {
+            self.check_writable()?;
+            self.flush_metadata()?;
+        }
+        check_ranges(free, self.size)?;
+        let band_size = self.band_size;
+        let mut stats = ReclaimStats {
+            bands_before: self.map.len() as u64,
+            ..Default::default()
+        };
+        let mut keep = Vec::new();
+        let mut zero: HashMap<u32, Vec<Range<u64>>> = HashMap::new();
+        for b in self.slot_order() {
+            let start = b as u64 * band_size;
+            let end = (start + band_size).min(self.size);
+            let holes = free_within(free, start, end);
+            if holes.is_empty() {
+                keep.push(b);
+                continue;
+            }
+            let slot = self.map[&b];
+            let mut rest_zero = true;
+            for r in complement(&holes, end - start) {
+                if !range_is_zero(&mut self.file, slot + r.start, r.end - r.start)? {
+                    rest_zero = false;
+                    break;
+                }
+            }
+            if rest_zero {
+                stats.bands_released += 1;
+                continue;
+            }
+            keep.push(b);
+            if opts.partial == PartialBandPolicy::ZeroFree {
+                stats.bands_zeroed += 1;
+                stats.bytes_zeroed += holes.iter().map(|r| r.end - r.start).sum::<u64>();
+                zero.insert(b, holes);
+            }
+        }
+        if !opts.dry_run && (stats.bands_released > 0 || !zero.is_empty()) {
+            self.rewrite(self.size, &keep, &zero)?;
+        }
+        Ok(stats)
     }
 
     /// Allocated bands (0-based), in slot order.
@@ -724,8 +832,14 @@ impl SparseImageBackend {
 
     /// Write a fresh image of `new_size` bytes holding `keep` (0-based
     /// bands, copied in that order) next to this one, then rename it into
-    /// place. Bytes past `new_size` are zeroed in the copy.
-    fn rewrite(&mut self, new_size: u64, keep: &[u32]) -> Result<()> {
+    /// place. Bytes past `new_size`, and the band-relative ranges `zero`
+    /// lists for a band, are zeroed in the copy.
+    fn rewrite(
+        &mut self,
+        new_size: u64,
+        keep: &[u32],
+        zero: &HashMap<u32, Vec<Range<u64>>>,
+    ) -> Result<()> {
         let band_size = self.band_size;
         let name = self.path.file_name().ok_or_else(|| {
             crate::Error::InvalidArgument("sparseimage: path has no file name".into())
@@ -787,6 +901,13 @@ impl SparseImageBackend {
                     if vpos + n as u64 > new_size {
                         let keep_n = new_size.saturating_sub(vpos) as usize;
                         chunk[keep_n..].fill(0);
+                    }
+                    for r in zero.get(&b).into_iter().flatten() {
+                        let lo = r.start.max(done);
+                        let hi = r.end.min(done + n as u64);
+                        if lo < hi {
+                            chunk[(lo - done) as usize..(hi - done) as usize].fill(0);
+                        }
                     }
                     write_all_at(&mut out, dst + done, chunk)?;
                     done += n as u64;
@@ -904,7 +1025,7 @@ impl BlockDevice for SparseImageBackend {
             return Ok(());
         }
         self.flush_metadata()?;
-        self.file.sync_data()?;
+        self.barrier()?;
         Ok(())
     }
 
@@ -1098,6 +1219,242 @@ mod tests {
         let img = SparseImageBackend::open(&p).unwrap();
         assert_eq!(img.total_size(), 8 * 4096);
         drop(img);
+    }
+
+    /// One recorded change to the image file.
+    #[derive(Debug, Clone)]
+    pub(super) enum Op {
+        Write(u64, Vec<u8>),
+        SetLen(u64),
+        Barrier,
+    }
+
+    fn apply(state: &mut Vec<u8>, op: &Op) {
+        match op {
+            Op::Write(off, data) => {
+                let end = *off as usize + data.len();
+                if state.len() < end {
+                    state.resize(end, 0);
+                }
+                state[*off as usize..end].copy_from_slice(data);
+            }
+            Op::SetLen(n) => state.resize(*n as usize, 0),
+            Op::Barrier => {}
+        }
+    }
+
+    /// File contents a crash could leave behind after `ops` ran on
+    /// `base`: every in-order prefix, and — since the disk may persist
+    /// the writes between two barriers in any order — for each barrier
+    /// epoch, everything before it plus any single op of the epoch, and
+    /// plus all of the epoch but one op.
+    fn crash_states(base: &[u8], ops: &[Op]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut state = base.to_vec();
+        out.push(state.clone());
+        for op in ops {
+            apply(&mut state, op);
+            out.push(state.clone());
+        }
+        let epochs: Vec<&[Op]> = ops.split(|o| matches!(o, Op::Barrier)).collect();
+        let mut durable = base.to_vec();
+        for epoch in epochs {
+            for skip in 0..epoch.len() {
+                let mut one = durable.clone();
+                apply(&mut one, &epoch[skip]);
+                out.push(one);
+                let mut all_but = durable.clone();
+                for (i, op) in epoch.iter().enumerate() {
+                    if i != skip {
+                        apply(&mut all_but, op);
+                    }
+                }
+                out.push(all_but);
+            }
+            for op in epoch {
+                apply(&mut durable, op);
+            }
+        }
+        out
+    }
+
+    /// Open every crash state and check each listed band reads either
+    /// its old contents (zeros for a hole) or its new ones — never
+    /// anything else, in particular not the garbage left in free slots.
+    fn check_crash_states(base: &[u8], ops: &[Op], band_size: u64, bands: &[(u64, u8, u8)]) {
+        let d = tmpdir();
+        let states = crash_states(base, ops);
+        assert!(states.len() > ops.len());
+        for (n, state) in states.iter().enumerate() {
+            let p = d.path().join(format!("crash{n}.sparseimage"));
+            std::fs::write(&p, state).unwrap();
+            let mut img = SparseImageBackend::open_read_only(&p)
+                .unwrap_or_else(|e| panic!("state {n}: does not open: {e}"));
+            for &(b, old, new) in bands {
+                let mut got = vec![0u8; band_size as usize];
+                img.read_at(b * band_size, &mut got).unwrap();
+                let is = |v: u8| got.iter().all(|&x| x == v);
+                assert!(
+                    is(old) || is(new),
+                    "state {n}: band {b} reads neither {old:#x} nor {new:#x} (first byte {:#x})",
+                    got[0]
+                );
+            }
+            drop(img);
+            // A writer recovering it works too, and allocating again
+            // never resurrects garbage.
+            let mut img = SparseImageBackend::open(&p).unwrap();
+            let spare = img.total_size() / band_size - 1;
+            img.write_at(spare * band_size, &[0x99]).unwrap();
+            let mut got = vec![0u8; band_size as usize];
+            img.read_at(spare * band_size, &mut got).unwrap();
+            assert!(got[1..].iter().all(|&x| x == 0), "state {n}: dirty slot");
+            drop(img);
+            std::fs::remove_file(&p).ok();
+        }
+        // With every op applied, every band has its new contents.
+        let last = states[ops.len()].clone();
+        let p = d.path().join("done.sparseimage");
+        std::fs::write(&p, last).unwrap();
+        let mut img = SparseImageBackend::open_read_only(&p).unwrap();
+        for &(b, _, new) in bands {
+            let mut got = vec![0u8; band_size as usize];
+            img.read_at(b * band_size, &mut got).unwrap();
+            assert!(got.iter().all(|&x| x == new), "band {b} after sync");
+        }
+    }
+
+    #[test]
+    fn crash_between_data_and_table_never_maps_garbage() {
+        let d = tmpdir();
+        let p = d.path().join("cr.sparseimage");
+        let bs = 4096u64;
+        let mut img = SparseImageBackend::create(&p, 16 * bs, bs).unwrap();
+        img.write_at(0, &[0xA0; 4096]).unwrap();
+        img.write_at(bs, &[0xA1; 4096]).unwrap();
+        img.sync().unwrap();
+        drop(img);
+        // Leftovers of allocations a crash lost: two slots of garbage
+        // past the table's last entry.
+        let mut raw = std::fs::read(&p).unwrap();
+        raw.resize(raw.len() + 2 * bs as usize, 0xEE);
+        std::fs::write(&p, &raw).unwrap();
+
+        let mut img = SparseImageBackend::open(&p).unwrap();
+        let base = raw_bytes(&mut img);
+        img.oplog = Some(Vec::new());
+        img.write_at(bs, &[0xB1; 4096]).unwrap(); // in place
+        img.write_at(2 * bs, &[0xB2; 4096]).unwrap(); // onto a garbage slot
+        img.write_at(5 * bs, &[0xB5; 4096]).unwrap(); // past the garbage
+        img.sync().unwrap();
+        img.resize(32 * bs, ShrinkPolicy::RequireZero).unwrap();
+        let ops = img.oplog.take().unwrap();
+        drop(img);
+        assert!(ops.iter().filter(|o| matches!(o, Op::Barrier)).count() >= 3);
+        check_crash_states(
+            &base,
+            &ops,
+            bs,
+            &[
+                (0, 0xA0, 0xA0),
+                (1, 0xA1, 0xB1),
+                (2, 0x00, 0xB2),
+                (3, 0x00, 0x00),
+                (5, 0x00, 0xB5),
+            ],
+        );
+    }
+
+    #[test]
+    fn crash_while_chaining_an_extension_header() {
+        let d = tmpdir();
+        let p = d.path().join("cx.sparseimage");
+        let bs = 512u64;
+        let total = FIRST_TABLE_ENTRIES as u64 + 8;
+        let mut img = SparseImageBackend::create(&p, (total + 4) * bs, bs).unwrap();
+        // Fill the first table but for two entries.
+        for b in 0..FIRST_TABLE_ENTRIES as u64 - 2 {
+            img.write_at(b * bs, &[0x10; 512]).unwrap();
+        }
+        img.sync().unwrap();
+        let base = raw_bytes(&mut img);
+        img.oplog = Some(Vec::new());
+        // Five new bands: two finish the first table, three start an
+        // extension header.
+        for b in total - 5..total {
+            img.write_at(b * bs, &[0x20 + (b % 7) as u8; 512]).unwrap();
+        }
+        img.sync().unwrap();
+        assert_eq!(img.header_count(), 2);
+        let ops = img.oplog.take().unwrap();
+        drop(img);
+        let mut bands = vec![
+            (0, 0x10, 0x10),
+            (FIRST_TABLE_ENTRIES as u64 - 3, 0x10, 0x10),
+        ];
+        for b in total - 5..total {
+            bands.push((b, 0, 0x20 + (b % 7) as u8));
+        }
+        check_crash_states(&base, &ops, bs, &bands);
+    }
+
+    #[test]
+    fn reclaim_releases_free_bands_and_preserves_on_failure() {
+        let d = tmpdir();
+        let p = d.path().join("rc.sparseimage");
+        let bs = 4096u64;
+        let mut img = SparseImageBackend::create(&p, 8 * bs, bs).unwrap();
+        img.write_at(0, &[0xAB; 4096]).unwrap(); // band 0: all free
+        img.write_at(bs, &[0x11; 2048]).unwrap(); // band 1: used half…
+        img.write_at(bs + 2048, &[0xCD; 2048]).unwrap(); // …free half
+        img.write_at(2 * bs + 2048, &[0xEF; 2048]).unwrap(); // band 2: zero + free
+        img.write_at(3 * bs, &[1]).unwrap(); // band 3: zeros, no free byte
+        img.write_at(3 * bs, &[0]).unwrap();
+        img.write_at(4 * bs, &[0x44; 4096]).unwrap(); // band 4: untouched
+        img.sync().unwrap();
+        let free = [0..bs, bs + 2048..3 * bs];
+        let snapshot = raw_bytes(&mut img);
+
+        let mut opts = ReclaimOpts {
+            dry_run: true,
+            ..Default::default()
+        };
+        let st = img.reclaim(&free, &opts).unwrap();
+        assert_eq!((st.bands_before, st.bands_released), (5, 2));
+        assert_eq!(raw_bytes(&mut img), snapshot);
+        // Unsorted ranges are refused.
+        assert!(img.reclaim(&[bs..2 * bs, 0..bs], &opts).is_err());
+
+        // A failed rewrite leaves the image as it was.
+        opts.dry_run = false;
+        let tmp = d.path().join("rc.sparseimage.fstool-tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        assert!(img.reclaim(&free, &opts).is_err());
+        assert_eq!(raw_bytes(&mut img), snapshot);
+        assert_eq!(img.allocated_bands(), 5);
+        std::fs::remove_dir(&tmp).unwrap();
+
+        let st = img.reclaim(&free, &opts).unwrap();
+        assert_eq!((st.bands_released, st.bands_zeroed), (2, 0));
+        assert_eq!(img.allocated_bands(), 3);
+        let mut b = vec![0u8; 5 * bs as usize];
+        img.read_at(0, &mut b).unwrap();
+        let mut want = vec![0u8; 5 * bs as usize];
+        want[4096..6144].fill(0x11);
+        want[6144..8192].fill(0xCD);
+        want[4 * 4096..5 * 4096].fill(0x44);
+        assert_eq!(b, want);
+
+        opts.partial = PartialBandPolicy::ZeroFree;
+        let st = img.reclaim(&free, &opts).unwrap();
+        assert_eq!((st.bands_released, st.bands_zeroed), (0, 1));
+        assert_eq!(st.bytes_zeroed, 2048);
+        want[6144..8192].fill(0);
+        drop(img);
+        let mut img = SparseImageBackend::open(&p).unwrap();
+        img.read_at(0, &mut b).unwrap();
+        assert_eq!(b, want);
+        assert_eq!(img.allocated_bands(), 3);
     }
 
     #[test]

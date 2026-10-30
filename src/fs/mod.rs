@@ -48,6 +48,10 @@ pub mod f2fs;
 // One of the two backends that work with or without a heap.
 #[cfg(feature = "fat")]
 pub mod fat;
+// Free-space maps read straight from allocation bitmaps — self-contained
+// parsers, so they need no filesystem backend compiled in.
+#[cfg(feature = "alloc")]
+pub mod free_space;
 #[cfg(all(feature = "alloc", feature = "grf"))]
 pub mod grf;
 #[cfg(all(feature = "alloc", feature = "hfs"))]

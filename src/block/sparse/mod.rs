@@ -16,14 +16,27 @@
 //!
 //! ## Space management
 //!
-//! Two explicit operations sit beside the I/O, kept apart from anything
-//! filesystem-aware: [`resize`](SparseImageBackend::resize) changes the
-//! virtual size (shrinking refuses to drop nonzero bytes unless the
-//! [`ShrinkPolicy`] says so) and [`compact`](SparseImageBackend::compact)
-//! returns the space of bands that are entirely zero. A deleted file
-//! usually leaves its old bytes behind, so compaction alone reclaims little
-//! after deletions; zeroing the free space first is the filesystem's job
-//! and out of scope here. Both leave the image untouched when they fail.
+//! Three explicit operations sit beside the I/O:
+//!
+//! - [`resize`](SparseImageBackend::resize) changes the virtual size.
+//!   Shrinking refuses to drop nonzero bytes unless the [`ShrinkPolicy`]
+//!   says so.
+//! - [`compact`](SparseImageBackend::compact) returns the space of bands
+//!   that are entirely zero. It knows nothing of filesystems — and a
+//!   deleted file leaves its bytes behind, so after deletions it finds
+//!   little to do.
+//! - [`reclaim`] is the filesystem-aware one: it reads each volume's
+//!   allocation bitmap ([`crate::fs::free_space`]: HFS+, HFS, FAT, exFAT,
+//!   ext2/3/4), through the partition table, and releases the bands that
+//!   hold only free space, discarding the stale bytes of deleted files.
+//!   It runs only on cleanly unmounted volumes; zeroing the free part of
+//!   bands that also hold live data is a separate opt-in
+//!   ([`PartialBandPolicy::ZeroFree`]). The backends'
+//!   [`reclaim`](SparseImageBackend::reclaim) methods take the free ranges
+//!   from the caller instead.
+//!
+//! All three leave a sparseimage untouched when they fail (see below); a
+//! bundle is changed one atomic file operation at a time.
 //!
 //! ## Concurrency
 //!
@@ -39,23 +52,48 @@
 //!
 //! ## Crash safety
 //!
-//! Band data always lands before the metadata that makes it reachable:
-//! the sparseimage band table is written only at
-//! [`sync`](super::BlockDevice::sync) (or drop), after the new bands'
-//! data has been flushed, and an extension header is complete on disk
-//! before the header before it points at it. A crash therefore loses at
-//! most bands allocated since the last sync — never maps a band to
-//! garbage. The sparseimage header and each table entry sit within one
-//! 512-byte sector, so a resize is a single-sector update. Shrinking or
-//! compacting a sparseimage writes a new file beside the old one and
-//! renames it into place; a bundle's `Info.plist` is replaced the same way.
+//! Both backends behave like a disk with a volatile write cache, with
+//! [`sync`](super::BlockDevice::sync) as the cache flush: everything
+//! written before a `sync` returns survives a crash; a write after it
+//! may be lost — the band reads its previous contents, or zeros if it was
+//! a hole — but a crash never makes a band read bytes that were not
+//! written to it. That is the contract journaling filesystems already
+//! rely on, so no journal of its own is needed. In detail:
+//!
+//! - **sparseimage.** A band's slot is zeroed and its data written
+//!   first; the band-table entry that maps it is written only at `sync`
+//!   (or drop) after a flush of that data, and flushed in turn before an
+//!   extension header holding new entries is linked from the header
+//!   before it. A crash in between leaves the entry missing — the band is
+//!   a hole again — and the next writer zeroes the unreachable slot before
+//!   reusing it, so its stale bytes can never be mapped. Overwrites of
+//!   mapped bands are in place, like sector writes. The header fields
+//!   (size, flags) and any table entry each lie within one 512-byte
+//!   sector, so a grow is a single-sector update; a torn table write
+//!   leaves a prefix of the new entries. Shrink, compact and reclaim
+//!   write a complete new image beside the old one, flush it and rename
+//!   it into place: a crash leaves the old image or the new one. These
+//!   orderings are checked by replaying recorded writes in every order
+//!   the disk could persist them between flushes.
+//! - **sparsebundle.** There is no mapping table: a band exists when its
+//!   file does, and a missing or short file reads as zeros. Band files
+//!   are flushed at `sync` along with the `bands/` directory. A shrink
+//!   deletes and truncates band files before `Info.plist` (replaced by
+//!   write-flush-rename) records the new size; compaction and reclamation
+//!   delete band files one at a time, each deletion atomic and each
+//!   dropping only bytes that were zero or free.
 
 mod bundle;
 mod image;
 pub(crate) mod plist;
+mod reclaim;
 
 pub use bundle::SparseBundleBackend;
 pub use image::SparseImageBackend;
+pub use reclaim::{
+    MappedVolume, PartialBandPolicy, ReclaimOpts, ReclaimReport, ReclaimStats, SkippedVolume,
+    SparseBackend, reclaim,
+};
 
 use std::fs::{File, Metadata};
 use std::io;
@@ -111,6 +149,7 @@ pub(crate) fn open_auto(
         };
         return Ok(Some(alloc::boxed::Box::new(b)));
     }
+    refuse_encrypted_image(path)?;
     if SparseImageBackend::probe(path)? {
         let b = if read_only {
             SparseImageBackend::open_read_only(path)?
@@ -120,6 +159,25 @@ pub(crate) fn open_auto(
         return Ok(Some(alloc::boxed::Box::new(b)));
     }
     Ok(None)
+}
+
+/// An encrypted `.sparseimage` is an `encrcdsa` container around the
+/// `sprs` file. Decrypting it is not supported: say so, rather than let it
+/// be read as a raw disk full of ciphertext.
+fn refuse_encrypted_image(path: &Path) -> crate::Result<()> {
+    if !is_sparseimage_path(path) || !path.is_file() {
+        return Ok(());
+    }
+    let mut head = [0u8; 8];
+    let mut f = File::open(path)?;
+    read_full_at(&mut f, 0, &mut head)?;
+    if &head == b"encrcdsa" {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: encrypted sparseimages are not supported",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Validate a caller-supplied band size: a nonzero multiple of 512, at
@@ -351,6 +409,23 @@ mod tests {
         assert_eq!(band_pieces(0, 0, 512).count(), 0);
         let v: alloc::vec::Vec<_> = band_pieces(2048, 1024, 1024).collect();
         assert_eq!(v, [(2, 0, 0, 1024)]);
+    }
+
+    #[test]
+    fn encrypted_sparseimage_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("e.sparseimage");
+        let mut raw = b"encrcdsa".to_vec();
+        raw.resize(8192, 0);
+        std::fs::write(&p, raw).unwrap();
+        assert!(matches!(
+            open_auto(&p, true),
+            Err(crate::Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            SparseBackend::open(&p),
+            Err(crate::Error::Unsupported(_))
+        ));
     }
 
     #[test]

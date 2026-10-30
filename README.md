@@ -239,8 +239,15 @@ through the TOML spec — see "[filesystem.options]" below.
   points at it; nothing inside a bundle may be a symlink. `resize` (grow, or
   shrink — refused over nonzero data unless `ShrinkPolicy::Discard`) and
   `compact` (drop all-zero bands) are explicit and leave the image intact on
-  failure. Cross-checked against `hdiutil attach` + `fsck_hfs` both ways.
-  Encrypted sparse images are not supported.
+  failure. `reclaim` is the filesystem-aware one, like `hdiutil compact`
+  without attaching: it reads the allocation bitmaps of the volumes inside
+  (HFS+, HFS, FAT12/16/32, exFAT, ext2/3/4 — via `fs::free_space`, through
+  the partition table) and releases bands holding only free space, so a
+  deleted file's leftover bytes go too; it refuses volumes that weren't
+  cleanly unmounted. On the CLI: `fstool compact IMG`, `fstool reclaim
+  IMG[:N] [--zero-free] [--dry-run]`, `fstool resize IMG SIZE [--discard]`.
+  Cross-checked against `hdiutil attach` + `fsck_hfs` both ways, and
+  against `hdiutil compact`. Encrypted sparse images are not supported.
 
 ### DMG writing
 

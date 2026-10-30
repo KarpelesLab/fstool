@@ -31,12 +31,16 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use super::plist;
+use super::reclaim::{
+    PartialBandPolicy, ReclaimOpts, ReclaimStats, check_ranges, complement, free_within,
+};
 use super::{
     ShrinkPolicy, band_pieces, check_band_size, is_link, lock, open_regular, range_is_zero,
-    read_full_at, require_regular, sync_dir, write_all_at,
+    read_full_at, require_regular, sync_dir, write_all_at, write_zeros_at,
 };
 use crate::Result;
 use crate::block::BlockDevice;
@@ -639,6 +643,88 @@ impl SparseBundleBackend {
         self.sync()?;
         Ok(dropped)
     }
+
+    /// Delete every band file whose bytes are all either in `free` or
+    /// zero, and — under [`PartialBandPolicy::ZeroFree`] — zero the `free`
+    /// bytes of the band files that stay (truncating a free tail). Band
+    /// files with no free byte are left alone.
+    ///
+    /// `free` holds virtual byte ranges, sorted and non-overlapping, that
+    /// the caller guarantees nothing needs: normally a filesystem's free
+    /// space from [`crate::fs::free_space`], as [`reclaim`](super::reclaim)
+    /// gathers it. Their contents are discarded, nonzero or not.
+    ///
+    /// Each band is handled on its own: a deletion is atomic and zeroing
+    /// only touches bytes in `free`, so an interrupted run leaves the
+    /// bundle consistent with everything outside `free` intact.
+    /// `opts.partition` is ignored here.
+    pub fn reclaim(&mut self, free: &[Range<u64>], opts: &ReclaimOpts) -> Result<ReclaimStats> {
+        if !opts.dry_run {
+            self.check_writable()?;
+            self.sync()?;
+        }
+        check_ranges(free, self.size)?;
+        let mut stats = ReclaimStats {
+            bands_before: self.present.len() as u64,
+            ..Default::default()
+        };
+        let mut bands: Vec<(u64, u64)> = self.present.iter().map(|(&b, &l)| (b, l)).collect();
+        bands.sort_unstable();
+        for (b, len) in bands {
+            let start = b * self.band_size;
+            let holes = free_within(free, start, start + len);
+            if holes.is_empty() {
+                continue;
+            }
+            let mut rest_zero = true;
+            for r in complement(&holes, len) {
+                let f = self.handle(b)?;
+                if !range_is_zero(f, r.start, r.end - r.start)? {
+                    rest_zero = false;
+                    break;
+                }
+            }
+            if rest_zero {
+                stats.bands_released += 1;
+                if !opts.dry_run {
+                    self.close(b)?;
+                    std::fs::remove_file(self.bands_dir.join(band_name(b)))?;
+                    self.present.remove(&b);
+                    self.names_dirty = true;
+                }
+                continue;
+            }
+            if opts.partial != PartialBandPolicy::ZeroFree {
+                continue;
+            }
+            stats.bands_zeroed += 1;
+            stats.bytes_zeroed += holes.iter().map(|r| r.end - r.start).sum::<u64>();
+            if opts.dry_run {
+                continue;
+            }
+            // A free tail is cut off rather than written.
+            let new_len = match holes.last() {
+                Some(last) if last.end == len => last.start,
+                _ => len,
+            };
+            let f = self.handle(b)?;
+            for r in &holes {
+                let hi = r.end.min(new_len);
+                if r.start < hi {
+                    write_zeros_at(f, r.start, hi - r.start)?;
+                }
+            }
+            if new_len < len {
+                f.set_len(new_len)?;
+            }
+            f.sync_all()?;
+            self.present.insert(b, new_len);
+        }
+        if !opts.dry_run {
+            self.sync()?;
+        }
+        Ok(stats)
+    }
 }
 
 impl Read for SparseBundleBackend {
@@ -823,6 +909,53 @@ mod tests {
         assert!(!p.join("bands/9").exists());
         b.read_at(4096 + 10, &mut x).unwrap();
         assert_eq!(&x, b"keep");
+    }
+
+    #[test]
+    fn reclaim_deletes_free_bands_and_trims_free_tails() {
+        let d = tmpdir();
+        let p = d.path().join("rc.sparsebundle");
+        let bs = 4096u64;
+        let mut b = SparseBundleBackend::create(&p, 8 * bs, bs).unwrap();
+        b.write_at(0, &[0xAB; 4096]).unwrap(); // band 0: all free
+        b.write_at(bs, &[0x11; 1024]).unwrap(); // band 1: used, free middle,
+        b.write_at(bs + 1024, &[0xCD; 1024]).unwrap();
+        b.write_at(bs + 2048, &[0x22; 1024]).unwrap(); // used, free tail
+        b.write_at(bs + 3072, &[0xCD; 1024]).unwrap();
+        b.write_at(2 * bs + 2048, &[0xEF; 512]).unwrap(); // band 2: zero + free
+        b.write_at(4 * bs, &[0x44; 100]).unwrap(); // band 4: no free byte
+        b.sync().unwrap();
+        let free = [0..bs, bs + 1024..bs + 2048, bs + 3072..3 * bs];
+
+        let mut opts = ReclaimOpts {
+            dry_run: true,
+            ..Default::default()
+        };
+        let st = b.reclaim(&free, &opts).unwrap();
+        assert_eq!((st.bands_before, st.bands_released), (4, 2));
+        assert!(p.join("bands/0").exists() && p.join("bands/2").exists());
+
+        opts.dry_run = false;
+        let st = b.reclaim(&free, &opts).unwrap();
+        assert_eq!((st.bands_released, st.bands_zeroed), (2, 0));
+        assert!(!p.join("bands/0").exists() && !p.join("bands/2").exists());
+        assert_eq!(std::fs::metadata(p.join("bands/1")).unwrap().len(), bs);
+
+        opts.partial = PartialBandPolicy::ZeroFree;
+        let st = b.reclaim(&free, &opts).unwrap();
+        assert_eq!((st.bands_zeroed, st.bytes_zeroed), (1, 2048));
+        // The free tail is cut off, the free middle zeroed.
+        assert_eq!(std::fs::metadata(p.join("bands/1")).unwrap().len(), 3072);
+        drop(b);
+        let mut b = SparseBundleBackend::open(&p).unwrap();
+        let mut got = vec![0u8; 5 * bs as usize];
+        b.read_at(0, &mut got).unwrap();
+        let mut want = vec![0u8; 5 * bs as usize];
+        want[4096..5120].fill(0x11);
+        want[6144..7168].fill(0x22);
+        want[4 * 4096..4 * 4096 + 100].fill(0x44);
+        assert_eq!(got, want);
+        assert_eq!(b.allocated_bands(), 2);
     }
 
     #[test]
