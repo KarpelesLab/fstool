@@ -531,10 +531,10 @@ enum Command {
     /// stored bytes (a .dmg's data fork, any other image's file).
     Checksum(imgops::ChecksumArgs),
 
-    /// Make a hybrid optical image: ISO 9660 (+ Rock Ridge), Joliet and
-    /// HFS+ views over one copy of SRC's files, laid out the way
+    /// Make a hybrid optical image: ISO 9660 (+ Rock Ridge), Joliet, HFS+
+    /// and UDF views over one copy of SRC's files, laid out the way
     /// `hdiutil makehybrid` does (HFS+ in an Apple Partition Map
-    /// partition whose file data the ISO 9660 records share). SRC is a
+    /// partition whose file data the ISO 9660 and UDF records share). SRC is a
     /// host directory or an image (`IMAGE[:N]`). Per-view labels,
     /// `--hide-*` / `--only-*` globs, El Torito boot, HFS+ blessing.
     /// Prints the layout and everything a view could not represent.

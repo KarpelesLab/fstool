@@ -706,15 +706,21 @@ fstool repack disc.iso plain.tar
 fstool repack plain.tar disc2.iso --fs-type iso
 ```
 
-### Hybrid images (ISO 9660 + Joliet + HFS+)
+### Hybrid images (ISO 9660 + Joliet + HFS+ + UDF)
 
 `fstool makehybrid` (library: `fs::hybrid`, feature `hybrid`) plans one
 sector space for every view and writes each file's bytes once: the
-ISO 9660 / Rock Ridge and Joliet records and the HFS+ catalog all point
-at the same sectors. The layout is `hdiutil makehybrid`'s — an Apple
-Partition Map in the system area, the ISO 9660 metadata from LBA 16, then
-an `Apple_HFS` partition holding the HFS+ metadata and the shared file
-data — so macOS mounts HFS+ and everything else ISO 9660. Per-view
+ISO 9660 / Rock Ridge and Joliet records, the HFS+ catalog and the UDF
+File Entries all point at the same sectors. The layout is `hdiutil
+makehybrid`'s — an Apple Partition Map in the system area, the ISO 9660
+descriptors from LBA 16 followed by UDF's BEA01/NSR0x/TEA01, the
+ISO 9660 metadata and UDF's volume descriptor sequences, the UDF anchor
+at 256, then an `Apple_HFS` partition holding the HFS+ metadata and the
+shared file data, UDF's read-only partition spanning the payloads and its
+own metadata, and a last anchor in the final sector — so macOS mounts
+HFS+, DVD players and Windows UDF, everything else ISO 9660. UDF
+(feature `udf`, revisions 1.02 / 1.50 / 2.01 / 2.50, 1.50 by default as
+with `hdiutil`) is on in the CLI unless views are named. Per-view
 labels and `--hide-*` / `--only-*` globs shape each view; whatever a view
 cannot represent (a symlink in Joliet, a name mapped for level 1, a
 4 GiB file below level 3) is reported, not dropped silently.
@@ -722,6 +728,7 @@ cannot represent (a symlink in Joliet, a name mapped for level 1, a
 ```sh
 fstool makehybrid ./dist -o app.iso -V "My App" --hide-hfs '*.exe' --hide-joliet '*.app'
 fstool makehybrid ./dist -o app.iso --dry-run    # print the layout and the report
+fstool makehybrid ./dist -o dvd.iso --iso --udf --udf-version 2.01 --hide-udf '*.txt'
 ```
 
 ## Archive formats

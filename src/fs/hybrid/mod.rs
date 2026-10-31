@@ -1,6 +1,6 @@
 //! Hybrid optical images: one sector space, one copy of every file, and
-//! several filesystem views over it — ISO 9660 (with Rock Ridge), Joliet
-//! and HFS+ today, UDF through the same [`HybridView`] interface.
+//! several filesystem views over it — ISO 9660 (with Rock Ridge), Joliet,
+//! HFS+ and (feature `udf`) UDF, each a [`HybridView`].
 //!
 //! Concatenating individually valid images does not produce a hybrid:
 //! their sector addresses have not received the news that they moved.
@@ -9,24 +9,29 @@
 //! ```text
 //! LBA 0..15    system area: Apple Partition Map (DDM + 2 entries) when HFS+
 //! LBA 16..     volume recognition: PVD, El Torito boot record, Joliet SVD,
-//!              terminator (then a UDF VRS, when a UDF view is added)
+//!              terminator, then UDF's BEA01 / NSR02|NSR03 / TEA01
 //! ...          head metadata: El Torito catalog, path tables, ISO 9660 and
-//!              Joliet directories, Rock Ridge continuation areas
+//!              Joliet directories, Rock Ridge continuation areas; UDF main
+//!              and reserve volume descriptor sequences, integrity sequence
+//! 256          UDF anchor volume descriptor pointer
 //! P            ┌ Apple_HFS partition: volume header (byte P*2048+1024),
 //!              │ bitmap, extents / catalog / attributes B-trees, a pool for
 //!              │ HFS+-only blocks (symlink targets, resource forks, xattrs)
-//!              │ payloads listed by HFS+ — shared: the ISO 9660 / Joliet
-//!              │ records point at these very sectors
-//!              └ alternate volume header (last 1 KiB of the partition)
-//! ...          payloads hidden from HFS+ (outside its partition, so HFS+
-//!              never sees blocks it does not own)
-//! ...          tail metadata of other views; end-relative claims
+//!              │ payloads listed by HFS+ — shared: the ISO 9660 / Joliet  ┐
+//!              │ records and UDF File Entries point at these very sectors │
+//!              └ alternate volume header (last 1 KiB of the partition)    │ UDF
+//! ...          payloads hidden from HFS+ (outside its partition, so HFS+  │ partition
+//!              never sees blocks it does not own)                         │
+//! ...          tail metadata: UDF FSD, File Entries, directories          ┘
+//! N-1          UDF anchor (end-relative claims)
 //! ```
 //!
 //! This is the arrangement `hdiutil makehybrid` produces (an APM whose
 //! `Apple_HFS` partition starts right after the ISO 9660 metadata and
-//! holds the file data), so macOS mounts the HFS+ view and every other
-//! system the ISO 9660 one; the ISO volume space covers the whole image.
+//! holds the file data; with `-udf`, a read-only UDF partition spanning
+//! the same data), so macOS mounts the HFS+ view, UDF readers (DVD
+//! players, Windows) the UDF one and every other system the ISO 9660
+//! one; the ISO volume space covers the whole image.
 //! HFS+ allocation blocks are 2048 bytes by default, one per sector, so
 //! file extents line up with ISO 9660 sectors exactly.
 //!
@@ -61,7 +66,10 @@
 //! Anything a view cannot represent exactly — names mapped to
 //! d-characters, names truncated for Joliet, symlinks absent from Joliet,
 //! files of 4 GiB and more below ISO level 3, xattrs outside HFS+ — is
-//! listed in the [`HybridReport`], never dropped silently.
+//! listed in the [`HybridReport`], never dropped silently. UDF reports
+//! names shortened to its 255-byte identifiers, labels shortened to its
+//! descriptor fields, xattrs (which it does not carry here) and
+//! timestamps outside 1970–2106.
 //!
 //! # Adding a view
 //!
@@ -69,8 +77,11 @@
 //! sectors, fixed LBAs, floating head / tail runs, end-relative runs, a
 //! payload-enclosing partition, system-area bytes), the planner assigns
 //! them, and the view writes inside its share. [`HybridPlan::with_views`]
-//! takes extra views; [`build_views`] is where an option-driven built-in
-//! view (UDF) is wired in.
+//! takes extra views; [`build_views`] wires in the option-driven
+//! built-in ones (the UDF view, `UdfView`, is the worked example of the
+//! interface: it asks for recognition sectors, the fixed anchor at 256,
+//! head and tail runs and an end-relative anchor, and records its File
+//! Entries over the payload extents the planner placed).
 
 mod apm;
 mod error;
@@ -81,6 +92,8 @@ mod names;
 mod plan;
 mod report;
 mod source;
+#[cfg(feature = "udf")]
+mod udf_view;
 mod view;
 
 pub use error::{HybridError, Result};
@@ -92,6 +105,8 @@ pub use source::{
     Content, ContentId, EntryMeta, FilesystemPayloads, HostPayloads, NodeId, Payload,
     PayloadOpener, SourceKind, SourceNode, SourceTree,
 };
+#[cfg(feature = "udf")]
+pub use udf_view::UdfView;
 pub use view::{
     ByteRequest, EndRequest, Extent, FixedRequest, HybridView, PayloadEntry, PayloadLayout,
     PayloadZone, Placement, SectorRequest, ViewId, ViewInput, ViewNeeds, ViewPlacement, Visibility,
@@ -314,6 +329,59 @@ impl Default for HfsOptions {
     }
 }
 
+/// The UDF view (feature `udf`): a UDF volume over the same payload
+/// sectors, as `hdiutil makehybrid -udf` writes it — its recognition
+/// sequence right after the ISO 9660 terminator, anchors at sector 256
+/// and in the last sector, and one read-only partition from the first
+/// payload sector through UDF's own metadata.
+#[cfg(feature = "udf")]
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct UdfOptions {
+    /// Advertise a UDF volume. Off by default (the CLI turns it on with
+    /// the other three when no view is named, like `hdiutil makehybrid`).
+    pub enabled: bool,
+    /// Revision: 1.02, 1.50 (the default, as `hdiutil makehybrid`), 2.01
+    /// or 2.50 (a metadata partition whose File Entries point at the
+    /// shared payload in the physical partition).
+    pub revision: crate::fs::udf::UdfRevision,
+    /// The label — the logical volume identifier macOS, Windows and Linux
+    /// show (`None`: [`HybridOptions::volume_name`]); 126 Latin-1 or 63
+    /// UTF-16 characters, shortened (and reported) beyond.
+    pub volume_name: Option<String>,
+    /// Primary Volume Descriptor volume identifier (`None`: the label,
+    /// shortened to 30 Latin-1 / 15 UTF-16 characters).
+    pub volume_id: Option<String>,
+    /// Volume set identifier (`None`: 16 hex digits, as UDF 2.2.2.5 asks).
+    pub volume_set_id: Option<String>,
+    /// File set identifier (`None`: the label, shortened like
+    /// [`volume_id`](Self::volume_id)).
+    pub file_set_id: Option<String>,
+    /// Application identifier (at most 23 ASCII bytes).
+    pub application_id: String,
+    /// Globs hidden from UDF.
+    pub hide: Vec<String>,
+    /// Globs shown in UDF only.
+    pub only: Vec<String>,
+}
+
+#[cfg(feature = "udf")]
+impl Default for UdfOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            revision: crate::fs::udf::UdfRevision::V1_50,
+            volume_name: None,
+            volume_id: None,
+            volume_set_id: None,
+            file_set_id: None,
+            application_id: String::new(),
+            hide: Vec::new(),
+            only: Vec::new(),
+        }
+    }
+}
+
 /// Everything about a hybrid image except its contents.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -328,7 +396,10 @@ pub struct HybridOptions {
     pub joliet: JolietOptions,
     /// The HFS+ view.
     pub hfs: HfsOptions,
-    /// `hide` / `only` globs for views beyond the built-in three (a
+    /// The UDF view (disabled by default).
+    #[cfg(feature = "udf")]
+    pub udf: UdfOptions,
+    /// `hide` / `only` globs for views beyond the built-in ones (a
     /// view added through [`HybridPlan::with_views`]).
     pub view_filters: Vec<ViewFilter>,
 }
@@ -362,6 +433,8 @@ impl HybridOptions {
             iso: IsoOptions::default(),
             joliet: JolietOptions::default(),
             hfs: HfsOptions::default(),
+            #[cfg(feature = "udf")]
+            udf: UdfOptions::default(),
             view_filters: Vec::new(),
         }
     }
@@ -375,7 +448,7 @@ impl Default for HybridOptions {
 
 /// The built-in views `opts` enables, in the order the planner calls
 /// them (ISO 9660 first: its descriptor set opens the volume recognition
-/// area). This is the place an option-driven UDF view is added.
+/// area, UDF's recognition sequence follows it).
 pub fn build_views(opts: &HybridOptions) -> Vec<Box<dyn HybridView>> {
     let mut v: Vec<Box<dyn HybridView>> = Vec::new();
     if opts.iso.enabled || opts.joliet.enabled {
@@ -383,6 +456,10 @@ pub fn build_views(opts: &HybridOptions) -> Vec<Box<dyn HybridView>> {
     }
     if opts.hfs.enabled {
         v.push(Box::new(HfsView::new(opts)));
+    }
+    #[cfg(feature = "udf")]
+    if opts.udf.enabled {
+        v.push(Box::new(UdfView::new(opts)));
     }
     v
 }
@@ -406,6 +483,8 @@ pub(crate) fn filters(opts: &HybridOptions) -> Vec<(ViewId, Vec<String>, Vec<Str
             opts.hfs.only.clone(),
         ),
     ];
+    #[cfg(feature = "udf")]
+    v.push((ViewId::Udf, opts.udf.hide.clone(), opts.udf.only.clone()));
     for f in &opts.view_filters {
         v.push((f.view, f.hide.clone(), f.only.clone()));
     }

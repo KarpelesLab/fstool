@@ -9,10 +9,15 @@
 //!   the Rock Ridge, Joliet and plain ISO 9660 views of the same device,
 //!   `fsck_hfs -fn` checks the HFS+ volume; images from
 //!   `hdiutil makehybrid` are read through every fstool view.
+//! * With feature `udf`, on macOS: `mount_udf` mounts the UDF view of
+//!   fstool's four-view hybrids (every revision) and ISO 9660 + UDF
+//!   bridges, `fsck_udf -n` checks them, per-view globs reach UDF, and
+//!   `hdiutil makehybrid -udf` images read through fstool's UDF view.
 //! * Linux (CI): `xorriso` extracts the Rock Ridge tree, `isoinfo`
 //!   lists the Joliet and plain hierarchies, `fsck.hfsplus` checks the
-//!   HFS+ partition; with passwordless `sudo`, the kernel's iso9660 and
-//!   hfsplus drivers mount the image read-only.
+//!   HFS+ partition, `udfinfo` reads the UDF view; with passwordless
+//!   `sudo`, the kernel's iso9660, hfsplus and udf drivers mount the
+//!   image read-only.
 //!
 //! Every test skips (with a message) when a tool it needs is missing,
 //! and every attach / mount is undone by a guard, also on panic.
@@ -28,6 +33,8 @@ use fstool::fs::Filesystem;
 use fstool::fs::hfs_plus::HfsPlus;
 use fstool::fs::hybrid::{EntryMeta, HybridOptions, HybridPlan, Payload, SourceTree};
 use fstool::fs::iso9660::{Iso9660, ReadView};
+#[cfg(feature = "udf")]
+use fstool::fs::udf::{Udf, UdfRevision};
 use tempfile::TempDir;
 
 fn which(tool: &str) -> bool {
@@ -556,7 +563,15 @@ fn tool_source_and_image() -> (TempDir, TempDir, PathBuf, HybridPlan) {
     let src = make_source();
     let work = TempDir::new().unwrap();
     let img = work.path().join("hybrid.iso");
-    let plan = build(src.path(), &HybridOptions::new("Hybrid CI"), &img);
+    #[allow(unused_mut)]
+    let mut opts = HybridOptions::new("Hybrid CI");
+    // The ISO 9660 and HFS+ tools must be happy with a UDF view beside
+    // their own.
+    #[cfg(feature = "udf")]
+    {
+        opts.udf.enabled = true;
+    }
+    let plan = build(src.path(), &opts, &img);
     (src, work, img, plan)
 }
 
@@ -771,6 +786,9 @@ fn cli_makehybrid() {
     assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
     assert!(!out.exists());
     let text = String::from_utf8_lossy(&r.stdout);
+    #[cfg(feature = "udf")]
+    assert!(text.contains("views: iso9660, joliet, hfs+, udf"), "{text}");
+    #[cfg(not(feature = "udf"))]
     assert!(text.contains("views: iso9660, joliet, hfs+"), "{text}");
     let r = run(&["--hide-hfs", "*.bin", "-V", "Cli Test", "--iso-level", "3"]);
     assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
@@ -788,6 +806,41 @@ fn cli_makehybrid() {
         !fstool::part::Apm::probe(&mut dev),
         "--iso alone has no HFS+"
     );
+    drop(dev);
+    #[cfg(feature = "udf")]
+    {
+        let r = run(&[
+            "--force",
+            "--iso",
+            "--udf",
+            "--udf-version",
+            "2.01",
+            "--udf-volume-name",
+            "Cli UDF",
+            "--hide-udf",
+            "*.bin",
+            "--only-udf",
+            "secret.txt",
+        ]);
+        assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+        let mut dev = FileBackend::open_read_only(&out).unwrap();
+        let mut udf = Udf::open(&mut dev).unwrap();
+        assert_eq!(udf.volume_label(), "Cli UDF");
+        assert_eq!(udf.info().unwrap().udf_revision, 0x0201);
+        let names: Vec<String> = udf
+            .list(&mut dev, Path::new("/sub"))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(!names.contains(&"payload.bin".to_string()), "{names:?}");
+        assert!(udf.getattr(&mut dev, Path::new("/secret.txt")).is_ok());
+        let mut iso = Iso9660::open(&mut dev).unwrap();
+        assert!(iso.getattr(&mut dev, Path::new("/secret.txt")).is_err());
+        assert!(iso.getattr(&mut dev, Path::new("/sub/payload.bin")).is_ok());
+        let r = run(&["--force", "--udf-version", "3.0", "--dry-run"]);
+        assert!(!r.status.success());
+    }
 }
 
 /// A tree built by hand (the library path), with a payload too long for
@@ -808,4 +861,442 @@ fn payload_length_is_checked_at_write() {
         plan.write(&mut dev),
         Err(fstool::fs::hybrid::HybridError::PayloadLength { .. })
     ));
+}
+
+// ---------------------------------------------------------------------
+// The UDF view (feature `udf`).
+// ---------------------------------------------------------------------
+
+/// Hybrid options with the UDF view on.
+#[cfg(feature = "udf")]
+fn udf_opts(name: &str, rev: UdfRevision) -> HybridOptions {
+    let mut o = HybridOptions::new(name);
+    o.create_date = 1_700_000_000;
+    o.udf.enabled = true;
+    o.udf.revision = rev;
+    o
+}
+
+/// The UDF view through fstool's reader.
+#[cfg(feature = "udf")]
+fn udf_snapshot(img: &Path) -> BTreeMap<String, Snap> {
+    let mut dev = FileBackend::open_read_only(img).unwrap();
+    let mut udf = Udf::open(&mut dev).unwrap();
+    fs_snapshot(&mut udf, &mut dev)
+}
+
+/// `(partition start, length)` in sectors of the UDF partition, and
+/// the anchors found at 256 and N-1 — read straight off the image.
+#[cfg(feature = "udf")]
+fn udf_layout(img: &Path) -> (u64, u64, bool, bool) {
+    let bytes = std::fs::read(img).unwrap();
+    let n = bytes.len() / 2048;
+    let tag = |s: usize| u16::from_le_bytes([bytes[s * 2048], bytes[s * 2048 + 1]]);
+    let anchor_256 = tag(256) == 2;
+    let anchor_end = tag(n - 1) == 2 || tag(n - 257) == 2;
+    // The main VDS from the anchor at 256; its Partition Descriptor.
+    let a = 256 * 2048;
+    let main = u32::from_le_bytes(bytes[a + 20..a + 24].try_into().unwrap()) as usize;
+    for s in main..main + 16 {
+        if tag(s) == 5 {
+            let o = s * 2048;
+            let start = u32::from_le_bytes(bytes[o + 188..o + 192].try_into().unwrap());
+            let len = u32::from_le_bytes(bytes[o + 192..o + 196].try_into().unwrap());
+            return (u64::from(start), u64::from(len), anchor_256, anchor_end);
+        }
+    }
+    panic!("{}: no UDF partition descriptor", img.display());
+}
+
+/// The UDF recognition sequence follows the ISO 9660 terminator.
+#[cfg(feature = "udf")]
+fn vrs_after_terminator(img: &Path) -> bool {
+    let bytes = std::fs::read(img).unwrap();
+    let mut s = 16;
+    while &bytes[s * 2048 + 1..s * 2048 + 6] == b"CD001" {
+        if bytes[s * 2048] == 255 {
+            let next = &bytes[(s + 1) * 2048 + 1..(s + 1) * 2048 + 6];
+            return next == b"BEA01";
+        }
+        s += 1;
+    }
+    false
+}
+
+#[cfg(all(target_os = "macos", feature = "udf"))]
+mod macos_udf {
+    use super::*;
+
+    pub(super) fn mount_udf(dev: &str, at: &Path) -> macos::Mounted {
+        std::fs::create_dir_all(at).unwrap();
+        let mut last = String::new();
+        for _ in 0..5 {
+            let out = Command::new("/sbin/mount_udf")
+                .args(["-o", "rdonly"])
+                .arg(dev)
+                .arg(at)
+                .output()
+                .unwrap();
+            if out.status.success() {
+                return macos::Mounted(at.to_path_buf());
+            }
+            last = String::from_utf8_lossy(&out.stderr).into_owned();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        panic!("mount_udf {dev}: {last}");
+    }
+
+    pub(super) fn fsck_udf(img: &Path) {
+        let out = Command::new("/sbin/fsck_udf")
+            .arg("-n")
+            .arg(img)
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success() && text.contains("is clean") && !text.contains("* * *"),
+            "fsck_udf -n {}:\n{text}",
+            img.display()
+        );
+    }
+}
+
+/// Parallel attaches make hdiutil answer EAGAIN; the UDF tests take turns.
+#[cfg(all(target_os = "macos", feature = "udf"))]
+static UDF_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// fstool's ISO 9660 + Joliet + HFS+ + UDF hybrid, every revision:
+/// macOS mounts HFS+ on attach, `mount_udf` the UDF view of the same
+/// device, `mount_cd9660` the ISO 9660 views; every one shows the source
+/// tree with the same bytes; `fsck_udf -n` and `fsck_hfs -fn` are clean.
+#[cfg(all(target_os = "macos", feature = "udf"))]
+#[test]
+fn macos_mounts_every_view_of_an_fstool_udf_hybrid() {
+    if !have(&[
+        "hdiutil",
+        "fsck_hfs",
+        "mount_cd9660",
+        "/sbin/mount_udf",
+        "/sbin/fsck_udf",
+    ]) {
+        return;
+    }
+    let _g = UDF_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let src = make_source();
+    let want = snapshot(src.path(), &ident);
+    let want_hfs = snapshot(src.path(), &nfd);
+    for &rev in UdfRevision::WRITABLE {
+        eprintln!("UDF {rev}");
+        let work = TempDir::new().unwrap();
+        let img = work.path().join(format!("hybrid-udf-{rev}.iso"));
+        let plan = build(src.path(), &udf_opts("Hybrid UDF", rev), &img);
+        assert!(plan.wrap().is_some());
+        check_with_fstool(&img, &want, &want_hfs);
+        same("fstool udf", &udf_snapshot(&img), &want);
+        assert!(vrs_after_terminator(&img));
+        let (start, len, a256, aend) = udf_layout(&img);
+        assert!(a256 && aend, "anchors");
+        let (off, hlen) = hfs_partition(&img);
+        assert!(
+            start * 2048 <= off + hlen && (start + len) * 2048 >= off + hlen,
+            "the UDF partition {start}+{len} spans the HFS+ payloads"
+        );
+        macos_udf::fsck_udf(&img);
+        {
+            let a = macos::attach(&img, Some(work.path()));
+            let hfs_mount = a.mounts.first().cloned().expect("HFS+ mounted");
+            same(
+                "macOS hfs+",
+                &snapshot(Path::new(&hfs_mount), &nfd),
+                &want_hfs,
+            );
+            macos::fsck_hfs(&format!("{}s2", a.dev));
+            let u = work.path().join("udf");
+            {
+                let _m = macos_udf::mount_udf(&a.dev, &u);
+                same("macOS udf", &snapshot(&u, &nfd), &want_hfs);
+            }
+            let rr = work.path().join("rr");
+            std::fs::create_dir_all(&rr).unwrap();
+            if let Some(_m) = macos::mount_cd9660(&a.dev, &rr, &[]) {
+                same("macOS rock ridge", &snapshot(&rr, &ident), &want);
+            }
+            let j = work.path().join("joliet");
+            std::fs::create_dir_all(&j).unwrap();
+            if let Some(_m) = macos::mount_cd9660(&a.dev, &j, &["-r"]) {
+                same(
+                    "macOS joliet",
+                    &snapshot(&j, &nfd),
+                    &without_links(&want_hfs),
+                );
+            }
+        }
+        macos::assert_detached(&img);
+    }
+}
+
+/// An ISO 9660 + Joliet + UDF bridge (no HFS+, no partition map):
+/// `mount_udf` and `mount_cd9660` on the attached device.
+#[cfg(all(target_os = "macos", feature = "udf"))]
+#[test]
+fn macos_mounts_an_iso_udf_bridge() {
+    if !have(&[
+        "hdiutil",
+        "mount_cd9660",
+        "/sbin/mount_udf",
+        "/sbin/fsck_udf",
+    ]) {
+        return;
+    }
+    let _g = UDF_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let src = make_source();
+    let want = snapshot(src.path(), &ident);
+    let want_nfd = snapshot(src.path(), &nfd);
+    for rev in [UdfRevision::V1_02, UdfRevision::V2_01] {
+        let work = TempDir::new().unwrap();
+        let img = work.path().join(format!("bridge-{rev}.iso"));
+        let mut opts = udf_opts("Bridge", rev);
+        opts.hfs.enabled = false;
+        let plan = build(src.path(), &opts, &img);
+        assert!(plan.wrap().is_none());
+        assert!(vrs_after_terminator(&img));
+        same("fstool udf", &udf_snapshot(&img), &want);
+        macos_udf::fsck_udf(&img);
+        {
+            let a = macos::attach(&img, None);
+            let u = work.path().join("udf");
+            {
+                let _m = macos_udf::mount_udf(&a.dev, &u);
+                same("macOS udf", &snapshot(&u, &nfd), &want_nfd);
+            }
+            let rr = work.path().join("rr");
+            std::fs::create_dir_all(&rr).unwrap();
+            if let Some(_m) = macos::mount_cd9660(&a.dev, &rr, &[]) {
+                same("macOS rock ridge", &snapshot(&rr, &ident), &want);
+            }
+        }
+        macos::assert_detached(&img);
+    }
+}
+
+/// `hide` / `only` on the UDF view, seen through macOS's UDF driver.
+#[cfg(all(target_os = "macos", feature = "udf"))]
+#[test]
+fn macos_sees_per_view_trees_with_udf() {
+    if !have(&[
+        "hdiutil",
+        "mount_cd9660",
+        "/sbin/mount_udf",
+        "/sbin/fsck_udf",
+    ]) {
+        return;
+    }
+    let _g = UDF_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let src = make_source();
+    let work = TempDir::new().unwrap();
+    let img = work.path().join("udf-globs.iso");
+    let mut opts = udf_opts("UDF Globs", UdfRevision::V1_50);
+    opts.udf.hide.push("/sub/deeper".into());
+    opts.udf.only.push("payload.bin".into());
+    opts.iso.only.push("secret.txt".into());
+    build(src.path(), &opts, &img);
+    let drop = |s: &BTreeMap<String, Snap>, f: &dyn Fn(&str) -> bool| {
+        s.iter()
+            .filter(|(k, _)| !f(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let all = snapshot(src.path(), &ident);
+    let want_udf = drop(&snapshot(src.path(), &nfd), &|k| {
+        k.starts_with("/sub/deeper") || k == "/secret.txt"
+    });
+    let want_rr = drop(&all, &|k| k == "/sub/payload.bin");
+    let want_hfs = drop(&snapshot(src.path(), &nfd), &|k| {
+        k == "/sub/payload.bin" || k == "/secret.txt"
+    });
+    let nfc_udf: BTreeMap<String, Snap> = drop(&all, &|k| {
+        k.starts_with("/sub/deeper") || k == "/secret.txt"
+    });
+    same("fstool udf", &udf_snapshot(&img), &nfc_udf);
+    macos_udf::fsck_udf(&img);
+    {
+        let a = macos::attach(&img, Some(work.path()));
+        let m = a.mounts.first().cloned().expect("HFS+ mounted");
+        same("macOS hfs+", &snapshot(Path::new(&m), &nfd), &want_hfs);
+        let u = work.path().join("udf");
+        {
+            let _m = macos_udf::mount_udf(&a.dev, &u);
+            same("macOS udf", &snapshot(&u, &nfd), &want_udf);
+        }
+        let rr = work.path().join("rr");
+        std::fs::create_dir_all(&rr).unwrap();
+        if let Some(_m) = macos::mount_cd9660(&a.dev, &rr, &[]) {
+            same("macOS rock ridge", &snapshot(&rr, &ident), &want_rr);
+        }
+    }
+    macos::assert_detached(&img);
+}
+
+/// `hdiutil makehybrid -iso -joliet -hfs -udf -udf-version 1.50` reads
+/// through every fstool view, UDF included, and has the structure
+/// fstool's own four-view hybrid has: the UDF recognition sequence after
+/// the ISO 9660 terminator, an anchor at 256 and one at the end, and a
+/// UDF partition spanning the HFS+ partition's shared payloads.
+#[cfg(all(target_os = "macos", feature = "udf"))]
+#[test]
+fn fstool_reads_hdiutil_makehybrid_udf_images() {
+    if !have(&["hdiutil"]) {
+        return;
+    }
+    let _g = UDF_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let src = make_source();
+    let work = TempDir::new().unwrap();
+    let theirs = work.path().join("makehybrid-udf.iso");
+    let out = Command::new("hdiutil")
+        .args([
+            "makehybrid",
+            "-iso",
+            "-joliet",
+            "-hfs",
+            "-udf",
+            "-udf-version",
+            "1.50",
+            "-ov",
+            "-o",
+        ])
+        .arg(&theirs)
+        .arg(src.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "makehybrid: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ours = work.path().join("fstool-udf.iso");
+    build(src.path(), &udf_opts("Same", UdfRevision::V1_50), &ours);
+    let want = snapshot(src.path(), &ident);
+    let want_hfs = snapshot(src.path(), &nfd);
+    for img in [&theirs, &ours] {
+        let name = img.display().to_string();
+        assert!(vrs_after_terminator(img), "{name}");
+        let (start, len, a256, aend) = udf_layout(img);
+        assert!(a256 && aend, "{name}: anchors");
+        let (off, hlen) = hfs_partition(img);
+        let mut dev = FileBackend::open_read_only(img).unwrap();
+        let mut udf = Udf::open(&mut dev).unwrap();
+        assert_eq!(udf.info().unwrap().udf_revision, 0x0150, "{name}");
+        // The UDF record of the payload names a sector inside the HFS+
+        // partition — the one the ISO 9660 record names.
+        let mut iso = Iso9660::open(&mut dev).unwrap();
+        iso.set_read_view(ReadView::Joliet).unwrap();
+        let list = iso.list(&mut dev, Path::new("/sub")).unwrap();
+        let p = list.iter().find(|e| e.name == "payload.bin").unwrap();
+        let at = u64::from(p.inode) * 2048;
+        assert!(at >= off && at < off + hlen, "{name}");
+        assert!(
+            at >= start * 2048 && at < (start + len) * 2048,
+            "{name}: payload at {at} outside the UDF partition {start}+{len}"
+        );
+        let mut first = vec![0u8; 2048];
+        udf.read_file(&mut dev, Path::new("/sub/payload.bin"))
+            .unwrap()
+            .read_exact(&mut first)
+            .unwrap();
+        let mut raw = vec![0u8; 2048];
+        dev.read_at(at, &mut raw).unwrap();
+        assert_eq!(first, raw, "{name}: UDF and ISO 9660 share the payload");
+        same(
+            &format!("udf of {name}"),
+            &fs_snapshot(&mut udf, &mut dev),
+            &want,
+        );
+        let mut slice = SlicedBackend::new(&mut dev, off, hlen).unwrap();
+        let mut hfs = HfsPlus::open(&mut slice).unwrap();
+        same(
+            &format!("hfs+ of {name}"),
+            &fs_snapshot(&mut hfs, &mut slice),
+            &want_hfs,
+        );
+    }
+}
+
+/// Structure of fstool's UDF hybrids, everywhere: the recognition
+/// sequence after the ISO 9660 terminator, anchors at 256 and N-1, a UDF
+/// partition holding every payload, fstool's UDF reader seeing the tree.
+#[cfg(feature = "udf")]
+#[test]
+fn fstool_udf_hybrid_structure() {
+    let src = make_source();
+    let want = snapshot(src.path(), &ident);
+    let work = TempDir::new().unwrap();
+    for hfs in [true, false] {
+        let img = work.path().join(format!("structure-{hfs}.iso"));
+        let mut opts = udf_opts("Structure", UdfRevision::V1_50);
+        opts.hfs.enabled = hfs;
+        let plan = build(src.path(), &opts, &img);
+        assert!(vrs_after_terminator(&img));
+        let (start, len, a256, aend) = udf_layout(&img);
+        assert!(a256 && aend);
+        assert!(start > 256 && start + len < u64::from(plan.total_sectors()));
+        for f in plan.files() {
+            assert!(
+                u64::from(f.extent.lba) >= start && f.extent.end() <= start + len,
+                "{} outside the UDF partition",
+                f.path
+            );
+        }
+        same("fstool udf", &udf_snapshot(&img), &want);
+    }
+}
+
+/// `udfinfo` (udftools) on fstool's four-view hybrids and on an
+/// ISO 9660 / UDF bridge; with passwordless sudo the kernel's udf driver
+/// mounts them and shows the source tree.
+#[cfg(feature = "udf")]
+#[test]
+fn udfinfo_and_linux_udf_mount_read_fstool_hybrids() {
+    if cfg!(target_os = "macos") || !have(&["udfinfo"]) {
+        return;
+    }
+    let src = make_source();
+    let want = snapshot(src.path(), &ident);
+    let work = TempDir::new().unwrap();
+    for (name, hfs, rev) in [
+        ("full-1.50", true, UdfRevision::V1_50),
+        ("full-2.01", true, UdfRevision::V2_01),
+        ("full-2.50", true, UdfRevision::V2_50),
+        ("bridge-1.02", false, UdfRevision::V1_02),
+    ] {
+        let img = work.path().join(format!("{name}.iso"));
+        let label = format!("Hybrid {name}");
+        let mut opts = udf_opts(&label, rev);
+        opts.hfs.enabled = hfs;
+        build(src.path(), &opts, &img);
+        same(&format!("fstool udf {name}"), &udf_snapshot(&img), &want);
+        let out = Command::new("udfinfo").arg(&img).output().unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "udfinfo {name}: {text}");
+        assert!(
+            text.contains(&format!("udfrev={rev}")),
+            "udfinfo {name}: {text}"
+        );
+        assert!(text.contains(&label), "udfinfo {name}: {text}");
+        #[cfg(target_os = "linux")]
+        if sudo_ok() {
+            let at = work.path().join(format!("mnt-{name}"));
+            std::fs::create_dir_all(&at).unwrap();
+            if let Some(_m) = sudo_mount(&["-o", "loop,ro", "-t", "udf"], &img, &at) {
+                same(&format!("linux udf {name}"), &snapshot(&at, &ident), &want);
+            }
+        }
+    }
 }

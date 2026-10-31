@@ -1,4 +1,4 @@
-//! `fstool makehybrid`: an ISO 9660 / Joliet / HFS+ hybrid image from a
+//! `fstool makehybrid`: an ISO 9660 / Joliet / HFS+ / UDF hybrid image from a
 //! host directory or any filesystem image, with flags after
 //! `hdiutil makehybrid`'s.
 
@@ -24,7 +24,7 @@ pub struct MakehybridArgs {
     #[arg(short = 'o', long, value_name = "OUT")]
     pub output: PathBuf,
     /// Advertise an ISO 9660 primary hierarchy. Without any of `--iso`,
-    /// `--joliet`, `--hfs`, all three are made.
+    /// `--joliet`, `--hfs`, `--udf`, all four are made.
     #[arg(long)]
     pub iso: bool,
     /// Advertise a Joliet hierarchy.
@@ -33,6 +33,27 @@ pub struct MakehybridArgs {
     /// Advertise an HFS+ volume (in an `Apple_HFS` partition).
     #[arg(long)]
     pub hfs: bool,
+    /// Advertise a UDF volume over the same payload sectors.
+    #[cfg(feature = "udf")]
+    #[arg(long)]
+    pub udf: bool,
+    /// UDF revision: 1.02, 1.50 (the default, as `hdiutil makehybrid`),
+    /// 2.01 or 2.50.
+    #[cfg(feature = "udf")]
+    #[arg(long, value_name = "VERSION", default_value = "1.50")]
+    pub udf_version: String,
+    /// UDF volume name (the logical volume identifier).
+    #[cfg(feature = "udf")]
+    #[arg(long, value_name = "NAME")]
+    pub udf_volume_name: Option<String>,
+    /// Hide entries matching GLOB from UDF.
+    #[cfg(feature = "udf")]
+    #[arg(long, value_name = "GLOB")]
+    pub hide_udf: Vec<String>,
+    /// Show entries matching GLOB in UDF only.
+    #[cfg(feature = "udf")]
+    #[arg(long, value_name = "GLOB")]
+    pub only_udf: Vec<String>,
     /// Add Rock Ridge to the ISO 9660 hierarchy (the default).
     #[arg(long, overrides_with = "no_rock_ridge")]
     pub rock_ridge: bool,
@@ -177,10 +198,27 @@ fn options(a: &MakehybridArgs, default_name: &str) -> fstool::Result<HybridOptio
             .clone()
             .unwrap_or_else(|| default_name.to_string()),
     );
-    let all = !(a.iso || a.joliet || a.hfs);
+    #[cfg(feature = "udf")]
+    let udf = a.udf;
+    #[cfg(not(feature = "udf"))]
+    let udf = false;
+    let all = !(a.iso || a.joliet || a.hfs || udf);
     o.iso.enabled = all || a.iso;
     o.joliet.enabled = all || a.joliet;
     o.hfs.enabled = all || a.hfs;
+    #[cfg(feature = "udf")]
+    {
+        o.udf.enabled = all || udf;
+        o.udf.revision = fstool::fs::udf::UdfRevision::parse(&a.udf_version).map_err(|_| {
+            bad(format!(
+                "--udf-version {:?}: use 1.02, 1.50, 2.01 or 2.50",
+                a.udf_version
+            ))
+        })?;
+        o.udf.volume_name = a.udf_volume_name.clone();
+        o.udf.hide = a.hide_udf.clone();
+        o.udf.only = a.only_udf.clone();
+    }
     o.iso.rock_ridge = !a.no_rock_ridge;
     o.iso.level = match a.iso_level {
         1 => IsoLevel::L1,

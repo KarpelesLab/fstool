@@ -589,3 +589,165 @@ fn files_of_four_gib_and_more() {
         assert_eq!(read_all(&mut iso, &mut dev, after), b"after\n");
     }
 }
+
+#[cfg(feature = "udf")]
+mod udf {
+    use super::*;
+    use crate::fs::udf::{Udf, UdfRevision};
+
+    fn udf_opts(rev: UdfRevision) -> HybridOptions {
+        let mut opts = HybridOptions::new("Hybrid UDF");
+        opts.create_date = 1_700_000_000;
+        opts.udf.enabled = true;
+        opts.udf.revision = rev;
+        opts
+    }
+
+    fn build(tree: SourceTree, opts: &HybridOptions) -> (HybridPlan, MemoryBackend) {
+        let plan = HybridPlan::new(tree, opts).unwrap();
+        let mut dev = MemoryBackend::new(plan.total_bytes());
+        plan.write(&mut dev).unwrap();
+        plan.verify(&mut dev).unwrap();
+        (plan, dev)
+    }
+
+    /// First sector of `path` as the ISO 9660 hierarchy records it.
+    fn iso_lba(dev: &mut MemoryBackend, path: &str) -> u64 {
+        let mut iso = Iso9660::open(dev).unwrap();
+        iso.set_read_view(ReadView::Joliet).unwrap();
+        let parent = Path::new(path).parent().unwrap();
+        let name = Path::new(path).file_name().unwrap().to_str().unwrap();
+        let list = iso.list(dev, parent).unwrap();
+        u64::from(list.iter().find(|e| e.name == name).unwrap().inode)
+    }
+
+    fn rand() -> Vec<u8> {
+        (0..300_000u32).map(|i| (i * 7 % 253) as u8).collect()
+    }
+
+    #[test]
+    fn every_revision_shares_the_payload() {
+        for &rev in UdfRevision::WRITABLE {
+            let (plan, mut dev) = build(sample_tree(), &udf_opts(rev));
+            assert_eq!(
+                plan.view_ids(),
+                vec![
+                    ViewId::Iso9660,
+                    ViewId::Joliet,
+                    ViewId::HfsPlus,
+                    ViewId::Udf
+                ]
+            );
+            let lba = iso_lba(&mut dev, "/sub/rand.bin");
+            let mut udf = Udf::open(&mut dev).unwrap();
+            assert_eq!(udf.volume_label(), "Hybrid UDF");
+            assert_eq!(udf.info().unwrap().udf_revision, rev.bcd(), "{rev}");
+            let want = rand();
+            assert_eq!(read_all(&mut udf, &mut dev, "/sub/rand.bin"), want);
+            assert_eq!(
+                read_all(&mut udf, &mut dev, "/sub/hard.txt"),
+                b"hello world\n"
+            );
+            let a = udf.getattr(&mut dev, Path::new("/hello.txt")).unwrap();
+            assert_eq!(a.nlink, 2);
+            assert_eq!(a.mtime, 1_700_000_000);
+            assert_eq!(
+                udf.read_symlink(&mut dev, Path::new("/link")).unwrap(),
+                Path::new("hello.txt")
+            );
+            let d = udf.getattr(&mut dev, Path::new("/dev/null")).unwrap();
+            assert_eq!(d.kind, EntryKind::Char);
+            // The ISO 9660 record names the sectors UDF reads from.
+            let mut raw = vec![0u8; 2048];
+            dev.read_at(lba * 2048, &mut raw).unwrap();
+            assert_eq!(raw, want[..2048]);
+            let mut s = hfs_slice(&mut dev, &plan);
+            hfs_clean(&mut s);
+            let regions = plan.regions();
+            assert!(
+                regions
+                    .iter()
+                    .any(|r| r.view == Some(ViewId::Udf) && r.extent.lba == 256)
+            );
+            assert!(
+                regions.iter().any(
+                    |r| r.view == Some(ViewId::Udf) && r.extent.lba == plan.total_sectors() - 1
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn iso_and_udf_bridge_without_hfs() {
+        let mut opts = udf_opts(UdfRevision::V1_02);
+        opts.hfs.enabled = false;
+        let (plan, mut dev) = build(sample_tree(), &opts);
+        assert!(plan.wrap().is_none());
+        let mut udf = Udf::open(&mut dev).unwrap();
+        assert_eq!(read_all(&mut udf, &mut dev, "/sub/rand.bin"), rand());
+        let mut iso = Iso9660::open(&mut dev).unwrap();
+        assert_eq!(read_all(&mut iso, &mut dev, "/sub/rand.bin"), rand());
+    }
+
+    #[test]
+    fn udf_only_image() {
+        let mut opts = udf_opts(UdfRevision::V2_01);
+        opts.iso.enabled = false;
+        opts.joliet.enabled = false;
+        opts.hfs.enabled = false;
+        let (plan, mut dev) = build(sample_tree(), &opts);
+        assert_eq!(plan.view_ids(), vec![ViewId::Udf]);
+        let mut udf = Udf::open(&mut dev).unwrap();
+        assert_eq!(read_all(&mut udf, &mut dev, "/hello.txt"), b"hello world\n");
+    }
+
+    #[test]
+    fn udf_hide_only_labels_and_report() {
+        let mut t = sample_tree();
+        let long = format!("{}.txt", "L".repeat(300));
+        t.add_file(&format!("/{long}"), bytes(b"x"), 1, EntryMeta::default())
+            .unwrap();
+        t.set_xattr("/hello.txt", "user.test", b"v".to_vec())
+            .unwrap();
+        let mut opts = udf_opts(UdfRevision::V1_50);
+        opts.udf.hide.push("*.bin".into());
+        opts.udf.only.push("empty".into());
+        let label = "A label much longer than the thirty-character volume id";
+        opts.udf.volume_name = Some(label.into());
+        let (plan, mut dev) = build(t, &opts);
+        let items: Vec<&ReportItem> = plan.report().for_view(ViewId::Udf).collect();
+        assert!(items.iter().any(|i| i.path == "/sub/rand.bin"
+            && matches!(i.kind, ReportKind::Omitted(OmitReason::Hidden { .. }))));
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i.kind, ReportKind::NameTruncated { .. }))
+        );
+        assert!(items.iter().any(|i| i.path == "/hello.txt"
+            && matches!(i.kind, ReportKind::MetadataDropped { what: "xattrs" })));
+        // `only` hides the entry from the other views.
+        assert!(
+            plan.report()
+                .items()
+                .iter()
+                .any(|i| i.view == ViewId::HfsPlus
+                    && i.path == "/empty"
+                    && matches!(i.kind, ReportKind::Omitted(OmitReason::Hidden { .. })))
+        );
+        let mut udf = Udf::open(&mut dev).unwrap();
+        assert_eq!(udf.volume_label(), label);
+        assert_eq!(
+            udf.info().unwrap().volume_id,
+            "A label much longer than the t"
+        );
+        assert!(
+            udf.list(&mut dev, Path::new("/sub"))
+                .unwrap()
+                .iter()
+                .all(|e| e.name != "rand.bin")
+        );
+        assert!(udf.getattr(&mut dev, Path::new("/empty")).is_ok());
+        let mut iso = Iso9660::open(&mut dev).unwrap();
+        assert_eq!(read_all(&mut iso, &mut dev, "/sub/rand.bin"), rand());
+    }
+}

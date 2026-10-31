@@ -54,7 +54,7 @@ use crate::Result;
 use crate::block::BlockDevice;
 use crate::fs::{DirEntry, EntryKind, FileAttrs, FileMeta, FileSource};
 
-mod ecma;
+pub(crate) mod ecma;
 pub mod layout;
 mod read;
 mod write;

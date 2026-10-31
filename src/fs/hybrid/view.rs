@@ -41,7 +41,7 @@ pub enum ViewId {
     Joliet,
     /// The HFS+ volume.
     HfsPlus,
-    /// A UDF volume (reserved for the UDF view).
+    /// The UDF volume (feature `udf`).
     Udf,
     /// A caller-supplied view.
     Custom(&'static str),
@@ -384,12 +384,12 @@ pub struct Placement<'a> {
 
 /// One filesystem view of a hybrid image.
 ///
-/// # Adding a view (UDF)
+/// # Adding a view
 ///
 /// Implement this trait in `src/fs/hybrid/<view>.rs` and hand an
 /// instance to [`super::HybridPlan::with_views`] (or add it to
 /// [`super::build_views`] behind an option, as the ISO 9660 and HFS+ views
-/// are). A UDF view would:
+/// are). The UDF view (`src/fs/hybrid/udf_view.rs`) does this:
 ///
 /// * return [`ViewId::Udf`] from [`id`](Self::id);
 /// * in [`prepare`](Self::prepare), walk the nodes with
@@ -397,13 +397,13 @@ pub struct Placement<'a> {
 ///   and file identifier descriptors over `input.payload` (sizes only —
 ///   LBAs come later), and ask for `vrs_sectors: 3` (BEA01, NSR02,
 ///   TEA01 — the planner puts them right after ISO 9660's terminator),
-///   a [`FixedRequest`] for the anchor at 256, [`EndRequest`]s for the
-///   anchors at N-1 / N-257, and [`SectorRequest`]s for the main and
-///   reserve volume descriptor sequences, the integrity sequence and
-///   the metadata (file set descriptor, directories, file entries);
-/// * in [`place`](Self::place), choose its partition (for instance
-///   `wrap.start` or the first payload sector through the end of its
-///   tail metadata), translate `payload.extent_of(tree, n)` into
+///   a [`FixedRequest`] for the anchor at 256, an [`EndRequest`] for the
+///   anchor at N-1, head [`SectorRequest`]s for the main and reserve
+///   volume descriptor sequences and the integrity sequence, and a tail
+///   one for the metadata (file set descriptor, directories, file
+///   entries);
+/// * in [`place`](Self::place), choose its partition (the first payload
+///   sector through the end of its tail metadata), translate `payload.extent_of(tree, n)` into
 ///   partition-relative short / long allocation descriptors, and
 ///   compute descriptor tags and CRCs;
 /// * in [`write`](Self::write), write exactly the sectors in `own`;
