@@ -67,8 +67,9 @@ pub const VOL_ATTR_JOURNALED: u32 = 1 << 13;
 
 /// `JournalInfoBlock.flags`: journal lives inside the filesystem (the
 /// volume's own journal-buffer reserved blocks rather than an external
-/// device). TN1150 names this `kJIJournalInFSMask`.
-pub const JI_JOURNAL_IN_FS: u32 = 0x0000_0002;
+/// device). TN1150 names this `kJIJournalInFSMask` (`0x1`, what macOS
+/// writes; `0x2` is `kJIJournalOnOtherDeviceMask`).
+pub const JI_JOURNAL_IN_FS: u32 = 0x0000_0001;
 
 /// Journal-header magic number, ASCII `"JNLx"` in big-endian word order.
 pub const JOURNAL_HEADER_MAGIC: u32 = 0x4a4e_4c78;
