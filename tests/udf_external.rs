@@ -200,8 +200,12 @@ fn verify_tree(root: &Path, check_perms: bool) {
                 u32::from(*mode),
                 "{p}: mode"
             );
-            assert_eq!(md.uid(), 501, "{p}: uid");
-            assert_eq!(md.gid(), 20, "{p}: gid");
+            // Linux mounts map every file to the test user (see
+            // `linux::mount`), so the recorded owner shows on macOS only.
+            if cfg!(target_os = "macos") {
+                assert_eq!(md.uid(), 501, "{p}: uid");
+                assert_eq!(md.gid(), 20, "{p}: gid");
+            }
             assert_eq!(md.mtime(), i64::from(MTIME), "{p}: mtime");
         }
     }
@@ -914,9 +918,21 @@ mod linux {
 
     fn mount(img: &Path, mp: &Path, rw: bool) -> Option<Mounted> {
         std::fs::create_dir_all(mp).unwrap();
-        let opts = if rw { "loop,rw" } else { "loop,ro" };
+        // The sample is owned by uid 501 with modes like 0600 / 0750,
+        // which the kernel enforces: map everything to the test user so
+        // it can read the tree back.
+        let id = |flag: &str| {
+            let out = Command::new("id").arg(flag).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let opts = format!(
+            "{},uid={},gid={}",
+            if rw { "loop,rw" } else { "loop,ro" },
+            id("-u"),
+            id("-g")
+        );
         let out = Command::new("sudo")
-            .args(["-n", "mount", "-t", "udf", "-o", opts])
+            .args(["-n", "mount", "-t", "udf", "-o", &opts])
             .arg(img)
             .arg(mp)
             .output()

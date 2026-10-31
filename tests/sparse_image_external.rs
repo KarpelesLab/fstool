@@ -90,22 +90,36 @@ impl Drop for Attached {
                 .args(["detach", "-force", &self.dev])
                 .output();
         }
-        wait_unlocked(&self.image);
+        // Best effort: a test that needs the image again waits (and
+        // fails) through `wait_unlocked` itself; panicking here would only
+        // fail tests that are done with it.
+        if !try_wait_unlocked(&self.image) {
+            eprintln!("{}: still locked 60 s after detach", self.image.display());
+        }
     }
 }
 
 /// hdiutil's helper can keep an image locked for a while after `detach`
 /// or `compact` return (seconds, on CI runners). Wait until it opens.
 fn wait_unlocked(img: &Path) {
+    assert!(
+        try_wait_unlocked(img),
+        "{}: still locked 60 s after detach",
+        img.display()
+    );
+}
+
+/// [`wait_unlocked`] without the panic: whether the image opened.
+fn try_wait_unlocked(img: &Path) -> bool {
     for _ in 0..300 {
         match fstool::block::sparse::SparseBackend::open_read_only(img) {
             Err(fstool::Error::Io(e)) if e.kind() == std::io::ErrorKind::ResourceBusy => {
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
-            _ => return,
+            _ => return true,
         }
     }
-    panic!("{}: still locked 60 s after detach", img.display());
+    false
 }
 
 fn whole_disk(plist: &str) -> Option<String> {
