@@ -277,7 +277,7 @@ MBR, one entry per region with `hdiutil`'s names and IDs
 | `ULMO` | LZMA (XZ-framed, as `hdiutil`), level 0–9 | `dmg-write-lzma` |
 | `UFBI` | raw, every sector, MD5 checksums | `dmg-write` |
 | `UDRW` | bare sectors, no trailer (as current `hdiutil`) | `dmg-write` |
-| `ULFO` | LZFSE | not writable yet — compcol's LZFSE only decodes; `dmg-write-lzfse` reserves the encoder hook |
+| `ULFO` | LZFSE | `dmg-write-lzfse` |
 
 Every format passes `hdiutil verify`, attach + raw readback and a real
 mount on macOS, whole-device and over GPT / APM / MBR disks, with the
@@ -806,7 +806,7 @@ none of the other 130 000 lines.
 | `tar` | tar (streaming reader / writer, tar-as-filesystem) | |
 | `archive` | zip / cpio / ar, plus the per-format readers | pulls `charcode`; `cab`, `lha`, `arc`, `sit`, `sevenz`, `rar`, `amiga-lzx` each imply it. On its own zip handles Stored members (and PKWARE-encrypted ones, and split sets); each compression method is a codec feature (`gzip` for Deflate, then `deflate64`, `bzip2`, `lzma`, `xz`, `zstd`, `zip-legacy`) and WinZip AES is `zip-aes` (pulls `purecrypto`), so `--features archive,gzip` is the slim everyday zip build |
 | `ramfs` | the in-memory scratch filesystem `repack` / `merge` / FUSE build on | |
-| `qcow2`, `dmg`, `diskcopy` | disk-image containers | `qcow2-crypto` implies `qcow2`; `dmg-encrypted` / `dmg-bzip2` / `dmg-lzfse` / `dmg-write` imply `dmg`; `dmg-write-zlib` / `-bzip2` / `-lzma` / `-lzfse` add one write codec each to `dmg-write` (`-lzfse` is a reserved hook for now); `dmg-encrypted-write` and `dmg-encrypted-recovery` imply `dmg-encrypted` |
+| `qcow2`, `dmg`, `diskcopy` | disk-image containers | `qcow2-crypto` implies `qcow2`; `dmg-encrypted` / `dmg-bzip2` / `dmg-lzfse` / `dmg-write` imply `dmg`; `dmg-write-zlib` / `-bzip2` / `-lzma` / `-lzfse` add one write codec each to `dmg-write`; `dmg-encrypted-write` and `dmg-encrypted-recovery` imply `dmg-encrypted` |
 | `sparse-image` | Apple `.sparseimage` / `.sparsebundle` | |
 | `luks` | LUKS1 / LUKS2 | pulls `purecrypto`; implies `json` (LUKS2 metadata is JSON) |
 
@@ -1319,9 +1319,10 @@ Things explicitly out of scope today, in rough order of likely-to-change:
   fork) work. LZVN (types 7/8) and LZFSE (types 11/12) return
   `Unsupported`.
 - **DMG**: encrypted v1 (`cdsaencr` legacy 3DES) chunks return
-  `Unsupported`; v2 is covered. The writer emits single-segment images
-  only — no ULFO yet (no LZFSE encoder), encryption or segmented
-  output (sparse images are the separate `sparse-image` backends).
+  `Unsupported`; v2 is covered. The UDIF writer itself emits single-segment,
+  unencrypted images; segmenting (`segment_udif`) and encryption
+  (`dmg::encrypted`) are separate operations, and sparse images are
+  the `sparse-image` backends.
 - **Partial-file rewrites** on the trait surface — `open_file_rw`
   exists everywhere it's safe, but a typed "patch this byte range
   on a known-large file" API is not surfaced beyond `Read + Write +

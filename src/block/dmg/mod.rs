@@ -1117,7 +1117,7 @@ mod tests {
     }
 
     /// LZFSE chunk end-to-end: compress with the `lzfse_rust` dev-dep (an
-    /// independent encoder; compcol's LZFSE is decode-only), embed, and read
+    /// independent encoder), embed, and read
     /// back through the production `compcol` LZFSE decoder.
     #[cfg(feature = "dmg-lzfse")]
     #[test]

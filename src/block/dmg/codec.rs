@@ -303,7 +303,7 @@ pub fn decode_bzip2(_src: &[u8], _plain_len: usize) -> Result<Vec<u8>> {
 
 /// Decode an LZFSE chunk payload into a vector of exactly `plain_len`
 /// bytes. DMG LZFSE chunks are standalone bvxN/bvx2/bvx1/bvx- framed
-/// blocks; decoded via `compcol::lzfse` (decode-only).
+/// blocks; decoded via `compcol::lzfse`.
 #[cfg(feature = "dmg-lzfse")]
 pub fn decode_lzfse(src: &[u8], plain_len: usize) -> Result<Vec<u8>> {
     let out = decode_chunk::<compcol::lzfse::Lzfse>(src, plain_len, "lzfse")?;

@@ -441,6 +441,11 @@ fn ulmo_passes_hdiutil() {
 }
 
 #[test]
+fn ulfo_passes_hdiutil() {
+    check_native(UdifFormat::Ulfo, |_| {});
+}
+
+#[test]
 fn ufbi_passes_hdiutil() {
     check_native(UdifFormat::Ufbi, |_| {});
 }
@@ -459,6 +464,7 @@ fn gpt_partitioned_every_format_passes_hdiutil() {
         UdifFormat::Udco,
         UdifFormat::Udbz,
         UdifFormat::Ulmo,
+        UdifFormat::Ulfo,
         UdifFormat::Ufbi,
         UdifFormat::Udrw,
     ] {
@@ -736,7 +742,7 @@ fn cli_convert_to_dmg() {
     let bad = dir.path().join("bad.dmg");
     let st = Command::new(fstool)
         .args(["convert".as_ref(), raw.as_os_str(), bad.as_os_str()])
-        .args(["--dmg-format", "ULFO"])
+        .args(["--dmg-format", "UDTO"])
         .status()
         .unwrap();
     assert!(!st.success());

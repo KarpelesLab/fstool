@@ -66,7 +66,7 @@
 //! | `Udzo` | zlib | `dmg-write-zlib` |
 //! | `Udbz` | bzip2 | `dmg-write-bzip2` |
 //! | `Ulmo` | LZMA (XZ-framed, as current `hdiutil` writes) | `dmg-write-lzma` |
-//! | `Ulfo` | LZFSE | `dmg-write-lzfse` — reserved, not yet writable |
+//! | `Ulfo` | LZFSE | `dmg-write-lzfse` |
 //!
 //! A format whose codec feature is compiled out (or, for ULFO, whose
 //! encoder doesn't exist yet) is refused by [`UdifWriter::new`] with
@@ -204,12 +204,8 @@ impl UdifFormat {
             Self::Udbz => missing("dmg-write-bzip2"),
             Self::Ulmo if cfg!(feature = "dmg-write-lzma") => Ok(()),
             Self::Ulmo => missing("dmg-write-lzma"),
-            Self::Ulfo if cfg!(feature = "dmg-write-lzfse") && lzfse_hook::READY => Ok(()),
-            Self::Ulfo => Err(crate::Error::Unsupported(
-                "dmg: writing ULFO is not supported yet — the LZFSE codec fstool uses \
-                 (compcol) can decode but not encode"
-                    .into(),
-            )),
+            Self::Ulfo if cfg!(feature = "dmg-write-lzfse") => Ok(()),
+            Self::Ulfo => missing("dmg-write-lzfse"),
         }
     }
 
@@ -1189,7 +1185,10 @@ fn encode_chunk(
             Some((ChunkType::Lzma, cc_encode::<compcol::xz::Xz>(plain, cfg)?))
         }
         #[cfg(feature = "dmg-write-lzfse")]
-        UdifFormat::Ulfo => Some((ChunkType::Lzfse, lzfse_hook::encode(plain)?)),
+        UdifFormat::Ulfo => Some((
+            ChunkType::Lzfse,
+            cc_encode::<compcol::lzfse::Lzfse>(plain, ())?,
+        )),
         // Formats whose codec is compiled out were refused by `validate`;
         // UDRW never reaches the chunker.
         #[allow(unreachable_patterns)]
@@ -1200,39 +1199,11 @@ fn encode_chunk(
     })
 }
 
-/// ULFO (LZFSE) encode hook — **the one place to finish ULFO writing.**
-///
-/// `compcol` 0.7.6 can only decode LZFSE, so ULFO stays unwritable:
-/// [`UdifFormat::check_writable`] refuses it unless the
-/// `dmg-write-lzfse` feature is on *and* [`READY`](lzfse_hook::READY) is
-/// true. Once a compcol release with an LZFSE encoder lands:
-///
-/// 1. bump `compcol` in `Cargo.toml` and make `dmg-write-lzfse` enable
-///    its encoder (it already implies `dmg-lzfse`, the reader side);
-/// 2. replace the body of `encode` below with
-///    `cc_encode::<compcol::lzfse::Lzfse>(plain, Default::default())`;
-/// 3. flip `READY` to `true` and add ULFO to the writer's tests
-///    (`all_writable`, `tests/dmg_write_external.rs`).
-///
-/// Everything else — chunking, raw fallback, `buffers_needed`, checksums,
-/// the `0x80000007` chunk type — is already format-generic.
-mod lzfse_hook {
-    /// Whether [`encode`] is a real encoder.
-    pub(super) const READY: bool = false;
-
-    /// Encode one ULFO chunk (a bare LZFSE stream, as `hdiutil` writes).
-    #[cfg(feature = "dmg-write-lzfse")]
-    pub(super) fn encode(_plain: &[u8]) -> crate::Result<Vec<u8>> {
-        Err(crate::Error::Unsupported(
-            "dmg: no LZFSE encoder is available yet (compcol is decode-only)".into(),
-        ))
-    }
-}
-
 #[cfg(any(
     feature = "dmg-write-zlib",
     feature = "dmg-write-bzip2",
-    feature = "dmg-write-lzma"
+    feature = "dmg-write-lzma",
+    feature = "dmg-write-lzfse"
 ))]
 fn cc_encode<A: compcol::Algorithm>(plain: &[u8], cfg: A::EncoderConfig) -> Result<Vec<u8>> {
     compcol::vec::compress_to_vec_with::<A>(plain, cfg).map_err(|e| {
@@ -1506,6 +1477,7 @@ mod tests {
             UdifFormat::Udzo,
             UdifFormat::Udbz,
             UdifFormat::Ulmo,
+            UdifFormat::Ulfo,
             UdifFormat::Ufbi,
         ]
         .into_iter()
@@ -1675,6 +1647,7 @@ mod tests {
             bad(&|o| o.partition_name = String::new()),
             crate::Error::InvalidArgument(_)
         ));
+        #[cfg(not(feature = "dmg-write-lzfse"))]
         assert!(matches!(
             bad(&|o| o.format = UdifFormat::Ulfo),
             crate::Error::Unsupported(_)
@@ -1841,9 +1814,10 @@ mod tests {
             assert_eq!(UdifFormat::from_name(&f.name().to_lowercase()), Some(f));
         }
         assert_eq!(UdifFormat::from_name("UDTO"), None);
-        // ULFO stays unwritable until an LZFSE encoder exists, with or
-        // without the reserved feature.
-        assert!(!UdifFormat::Ulfo.writable());
+        assert_eq!(
+            UdifFormat::Ulfo.writable(),
+            cfg!(feature = "dmg-write-lzfse")
+        );
     }
 
     /// Pull every blkx entry's (Name, ID, decoded mish) out of an image.

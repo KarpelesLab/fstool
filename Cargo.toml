@@ -131,7 +131,7 @@ alloc = []
 #
 # which drops `clap` and `rustyline` (and their ~30 transitive crates)
 # while keeping every format.
-codecs = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "bzip2", "deflate64", "zip-legacy", "zip-aes", "cab", "amiga-lzx", "lha", "arc", "sit", "sevenz", "rar", "dmg-bzip2", "dmg-lzfse", "dmg-write-zlib", "dmg-write-bzip2", "dmg-write-lzma"]
+codecs = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "bzip2", "deflate64", "zip-legacy", "zip-aes", "cab", "amiga-lzx", "lha", "arc", "sit", "sevenz", "rar", "dmg-bzip2", "dmg-lzfse", "dmg-write-zlib", "dmg-write-bzip2", "dmg-write-lzma", "dmg-write-lzfse"]
 
 # ---------------------------------------------------------------------
 # Filesystems. One feature per backend, every one on by default through
@@ -370,7 +370,7 @@ zip-aes = ["archive", "dep:purecrypto"]
 # DMG chunk codecs beyond the always-available zero / raw / zlib / ADC set,
 # decoded via compcol (bzip2 + lzfse decoders). Gated so a slim build can
 # drop them. (`lzfse_rust` is a dev-dependency used only to generate the
-# lzfse test vector — compcol's LZFSE is decode-only.)
+# lzfse test vector.)
 dmg-bzip2 = ["dmg", "dep:compcol", "compcol/bzip2"]
 dmg-lzfse = ["dmg", "dep:compcol", "compcol/lzfse"]
 # UDIF (.dmg) writing: `block::dmg::UdifWriter` encodes a sector stream
@@ -379,8 +379,7 @@ dmg-lzfse = ["dmg", "dep:compcol", "compcol/lzfse"]
 # built in, no dependency), UFBI (raw + MD5) and UDRW (bare sectors);
 # each compressed format adds its own codec and the matching read-side
 # decoder, so the writer's output always re-opens: UDZO (zlib), UDBZ
-# (bzip2), ULMO (LZMA, XZ-framed). `dmg-write-lzfse` reserves ULFO's
-# encode hook; ULFO stays unwritable until compcol ships an LZFSE encoder.
+# (bzip2), ULMO (LZMA, XZ-framed), ULFO (LZFSE).
 dmg-write = ["dmg"]
 dmg-write-zlib = ["dmg-write", "gzip"]
 dmg-write-bzip2 = ["dmg-write", "dmg-bzip2"]
@@ -468,7 +467,7 @@ charcode = { version = "0.1.3", optional = true, default-features = false, featu
 # compcol: uniform no_std codec collection serving gzip/zlib/deflate/xz/zstd
 # /lz4/lzo plus the CAB codecs. `std` is always on (for the `io` Read/Write
 # adapters); per-algorithm features are added by fstool's feature flags.
-compcol = { version = "0.7.6", optional = true, default-features = false, features = ["std", "checksum"] }
+compcol = { version = "0.7.8", optional = true, default-features = false, features = ["std", "checksum"] }
 
 # Line editing + persistent history for the interactive shell. Optional, behind
 # the `readline` feature; the bin enables it by default. Pure-Rust line editor.

@@ -36,7 +36,7 @@ pub struct ContainerResizeOptions {
     /// `None` keeps the source's format (by its chunk codec), checksum
     /// type, segment ID and resources; its `blkx` map is kept too, with a
     /// grown tail recorded as one free-space entry and a shrunken one
-    /// clipped. A format fstool cannot write (ULFO) needs an override.
+    /// clipped. A format this build cannot write needs an override.
     #[cfg(feature = "dmg-write")]
     pub udif: Option<crate::block::dmg::UdifWriteOptions>,
     /// What a UDIF rewrite may drop (code signature, legacy resource

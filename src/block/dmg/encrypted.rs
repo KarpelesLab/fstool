@@ -1386,6 +1386,7 @@ mod tests {
 
     /// Which cipher a synthetic fixture wraps its keyblob with.
     #[derive(Clone, Copy)]
+    #[cfg_attr(not(feature = "dmg-encrypted"), allow(dead_code))]
     enum Wrap {
         Aes192,
         Tdes,
