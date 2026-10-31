@@ -574,6 +574,29 @@ impl Apfs {
                 write::XP_DESC_BLOCKS,
             )));
         }
+        // Every checkpoint fstool writes keeps its ephemeral objects at
+        // the start of the data area (`xp_data_index` 0, length 2) and
+        // never moves the spaceman. Once macOS has mounted the
+        // container read-write its checkpoints rotate through the data
+        // area and its allocations live in a spaceman fstool doesn't
+        // follow, so the bump allocator could hand out blocks macOS
+        // already uses. Refuse rather than corrupt the container.
+        {
+            let live_paddr = ctx
+                .live_xp_desc_offset
+                .map_or(0, |off| ctx.live_sb.xp_desc_base + off);
+            let mut nx = vec![0u8; block_size as usize];
+            dev.read_at(live_paddr * block_size as u64, &mut nx)?;
+            let data_index = u32::from_le_bytes(nx[144..148].try_into().unwrap());
+            let data_len = u32::from_le_bytes(nx[148..152].try_into().unwrap());
+            if (data_index, data_len) != (0, 2) {
+                return Err(crate::Error::Unsupported(format!(
+                    "apfs: the live checkpoint (xid {cur_xid}) was written by another \
+                     implementation (checkpoint data at index {data_index}, {data_len} \
+                     blocks), so fstool can't track its free space — open it read-only"
+                )));
+            }
+        }
 
         // Read the APSB to capture volume_uuid + counters + next_oid.
         let (vol_index, apsb_paddr) = find_volume_paddr(dev, &ctx)?;
@@ -3372,14 +3395,15 @@ mod tests {
         apfs.flush(&mut dev).unwrap();
         drop(apfs);
 
-        // Rewrite the 53-byte file's fixed `uncompressed_size` to 0, the
-        // way macOS leaves it for an uncompressed file. The fixed inode
-        // tail is `mode(u16) pad(u16) uncompressed_size(u64)`, followed by
-        // the xfield blob header (1 ext, 40 bytes used).
+        // The writer leaves the fixed `uncompressed_size` at 0, the way
+        // macOS does for an uncompressed file (and the zeroing below
+        // keeps this test honest should that ever regress). The fixed
+        // inode tail is `mode(u16) pad(u16) uncompressed_size(u64)`,
+        // followed by the xfield blob header (1 ext, 40 bytes used).
         let mut needle = Vec::new();
         needle.extend_from_slice(&0o100_644u16.to_le_bytes());
         needle.extend_from_slice(&0u16.to_le_bytes());
-        needle.extend_from_slice(&53u64.to_le_bytes());
+        needle.extend_from_slice(&0u64.to_le_bytes());
         needle.extend_from_slice(&1u16.to_le_bytes());
         needle.extend_from_slice(&40u16.to_le_bytes());
         let mut img = vec![0u8; (total_blocks * bs as u64) as usize];
@@ -3390,7 +3414,7 @@ mod tests {
             .filter(|(_, w)| *w == needle.as_slice())
             .map(|(i, _)| i)
             .collect();
-        assert!(!hits.is_empty(), "53-byte inode not found in image");
+        assert!(!hits.is_empty(), "regular-file inode not found in image");
         for off in hits {
             dev.write_at((off + 4) as u64, &0u64.to_le_bytes()).unwrap();
         }

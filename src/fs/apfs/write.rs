@@ -2,29 +2,36 @@
 //!
 //! ## Scope
 //!
-//! This produces a minimal but *readable* APFS image: an NXSB at block 0
-//! plus an additional NXSB inside the checkpoint descriptor area, a
-//! container omap, a stub spaceman, one volume with its own omap, an
-//! fs-tree (single- or multi-leaf), and any number of regular files,
-//! directories, symlinks and xattrs rooted at inode 2.
+//! This produces a single-volume container that macOS mounts natively
+//! (see `tests/apfs_mount_external.rs`), laid out the way `newfs_apfs`
+//! lays one out: an NXSB at block 0 plus the live checkpoint inside the
+//! checkpoint descriptor area, a container omap, a space manager with
+//! its internal pool, a reaper, and one volume with its own omap, an
+//! fs-tree (single- or multi-leaf), an extent-reference tree and an
+//! empty snapshot-metadata tree, holding any number of regular files,
+//! directories, symlinks and xattrs under the root directory (inode 2)
+//! next to the private directory (inode 3).
 //!
-//! Layout (block numbers given for `block_size = 4096`):
+//! Layout (block numbers given for `block_size = 4096`; `D` is the
+//! checkpoint data area's size, see `xp_data_blocks_for`):
 //!
 //! ```text
-//!   0      NXSB           container label
-//!   1      checkpoint_map (resolves spaceman ephemeral oid → block 17)
-//!   2      NXSB           live checkpoint (xid=2)
-//!   3..16  reserved xp_desc slots for future NXSB checkpoints
-//!          (used by reopen-and-write — see [`crate::fs::apfs::Apfs::open_writable`])
-//!  17      spaceman_phys  real header + inline single-CIB address array
-//!  18      omap_phys_t    container omap header
-//!  19      APSB           volume superblock
-//!  20      omap_phys_t    volume omap header
-//!  21..    bump area — fs-tree leaves, omap leaves/internal nodes,
-//!          file-extent data blocks. The CIB and per-chunk allocation
-//!          bitmap(s) referenced by the spaceman are also bump-allocated
-//!          at the *end* of this area, after every other block address
-//!          has been pinned.
+//!   0        NXSB           container label (copy of the live one)
+//!   1        checkpoint_map (resolves the spaceman and reaper oids)
+//!   2        NXSB           live checkpoint (xid=2)
+//!   3..16    reserved xp_desc slots for future NXSB checkpoints
+//!            (used by reopen-and-write — see [`crate::fs::apfs::Apfs::open_writable`])
+//!  17        spaceman_phys  first block of the checkpoint data area
+//!  18        reaper
+//!  ..17+D    rest of the data area, left for the kernel's checkpoints
+//!  +0        omap_phys_t    container omap header
+//!  +1        APSB           volume superblock
+//!  +2        omap_phys_t    volume omap header
+//!  +3..      internal pool: 16-block IP-bitmap ring, then the pool
+//!            proper (3 blocks per chunk + CIB) holding the CIB and the
+//!            chunk bitmaps
+//!  then      bump area — file data, then fs-tree, extent-ref and
+//!            snapshot-metadata nodes and omap nodes
 //! ```
 //!
 //! ## xp_desc area sizing
@@ -38,31 +45,20 @@
 //! per `sync()` so each new checkpoint goes at a fresh xp_desc block,
 //! leaving the previous checkpoint's NXSB untouched (COW).
 //!
-//! Metadata and data blocks past the fixed prefix are bump-allocated:
-//! metadata first, then data. The on-disk locations of the various
-//! omap/fsroot roots are recorded by [`ApfsWriter::finish`] and stamped
-//! into the NXSB/APSB before they're written.
-//!
 //! ## Space manager
 //!
-//! The `spaceman` module emits a structurally-correct
-//! `spaceman_phys_t` describing the entire container as a single
-//! device. A single chunk-info-block (CIB) lists one `chunk_info_t` per
-//! container chunk (`blocks_per_chunk = 8 * block_size`); each non-empty
-//! chunk points at its own allocation-bitmap block where set bits mean
-//! "used". The bitmaps reflect every block the writer touched (NXSB
-//! copies, checkpoint map, spaceman/CIB/bitmaps themselves, omap and
-//! fs-tree nodes, and file-extent data blocks).
+//! The `spaceman` module emits the `spaceman_phys_t` `newfs_apfs`
+//! writes for a fresh container: one device, a single chunk-info block
+//! (CIB) listing one `chunk_info_t` per chunk (`8 * block_size`
+//! blocks), each with an allocation bitmap where set bits mean "used",
+//! all of them inside the internal pool; empty free queues with no
+//! trees; and size-dependent limits the kernel recomputes and checks
+//! (see `main_fq_node_limit`). The main bitmap marks the whole used
+//! prefix — NXSB copies, the descriptor and data areas, the pool,
+//! metadata and file data.
 //!
-//! The writer also reserves a small internal-pool (IP) ring near the
-//! start of the container, populates the three space-manager
-//! free-queue B-trees (`SFQ_IP`, `SFQ_MAIN`, `SFQ_TIER2`) as empty
-//! fixed-KV trees, and writes one main-device allocation zone covering
-//! the whole device into `sm_datazone`. The IP ring is never allocated
-//! from during formatting — every block is just bump-allocated so the
-//! bitmap correctly marks the ring blocks as "used" — but the
-//! `spaceman_phys_t` fields describing the ring are fully populated
-//! per the Apple File System Reference.
+//! On a checkpoint (the reopen-and-write path) the spaceman is not
+//! rewritten, so it keeps describing the format-time allocations.
 //!
 //! ## Multi-leaf fs-tree
 //!
@@ -127,7 +123,7 @@ use super::obj::{
     OBJECT_TYPE_BTREE, OBJECT_TYPE_BTREE_NODE, OBJECT_TYPE_CHECKPOINT_MAP, OBJECT_TYPE_FS,
     OBJECT_TYPE_FSTREE, OBJECT_TYPE_NX_SUPERBLOCK, OBJECT_TYPE_OMAP,
 };
-use super::spaceman::{self, DEFAULT_IP_BLOCK_COUNT, SpacemanLayout, blocks_per_chunk};
+use super::spaceman::{self, SPACEMAN_IP_BM_TX_MULTIPLIER, SpacemanLayout, blocks_per_chunk};
 use super::superblock::{APFS_MAGIC, NX_MAGIC, NX_MAX_FILE_SYSTEMS};
 
 /// `OBJ_VIRTUAL = 0` (the default flag); `OBJ_PHYSICAL = 0x4000_0000`;
@@ -158,31 +154,76 @@ pub(crate) const NXSB_LIVE_PADDR: u64 = 2;
 /// Physical block of the spaceman_phys — the first block of the
 /// checkpoint *data* area, which starts just past the xp_desc area.
 pub(crate) const SPACEMAN_PADDR: u64 = (XP_DESC_BLOCKS as u64) + 1;
-/// Blocks reserved for the checkpoint data area (`nx_xp_data_blocks`).
-/// Only the first holds anything we write (the spaceman), but
+/// Smallest checkpoint data area (`nx_xp_data_blocks`) we emit.
 /// `fsck_apfs` rejects a container whose data area is smaller than 8
-/// blocks ("nx_xp_data_blocks (1) is less than 8"), so the rest stay
-/// reserved and zeroed.
-pub(crate) const XP_DATA_BLOCKS: u32 = 8;
-/// Blocks of the checkpoint data area a checkpoint actually uses: the
-/// spaceman and the reaper, in that order.
+/// blocks ("nx_xp_data_blocks (1) is less than 8"). Larger containers
+/// get a proportionally larger area — see [`xp_data_blocks_for`].
+pub(crate) const XP_DATA_BLOCKS_MIN: u32 = 8;
+/// Blocks of the checkpoint data area a format-time checkpoint actually
+/// uses: the spaceman and the reaper, in that order.
 const XP_DATA_USED: u32 = 2;
-/// Physical block of the container omap_phys_t header.
-pub(crate) const CONT_OMAP_PADDR: u64 = SPACEMAN_PADDR + XP_DATA_BLOCKS as u64;
-/// Physical block of the volume superblock (APSB).
-pub(crate) const APSB_PADDR: u64 = CONT_OMAP_PADDR + 1;
-/// Physical block of the volume omap_phys_t header.
-pub(crate) const VOL_OMAP_PADDR: u64 = APSB_PADDR + 1;
-/// First bump-allocated block. Everything past this is COW-friendly
-/// scratch space for fs-tree leaves, omap leaves, and file extents.
-pub(crate) const BUMP_BLOCK_START: u64 = VOL_OMAP_PADDR + 1;
+/// Lowest possible first bump-allocated block: the data area at its
+/// minimum size followed by the container omap header, the volume
+/// superblock and the volume omap header.
+pub(crate) const BUMP_BLOCK_START: u64 = SPACEMAN_PADDR + XP_DATA_BLOCKS_MIN as u64 + 3;
 
-/// Inode-2 default-data-stream object id constant. The fs-tree pairs
-/// every regular-file inode with a `private_id` pointing at the dstream
-/// object id; we encode them with `private_id == inode_oid` (i.e. the
-/// dstream and inode share an id), which is permitted by the spec and
-/// is also what genuine APFS volumes do for normal files.
-const DSTREAM_ID_SHARES_INODE: bool = true;
+/// `sfq_tree_node_limit` of the main free queue for a container of
+/// `total_blocks` 4 KiB blocks.
+///
+/// The macOS kernel recomputes this figure when it opens a container
+/// and refuses one whose spaceman disagrees — in either direction — by
+/// silently never bringing the container up (`diskutil` shows the
+/// container with no physical store, error -69808). `fsck_apfs` does
+/// not check it. The formula below reproduces what `newfs_apfs`
+/// writes, measured at every transition point from one block to
+/// 16 GiB: one node per 4544 blocks (32 × the 142 entries of a free
+/// queue root node), but never exactly 2; one per 2272 blocks from
+/// 1 GiB (262 144 blocks) on; and 512 from 4 GiB (1 048 576 blocks)
+/// up.
+fn main_fq_node_limit(total_blocks: u64) -> u16 {
+    let limit = match total_blocks {
+        b if b >= 1 << 20 => 512,
+        b if b >= 1 << 18 => b.div_ceil(2272),
+        b => match b.div_ceil(4544) {
+            2 => 3,
+            n => n.max(1),
+        },
+    };
+    limit.min(512) as u16
+}
+
+/// Size of the checkpoint data area for a container of `total_blocks`
+/// blocks. The area holds the ephemeral objects of the live checkpoint
+/// *and* of the previous one — the spaceman, the reaper and the
+/// spaceman's free-queue trees, which the kernel creates there once it
+/// starts freeing blocks and which may grow to the free queues' node
+/// limits — so it scales with the main free queue's limit `L` the way
+/// `newfs_apfs`'s does: `16 + 36·L` blocks up to `L = 8`, then
+/// `272 + 4·L`. (macOS accepts other sizes too, as long as the area
+/// overlaps nothing.) Containers too small for that keep at least
+/// [`XP_DATA_BLOCKS_MIN`].
+pub(crate) fn xp_data_blocks_for(total_blocks: u64) -> u32 {
+    let l = main_fq_node_limit(total_blocks) as u64;
+    let native = if l <= 8 { 16 + 36 * l } else { 272 + 4 * l };
+    native.min(total_blocks / 8).max(XP_DATA_BLOCKS_MIN as u64) as u32
+}
+
+/// Blocks the space manager's internal pool occupies on format: the
+/// IP-bitmap ring followed by the pool proper. It sits right after the
+/// container omap header, the APSB and the volume omap header, ahead of
+/// the bump area — where `newfs_apfs` puts it, just past the checkpoint
+/// data area.
+fn internal_pool_span(total_blocks: u64, block_size: u32) -> u64 {
+    let chunks = total_blocks.div_ceil(blocks_per_chunk(block_size as usize));
+    SPACEMAN_IP_BM_TX_MULTIPLIER as u64 + spaceman::ip_block_count(chunks)
+}
+
+/// `INODE_NO_RSRC_FORK` in `j_inode_val_t.internal_flags`.
+const INODE_NO_RSRC_FORK: u64 = 0x0000_8000;
+
+/// `XF_SYSTEM_FIELD` — `x_field_t.x_flags` bit for fields the
+/// filesystem owns (the data stream among them).
+const XF_SYSTEM_FIELD: u8 = 0x20;
 
 /// `XATTR_DATA_EMBEDDED` flag in `j_xattr_val_t.flags`. When set the
 /// xattr value is stored inline immediately after the val header.
@@ -214,13 +255,20 @@ pub(crate) const CHECKPOINT_DESC_SLOTS: u32 = 2;
 /// `o_oid`, whatever block it lives on.
 const OID_NX_SUPERBLOCK: u64 = 1;
 
-/// `nx_ephemeral_info[0]`: `(min_block_count 1 << 32) |
-/// (NX_MAX_FILE_SYSTEM_EPH_STRUCTS 4 << 16) |
-/// NX_EPHEMERAL_INFO_VERSION_1`, byte-for-byte what macOS writes.
 /// `BTOFF_INVALID` — the "this free list is empty" offset marker.
 const BTOFF_INVALID: u16 = 0xFFFF;
 
-const NX_EPHEMERAL_INFO_0: u64 = 0x0000_0001_0004_0001;
+/// `nx_ephemeral_info[0]` without its minimum block count:
+/// `(NX_MAX_FILE_SYSTEM_EPH_STRUCTS 4 << 16) | NX_EPHEMERAL_INFO_VERSION_1`.
+/// [`ApfsWriter::build_nxsb`] ORs `min_block_count << 32` in.
+const NX_EPHEMERAL_INFO_0: u64 = 0x0000_0000_0004_0001;
+
+/// `NX_INCOMPAT_VERSION2` — the container uses APFS version 2.
+const NX_INCOMPAT_VERSION2: u64 = 0x0000_0000_0000_0002;
+
+/// `OMAP_MANUALLY_MANAGED` — set on the container omap, which never
+/// carries snapshots.
+const OMAP_MANUALLY_MANAGED: u32 = 0x0000_0001;
 
 /// `OBJECT_TYPE_NX_REAPER` from the Apple File System Reference.
 const OBJECT_TYPE_NX_REAPER: u32 = 0x0000_0011;
@@ -228,6 +276,14 @@ const OBJECT_TYPE_NX_REAPER: u32 = 0x0000_0011;
 /// First virtual oid we assign to fs-tree leaves. We start well past the
 /// reserved-range used by other writer constants.
 const FS_LEAF_VID_BASE: u64 = 0x1_0000;
+
+/// `ROOT_DIR_PARENT`: the parent inode number of the root directory.
+/// It has no inode record of its own.
+const ROOT_DIR_PARENT: u64 = 1;
+/// `ROOT_DIR_INO_NUM`.
+const ROOT_DIR_INO_NUM: u64 = 2;
+/// `PRIV_DIR_INO_NUM`: the volume's private directory.
+const PRIV_DIR_INO_NUM: u64 = 3;
 
 /// One pending fs-tree record (key + value bytes), used by the in-memory
 /// builder before serialization.
@@ -237,20 +293,39 @@ struct FsRecord {
     val: Vec<u8>,
 }
 
-/// Type/category sort order tag for fs-tree records — encodes the APFS
-/// record-ordering rules: ascending oid first, then ascending kind,
-/// then a type-specific tail. We pre-compute a comparator key per
-/// record so the final sort is straightforward.
-fn fs_record_sort_key(rec: &FsRecord) -> (u64, u8, Vec<u8>) {
-    let hdr = u64::from_le_bytes(rec.key[0..8].try_into().unwrap());
-    let oid = hdr & OBJ_ID_MASK;
-    let kind = (hdr >> OBJ_TYPE_SHIFT) as u8;
-    let tail = if rec.key.len() > 8 {
-        rec.key[8..].to_vec()
-    } else {
-        Vec::new()
-    };
-    (oid, kind, tail)
+/// APFS fs-tree record order: ascending oid, then ascending record
+/// type, then a type-specific tail — the same rules the reader's
+/// `cmp_fs_key` and macOS apply. Directory entries sort by name
+/// (plain keys) or by hash then name (hashed keys), never by their
+/// length prefix; file extents by their logical offset as a number;
+/// xattrs by name.
+fn fs_record_cmp(a: &FsRecord, b: &FsRecord, hashed_drecs: bool) -> std::cmp::Ordering {
+    let ha = u64::from_le_bytes(a.key[0..8].try_into().unwrap());
+    let hb = u64::from_le_bytes(b.key[0..8].try_into().unwrap());
+    let kind = (ha >> OBJ_TYPE_SHIFT) as u8;
+    let head = (ha & OBJ_ID_MASK, kind).cmp(&(hb & OBJ_ID_MASK, (hb >> OBJ_TYPE_SHIFT) as u8));
+    if head != std::cmp::Ordering::Equal {
+        return head;
+    }
+    let (ta, tb) = (&a.key[8..], &b.key[8..]);
+    let u16_name = |t: &[u8]| t.get(2..).unwrap_or(&[]).to_vec();
+    match kind {
+        APFS_TYPE_DIR_REC if hashed_drecs => {
+            let hash = |t: &[u8]| {
+                t.get(0..4)
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()) & !0x3ff)
+                    .unwrap_or(0)
+            };
+            let name = |t: &[u8]| t.get(4..).unwrap_or(&[]).to_vec();
+            (hash(ta), name(ta)).cmp(&(hash(tb), name(tb)))
+        }
+        APFS_TYPE_DIR_REC | APFS_TYPE_XATTR => u16_name(ta).cmp(&u16_name(tb)),
+        APFS_TYPE_FILE_EXTENT if ta.len() >= 8 && tb.len() >= 8 => {
+            let off = |t: &[u8]| u64::from_le_bytes(t[0..8].try_into().unwrap());
+            off(ta).cmp(&off(tb))
+        }
+        _ => ta.cmp(tb),
+    }
 }
 
 /// A streaming APFS writer. Construct one with [`ApfsWriter::new`],
@@ -317,6 +392,11 @@ pub struct ApfsWriter<'a> {
     nxsb_template: Option<Vec<u8>>,
     /// Which `nx_fs_oid[]` slot the volume being rewritten occupies.
     volume_index: usize,
+    /// `nx_xp_data_blocks`: size of the checkpoint data area, which
+    /// starts at [`SPACEMAN_PADDR`]. Chosen by [`xp_data_blocks_for`]
+    /// on format, carried over from the live superblock on a
+    /// checkpoint.
+    xp_data_blocks: u32,
 }
 
 // ───────────────────────── shared record builders ─────────────────────────
@@ -455,12 +535,10 @@ pub(crate) fn build_inode_record(
     let has_dstream = !is_symlink && (dstream_size > 0 || (mode & 0o170_000 == 0o100_000));
     let mut val = vec![0u8; J_INODE_VAL_FIXED_SIZE];
     val[0..8].copy_from_slice(&parent_oid.to_le_bytes());
-    let private_id = if has_dstream && DSTREAM_ID_SHARES_INODE {
-        oid
-    } else {
-        0
-    };
-    val[8..16].copy_from_slice(&private_id.to_le_bytes());
+    // `private_id` is the inode's own id for every inode — directories
+    // and symlinks included — exactly as macOS writes it; for files it
+    // doubles as the default data stream's id.
+    val[8..16].copy_from_slice(&oid.to_le_bytes());
     // Stamp all four time fields with `mtime_ns`. APFS records
     // create_time/mod_time/change_time/access_time as four separate
     // u64-ns slots; we collapse them to a single value because most
@@ -470,21 +548,28 @@ pub(crate) fn build_inode_record(
     val[24..32].copy_from_slice(&mtime_ns.to_le_bytes()); // mod_time
     val[32..40].copy_from_slice(&mtime_ns.to_le_bytes()); // change_time
     val[40..48].copy_from_slice(&mtime_ns.to_le_bytes()); // access_time
-    // internal_flags: 0.
-    let nlink: i32 = if mode & 0o170_000 == 0o040_000 { 2 } else { 1 };
+    // internal_flags: INODE_NO_RSRC_FORK — macOS sets it on every
+    // inode without a resource fork, and fsck_apfs asks for it.
+    val[48..56].copy_from_slice(&INODE_NO_RSRC_FORK.to_le_bytes());
+    // `nchildren` for a directory (filled in by the writer from the
+    // record set it finally commits), `nlink` for everything else.
+    let nlink: i32 = if mode & 0o170_000 == 0o040_000 { 0 } else { 1 };
     val[56..60].copy_from_slice(&nlink.to_le_bytes());
     // owner/group: 0 (root).
     val[80..82].copy_from_slice(&mode.to_le_bytes());
-    val[84..92].copy_from_slice(&dstream_size.to_le_bytes());
+    // uncompressed_size (84..92) stays 0: it is only meaningful with
+    // INODE_HAS_UNCOMPRESSED_SIZE (decmpfs files). The size lives in
+    // the DSTREAM xfield.
 
     if has_dstream {
         // xfield blob: 1 entry (DSTREAM), 40 bytes value, padded to 8.
         let mut xfields = Vec::new();
         xfields.extend_from_slice(&1u16.to_le_bytes()); // num_exts
         xfields.extend_from_slice(&40u16.to_le_bytes()); // used_data
-        // x_field_t = (type:u8, flags:u8, size:u16)
+        // x_field_t = (type:u8, flags:u8, size:u16). The data stream
+        // is a system field (`XF_SYSTEM_FIELD`), as macOS marks it.
         xfields.push(INO_EXT_TYPE_DSTREAM);
-        xfields.push(0);
+        xfields.push(XF_SYSTEM_FIELD);
         xfields.extend_from_slice(&40u16.to_le_bytes());
         // value: j_dstream_t (40 bytes)
         let mut ds = [0u8; 40];
@@ -526,11 +611,12 @@ pub(crate) fn build_file_extent_records(
     fe_val[8..16].copy_from_slice(&phys_block.to_le_bytes());
     // crypto_id stays zero.
 
-    // DSTREAM_ID (just a refcnt=0 marker; reader uses presence not value)
+    // DSTREAM_ID: `j_dstream_id_val_t.refcnt` — one reference (the
+    // inode). macOS treats a zero-refcount stream as already deleted.
     let mut ds_key = vec![0u8; 8];
     let ds_hdr = ((APFS_TYPE_DSTREAM_ID as u64) << OBJ_TYPE_SHIFT) | (dstream_oid & OBJ_ID_MASK);
     ds_key.copy_from_slice(&ds_hdr.to_le_bytes());
-    let ds_val = vec![0u8; 4];
+    let ds_val = 1u32.to_le_bytes().to_vec();
     [(fe_key, fe_val), (ds_key, ds_val)]
 }
 
@@ -623,9 +709,14 @@ impl<'a> ApfsWriter<'a> {
         let container_uuid = derive_uuid(volume_name.as_bytes(), b"container");
         let volume_uuid = derive_uuid(volume_name.as_bytes(), b"volume");
 
-        // See module-level layout. Bump area begins at BUMP_BLOCK_START
-        // (block 21 at the default xp_desc sizing).
-        let bump_block_start: u64 = BUMP_BLOCK_START;
+        // See module-level layout: the checkpoint data area, then the
+        // container omap header, the APSB and the volume omap header,
+        // then the bump area.
+        let xp_data_blocks = xp_data_blocks_for(total_blocks);
+        let bump_block_start: u64 = SPACEMAN_PADDR
+            + xp_data_blocks as u64
+            + 3
+            + internal_pool_span(total_blocks, block_size);
         let mut w = Self {
             dev,
             block_size,
@@ -647,11 +738,18 @@ impl<'a> ApfsWriter<'a> {
             apsb_template: None,
             nxsb_template: None,
             volume_index: 0,
+            xp_data_blocks,
         };
-        // Seed the root inode record (oid = 2). Times stay at 0
-        // (epoch 1970) at format — callers refine via set_times /
-        // set_attrs.
-        w.add_inode_record(2, 0, mode_dir(0o755), 0, 0)?;
+        // Seed the two directories every APFS volume starts with: the
+        // root (inode 2) and the private directory (inode 3), both
+        // children of the pseudo-parent `ROOT_DIR_PARENT` (1), with
+        // their directory entries — what `newfs_apfs` writes. Times
+        // stay at 0 (epoch 1970) at format — callers refine via
+        // set_times / set_attrs.
+        w.add_drec(ROOT_DIR_PARENT, "private-dir", PRIV_DIR_INO_NUM, DT_DIR)?;
+        w.add_drec(ROOT_DIR_PARENT, "root", ROOT_DIR_INO_NUM, DT_DIR)?;
+        w.add_inode_record(ROOT_DIR_INO_NUM, ROOT_DIR_PARENT, mode_dir(0o755), 0, 0)?;
+        w.add_inode_record(PRIV_DIR_INO_NUM, ROOT_DIR_PARENT, mode_dir(0o644), 0, 0)?;
         Ok(w)
     }
 
@@ -712,6 +810,12 @@ impl<'a> ApfsWriter<'a> {
                 XP_DESC_BLOCKS as u64 + 1
             )));
         }
+        // Keep the live checkpoint's data-area geometry.
+        let xp_data_blocks = nxsb_template
+            .get(108..112)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .filter(|&n| n >= XP_DATA_BLOCKS_MIN)
+            .unwrap_or(XP_DATA_BLOCKS_MIN);
         Ok(Self {
             dev,
             block_size,
@@ -733,6 +837,7 @@ impl<'a> ApfsWriter<'a> {
             apsb_template: Some(apsb_template),
             nxsb_template: Some(nxsb_template),
             volume_index,
+            xp_data_blocks,
         })
     }
 
@@ -940,14 +1045,24 @@ impl<'a> ApfsWriter<'a> {
         self.finished = true;
 
         // Sort records into APFS canonical order.
-        self.records.sort_by(|a, b| {
-            let ka = fs_record_sort_key(a);
-            let kb = fs_record_sort_key(b);
-            ka.cmp(&kb)
-        });
+        // A checkpoint keeps the live volume's drec layout; our own
+        // format is always plain.
+        let hashed = self
+            .apsb_template
+            .as_ref()
+            .and_then(|t| t.get(56..64))
+            .is_some_and(|b| {
+                super::is_hashed_drec_layout(u64::from_le_bytes(b.try_into().unwrap()))
+            });
+        ensure_dstream_ids(&mut self.records);
+        self.records.sort_by(|a, b| fs_record_cmp(a, b, hashed));
+        // Directory inodes carry their child count; the record set is
+        // complete here on both the format and the checkpoint path.
+        fix_dir_child_counts(&mut self.records);
 
         let bs = self.block_size as usize;
         let cur_xid = self.xid;
+        let format = self.write_label_nxsb;
 
         // ---- Block addresses (see module-level layout) ----
         // On format (write_label_nxsb = true) we use the fixed layout.
@@ -966,26 +1081,17 @@ impl<'a> ApfsWriter<'a> {
         let chkmap_paddr: u64 = nxsb_live_paddr - 1;
         let spaceman_paddr: u64 = SPACEMAN_PADDR;
         let reaper_paddr: u64 = SPACEMAN_PADDR + 1;
-        let cont_omap_paddr: u64 = if self.write_label_nxsb {
-            CONT_OMAP_PADDR
+        let fixed_meta = SPACEMAN_PADDR + self.xp_data_blocks as u64;
+        let (cont_omap_paddr, apsb_paddr, vol_omap_paddr) = if format {
+            (fixed_meta, fixed_meta + 1, fixed_meta + 2)
         } else {
-            self.alloc_block()?
-        };
-        let apsb_paddr: u64 = if self.write_label_nxsb {
-            APSB_PADDR
-        } else {
-            self.alloc_block()?
-        };
-        let vol_omap_paddr: u64 = if self.write_label_nxsb {
-            VOL_OMAP_PADDR
-        } else {
-            self.alloc_block()?
+            (
+                self.alloc_block()?,
+                self.alloc_block()?,
+                self.alloc_block()?,
+            )
         };
 
-        // Virtual oids assigned to: container volume (=1024), spaceman
-        // (=512), volume omap target -> fsroot (=fsroot_vid=2). The
-        // container omap maps volume_vid → APSB paddr; the volume omap
-        // maps fsroot_vid → fsroot paddr.
         // Virtual / ephemeral object ids must be at or above
         // `OID_RESERVED_COUNT` (1024); everything below is reserved for
         // fixed oids like OID_NX_SUPERBLOCK. `fsck_apfs` rejects the
@@ -997,199 +1103,110 @@ impl<'a> ApfsWriter<'a> {
         let volume_vid: u64 = 1026;
         let fsroot_vid: u64 = 1027;
 
-        // ---- Plan fs-tree (single leaf or multi-leaf with internal root) ----
-        let leaf_payload_cap = leaf_payload_capacity(bs);
-        // Each leaf has a per-entry ToC overhead of 8 bytes (kvloc_t) plus
-        // the key+val payload. We pack greedily by sort order, ensuring
-        // each leaf fits inside `leaf_payload_cap`.
-        let leaves = pack_records_into_leaves(&self.records, leaf_payload_cap)?;
+        // Blocks the volume owns (`apfs_fs_alloc_count`): its omap,
+        // trees and file data. File data was bump-allocated while the
+        // records were built, before any metadata.
+        let data_blocks = self.next_block - self.bump_block_start;
 
-        // Reserve metadata block addresses for fs-tree leaves (and the
-        // internal root if needed) BEFORE we allocate any file-extent
-        // data blocks. Otherwise extent blocks would land before the
-        // metadata, which is fine functionally but harder to reason
-        // about. NOTE: per-spec layout, all extent allocations done by
-        // add_file_from_reader / add_symlink already happened during
-        // record building, so by the time we get here `next_block` has
-        // grown past the data. We allocate fresh metadata blocks
-        // AFTER data — that's still legal because we record their
-        // actual paddrs into the omap.
-        let fs_leaf_paddrs: Vec<u64> = (0..leaves.len())
-            .map(|_| self.alloc_block())
-            .collect::<Result<Vec<_>>>()?;
-        // Compute the fs-tree root paddr & vid:
-        //   single leaf  → root *is* the leaf (vid = fsroot_vid).
-        //   multi leaf   → root is an internal node we add on top;
-        //                  fsroot_vid maps to its paddr.
-        let (fsroot_paddr, vol_omap_entries) = if leaves.len() <= 1 {
-            // Single root-leaf at fsroot_vid.
-            let leaf_paddr = fs_leaf_paddrs.first().copied().unwrap_or(0);
-            // If `leaves` is empty we'd never get here (we always have
-            // at least one record), but be defensive.
-            (leaf_paddr, vec![(fsroot_vid, cur_xid, leaf_paddr)])
+        // ---- fs-tree (virtual: leaves resolved through the volume omap) ----
+        let records = std::mem::take(&mut self.records);
+        let fs_tree = self.write_var_tree(&records, FS_TREE, Some(fsroot_vid))?;
+
+        // ---- Extent-reference tree (physical) ----
+        // One `j_phys_ext` record per allocated file extent: the kernel
+        // consults it to learn who owns a block before it frees or
+        // clones it.
+        let extent_refs = extent_ref_records(&records, self.block_size);
+        let extentref_tree = self.write_var_tree(&extent_refs, EXTENTREF_TREE, None)?;
+        self.records = records;
+
+        // ---- Snapshot-metadata tree (physical, empty) ----
+        // Only created on format; a checkpoint keeps the live one.
+        let snap_meta_tree = if format {
+            Some(self.write_var_tree(&[], SNAP_META_TREE, None)?)
         } else {
-            // Multi-leaf: assign vids to each leaf and add an internal
-            // root above them. The internal root itself gets fsroot_vid.
-            let mut entries = Vec::with_capacity(leaves.len() + 1);
-            let mut child_vids = Vec::with_capacity(leaves.len());
-            for (i, &paddr) in fs_leaf_paddrs.iter().enumerate() {
-                let vid = FS_LEAF_VID_BASE + i as u64;
-                entries.push((vid, cur_xid, paddr));
-                child_vids.push(vid);
-            }
-            let root_paddr = self.alloc_block()?;
-            entries.push((fsroot_vid, cur_xid, root_paddr));
-            entries.sort_by_key(|e| e.0);
-            (root_paddr, entries)
+            None
         };
 
-        // ---- Write fs-tree leaves ----
-        // Node count for the tree's `btree_info_t`: every leaf plus the
-        // internal root when there is one.
-        let fs_node_count = leaves.len() as u64 + u64::from(leaves.len() > 1);
-        for (i, leaf_records) in leaves.iter().enumerate() {
-            let is_root = leaves.len() == 1;
-            let vid = if is_root {
-                fsroot_vid
-            } else {
-                FS_LEAF_VID_BASE + i as u64
-            };
-            let leaf_block = build_fs_leaf(
-                leaf_records,
-                bs,
-                vid,
-                is_root,
-                cur_xid,
-                self.records.len() as u64,
-                fs_node_count,
-            )?;
-            self.write_block(fs_leaf_paddrs[i], &leaf_block)?;
-        }
-        if leaves.len() > 1 {
-            // Build internal root keyed by first record of each leaf,
-            // values = leaf vids.
-            let mut sep_entries: Vec<(Vec<u8>, u64)> = Vec::with_capacity(leaves.len());
-            for (i, leaf) in leaves.iter().enumerate() {
-                let sep_key = leaf[0].key.clone();
-                let vid = FS_LEAF_VID_BASE + i as u64;
-                sep_entries.push((sep_key, vid));
-            }
-            let longest_key = self.records.iter().map(|r| r.key.len()).max().unwrap_or(0) as u32;
-            let longest_val = self.records.iter().map(|r| r.val.len()).max().unwrap_or(0) as u32;
-            let internal_block = build_fs_internal_root(
-                &sep_entries,
-                bs,
-                fsroot_vid,
-                cur_xid,
-                longest_key,
-                longest_val,
-                self.records.len() as u64,
-                fs_node_count,
-            )?;
-            self.write_block(fsroot_paddr, &internal_block)?;
-        }
-
-        // ---- Volume omap (single- or multi-leaf) ----
-        // vol_omap_entries is sorted by oid above.
-        let vol_omap_root_paddr = self.write_omap_tree(&vol_omap_entries)?;
-        let vol_omap_phys = build_omap_phys(bs, vol_omap_paddr, vol_omap_root_paddr, cur_xid)?;
+        // ---- Volume omap ----
+        let (vol_omap_root_paddr, vol_omap_nodes) = self.write_omap_tree(&fs_tree.omap)?;
+        let vol_omap_phys = build_omap_phys(bs, vol_omap_paddr, vol_omap_root_paddr, cur_xid, 0)?;
         self.write_block(vol_omap_paddr, &vol_omap_phys)?;
 
         // ---- APSB ----
-        let apsb_block = self.build_apsb(bs, apsb_paddr, vol_omap_paddr, fsroot_vid, volume_vid)?;
+        let fs_alloc_count = data_blocks
+            + 1 // the volume omap header
+            + vol_omap_nodes
+            + fs_tree.node_count
+            + extentref_tree.node_count
+            + snap_meta_tree.as_ref().map_or(0, |t| t.node_count);
+        let vol = VolumeState {
+            vol_omap_paddr,
+            fsroot_vid,
+            volume_vid,
+            extentref_tree_paddr: extentref_tree.root,
+            snap_meta_tree_paddr: snap_meta_tree.as_ref().map(|t| t.root),
+            fs_alloc_count,
+            data_blocks,
+        };
+        let apsb_block = self.build_apsb(bs, &vol)?;
         self.write_block(apsb_paddr, &apsb_block)?;
 
-        // ---- Container omap (single entry, but goes through the same
-        //      multi-leaf path so we exercise the writer uniformly) ----
-        let cont_omap_root_paddr = self.write_omap_tree(&[(volume_vid, cur_xid, apsb_paddr)])?;
-        let cont_omap_phys = build_omap_phys(bs, cont_omap_paddr, cont_omap_root_paddr, cur_xid)?;
+        // ---- Container omap: the one volume superblock. Manually
+        //      managed, as every container omap is. ----
+        let (cont_omap_root_paddr, _) =
+            self.write_omap_tree(&[(volume_vid, cur_xid, apsb_paddr)])?;
+        let cont_omap_phys = build_omap_phys(
+            bs,
+            cont_omap_paddr,
+            cont_omap_root_paddr,
+            cur_xid,
+            OMAP_MANUALLY_MANAGED,
+        )?;
         self.write_block(cont_omap_paddr, &cont_omap_phys)?;
 
-        // ---- Spaceman: CIB + per-chunk bitmaps + spaceman_phys ----
+        // ---- Spaceman (format only) ----
         //
-        // The CIB and bitmap blocks are bump-allocated AFTER every other
-        // metadata/data block so they themselves can be marked "used"
-        // in their own bitmap without circular reasoning. Pre-reserve
-        // their addresses, then build the spaceman over the closed
-        // set of allocations.
+        // The internal pool — the 16-block IP-bitmap ring followed by
+        // the pool proper, which holds the CIB and the chunk bitmaps —
+        // was reserved by `new` between the fixed metadata and the bump
+        // area, so the main bitmap marks the whole used prefix, pool
+        // included, in one range.
         //
-        // We additionally reserve:
-        //   * a contiguous IP ring (DEFAULT_IP_BLOCK_COUNT blocks) for
-        //     ephemeral metadata; we never allocate out of it during
-        //     formatting,
-        //   * a single IP bitmap block at the start of the ring,
-        //   * three blocks for the empty SFQ_IP / SFQ_MAIN / SFQ_TIER2
-        //     free-queue B-tree roots.
-        //
-        // Every one of these blocks is bump-allocated here, so all of
-        // them end up inside the `(0, self.next_block)` used-range and
-        // the spaceman bitmap correctly marks them used.
         // The spaceman + chkmap are only rewritten on format. The reader
         // doesn't consult them during open, so leaving the previous
         // checkpoint's blocks intact keeps the previous checkpoint
         // bootable until the new one is signed.
-        if self.write_label_nxsb {
-            let bpc = blocks_per_chunk(bs);
-            let chunks: u64 = self.total_blocks.div_ceil(bpc);
-
-            // IP ring: ip_bm_size_in_blocks bitmap block(s) followed by
-            // ip_block_count ring blocks. We use one bitmap block — at a
-            // 4 KiB block size that bitmap can track 32 768 blocks, vastly
-            // more than the ring needs.
-            let ip_bm_size_in_blocks: u32 = 1;
-            let ip_block_count = DEFAULT_IP_BLOCK_COUNT;
-            let ip_bm_base = self.alloc_block()?;
-            for _ in 1..ip_bm_size_in_blocks {
-                // Future-proof: if we ever want a larger ring's bitmap.
-                let _ = self.alloc_block()?;
-            }
-            let ip_base = self.alloc_block()?;
-            for _ in 1..ip_block_count {
-                let _ = self.alloc_block()?;
-            }
-
-            // Three empty SFQ B-tree roots.
-            let free_queue_paddrs: [u64; 3] = [
-                self.alloc_block()?,
-                self.alloc_block()?,
-                self.alloc_block()?,
-            ];
-
-            let cib_paddr = self.alloc_block()?;
-            let mut bitmap_paddrs: Vec<u64> = Vec::with_capacity(chunks as usize);
-            for _ in 0..chunks {
-                bitmap_paddrs.push(self.alloc_block()?);
-            }
-
-            let used_ranges: Vec<(u64, u64)> = vec![(0, self.next_block)];
+        if format {
+            let ip_bm_base = fixed_meta + 3;
+            let ip_base = ip_bm_base + SPACEMAN_IP_BM_TX_MULTIPLIER as u64;
             let layout = SpacemanLayout {
                 block_size: bs,
                 total_blocks: self.total_blocks,
                 xid: cur_xid,
                 spaceman_oid: spaceman_vid,
-                cib_paddr,
-                bitmap_paddrs: bitmap_paddrs.clone(),
-                used_ranges,
+                used_ranges: vec![(0, self.next_block)],
                 ip_base,
-                ip_block_count,
                 ip_bm_base,
-                ip_bm_size_in_blocks,
-                free_queue_paddrs,
+                main_fq_node_limit: main_fq_node_limit(self.total_blocks),
             };
             let emitted = spaceman::build_spaceman(&layout)?;
             self.write_block(spaceman_paddr, &emitted.spaceman_block)?;
-            self.write_block(cib_paddr, &emitted.cib_block)?;
-            for (paddr, bmap) in bitmap_paddrs.iter().zip(emitted.bitmap_blocks.iter()) {
+            self.write_block(emitted.cib_paddr, &emitted.cib_block)?;
+            for (paddr, bmap) in emitted
+                .bitmap_paddrs
+                .iter()
+                .zip(emitted.bitmap_blocks.iter())
+            {
                 self.write_block(*paddr, bmap)?;
             }
-            // IP bitmap block (no obj_phys_t header per spec).
+            // Live IP-bitmap ring slot (no obj_phys_t header per spec);
+            // the free slots are zeroed so stale bytes from a reused
+            // image can't masquerade as pool state.
             self.write_block(ip_bm_base, &emitted.ip_bm_block)?;
-            // Three empty free-queue B-tree roots.
-            for (paddr, fq_block) in free_queue_paddrs
-                .iter()
-                .zip(emitted.free_queue_blocks.iter())
-            {
-                self.write_block(*paddr, fq_block)?;
+            let zero = vec![0u8; bs];
+            for slot in 1..SPACEMAN_IP_BM_TX_MULTIPLIER as u64 {
+                self.write_block(ip_bm_base + slot, &zero)?;
             }
         }
 
@@ -1230,29 +1247,101 @@ impl<'a> ApfsWriter<'a> {
         // — it acts as a stable "where to find the xp_desc area"
         // hint and must NOT be rewritten mid-checkpoint or readers may
         // see a torn label.
-        let nxsb = self.build_nxsb(
-            bs,
-            nxsb_live_paddr,
-            cont_omap_paddr,
-            spaceman_vid,
-            reaper_vid,
-            volume_vid,
-        )?;
+        let nxsb = self.build_nxsb(bs, cont_omap_paddr, spaceman_vid, reaper_vid, volume_vid)?;
         self.write_block(nxsb_live_paddr, &nxsb)?;
-        if self.write_label_nxsb {
-            let nxsb_label = self.build_nxsb(
-                bs,
-                nxsb_label_paddr,
-                cont_omap_paddr,
-                spaceman_vid,
-                reaper_vid,
-                volume_vid,
-            )?;
-            self.write_block(nxsb_label_paddr, &nxsb_label)?;
+        if format {
+            self.write_block(nxsb_label_paddr, &nxsb)?;
         }
-
-        let _ = fsroot_paddr;
         Ok(())
+    }
+
+    /// Emit a variable-size-record B-tree (the fs-tree, the
+    /// extent-reference tree or the snapshot-metadata tree) as one leaf
+    /// or as leaves under a single internal root.
+    ///
+    /// With `virtual_root = Some(vid)` the tree is virtual: the root is
+    /// object `vid`, non-root leaves get oids from
+    /// [`FS_LEAF_VID_BASE`], internal-node values are those oids, and
+    /// the returned `omap` lists the `(oid, xid, paddr)` mappings the
+    /// volume omap must carry. Otherwise the tree is physical: every
+    /// node's oid is its block address and so is every child pointer.
+    fn write_var_tree(
+        &mut self,
+        records: &[FsRecord],
+        kind: TreeKind,
+        virtual_root: Option<u64>,
+    ) -> Result<TreeOut> {
+        let bs = self.block_size as usize;
+        let xid = self.xid;
+        let leaves = pack_records_into_leaves(records, leaf_payload_capacity(bs))?;
+        let paddrs: Vec<u64> = (0..leaves.len())
+            .map(|_| self.alloc_block())
+            .collect::<Result<Vec<_>>>()?;
+        let multi = leaves.len() > 1;
+        let node_count = leaves.len() as u64 + u64::from(multi);
+        let key_count = records.len() as u64;
+        let mut omap = Vec::new();
+        let leaf_oid = |i: usize| match virtual_root {
+            Some(vid) if !multi => vid,
+            Some(_) => FS_LEAF_VID_BASE + i as u64,
+            None => paddrs[i],
+        };
+        let longest_key = records.iter().map(|r| r.key.len()).max().unwrap_or(0) as u32;
+        let longest_val = records.iter().map(|r| r.val.len()).max().unwrap_or(0) as u32;
+        for (i, leaf) in leaves.iter().enumerate() {
+            let oid = leaf_oid(i);
+            if virtual_root.is_some() {
+                omap.push((oid, xid, paddrs[i]));
+            }
+            let block = build_fs_leaf(
+                leaf,
+                bs,
+                oid,
+                !multi,
+                xid,
+                key_count,
+                node_count,
+                kind,
+                virtual_root.is_none(),
+            )?;
+            self.write_block(paddrs[i], &block)?;
+        }
+        if !multi {
+            return Ok(TreeOut {
+                root: paddrs[0],
+                node_count,
+                omap,
+            });
+        }
+        let root_paddr = self.alloc_block()?;
+        let root_oid = virtual_root.unwrap_or(root_paddr);
+        if virtual_root.is_some() {
+            omap.push((root_oid, xid, root_paddr));
+            omap.sort_by_key(|e| e.0);
+        }
+        let sep_entries: Vec<(Vec<u8>, u64)> = leaves
+            .iter()
+            .enumerate()
+            .map(|(i, leaf)| (leaf[0].key.clone(), leaf_oid(i)))
+            .collect();
+        let block = build_fs_internal_root(
+            &sep_entries,
+            bs,
+            root_oid,
+            xid,
+            longest_key,
+            longest_val,
+            key_count,
+            node_count,
+            kind,
+            virtual_root.is_none(),
+        )?;
+        self.write_block(root_paddr, &block)?;
+        Ok(TreeOut {
+            root: root_paddr,
+            node_count,
+            omap,
+        })
     }
 
     // ---- internal helpers ----
@@ -1373,8 +1462,9 @@ impl<'a> ApfsWriter<'a> {
 
     /// Emit an omap as one or more leaf blocks plus, if necessary, a
     /// single internal-root block. Returns the paddr of the tree's
-    /// root (leaf for a single-leaf tree, internal node otherwise).
-    fn write_omap_tree(&mut self, entries: &[(u64, u64, u64)]) -> Result<u64> {
+    /// root (leaf for a single-leaf tree, internal node otherwise) and
+    /// the number of nodes written.
+    fn write_omap_tree(&mut self, entries: &[(u64, u64, u64)]) -> Result<(u64, u64)> {
         let bs = self.block_size as usize;
         let xid = self.xid;
         let leaves = pack_omap_into_leaves(entries, omap_leaf_capacity(bs))?;
@@ -1385,7 +1475,7 @@ impl<'a> ApfsWriter<'a> {
             let block =
                 build_omap_leaf_node(bs, paddr, &leaves[0], true, xid, entries.len() as u64, 1)?;
             self.write_block(paddr, &block)?;
-            return Ok(paddr);
+            return Ok((paddr, 1));
         }
         // Multi-leaf: emit each leaf at its own paddr, then a single
         // internal root with 16-byte keys and 8-byte child paddrs.
@@ -1408,10 +1498,10 @@ impl<'a> ApfsWriter<'a> {
             leaves.len() as u64 + 1,
         )?;
         self.write_block(root_paddr, &root_block)?;
-        Ok(root_paddr)
+        Ok((root_paddr, leaves.len() as u64 + 1))
     }
 
-    /// Build the APSB block at offset `apsb_paddr`.
+    /// Build the volume superblock.
     ///
     /// On a checkpoint (`apsb_template` is `Some`) the live volume
     /// superblock is used as the base and only the fields this
@@ -1419,55 +1509,44 @@ impl<'a> ApfsWriter<'a> {
     /// template instead would zero `apfs_features`,
     /// `apfs_incompatible_features` (which decides whether drec keys
     /// are hashed — so the very next open would misparse every
-    /// directory entry), `apfs_extentref_tree_oid`,
-    /// `apfs_snap_meta_tree_oid`, `apfs_role` and the encryption
-    /// state.
-    fn build_apsb(
-        &self,
-        bs: usize,
-        apsb_paddr: u64,
-        vol_omap_paddr: u64,
-        fsroot_vid: u64,
-        volume_vid: u64,
-    ) -> Result<Vec<u8>> {
+    /// directory entry), `apfs_snap_meta_tree_oid`, `apfs_role` and
+    /// the encryption state.
+    fn build_apsb(&self, bs: usize, vol: &VolumeState) -> Result<Vec<u8>> {
         let mut buf = match &self.apsb_template {
             Some(t) if t.len() == bs => t.clone(),
-            _ => {
-                let mut fresh = vec![0u8; bs];
-                fresh[32..36].copy_from_slice(&APFS_MAGIC.to_le_bytes());
-                fresh[36..40].copy_from_slice(&0u32.to_le_bytes()); // fs_index
-                // features / ro_compat / incompat: 0 (plain drec
-                // layout, no sealed/encryption).
-                fresh[116..120].copy_from_slice(&(OBJECT_TYPE_BTREE).to_le_bytes());
-                fresh[120..124].copy_from_slice(&(OBJECT_TYPE_BTREE).to_le_bytes());
-                fresh[124..128].copy_from_slice(&(OBJECT_TYPE_BTREE).to_le_bytes());
-                fresh[144..152].copy_from_slice(&0u64.to_le_bytes()); // extentref_tree_oid
-                fresh[152..160].copy_from_slice(&0u64.to_le_bytes()); // snap_meta_tree_oid
-                fresh[160..168].copy_from_slice(&0u64.to_le_bytes()); // revert_to_xid
-                fresh[168..176].copy_from_slice(&0u64.to_le_bytes()); // revert_to_sblock_oid
-                const APFS_FS_UNENCRYPTED: u64 = 0x0000_0001;
-                fresh[264..272].copy_from_slice(&APFS_FS_UNENCRYPTED.to_le_bytes());
-                fresh
-            }
+            _ => self.fresh_apsb(bs),
         };
         // obj_phys. The volume superblock is a *virtual* object: its
         // `o_oid` is the oid the container omap maps to this block, not
         // the block address. Stamping the paddr here is what made
         // `fsck_apfs` report "o_oid invalid" and hdiutil refuse to
         // mount ("no mountable file systems").
-        buf[8..16].copy_from_slice(&volume_vid.to_le_bytes()); // oid
+        buf[8..16].copy_from_slice(&vol.volume_vid.to_le_bytes()); // oid
         buf[16..24].copy_from_slice(&self.xid.to_le_bytes());
         // o_type = OBJECT_TYPE_FS | OBJ_VIRTUAL (0).
         buf[24..28].copy_from_slice(&OBJECT_TYPE_FS.to_le_bytes());
         buf[28..32].copy_from_slice(&0u32.to_le_bytes()); // o_subtype
-        let _ = apsb_paddr;
 
-        buf[128..136].copy_from_slice(&vol_omap_paddr.to_le_bytes()); // omap_oid
-        buf[136..144].copy_from_slice(&fsroot_vid.to_le_bytes()); // root_tree_oid
+        buf[88..96].copy_from_slice(&vol.fs_alloc_count.to_le_bytes()); // apfs_fs_alloc_count
+        // Tree types: the fs-tree is virtual, the extent-reference and
+        // snapshot-metadata trees are physical.
+        buf[116..120].copy_from_slice(&OBJECT_TYPE_BTREE.to_le_bytes());
+        buf[120..124].copy_from_slice(&(OBJECT_TYPE_BTREE | OBJ_PHYSICAL).to_le_bytes());
+        buf[124..128].copy_from_slice(&(OBJECT_TYPE_BTREE | OBJ_PHYSICAL).to_le_bytes());
+        buf[128..136].copy_from_slice(&vol.vol_omap_paddr.to_le_bytes()); // omap_oid
+        buf[136..144].copy_from_slice(&vol.fsroot_vid.to_le_bytes()); // root_tree_oid
+        buf[144..152].copy_from_slice(&vol.extentref_tree_paddr.to_le_bytes());
+        if let Some(p) = vol.snap_meta_tree_paddr {
+            buf[152..160].copy_from_slice(&p.to_le_bytes());
+        }
         buf[176..184].copy_from_slice(&self.next_oid.to_le_bytes()); // next_obj_id
         buf[184..192].copy_from_slice(&self.num_files.to_le_bytes());
         buf[192..200].copy_from_slice(&self.num_directories.to_le_bytes());
         buf[200..208].copy_from_slice(&self.num_symlinks.to_le_bytes());
+        if self.apsb_template.is_none() {
+            // apfs_total_blocks_alloced: the file data written so far.
+            buf[224..232].copy_from_slice(&vol.data_blocks.to_le_bytes());
+        }
         buf[240..256].copy_from_slice(&self.volume_uuid);
         // volname at offset 704 (256 bytes)
         let name_bytes = self.volume_name.as_bytes();
@@ -1480,11 +1559,46 @@ impl<'a> ApfsWriter<'a> {
         Ok(buf)
     }
 
-    /// Build the live NXSB at `paddr`.
+    /// The format-time volume superblock fields that no checkpoint
+    /// changes, laid out the way `newfs_apfs` writes them.
+    fn fresh_apsb(&self, bs: usize) -> Vec<u8> {
+        let mut fresh = vec![0u8; bs];
+        fresh[32..36].copy_from_slice(&APFS_MAGIC.to_le_bytes());
+        fresh[36..40].copy_from_slice(&0u32.to_le_bytes()); // fs_index
+        // features / ro_compat / incompat: 0 (plain drec layout,
+        // case- and normalization-sensitive, no sealing / encryption).
+        //
+        // apfs_meta_crypto (wrapped_meta_crypto_state_t at 96): the
+        // version APFS expects even on an unencrypted volume —
+        // major 5 (APFS_WMCS_MAJOR_VERSION), minor 0, persistent
+        // class F (PROTECTION_CLASS_F = 6), key revision 1.
+        fresh[96..98].copy_from_slice(&5u16.to_le_bytes());
+        fresh[104..108].copy_from_slice(&6u32.to_le_bytes());
+        fresh[112..114].copy_from_slice(&1u16.to_le_bytes());
+        const APFS_FS_UNENCRYPTED: u64 = 0x0000_0001;
+        fresh[264..272].copy_from_slice(&APFS_FS_UNENCRYPTED.to_le_bytes());
+        // apfs_formatted_by (apfs_modified_by_t at 272): id[32],
+        // timestamp, last_xid.
+        let id = concat!("fstool (", env!("CARGO_PKG_VERSION"), ")").as_bytes();
+        let n = id.len().min(31);
+        fresh[272..272 + n].copy_from_slice(&id[..n]);
+        fresh[312..320].copy_from_slice(&self.xid.to_le_bytes());
+        // apfs_next_doc_id: document ids start after the two reserved.
+        fresh[960..964].copy_from_slice(&3u32.to_le_bytes());
+        // apfs_fext_tree_type / reserved_type: physical B-trees, as
+        // newfs_apfs records them even though no fext tree exists.
+        if bs >= 1048 {
+            fresh[1040..1044].copy_from_slice(&(OBJECT_TYPE_BTREE | OBJ_PHYSICAL).to_le_bytes());
+            fresh[1044..1048].copy_from_slice(&(OBJECT_TYPE_BTREE | OBJ_PHYSICAL).to_le_bytes());
+        }
+        fresh
+    }
+
+    /// Build the container superblock (the live checkpoint's copy and,
+    /// on format, the block-0 label — they are identical).
     fn build_nxsb(
         &self,
         bs: usize,
-        paddr: u64,
         cont_omap_paddr: u64,
         spaceman_vid: u64,
         reaper_vid: u64,
@@ -1504,13 +1618,20 @@ impl<'a> ApfsWriter<'a> {
         buf[8..16].copy_from_slice(&OID_NX_SUPERBLOCK.to_le_bytes());
         buf[16..24].copy_from_slice(&self.xid.to_le_bytes());
         buf[24..28].copy_from_slice(&(OBJECT_TYPE_NX_SUPERBLOCK | OBJ_EPHEMERAL).to_le_bytes());
-        let _ = paddr;
 
         buf[32..36].copy_from_slice(&NX_MAGIC.to_le_bytes());
         buf[36..40].copy_from_slice(&self.block_size.to_le_bytes());
         buf[40..48].copy_from_slice(&self.total_blocks.to_le_bytes());
-        // features / ro_compat / incompat come from the template on a
-        // checkpoint (zero on format — we ship a vanilla container).
+        // features / ro_compat come from the template on a checkpoint
+        // (zero on format — we ship a vanilla container). The
+        // incompatible features must carry NX_INCOMPAT_VERSION2: the
+        // macOS kernel only mounts version-2 containers, and a
+        // container without the bit is attached but never opened (the
+        // APFS container scheme shows up with no physical store and
+        // `diskutil` reports error -69808), while `fsck_apfs` checks it
+        // without complaint.
+        let incompat = u64::from_le_bytes(buf[64..72].try_into().unwrap()) | NX_INCOMPAT_VERSION2;
+        buf[64..72].copy_from_slice(&incompat.to_le_bytes());
         buf[72..88].copy_from_slice(&self.container_uuid);
         // nx_next_oid must be past every virtual/ephemeral oid we
         // hand out, and fs-tree leaves are numbered from
@@ -1523,7 +1644,7 @@ impl<'a> ApfsWriter<'a> {
         // xp_desc_base = 1; reader scans this range looking for the
         // largest-xid NXSB.
         buf[104..108].copy_from_slice(&XP_DESC_BLOCKS.to_le_bytes()); // xp_desc_blocks
-        buf[108..112].copy_from_slice(&XP_DATA_BLOCKS.to_le_bytes()); // xp_data_blocks
+        buf[108..112].copy_from_slice(&self.xp_data_blocks.to_le_bytes()); // xp_data_blocks
         buf[112..120].copy_from_slice(&CHKMAP_PADDR.to_le_bytes()); // xp_desc_base
         buf[120..128].copy_from_slice(&SPACEMAN_PADDR.to_le_bytes()); // xp_data_base = spaceman_paddr
         // Checkpoint geometry. `xp_desc_index` is where this checkpoint
@@ -1546,7 +1667,14 @@ impl<'a> ApfsWriter<'a> {
         buf[160..168].copy_from_slice(&cont_omap_paddr.to_le_bytes()); // omap_oid
         buf[168..176].copy_from_slice(&reaper_vid.to_le_bytes()); // reaper_oid
         buf[176..180].copy_from_slice(&0u32.to_le_bytes()); // test_type
-        buf[180..184].copy_from_slice(&(NX_MAX_FILE_SYSTEMS as u32).to_le_bytes());
+        // nx_max_file_systems: one volume per 512 MiB of container,
+        // rounded up, at most NX_MAX_FILE_SYSTEMS — the figure macOS
+        // computes and checks.
+        let bytes = self.total_blocks * self.block_size as u64;
+        let max_fs = bytes
+            .div_ceil(512 << 20)
+            .clamp(1, NX_MAX_FILE_SYSTEMS as u64) as u32;
+        buf[180..184].copy_from_slice(&max_fs.to_le_bytes());
         // fs_oid[volume_index] = volume_vid. `open_writable` refuses
         // multi-volume containers, so the remaining slots are already
         // zero (format) or already correct (checkpoint template).
@@ -1556,11 +1684,13 @@ impl<'a> ApfsWriter<'a> {
         }
 
         // nx_ephemeral_info[0]: version 1, 4 ephemeral structures per
-        // volume, minimum 1 block each — the exact packing macOS
-        // writes. Leaving it zero makes `fsck_apfs` warn about every
-        // field of it.
+        // volume, and the minimum block count newfs_apfs derives from
+        // the main free queue's node limit (capped at 8). Leaving it
+        // zero makes `fsck_apfs` warn about every field of it.
         if bs >= 1344 {
-            buf[1312..1320].copy_from_slice(&NX_EPHEMERAL_INFO_0.to_le_bytes());
+            let min_blocks = u64::from(main_fq_node_limit(self.total_blocks).min(8));
+            let info = NX_EPHEMERAL_INFO_0 | (min_blocks << 32);
+            buf[1312..1320].copy_from_slice(&info.to_le_bytes());
         }
 
         // Silence unused-variable warning when the writer ends up not
@@ -1583,14 +1713,23 @@ fn sign_block(buf: &mut [u8]) {
 /// Build an omap_phys_t (header) block. `paddr` is the block this
 /// header lives at; `tree_paddr` is the physical block of the tree's
 /// root.
-fn build_omap_phys(bs: usize, paddr: u64, tree_paddr: u64, xid: u64) -> Result<Vec<u8>> {
+fn build_omap_phys(
+    bs: usize,
+    paddr: u64,
+    tree_paddr: u64,
+    xid: u64,
+    flags: u32,
+) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; bs];
     buf[8..16].copy_from_slice(&paddr.to_le_bytes()); // oid
     buf[16..24].copy_from_slice(&xid.to_le_bytes()); // xid
     buf[24..28].copy_from_slice(&(OBJECT_TYPE_OMAP | OBJ_PHYSICAL).to_le_bytes());
-    // flags / snap_count / tree_type / snapshot_tree_type left zero
-    // (snapshot_tree_type is u32 at offset 44).
-    buf[40..44].copy_from_slice(&(OBJECT_TYPE_BTREE | OBJ_PHYSICAL).to_le_bytes()); // tree_type
+    buf[32..36].copy_from_slice(&flags.to_le_bytes()); // om_flags
+    // om_snap_count stays 0. Both tree types are physical B-trees, the
+    // snapshot tree's included even though there is none yet.
+    let tree_type = OBJECT_TYPE_BTREE | OBJ_PHYSICAL;
+    buf[40..44].copy_from_slice(&tree_type.to_le_bytes()); // om_tree_type
+    buf[44..48].copy_from_slice(&tree_type.to_le_bytes()); // om_snapshot_tree_type
     buf[48..56].copy_from_slice(&tree_paddr.to_le_bytes());
     // snapshot_tree_oid stays 0.
     sign_block(&mut buf);
@@ -1604,6 +1743,16 @@ fn build_omap_phys(bs: usize, paddr: u64, tree_paddr: u64, xid: u64) -> Result<V
 fn toc_space(raw_len: usize) -> usize {
     raw_len.div_ceil(8) * 8
 }
+
+/// ToC length for a variable-KV node holding `n` entries: the table
+/// grows in steps of `BTREE_TOC_ENTRY_INCREMENT` (8) `kvloc_t`s, so an
+/// empty or small node still reserves 8 — what macOS writes.
+fn toc_space_var(n: usize) -> usize {
+    n.max(1).div_ceil(BTREE_TOC_ENTRY_INCREMENT) * BTREE_TOC_ENTRY_INCREMENT * 8
+}
+
+/// `BTREE_TOC_ENTRY_INCREMENT`.
+const BTREE_TOC_ENTRY_INCREMENT: usize = 8;
 
 /// ToC length for a *fixed*-KV node. A fixed-layout node reserves a
 /// table entry for every record the node could ever hold, not just the
@@ -1645,6 +1794,164 @@ const BTREE_FLAGS_OMAP: u32 = 0x0000_0012;
 /// …and for an fs-tree: variable-size, unaligned keys and values,
 /// built by sequential insert. Both match what macOS writes.
 const BTREE_FLAGS_FSTREE: u32 = 0x0000_0042;
+/// …and for the volume's physical trees (extent references, snapshot
+/// metadata): the fs-tree flags plus `BTREE_PHYSICAL`.
+const BTREE_FLAGS_PHYS_VAR: u32 = 0x0000_0052;
+
+/// `OBJECT_TYPE_BLOCKREFTREE` — the extent-reference tree.
+const OBJECT_TYPE_BLOCKREFTREE: u32 = 0x0000_000f;
+/// `OBJECT_TYPE_SNAPMETATREE` — the snapshot-metadata tree.
+const OBJECT_TYPE_SNAPMETATREE: u32 = 0x0000_0010;
+
+/// What a variable-KV volume tree holds: its node subtype and its
+/// `btree_info_t.bt_flags`.
+#[derive(Clone, Copy)]
+struct TreeKind {
+    subtype: u32,
+    info_flags: u32,
+}
+
+const FS_TREE: TreeKind = TreeKind {
+    subtype: OBJECT_TYPE_FSTREE,
+    info_flags: BTREE_FLAGS_FSTREE,
+};
+const EXTENTREF_TREE: TreeKind = TreeKind {
+    subtype: OBJECT_TYPE_BLOCKREFTREE,
+    info_flags: BTREE_FLAGS_PHYS_VAR,
+};
+const SNAP_META_TREE: TreeKind = TreeKind {
+    subtype: OBJECT_TYPE_SNAPMETATREE,
+    info_flags: BTREE_FLAGS_PHYS_VAR,
+};
+
+/// Where [`ApfsWriter::write_var_tree`] put a tree.
+struct TreeOut {
+    /// Block address of the root node.
+    root: u64,
+    /// Nodes written.
+    node_count: u64,
+    /// `(oid, xid, paddr)` volume-omap entries (virtual trees only),
+    /// sorted by oid.
+    omap: Vec<(u64, u64, u64)>,
+}
+
+/// Per-checkpoint volume facts [`ApfsWriter::build_apsb`] stamps.
+struct VolumeState {
+    vol_omap_paddr: u64,
+    fsroot_vid: u64,
+    volume_vid: u64,
+    extentref_tree_paddr: u64,
+    /// `None` keeps the template's snapshot-metadata tree.
+    snap_meta_tree_paddr: Option<u64>,
+    fs_alloc_count: u64,
+    data_blocks: u64,
+}
+
+/// `APFS_TYPE_EXTENT` — a `j_phys_ext` record in the extent-reference
+/// tree.
+const APFS_TYPE_EXTENT: u8 = 2;
+/// `PEXT_KIND_NEW` in the top bits of `j_phys_ext_val_t.len_and_kind`.
+const PEXT_KIND_NEW: u64 = 1;
+
+/// Build the extent-reference tree's records — one `j_phys_ext` per
+/// allocated file extent, keyed by its first block, owned by the data
+/// stream and referenced once — from the fs-tree's FILE_EXTENT
+/// records. Sorted by block address.
+fn extent_ref_records(fs_records: &[FsRecord], block_size: u32) -> Vec<FsRecord> {
+    let mut out: Vec<(u64, FsRecord)> = Vec::new();
+    for r in fs_records {
+        if r.key.len() < 16 || r.val.len() < 16 {
+            continue;
+        }
+        let hdr = u64::from_le_bytes(r.key[0..8].try_into().unwrap());
+        if (hdr >> OBJ_TYPE_SHIFT) as u8 != APFS_TYPE_FILE_EXTENT {
+            continue;
+        }
+        let len = u64::from_le_bytes(r.val[0..8].try_into().unwrap()) & ((1 << 56) - 1);
+        let paddr = u64::from_le_bytes(r.val[8..16].try_into().unwrap());
+        let blocks = len.div_ceil(block_size as u64);
+        if paddr == 0 || blocks == 0 {
+            continue; // a hole owns no blocks
+        }
+        let mut key = vec![0u8; 8];
+        let khdr = ((APFS_TYPE_EXTENT as u64) << OBJ_TYPE_SHIFT) | (paddr & OBJ_ID_MASK);
+        key.copy_from_slice(&khdr.to_le_bytes());
+        let mut val = vec![0u8; 20];
+        val[0..8].copy_from_slice(&(blocks | (PEXT_KIND_NEW << 60)).to_le_bytes());
+        val[8..16].copy_from_slice(&(hdr & OBJ_ID_MASK).to_le_bytes()); // owning_obj_id
+        val[16..20].copy_from_slice(&1i32.to_le_bytes()); // refcnt
+        out.push((paddr, FsRecord { key, val }));
+    }
+    out.sort_by_key(|(p, _)| *p);
+    out.dedup_by_key(|(p, _)| *p);
+    out.into_iter().map(|(_, r)| r).collect()
+}
+
+/// Give every inode that carries a data stream (a DSTREAM xfield) the
+/// `j_dstream_id` record that keeps the stream alive. Writers only
+/// emit one alongside a file extent, so an empty regular file would
+/// otherwise reference a stream that doesn't exist ("dstream (id N)
+/// does not have an associated dstream id object").
+fn ensure_dstream_ids(records: &mut Vec<FsRecord>) {
+    let mut have = std::collections::HashSet::new();
+    let mut need = Vec::new();
+    for r in records.iter() {
+        let hdr = u64::from_le_bytes(r.key[0..8].try_into().unwrap());
+        match (hdr >> OBJ_TYPE_SHIFT) as u8 {
+            APFS_TYPE_DSTREAM_ID => {
+                have.insert(hdr & OBJ_ID_MASK);
+            }
+            APFS_TYPE_INODE if inode_has_dstream(&r.val) => {
+                need.push(u64::from_le_bytes(r.val[8..16].try_into().unwrap()));
+            }
+            _ => {}
+        }
+    }
+    for oid in need {
+        if have.insert(oid) {
+            let hdr = ((APFS_TYPE_DSTREAM_ID as u64) << OBJ_TYPE_SHIFT) | (oid & OBJ_ID_MASK);
+            records.push(FsRecord {
+                key: hdr.to_le_bytes().to_vec(),
+                val: 1u32.to_le_bytes().to_vec(),
+            });
+        }
+    }
+}
+
+/// Whether an inode value's xfields include `INO_EXT_TYPE_DSTREAM`.
+fn inode_has_dstream(val: &[u8]) -> bool {
+    let x = match val.get(J_INODE_VAL_FIXED_SIZE..) {
+        Some(x) if x.len() >= 4 => x,
+        _ => return false,
+    };
+    let n = u16::from_le_bytes([x[0], x[1]]) as usize;
+    (0..n).any(|i| x.get(4 + i * 4) == Some(&INO_EXT_TYPE_DSTREAM))
+}
+
+/// Set every directory inode's `nchildren` to the number of directory
+/// entries filed under it. `records` must be the complete, sorted
+/// record set.
+fn fix_dir_child_counts(records: &mut [FsRecord]) {
+    let mut counts: std::collections::HashMap<u64, i32> = std::collections::HashMap::new();
+    for r in records.iter() {
+        let hdr = u64::from_le_bytes(r.key[0..8].try_into().unwrap());
+        if (hdr >> OBJ_TYPE_SHIFT) as u8 == APFS_TYPE_DIR_REC {
+            *counts.entry(hdr & OBJ_ID_MASK).or_default() += 1;
+        }
+    }
+    for r in records.iter_mut() {
+        let hdr = u64::from_le_bytes(r.key[0..8].try_into().unwrap());
+        if (hdr >> OBJ_TYPE_SHIFT) as u8 != APFS_TYPE_INODE || r.val.len() < 84 {
+            continue;
+        }
+        let mode = u16::from_le_bytes(r.val[80..82].try_into().unwrap());
+        if mode & 0o170_000 != 0o040_000 {
+            continue;
+        }
+        let n = counts.get(&(hdr & OBJ_ID_MASK)).copied().unwrap_or(0);
+        r.val[56..60].copy_from_slice(&n.to_le_bytes());
+    }
+}
 
 /// Fill the trailing `btree_info_t` of a root node. `fsck_apfs`
 /// validates every field of it against the tree it actually finds, and
@@ -1889,18 +2196,21 @@ fn pack_records_into_leaves(records: &[FsRecord], cap: usize) -> Result<Vec<Vec<
     if records.is_empty() {
         return Ok(vec![Vec::new()]);
     }
+    // A leaf of `n` records costs its ToC (rounded up to whole
+    // `BTREE_TOC_ENTRY_INCREMENT`s, see `toc_space_var`) plus the key
+    // and value bytes.
     let mut leaves: Vec<Vec<FsRecord>> = Vec::new();
     let mut cur: Vec<FsRecord> = Vec::new();
     let mut cur_bytes: usize = 0;
     for r in records {
-        let needed = 8 + r.key.len() + r.val.len();
-        if needed > cap {
+        let needed = r.key.len() + r.val.len();
+        if toc_space_var(1) + needed > cap {
             return Err(crate::Error::Unsupported(format!(
                 "apfs writer: single fs-tree record ({} bytes) does not fit in a leaf (cap {})",
                 needed, cap
             )));
         }
-        if cur_bytes + needed > cap && !cur.is_empty() {
+        if toc_space_var(cur.len() + 1) + cur_bytes + needed > cap && !cur.is_empty() {
             leaves.push(std::mem::take(&mut cur));
             cur_bytes = 0;
         }
@@ -1918,6 +2228,7 @@ fn pack_records_into_leaves(records: &[FsRecord], cap: usize) -> Result<Vec<Vec<
 /// `BTNODE_ROOT` and a trailing `btree_info_t`. Both root-leaf (depth 1)
 /// and non-root leaf (depth 2) callers use this builder; the root flag
 /// is set accordingly.
+#[allow(clippy::too_many_arguments)]
 fn build_fs_leaf(
     records: &[FsRecord],
     bs: usize,
@@ -1926,11 +2237,13 @@ fn build_fs_leaf(
     xid: u64,
     tree_key_count: u64,
     tree_node_count: u64,
+    kind: TreeKind,
+    physical: bool,
 ) -> Result<Vec<u8>> {
     let mut block = vec![0u8; bs];
-    // obj_phys — real APFS fsroots are BTREE objects whose subtype is
-    // FSTREE (the BTREE constant identifies the on-disk B-tree object;
-    // FSTREE goes in the subtype slot to identify the tree's contents).
+    // obj_phys — B-tree objects whose subtype names the tree's contents
+    // (FSTREE, BLOCKREFTREE, SNAPMETATREE). A physical tree's node oid
+    // is its block address.
     block[8..16].copy_from_slice(&vid.to_le_bytes());
     block[16..24].copy_from_slice(&xid.to_le_bytes());
     let obj_type = if is_root {
@@ -1938,8 +2251,9 @@ fn build_fs_leaf(
     } else {
         OBJECT_TYPE_BTREE_NODE
     };
-    block[24..28].copy_from_slice(&obj_type.to_le_bytes());
-    block[28..32].copy_from_slice(&OBJECT_TYPE_FSTREE.to_le_bytes());
+    let storage = if physical { OBJ_PHYSICAL } else { 0 };
+    block[24..28].copy_from_slice(&(obj_type | storage).to_le_bytes());
+    block[28..32].copy_from_slice(&kind.subtype.to_le_bytes());
 
     let mut flags = BTNODE_LEAF;
     if is_root {
@@ -1949,7 +2263,7 @@ fn build_fs_leaf(
     block[34..36].copy_from_slice(&0u16.to_le_bytes()); // level
     block[36..40].copy_from_slice(&(records.len() as u32).to_le_bytes());
 
-    let toc_len = toc_space(records.len() * 8);
+    let toc_len = toc_space_var(records.len());
     block[40..42].copy_from_slice(&0u16.to_le_bytes());
     block[42..44].copy_from_slice(&(toc_len as u16).to_le_bytes());
 
@@ -2001,7 +2315,7 @@ fn build_fs_leaf(
         write_btree_info(
             &mut block,
             bs,
-            BTREE_FLAGS_FSTREE,
+            kind.info_flags,
             0,
             0,
             longest_key,
@@ -2029,19 +2343,22 @@ fn build_fs_internal_root(
     longest_val: u32,
     tree_key_count: u64,
     tree_node_count: u64,
+    kind: TreeKind,
+    physical: bool,
 ) -> Result<Vec<u8>> {
     let mut block = vec![0u8; bs];
     block[8..16].copy_from_slice(&root_vid.to_le_bytes());
     block[16..24].copy_from_slice(&xid.to_le_bytes());
-    block[24..28].copy_from_slice(&OBJECT_TYPE_BTREE.to_le_bytes());
-    block[28..32].copy_from_slice(&OBJECT_TYPE_FSTREE.to_le_bytes());
+    let storage = if physical { OBJ_PHYSICAL } else { 0 };
+    block[24..28].copy_from_slice(&(OBJECT_TYPE_BTREE | storage).to_le_bytes());
+    block[28..32].copy_from_slice(&kind.subtype.to_le_bytes());
 
     let flags = BTNODE_ROOT; // not leaf, var-KV
     block[32..34].copy_from_slice(&flags.to_le_bytes());
     block[34..36].copy_from_slice(&1u16.to_le_bytes()); // level = 1
     block[36..40].copy_from_slice(&(entries.len() as u32).to_le_bytes());
 
-    let toc_len = toc_space(entries.len() * 8);
+    let toc_len = toc_space_var(entries.len());
     block[40..42].copy_from_slice(&0u16.to_le_bytes());
     block[42..44].copy_from_slice(&(toc_len as u16).to_le_bytes());
 
@@ -2090,7 +2407,7 @@ fn build_fs_internal_root(
     write_btree_info(
         &mut block,
         bs,
-        BTREE_FLAGS_FSTREE,
+        kind.info_flags,
         0,
         0,
         longest_key,
@@ -2461,14 +2778,58 @@ mod tests {
             val: vec![0u8; v_len],
         };
         let recs = vec![r(1, 100), r(2, 100), r(3, 100)];
-        // cap = 8 + (8 + 100) = 116 → exactly one record per leaf.
-        let leaves = pack_records_into_leaves(&recs, 116).unwrap();
+        // The ToC is reserved 8 entries (64 bytes) at a time.
+        // cap = 64 + (8 + 100) = 172 → exactly one record per leaf.
+        let leaves = pack_records_into_leaves(&recs, 172).unwrap();
         assert_eq!(leaves.len(), 3);
-        // cap = 2 * (8 + 8 + 100) = 232 → two records per leaf.
-        let leaves = pack_records_into_leaves(&recs, 232).unwrap();
+        // cap = 64 + 2 * (8 + 100) = 280 → two records per leaf.
+        let leaves = pack_records_into_leaves(&recs, 280).unwrap();
         assert_eq!(leaves.len(), 2);
         assert_eq!(leaves[0].len(), 2);
         assert_eq!(leaves[1].len(), 1);
+    }
+
+    /// The main free queue's node limit and the checkpoint data area
+    /// follow `newfs_apfs` exactly at every measured transition (the
+    /// kernel refuses a container whose node limit is off by one).
+    #[test]
+    fn size_dependent_limits_match_newfs_apfs() {
+        for (blocks, limit) in [
+            (1000, 1),
+            (4544, 1),
+            (4545, 3),
+            (9088, 3),
+            (13632, 3),
+            (13633, 4),
+            (22721, 6),
+            (32768, 8),
+            (36352, 8),
+            (36353, 9),
+            (40897, 10),
+            (54529, 13),
+            (65536, 15),
+            (131072, 29),
+            (196608, 44),
+            (262143, 58),
+            (262144, 116),
+            (524288, 231),
+            (1048575, 462),
+            (1048576, 512),
+            (4194304, 512),
+        ] {
+            assert_eq!(main_fq_node_limit(blocks), limit, "{blocks} blocks");
+        }
+        for (blocks, data) in [
+            (4096, 52),
+            (8192, 124),
+            (32768, 304),
+            (40000, 308),
+            (65536, 332),
+        ] {
+            assert_eq!(xp_data_blocks_for(blocks), data, "{blocks} blocks");
+        }
+        // Tiny test images keep the fsck minimum.
+        assert_eq!(xp_data_blocks_for(64), XP_DATA_BLOCKS_MIN);
     }
 
     // ---- Spaceman tests ----
@@ -2610,11 +2971,13 @@ mod tests {
         );
     }
 
-    /// A freshly-formatted spaceman publishes non-zero IP-ring
-    /// metadata, three valid free-queue B-tree oids, and at least one
-    /// allocation zone covering the main device.
+    /// A freshly formatted spaceman is laid out the way `newfs_apfs`
+    /// lays it out: an internal pool of 3 blocks per chunk + CIB that
+    /// holds the CIB and the chunk bitmaps (and is tracked by the first
+    /// IP-bitmap ring slot), empty free queues with no trees, and a
+    /// zero allocation-zone table.
     #[test]
-    fn spaceman_populates_ip_sfq_and_datazone() {
+    fn spaceman_matches_newfs_apfs_layout() {
         let total_blocks = 128u64;
         let bs = 4096u32;
         let mut dev = MemoryBackend::new(total_blocks * bs as u64);
@@ -2624,80 +2987,30 @@ mod tests {
         }
         let sm = read_block(&mut dev, SPACEMAN_PADDR, bs);
         let dec = decode_spaceman(&sm).expect("decode spaceman_phys_t");
-
-        // sm_flags must publish SM_FLAG_VERSIONED so the reader trusts
-        // sm_version (=1).
         assert_eq!(dec.flags & 0x1, 0x1, "SM_FLAG_VERSIONED must be set");
-
-        // Issue 1 — internal-pool fields are non-zero.
-        assert_ne!(
-            dec.ip_bm_tx_multiplier, 0,
-            "sm_ip_bm_tx_multiplier must be populated"
-        );
-        assert_ne!(dec.ip_block_count, 0, "sm_ip_block_count must be non-zero");
-        assert_ne!(
-            dec.ip_bm_size_in_blocks, 0,
-            "sm_ip_bm_size_in_blocks must be non-zero"
-        );
-        assert_ne!(
-            dec.ip_bm_block_count, 0,
-            "sm_ip_bm_block_count must be non-zero"
-        );
-        assert_ne!(dec.ip_bm_base, 0, "sm_ip_bm_base must be non-zero");
-        assert_ne!(dec.ip_base, 0, "sm_ip_base must be non-zero");
-        // Sanity: the ring must lie inside the container.
-        assert!(
-            dec.ip_base + dec.ip_block_count <= total_blocks,
-            "IP ring (base={}, len={}) extends past container ({} blocks)",
-            dec.ip_base,
-            dec.ip_block_count,
-            total_blocks
-        );
-
-        // Issue 2 — three non-zero SFQ tree oids.
-        for (i, oid) in dec.sfq_tree_oids.iter().enumerate() {
-            assert_ne!(*oid, 0, "sm_fq[{i}].sfq_tree_oid must be non-zero");
-        }
-        // Each SFQ root must be a readable B-tree node.
-        for (i, &paddr) in dec.sfq_tree_oids.iter().enumerate() {
-            let node_block = read_block(&mut dev, paddr, bs);
-            // BTNODE_ROOT|BTNODE_LEAF|BTNODE_FIXED_KV_SIZE at offset 32.
-            let flags = u16::from_le_bytes(node_block[32..34].try_into().unwrap());
-            assert_eq!(
-                flags & 0x0007,
-                0x0007,
-                "SFQ[{i}] root must be a fixed-KV leaf root (flags={flags:#x})"
-            );
-            // nkeys must be 0 on a fresh image.
-            let nkeys = u32::from_le_bytes(node_block[36..40].try_into().unwrap());
-            assert_eq!(nkeys, 0, "SFQ[{i}] root must be empty (nkeys={nkeys})");
-            // Trailing btree_info_t: bt_key_size=16, bt_val_size=8.
-            let info_off = bs as usize - 40;
-            let bt_key_size =
-                u32::from_le_bytes(node_block[info_off + 8..info_off + 12].try_into().unwrap());
-            let bt_val_size =
-                u32::from_le_bytes(node_block[info_off + 12..info_off + 16].try_into().unwrap());
-            assert_eq!(bt_key_size, 16, "SFQ[{i}] bt_key_size must be 16");
-            assert_eq!(bt_val_size, 8, "SFQ[{i}] bt_val_size must be 8");
-        }
-
-        // Issue 3 — at least one allocation zone covers the main
-        // device.
-        assert_eq!(
-            dec.datazone_main_zone0_start, 0,
-            "main-device zone 0 must start at block 0"
-        );
-        assert_ne!(
-            dec.datazone_main_zone0_end, 0,
-            "main-device zone 0 saz_zone_end must be populated"
-        );
-        assert_eq!(
-            dec.datazone_main_zone0_end, total_blocks,
-            "main-device zone 0 must cover the whole device"
-        );
-
-        // Adding the IP ring + SFQ + IP-bitmap blocks must not break
-        // bitmap-vs-allocation consistency.
+        assert_eq!(dec.ip_bm_tx_multiplier, 16);
+        assert_eq!(dec.ip_block_count, 6, "3 × (1 chunk + 1 CIB)");
+        assert_eq!(dec.ip_bm_size_in_blocks, 1);
+        assert_eq!(dec.ip_bm_block_count, 16);
+        assert!(dec.ip_base + dec.ip_block_count <= total_blocks);
+        assert!(dec.ip_bm_base + 16 <= dec.ip_base || dec.ip_base + 6 <= dec.ip_bm_base);
+        // The CIB and the chunk bitmap live in the pool, and the live IP
+        // bitmap marks exactly those two blocks.
+        assert_eq!(dec.cib_paddr, dec.ip_base);
+        let cib = read_block(&mut dev, dec.cib_paddr, bs);
+        let entries = decode_cib_entries(&cib).unwrap();
+        assert_eq!(entries[0].bitmap_addr, dec.ip_base + 1);
+        let ip_bm = read_block(&mut dev, dec.ip_bm_base, bs);
+        assert_eq!(ip_bm[0], 0b11);
+        assert!(ip_bm[1..].iter().all(|&b| b == 0));
+        // Free queues: no tree yet, node limits 1 / ≥1 / 0.
+        assert_eq!(dec.sfq_tree_oids, [0, 0, 0]);
+        assert_eq!(dec.sfq_node_limits[0], 1);
+        assert!(dec.sfq_node_limits[1] >= 1);
+        assert_eq!(dec.sfq_node_limits[2], 0);
+        assert_eq!(dec.datazone_main_zone0_start, 0);
+        assert_eq!(dec.datazone_main_zone0_end, 0);
+        // The pool itself is part of the used prefix.
         assert_spaceman_consistent(&mut dev, bs, total_blocks);
     }
 

@@ -682,9 +682,9 @@ fn patch_inode_dstream_size(val: &mut [u8], new_size: u64, block_size: u64) {
     if val.len() < J_INODE_VAL_FIXED_SIZE {
         return;
     }
-    // The fixed inode value carries `total_size` at offset 84..92.
-    val[84..92].copy_from_slice(&new_size.to_le_bytes());
-    // Find the trailing xfield blob (offset 92..) and update the DSTREAM
+    // The fixed `uncompressed_size` (84..92) is left alone: it only
+    // means something for decmpfs-compressed files. The size lives in
+    // the DSTREAM xfield. Find the trailing xfield blob (offset 92..) and update the DSTREAM
     // value's size + alloced_size fields.
     if val.len() <= J_INODE_VAL_FIXED_SIZE {
         return;
