@@ -36,14 +36,20 @@ fn which(tool: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn tools_present() -> bool {
+/// Parallel attaches make hdiutil fail with EAGAIN on CI runners, so the
+/// tests take turns.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The tools are there: returns the guard that serializes the tests.
+fn tools_present() -> Option<std::sync::MutexGuard<'static, ()>> {
     let ok = ["hdiutil", "fsck_hfs", "diskutil", "xattr"]
         .iter()
         .all(|t| which(t));
     if !ok {
         eprintln!("skipping: hdiutil / fsck_hfs / diskutil / xattr not available");
+        return None;
     }
-    ok
+    Some(SERIAL.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// Detaches the attached image when dropped (also on panic).
@@ -76,7 +82,18 @@ fn attach(image: &Path, readonly: bool) -> Attached {
     if readonly {
         cmd.arg("-readonly");
     }
-    let out = cmd.arg(image).output().expect("hdiutil attach");
+    cmd.arg(image);
+    // hdiutil can refuse with EAGAIN for a while after an earlier detach.
+    let mut out = cmd.output().expect("hdiutil attach");
+    for _ in 0..30 {
+        if out.status.success()
+            || !String::from_utf8_lossy(&out.stderr).contains("temporarily unavailable")
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        out = cmd.output().expect("hdiutil attach");
+    }
     assert!(
         out.status.success(),
         "hdiutil attach {}: {}",
@@ -533,9 +550,9 @@ fn corruptions() -> Vec<Corruption> {
 
 #[test]
 fn verify_agrees_with_fsck_hfs() {
-    if !tools_present() {
+    let Some(_serial) = tools_present() else {
         return;
-    }
+    };
     let dir = tempfile::tempdir().unwrap();
     let src = make_src(dir.path());
     let mut images: Vec<PathBuf> = ["HFS+", "JHFS+", "HFSX", "JHFSX"]
@@ -575,9 +592,9 @@ fn verify_agrees_with_fsck_hfs() {
 
 #[test]
 fn grow_and_shrink_bare_volumes() {
-    if !tools_present() {
+    let Some(_serial) = tools_present() else {
         return;
-    }
+    };
     let dir = tempfile::tempdir().unwrap();
     let src = make_src(dir.path());
     let mut images: Vec<PathBuf> = ["HFS+", "JHFS+", "HFSX", "JHFSX"]
@@ -769,9 +786,9 @@ fn check_partition(img: &Path, idx: usize, src: &Path, dir: &Path, what: &str) {
 }
 
 fn partitioned(scheme: &str) {
-    if !tools_present() {
+    let Some(_serial) = tools_present() else {
         return;
-    }
+    };
     let dir = tempfile::tempdir().unwrap();
     let src = make_src(dir.path());
     let img = native_disk(dir.path(), scheme, &src);
