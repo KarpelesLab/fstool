@@ -152,6 +152,7 @@ filesystems = [
     "grf",
     "hfs",
     "hfs-plus",
+    "hybrid",
     "iso9660",
     "littlefs",
     "ntfs",
@@ -222,6 +223,11 @@ hfs-plus = ["std"]
 affs = ["std"]
 # ISO 9660 (+ Joliet, Rock Ridge, El Torito).
 iso9660 = ["std"]
+# Hybrid optical images (`fs::hybrid`): one shared payload copy under
+# several views — ISO 9660 / Rock Ridge, Joliet and HFS+ in an APM
+# partition, laid out the way `hdiutil makehybrid` does. Library-only;
+# the `makehybrid` subcommand comes with `cli`.
+hybrid = ["iso9660", "hfs-plus"]
 # SquashFS (reads decode through the codec features).
 squashfs = ["std"]
 # cramfs (Linux compressed ROM filesystem). Every block is zlib, so it

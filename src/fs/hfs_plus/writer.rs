@@ -647,6 +647,35 @@ impl Writer {
         ))
     }
 
+    /// Mark the `n` blocks at `start` used on behalf of a caller that
+    /// placed data there itself (see
+    /// [`super::HfsPlus::create_file_placed`]). Refuses a range that runs
+    /// past the volume or overlaps a block already in use — the special
+    /// files, the alternate volume header, or another claimed range — so
+    /// two owners can never share a block.
+    pub(crate) fn claim_range(&mut self, start: u32, n: u32) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let end = start.checked_add(n).filter(|&e| e <= self.total_blocks);
+        if end.is_none() {
+            return Err(crate::Error::OutOfBounds {
+                offset: u64::from(start) * u64::from(self.block_size),
+                len: u64::from(n) * u64::from(self.block_size),
+                size: u64::from(self.total_blocks) * u64::from(self.block_size),
+            });
+        }
+        if !self.range_is_free(start, n) {
+            return Err(crate::Error::InvalidArgument(format!(
+                "hfs+ writer: blocks {start}..{} overlap blocks already in use",
+                start + n
+            )));
+        }
+        self.set_used(start, n);
+        self.free_blocks -= n;
+        Ok(())
+    }
+
     /// Free `n` blocks starting at `start`. Clears the corresponding
     /// bitmap bits and grows `free_blocks` accordingly.
     pub(crate) fn free(&mut self, start: u32, n: u32) {
@@ -1382,89 +1411,19 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
     }
     let total_blocks = total_blocks_u64 as u32;
 
-    // ---- layout: place special files after the volume header.
-    //
-    // The reserved area is bytes 0..1024 plus the 512-byte volume
-    // header at 1024..1536 — one allocation block at the usual 4 KiB,
-    // but three at 512 bytes and two at 1 KiB. Starting at block 1
-    // unconditionally puts the allocation bitmap straight on top of the
-    // volume header on any volume with a block size below 2 KiB.
-    let head_reserved = 1536u64.div_ceil(u64::from(bs)) as u32;
-    let mut cursor: u32 = head_reserved;
-
-    // Allocation bitmap: one bit per allocation block, rounded up to a
-    // whole number of blocks.
-    let bitmap_bytes = (total_blocks as u64).div_ceil(8);
-    let alloc_blocks_needed = bitmap_bytes.div_ceil(u64::from(bs));
-    let alloc_blocks_needed = u32::try_from(alloc_blocks_needed).map_err(|_| {
-        crate::Error::InvalidArgument("hfs+ format: bitmap too large for u32".into())
-    })?;
-    // Allocation bitmap: clumpSize matches the allocation unit (block).
-    let allocation_file = layout_special(&mut cursor, alloc_blocks_needed, bs, bs)?;
-
-    // Extents-overflow and catalog B-trees: per TN1150 + mkfs.hfsplus
-    // convention, `clumpSize` on a B-tree fork equals the B-tree's
-    // node size (the BTHeaderRec.clumpSize and ForkData.clumpSize agree).
-    // fsck.hfsplus rejects an extents-overflow fork whose clumpSize is
-    // smaller than its declared nodeSize ("Invalid B-tree node size").
-    // Catalog / extents B-tree forks carry the clump size fsck.hfsplus
-    // expects for the volume (≈0.8%, capped at 1 MiB), not merely the node
-    // size — otherwise fsck rejects "Invalid file clump size" on volumes
-    // ≳512 MiB.
-    let btree_clump = btree_clump_size(total_blocks, bs, opts.node_size);
-    let ext_blocks = blocks_for_nodes(opts.extents_nodes, opts.node_size, bs)?;
-    let extents_file = layout_special(&mut cursor, ext_blocks, bs, btree_clump)?;
-
-    let cat_blocks = blocks_for_nodes(opts.catalog_nodes, opts.node_size, bs)?;
-    let catalog_file = layout_special(&mut cursor, cat_blocks, bs, btree_clump)?;
-
-    // Attributes B-tree: reserved here when asked for, otherwise created
-    // lazily at the first flush that has an xattr to store. Startup
-    // file: always empty (zero fork data).
-    let attr_node_size = attr_node_size_for(opts.node_size);
-    let (attributes_file, attr_blocks) = if opts.attributes_nodes > 0 {
-        let blocks = blocks_for_nodes(opts.attributes_nodes, attr_node_size, bs)?;
-        let clump = btree_clump_size(total_blocks, bs, attr_node_size);
-        (layout_special(&mut cursor, blocks, bs, clump)?, blocks)
-    } else {
-        (ForkData::default(), 0)
-    };
+    let SpecialLayout {
+        bitmap_bytes,
+        allocation_file,
+        extents_file,
+        catalog_file,
+        attributes_file,
+        attr_node_size,
+        journal_info_block,
+        journal_buffer_start,
+        journal_buffer_blocks,
+        cursor,
+    } = plan_special_layout(opts, total_blocks)?;
     let startup_file = ForkData::default();
-
-    // Journal stub: one block for the JournalInfoBlock, plus N blocks
-    // of journal buffer. Reserved up-front so the bitmap reflects the
-    // usage from format time onward.
-    //
-    // The buffer must be large enough to hold a single transaction
-    // covering all metadata writes a full `flush` emits — catalog +
-    // extents-overflow + bitmap + 2 VHs + journal-stub. We size it
-    // generously: at least `DEFAULT_JOURNAL_BUFFER_BLOCKS`, but at
-    // least as big as the catalog + extents + bitmap fork space plus
-    // a [`super::journal::BLHDR_SIZE`] block-list-header per recorded
-    // run. Each metadata block we journal carries an extra 16-byte
-    // [`super::journal::PendingBlock`] info entry, but those costs are
-    // negligible at the granularity we work in. A small constant
-    // headroom (16 blocks) covers VH writes, alt-VH, journal stub,
-    // and a couple of partial-sector slop allowances.
-    let (journal_info_block, journal_buffer_start, journal_buffer_blocks) = if opts.journaled {
-        let info_start = cursor;
-        cursor = cursor.checked_add(1).ok_or_else(|| {
-            crate::Error::InvalidArgument("hfs+ format: journal layout overflow".into())
-        })?;
-        let buf_start = cursor;
-        let metadata_blocks = alloc_blocks_needed
-            .saturating_add(ext_blocks)
-            .saturating_add(cat_blocks)
-            .saturating_add(attr_blocks)
-            .saturating_add(16);
-        let jbuf_blocks = DEFAULT_JOURNAL_BUFFER_BLOCKS.max(metadata_blocks);
-        cursor = cursor.checked_add(jbuf_blocks).ok_or_else(|| {
-            crate::Error::InvalidArgument("hfs+ format: journal buffer overflow".into())
-        })?;
-        (info_start, buf_start, jbuf_blocks)
-    } else {
-        (0, 0, 0)
-    };
 
     // Sanity: don't run past end of device.
     if cursor > total_blocks {
@@ -1619,6 +1578,154 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
     };
 
     Ok((vh, writer))
+}
+
+/// Where [`format()`] puts the special files on a volume of `total_blocks`
+/// allocation blocks: everything it reserves at the head of the volume,
+/// in order, and the first block it leaves free (`cursor`).
+pub(crate) struct SpecialLayout {
+    pub(crate) bitmap_bytes: u64,
+    pub(crate) allocation_file: ForkData,
+    pub(crate) extents_file: ForkData,
+    pub(crate) catalog_file: ForkData,
+    pub(crate) attributes_file: ForkData,
+    pub(crate) attr_node_size: u32,
+    pub(crate) journal_info_block: u32,
+    pub(crate) journal_buffer_start: u32,
+    pub(crate) journal_buffer_blocks: u32,
+    pub(crate) cursor: u32,
+}
+
+/// The head-of-volume layout [`format()`] uses — shared with
+/// [`format_reserved_head_blocks`] so a caller planning around the
+/// volume (the hybrid optical-image planner) sees exactly the blocks
+/// `format` will take.
+fn plan_special_layout(opts: &FormatOpts, total_blocks: u32) -> Result<SpecialLayout> {
+    let bs = opts.block_size;
+    // ---- layout: place special files after the volume header.
+    //
+    // The reserved area is bytes 0..1024 plus the 512-byte volume
+    // header at 1024..1536 — one allocation block at the usual 4 KiB,
+    // but three at 512 bytes and two at 1 KiB. Starting at block 1
+    // unconditionally puts the allocation bitmap straight on top of the
+    // volume header on any volume with a block size below 2 KiB.
+    let head_reserved = 1536u64.div_ceil(u64::from(bs)) as u32;
+    let mut cursor: u32 = head_reserved;
+
+    // Allocation bitmap: one bit per allocation block, rounded up to a
+    // whole number of blocks.
+    let bitmap_bytes = (total_blocks as u64).div_ceil(8);
+    let alloc_blocks_needed = bitmap_bytes.div_ceil(u64::from(bs));
+    let alloc_blocks_needed = u32::try_from(alloc_blocks_needed).map_err(|_| {
+        crate::Error::InvalidArgument("hfs+ format: bitmap too large for u32".into())
+    })?;
+    // Allocation bitmap: clumpSize matches the allocation unit (block).
+    let allocation_file = layout_special(&mut cursor, alloc_blocks_needed, bs, bs)?;
+
+    // Extents-overflow and catalog B-trees: per TN1150 + mkfs.hfsplus
+    // convention, `clumpSize` on a B-tree fork equals the B-tree's
+    // node size (the BTHeaderRec.clumpSize and ForkData.clumpSize agree).
+    // fsck.hfsplus rejects an extents-overflow fork whose clumpSize is
+    // smaller than its declared nodeSize ("Invalid B-tree node size").
+    // Catalog / extents B-tree forks carry the clump size fsck.hfsplus
+    // expects for the volume (≈0.8%, capped at 1 MiB), not merely the node
+    // size — otherwise fsck rejects "Invalid file clump size" on volumes
+    // ≳512 MiB.
+    let btree_clump = btree_clump_size(total_blocks, bs, opts.node_size);
+    let ext_blocks = blocks_for_nodes(opts.extents_nodes, opts.node_size, bs)?;
+    let extents_file = layout_special(&mut cursor, ext_blocks, bs, btree_clump)?;
+
+    let cat_blocks = blocks_for_nodes(opts.catalog_nodes, opts.node_size, bs)?;
+    let catalog_file = layout_special(&mut cursor, cat_blocks, bs, btree_clump)?;
+
+    // Attributes B-tree: reserved here when asked for, otherwise created
+    // lazily at the first flush that has an xattr to store. Startup
+    // file: always empty (zero fork data).
+    let attr_node_size = attr_node_size_for(opts.node_size);
+    let (attributes_file, attr_blocks) = if opts.attributes_nodes > 0 {
+        let blocks = blocks_for_nodes(opts.attributes_nodes, attr_node_size, bs)?;
+        let clump = btree_clump_size(total_blocks, bs, attr_node_size);
+        (layout_special(&mut cursor, blocks, bs, clump)?, blocks)
+    } else {
+        (ForkData::default(), 0)
+    };
+
+    // Journal stub: one block for the JournalInfoBlock, plus N blocks
+    // of journal buffer. Reserved up-front so the bitmap reflects the
+    // usage from format time onward.
+    //
+    // The buffer must be large enough to hold a single transaction
+    // covering all metadata writes a full `flush` emits — catalog +
+    // extents-overflow + bitmap + 2 VHs + journal-stub. We size it
+    // generously: at least `DEFAULT_JOURNAL_BUFFER_BLOCKS`, but at
+    // least as big as the catalog + extents + bitmap fork space plus
+    // a [`super::journal::BLHDR_SIZE`] block-list-header per recorded
+    // run. Each metadata block we journal carries an extra 16-byte
+    // [`super::journal::PendingBlock`] info entry, but those costs are
+    // negligible at the granularity we work in. A small constant
+    // headroom (16 blocks) covers VH writes, alt-VH, journal stub,
+    // and a couple of partial-sector slop allowances.
+    let (journal_info_block, journal_buffer_start, journal_buffer_blocks) = if opts.journaled {
+        let info_start = cursor;
+        cursor = cursor.checked_add(1).ok_or_else(|| {
+            crate::Error::InvalidArgument("hfs+ format: journal layout overflow".into())
+        })?;
+        let buf_start = cursor;
+        let metadata_blocks = alloc_blocks_needed
+            .saturating_add(ext_blocks)
+            .saturating_add(cat_blocks)
+            .saturating_add(attr_blocks)
+            .saturating_add(16);
+        let jbuf_blocks = DEFAULT_JOURNAL_BUFFER_BLOCKS.max(metadata_blocks);
+        cursor = cursor.checked_add(jbuf_blocks).ok_or_else(|| {
+            crate::Error::InvalidArgument("hfs+ format: journal buffer overflow".into())
+        })?;
+        (info_start, buf_start, jbuf_blocks)
+    } else {
+        (0, 0, 0)
+    };
+
+    Ok(SpecialLayout {
+        bitmap_bytes,
+        allocation_file,
+        extents_file,
+        catalog_file,
+        attributes_file,
+        attr_node_size,
+        journal_info_block,
+        journal_buffer_start,
+        journal_buffer_blocks,
+        cursor,
+    })
+}
+
+/// Number of allocation blocks [`format()`] reserves at the head of a
+/// volume of `total_blocks` blocks formatted with `opts`: the boot blocks
+/// and volume header, the allocation bitmap, the extents-overflow,
+/// catalog and (when reserved) attributes B-trees, and the journal when
+/// `opts.journaled`. Block `format_reserved_head_blocks(..)` is the first
+/// one `format` leaves free, and it is where the allocator starts.
+///
+/// The last `ceil(1024 / block_size)` blocks are reserved too (the
+/// alternate volume header); everything in between is free after
+/// `format`. Callers that place file data themselves — see
+/// [`super::HfsPlus::create_file_placed`] — use this to know where the
+/// free space begins before the volume exists. `opts` is validated as
+/// `format` validates it.
+pub fn format_reserved_head_blocks(opts: &FormatOpts, total_blocks: u32) -> Result<u32> {
+    if !(opts.block_size.is_power_of_two() && opts.block_size >= 512) {
+        return Err(crate::Error::InvalidArgument(format!(
+            "hfs+ format: block_size {} is not a power of two ≥ 512",
+            opts.block_size
+        )));
+    }
+    if !(opts.node_size.is_power_of_two() && opts.node_size >= 512) {
+        return Err(crate::Error::InvalidArgument(format!(
+            "hfs+ format: node_size {} is not a power of two ≥ 512",
+            opts.node_size
+        )));
+    }
+    Ok(plan_special_layout(opts, total_blocks)?.cursor)
 }
 
 fn blocks_for_nodes(nodes: u32, node_size: u32, block_size: u32) -> Result<u32> {
@@ -2335,6 +2442,8 @@ pub(crate) fn promote_to_hardlink(
     let src_file_id = u32::from_be_bytes(src_body[8..12].try_into().unwrap());
     let (uid, gid, mode_full) = extract_file_perms(src_body)?;
     let src_fork = extract_file_fork(src_body)?;
+    // The iNode keeps the content date of the file it takes over.
+    let src_mod_date = u32::from_be_bytes(src_body[16..20].try_into().unwrap());
     let src_body_clone = src_body.clone();
 
     // Lazily create the private-data directory. After this call the
@@ -2386,7 +2495,7 @@ pub(crate) fn promote_to_hardlink(
         uid,
         gid,
         writer.create_date,
-        0,
+        src_mod_date,
         [0u8; 4], // fileType (zero — Apple convention)
         [0u8; 4], // creator
         &src_fork,

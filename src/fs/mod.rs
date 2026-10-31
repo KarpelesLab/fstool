@@ -58,6 +58,8 @@ pub mod grf;
 pub mod hfs;
 #[cfg(all(feature = "alloc", feature = "hfs-plus"))]
 pub mod hfs_plus;
+#[cfg(all(feature = "alloc", feature = "hybrid"))]
+pub mod hybrid;
 #[cfg(all(feature = "alloc", feature = "iso9660"))]
 pub mod iso9660;
 // The other backend that works with or without a heap.

@@ -56,6 +56,8 @@ pub use el_torito::{BootCatalog, BootEntry};
 pub use vd::{PrimaryVolumeDescriptor, SupplementaryVolumeDescriptor, VolumeDescriptor};
 pub use writer::{FormatOpts, Iso9660Writer};
 
+pub mod placed;
+
 /// Logical sector size for ISO 9660 / ECMA-119. Fixed at 2 KiB.
 pub const SECTOR_SIZE: u32 = 2048;
 
@@ -96,6 +98,33 @@ pub struct Iso9660 {
     /// Present when the handle was built via `format`; absorbs all
     /// `create_*` calls until `flush()` lays out the image.
     writer: Option<Iso9660Writer>,
+    /// Which directory hierarchy name lookups and listings walk; see
+    /// [`Iso9660::set_read_view`].
+    view: ReadView,
+}
+
+/// Which of the hierarchies on an ISO 9660 volume the reader walks.
+///
+/// A volume can carry several views of (possibly) different trees over
+/// the same file data: the primary hierarchy with plain ECMA-119 names,
+/// the same hierarchy with Rock Ridge names and attributes, and a Joliet
+/// hierarchy of its own. [`ReadView::Auto`] picks the richest one the way
+/// the Linux kernel does (Rock Ridge, else Joliet, else plain); the
+/// others pin one, so each view of a hybrid image can be checked on its
+/// own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ReadView {
+    /// Rock Ridge when present, else Joliet when present, else plain.
+    #[default]
+    Auto,
+    /// The primary hierarchy with its ECMA-119 identifiers, Rock Ridge
+    /// ignored.
+    Primary,
+    /// The primary hierarchy through Rock Ridge (`NM`, `PX`, `SL`, `TF`).
+    RockRidge,
+    /// The Joliet supplementary hierarchy (UCS-2 names).
+    Joliet,
 }
 
 impl Iso9660 {
@@ -161,6 +190,7 @@ impl Iso9660 {
             boot,
             rock_ridge,
             writer: None,
+            view: ReadView::Auto,
         })
     }
 
@@ -190,7 +220,49 @@ impl Iso9660 {
             boot: None,
             rock_ridge: opts.rock_ridge,
             writer: Some(Iso9660Writer::new(opts.clone())),
+            view: ReadView::Auto,
         })
+    }
+
+    /// Pin the hierarchy that listings, lookups and reads walk. Fails
+    /// (leaving the view unchanged) when the volume has no such
+    /// hierarchy: no Joliet SVD for [`ReadView::Joliet`], no Rock Ridge
+    /// `SP` marker for [`ReadView::RockRidge`].
+    pub fn set_read_view(&mut self, view: ReadView) -> Result<()> {
+        match view {
+            ReadView::Joliet if self.joliet.is_none() => Err(crate::Error::InvalidArgument(
+                "iso9660: volume has no Joliet hierarchy".into(),
+            )),
+            ReadView::RockRidge if !self.rock_ridge => Err(crate::Error::InvalidArgument(
+                "iso9660: volume has no Rock Ridge extensions".into(),
+            )),
+            _ => {
+                self.view = view;
+                Ok(())
+            }
+        }
+    }
+
+    /// The hierarchy currently walked (see [`Self::set_read_view`]).
+    pub fn read_view(&self) -> ReadView {
+        self.view
+    }
+
+    /// Whether lookups apply Rock Ridge entries.
+    fn use_rr(&self) -> bool {
+        match self.view {
+            ReadView::Auto | ReadView::RockRidge => self.rock_ridge,
+            ReadView::Primary | ReadView::Joliet => false,
+        }
+    }
+
+    /// Whether lookups walk the Joliet hierarchy.
+    fn use_joliet(&self) -> bool {
+        match self.view {
+            ReadView::Auto => self.joliet.is_some() && !self.rock_ridge,
+            ReadView::Joliet => self.joliet.is_some(),
+            ReadView::Primary | ReadView::RockRidge => false,
+        }
     }
 
     /// Volume identifier from the PVD (or Joliet SVD if present) — the
@@ -210,11 +282,11 @@ impl Iso9660 {
                 "iso9660: {path:?} is not a directory"
             )));
         }
-        let prefer_joliet = self.joliet.is_some() && !self.rock_ridge;
+        let prefer_joliet = self.use_joliet();
         let entries = directory::read_directory(
             dev,
             &rec,
-            self.rock_ridge,
+            self.use_rr(),
             if prefer_joliet {
                 self.joliet.as_ref()
             } else {
@@ -240,7 +312,7 @@ impl Iso9660 {
     /// 3. **Plain ISO 9660** otherwise — uppercased 8.3 with `;version`
     ///    stripped.
     fn resolve_path(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<DirRecord> {
-        let prefer_joliet = self.joliet.is_some() && !self.rock_ridge;
+        let prefer_joliet = self.use_joliet();
         let mut cur = if prefer_joliet {
             self.joliet.as_ref().unwrap().root.clone()
         } else {
@@ -262,7 +334,7 @@ impl Iso9660 {
             let entries = directory::read_directory(
                 dev,
                 &cur,
-                self.rock_ridge,
+                self.use_rr(),
                 if prefer_joliet {
                     self.joliet.as_ref()
                 } else {
@@ -441,7 +513,7 @@ impl crate::fs::Filesystem for Iso9660 {
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("iso9660: non-UTF-8 path".into()))?;
         let rec = self.resolve_path(dev, p)?;
-        if !self.rock_ridge {
+        if !self.use_rr() {
             return Err(crate::Error::Unsupported(
                 "iso9660: symlinks require Rock Ridge extensions".into(),
             ));
@@ -472,7 +544,7 @@ impl crate::fs::Filesystem for Iso9660 {
         let (mut uid, mut gid, mut mtime) = (0u32, 0u32, 0u32);
         // Rock Ridge carries POSIX mode/uid/gid (PX) + timestamps (TF);
         // plain ISO / Joliet have none, so defaults stand.
-        if self.rock_ridge
+        if self.use_rr()
             && let Some(rr) = rock_ridge::parse_system_use(dev, &rec.system_use)
         {
             if let Some(m) = rr.mode {

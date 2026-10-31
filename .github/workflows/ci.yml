@@ -36,6 +36,8 @@ jobs:
             ntfs-3g \
             f2fs-tools \
             squashfs-tools \
+            xorriso \
+            genisoimage \
             libfuse3-dev \
             pkg-config
           # Sanity-check that everything we cross-validate against is on PATH.
@@ -55,7 +57,8 @@ jobs:
           for tool in fsck.exfat mkfs.exfat xfs_repair xfs_db mkfs.xfs \
                       fsck.hfsplus newfs_hfsplus ntfsfix ntfsls ntfscat \
                       mkntfs fsck.f2fs mkfs.f2fs dump.f2fs \
-                      unsquashfs mksquashfs mkfs.cramfs fsck.cramfs; do
+                      unsquashfs mksquashfs mkfs.cramfs fsck.cramfs \
+                      xorriso isoinfo; do
             if command -v "$tool" >/dev/null 2>&1; then
               echo "found: $tool ($(command -v "$tool"))"
             else
@@ -142,7 +145,7 @@ jobs:
                        std,archive,gzip std,archive,bzip2 std,archive,lzma std,archive,zip-legacy \
                        std,archive,deflate64 std,archive,zip-aes std,tar,bzip2 \
                        std,hfs std,hfs-plus std,apfs std,xfs std,ntfs std,f2fs \
-                       std,iso9660 std,squashfs std,cramfs std,grf std,affs std,ramfs \
+                       std,iso9660 std,hybrid std,squashfs std,cramfs std,grf std,affs std,ramfs \
                        std,fat,qcow2 std,ext,luks std,ext,tar,ramfs std,hfs-plus,sparse-image \
                        cli,readline,fat cli,readline,ext,spec cli,readline,filesystems,containers,codecs; do
             echo "::group::--features $feats"

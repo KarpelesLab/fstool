@@ -705,6 +705,24 @@ fstool repack disc.iso plain.tar
 fstool repack plain.tar disc2.iso --fs-type iso
 ```
 
+### Hybrid images (ISO 9660 + Joliet + HFS+)
+
+`fstool makehybrid` (library: `fs::hybrid`, feature `hybrid`) plans one
+sector space for every view and writes each file's bytes once: the
+ISO 9660 / Rock Ridge and Joliet records and the HFS+ catalog all point
+at the same sectors. The layout is `hdiutil makehybrid`'s — an Apple
+Partition Map in the system area, the ISO 9660 metadata from LBA 16, then
+an `Apple_HFS` partition holding the HFS+ metadata and the shared file
+data — so macOS mounts HFS+ and everything else ISO 9660. Per-view
+labels and `--hide-*` / `--only-*` globs shape each view; whatever a view
+cannot represent (a symlink in Joliet, a name mapped for level 1, a
+4 GiB file below level 3) is reported, not dropped silently.
+
+```sh
+fstool makehybrid ./dist -o app.iso -V "My App" --hide-hfs '*.exe' --hide-joliet '*.app'
+fstool makehybrid ./dist -o app.iso --dry-run    # print the layout and the report
+```
+
 ## Archive formats
 
 Archives are treated as filesystems through the same `Filesystem` trait as
@@ -801,6 +819,7 @@ none of the other 130 000 lines.
 | `cramfs` | cramfs | implies `gzip` (every block is zlib-compressed) |
 | `hfs` | classic HFS | |
 | `hfs-plus` | HFS+ / HFSX | pulls `intl` for HFS+ name normalisation (decomposition) |
+| `hybrid` | ISO 9660 / Joliet / HFS+ hybrid images | implies `iso9660` and `hfs-plus` |
 | `apfs` | APFS | pulls `intl` for the directory-record hash |
 | `grf` | GRF | pulls `charcode` for CP949 names; implies `gzip` (every member is zlib-compressed) |
 | `tar` | tar (streaming reader / writer, tar-as-filesystem) | |

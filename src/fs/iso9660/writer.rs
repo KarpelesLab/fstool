@@ -976,7 +976,7 @@ fn encode_iso_long_date(epoch: u32) -> [u8; 17] {
 }
 
 /// Hinnant's "days from civil" inverse for ISO timestamps.
-fn days_to_ymd(z: i64) -> (i64, i64, i64) {
+pub(super) fn days_to_ymd(z: i64) -> (i64, i64, i64) {
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = z - era * 146097;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
@@ -989,17 +989,17 @@ fn days_to_ymd(z: i64) -> (i64, i64, i64) {
     (y, m, d)
 }
 
-fn put_both_u16(buf: &mut [u8], v: u16) {
+pub(super) fn put_both_u16(buf: &mut [u8], v: u16) {
     buf[0..2].copy_from_slice(&v.to_le_bytes());
     buf[2..4].copy_from_slice(&v.to_be_bytes());
 }
 
-fn put_both_u32(buf: &mut [u8], v: u32) {
+pub(super) fn put_both_u32(buf: &mut [u8], v: u32) {
     buf[0..4].copy_from_slice(&v.to_le_bytes());
     buf[4..8].copy_from_slice(&v.to_be_bytes());
 }
 
-fn write_padded_ascii(buf: &mut [u8], s: &str) {
+pub(super) fn write_padded_ascii(buf: &mut [u8], s: &str) {
     let bytes = s.as_bytes();
     let n = bytes.len().min(buf.len());
     buf[..n].copy_from_slice(&bytes[..n]);
@@ -1008,7 +1008,7 @@ fn write_padded_ascii(buf: &mut [u8], s: &str) {
     }
 }
 
-fn write_padded_ucs2(buf: &mut [u8], ucs: &[u8]) {
+pub(super) fn write_padded_ucs2(buf: &mut [u8], ucs: &[u8]) {
     let n = ucs.len().min(buf.len() / 2 * 2);
     buf[..n].copy_from_slice(&ucs[..n]);
     // Pad with 0x00 0x20 (space) in UCS-2 BE.

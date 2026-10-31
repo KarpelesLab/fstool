@@ -173,6 +173,31 @@ pub fn read_directory(
             continue;
         }
 
+        // Multi-extent file (ECMA-119 9.1.6, flag bit 7): every record
+        // but the last carries the flag, and the records share one
+        // identifier. Fold the continuation into the entry already
+        // emitted. The reader streams a file as one extent, so the
+        // sections must be contiguous — as mkisofs, xorriso and fstool's
+        // own hybrid writer record them.
+        if let Some(prev) = out.last_mut()
+            && prev.record.flags & 0x80 != 0
+            && prev.record.identifier == rec.identifier
+        {
+            let prev_end =
+                u64::from(prev.record.extent_lba) * u64::from(SECTOR_SIZE) + prev.record.length;
+            if !prev.record.length.is_multiple_of(u64::from(SECTOR_SIZE))
+                || prev_end != u64::from(rec.extent_lba) * u64::from(SECTOR_SIZE)
+            {
+                return Err(crate::Error::Unsupported(format!(
+                    "iso9660: multi-extent file {:?} has non-contiguous sections",
+                    prev.name
+                )));
+            }
+            prev.record.length += rec.length;
+            prev.record.flags = (prev.record.flags & !0x80) | (rec.flags & 0x80);
+            continue;
+        }
+
         // Cooked name: Joliet first (if requested), then Rock Ridge NM
         // override on top, else the 8.3 form.
         let mut cooked = if joliet_svd.is_some() {

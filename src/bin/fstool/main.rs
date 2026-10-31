@@ -17,6 +17,8 @@
 mod dd;
 #[cfg(any(feature = "hfs-plus", feature = "fat"))]
 mod fscheck;
+#[cfg(feature = "hybrid")]
+mod hybrid;
 mod imgops;
 mod safety;
 mod shell;
@@ -528,6 +530,16 @@ enum Command {
     /// stored bytes (a .dmg's data fork, any other image's file).
     Checksum(imgops::ChecksumArgs),
 
+    /// Make a hybrid optical image: ISO 9660 (+ Rock Ridge), Joliet and
+    /// HFS+ views over one copy of SRC's files, laid out the way
+    /// `hdiutil makehybrid` does (HFS+ in an Apple Partition Map
+    /// partition whose file data the ISO 9660 records share). SRC is a
+    /// host directory or an image (`IMAGE[:N]`). Per-view labels,
+    /// `--hide-*` / `--only-*` globs, El Torito boot, HFS+ blessing.
+    /// Prints the layout and everything a view could not represent.
+    #[cfg(feature = "hybrid")]
+    Makehybrid(Box<hybrid::MakehybridArgs>),
+
     /// Verify a UDIF image's embedded checksums (per-partition, data fork
     /// of every segment, master), as `hdiutil verify`. Exits non-zero
     /// when any mismatches or cannot be computed.
@@ -840,6 +852,8 @@ fn output_path_of(cmd: &Command) -> &std::path::Path {
         Command::Create { output, .. } => output,
         Command::Build { output, .. } => output,
         Command::Convert { dst, .. } => dst,
+        #[cfg(feature = "hybrid")]
+        Command::Makehybrid(a) => &a.output,
         Command::Repack { paths, .. } => paths
             .last()
             .map(std::path::Path::new)
@@ -1303,6 +1317,8 @@ fn run(cli: Cli) -> fstool::Result<()> {
             remove_signature,
         } => imgops::resize_cmd(&image, &size, discard, remove_signature),
         Command::Checksum(a) => imgops::checksum_cmd(&a, password.as_deref()),
+        #[cfg(feature = "hybrid")]
+        Command::Makehybrid(a) => hybrid::makehybrid_cmd(&a),
         #[cfg(feature = "dmg")]
         Command::Verify(a) => imgops::verify_cmd(&a),
         #[cfg(feature = "dmg-write")]

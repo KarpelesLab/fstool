@@ -315,6 +315,91 @@ impl HfsPlus {
         Ok(cnid)
     }
 
+    /// Create a regular file at `path` whose data fork is `len` bytes
+    /// the caller has already written (or will write) at allocation
+    /// blocks `start_block .. start_block + block_count` of this volume.
+    /// No data is read or written: the blocks are marked used and the
+    /// catalog record points at them.
+    ///
+    /// This is the placement hook a planner uses when the same bytes are
+    /// shared with another filesystem view over the same image (an
+    /// ISO 9660 / HFS+ hybrid, see `fs::hybrid`). `block_count` must be
+    /// exactly `ceil(len / block_size)`, and the range must lie inside
+    /// the volume and not overlap anything already allocated — the
+    /// special files (whose extent ends at
+    /// [`writer::format_reserved_head_blocks`]), the alternate volume
+    /// header, or another file. Violations are errors, never a silent
+    /// overlap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_file_placed(
+        &mut self,
+        path: &str,
+        start_block: u32,
+        block_count: u32,
+        len: u64,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+        mtime: u32,
+    ) -> Result<u32> {
+        let (parent_id, name) = self.resolve_create_target(path)?;
+        let w = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: volume is read-only".into()))?;
+        let bs = u64::from(w.block_size);
+        if len.div_ceil(bs) != u64::from(block_count) {
+            return Err(crate::Error::InvalidArgument(format!(
+                "hfs+: {path:?}: {len} bytes need {} blocks of {bs}, not {block_count}",
+                len.div_ceil(bs)
+            )));
+        }
+        if block_count > 0 && start_block == 0 {
+            return Err(crate::Error::InvalidArgument(format!(
+                "hfs+: {path:?}: block 0 holds the volume header"
+            )));
+        }
+        let cnid = w.next_cnid;
+        let next = w
+            .next_cnid
+            .checked_add(1)
+            .ok_or_else(|| crate::Error::Unsupported("hfs+: CNID space exhausted".into()))?;
+        w.claim_range(start_block, block_count)?;
+        let mut extents =
+            [volume_header::ExtentDescriptor::default(); volume_header::FORK_EXTENT_COUNT];
+        if block_count > 0 {
+            extents[0] = volume_header::ExtentDescriptor {
+                start_block,
+                block_count,
+            };
+        }
+        let fork = ForkData {
+            logical_size: len,
+            clump_size: w.block_size,
+            total_blocks: block_count,
+            extents,
+        };
+        if let Err(e) = writer::insert_file(
+            w,
+            parent_id,
+            &name,
+            cnid,
+            mode | catalog::mode::S_IFREG,
+            uid,
+            gid,
+            unix_to_hfs_time(mtime),
+            *b"\0\0\0\0",
+            *b"\0\0\0\0",
+            &fork,
+            0,
+        ) {
+            w.free(start_block, block_count);
+            return Err(e);
+        }
+        w.next_cnid = next;
+        Ok(cnid)
+    }
+
     /// Create a symlink at `path` whose target is the UTF-8 byte string
     /// `target`. Finder type `slnk` / creator `rhap`, mode S_IFLNK.
     #[allow(clippy::too_many_arguments)]
@@ -1782,6 +1867,13 @@ impl crate::fs::Filesystem for HfsPlus {
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("hfs+: non-UTF-8 path".into()))?;
         let rec = self.lookup_path(dev, s)?;
+        // A hard link reports its shared iNode: the size, owner, mode and
+        // link count (the `hlnk` record's own `special` is the iNode
+        // number, not a count).
+        let rec = match rec {
+            CatalogRecord::File(f) => CatalogRecord::File(self.resolve_hard_link(dev, f)?),
+            other => other,
+        };
         // (bsd, cnid, content_mod_date, dir?, file size)
         let (bsd, cnid, mtime_hfs, is_dir, size) = match &rec {
             CatalogRecord::Folder(f) => (f.bsd, f.folder_id, f.content_mod_date, true, 0),
