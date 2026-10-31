@@ -1,6 +1,6 @@
 [package]
 name = "fstool"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 # Raised to 1.95 with 0.5.1. (Edition 2024 alone needs 1.85; the
 # `purecrypto` dependency, for encrypted-DMG crypto, needs 1.88 as of 0.6.14.)
