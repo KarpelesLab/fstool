@@ -314,6 +314,16 @@ pub struct DmgBackend {
     decoded: Option<(usize, Vec<u8>)>,
 }
 
+// `DmgBackend` stays `Send`, `Sync` and unwind-safe (it was all of these
+// in 0.5.x, holding a plain `File`).
+const _: () = {
+    const fn assert_auto<
+        T: Send + Sync + Unpin + std::panic::UnwindSafe + std::panic::RefUnwindSafe,
+    >() {
+    }
+    assert_auto::<DmgBackend>();
+};
+
 impl std::fmt::Debug for DmgBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DmgBackend")
@@ -339,7 +349,10 @@ impl DmgBackend {
     /// Open a single-file UDIF image held in any seekable source of `len`
     /// bytes — the plaintext of an [`EncryptedDmgBackend`], an image in
     /// memory, … The source is read on demand.
-    pub fn from_reader<R: Read + Seek + Send + 'static>(src: R, len: u64) -> Result<Self> {
+    pub fn from_reader<R>(src: R, len: u64) -> Result<Self>
+    where
+        R: Read + Seek + Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe + 'static,
+    {
         Self::from_container(container::Container::from_source(Box::new(src), len)?)
     }
 

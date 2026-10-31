@@ -47,8 +47,17 @@ const KOLY_CODESIGN_OFFSET: usize = 0x128;
 const KOLY_CODESIGN_LENGTH: usize = 0x130;
 
 /// A random-access byte source a segment is read from.
-pub(crate) trait Source: Read + Seek + Send {}
-impl<T: Read + Seek + Send> Source for T {}
+///
+/// The auto-trait bounds keep [`DmgBackend`](super::DmgBackend) `Send`,
+/// `Sync` and unwind-safe, as it was when it held a plain `File`.
+pub(crate) trait Source:
+    Read + Seek + Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe
+{
+}
+impl<T> Source for T where
+    T: Read + Seek + Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe
+{
+}
 
 /// The embedded code signature `codesign` adds to a disk image: a blob
 /// between the plist and the trailer, located by two trailer fields.
