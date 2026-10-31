@@ -650,7 +650,11 @@ fn isoinfo_lists_every_iso_view() {
         .keys()
         .cloned()
         .collect();
-    assert_eq!(isoinfo_paths(&img, &["-J"]), want_j, "joliet");
+    assert_eq!(
+        isoinfo_paths(&img, &["-J", "-j", "UTF-8"]),
+        want_j,
+        "joliet"
+    );
     // The plain hierarchy holds every entry (symlinks as empty files).
     assert_eq!(isoinfo_paths(&img, &[]).len(), want.len(), "plain");
     let out = Command::new("isoinfo")
