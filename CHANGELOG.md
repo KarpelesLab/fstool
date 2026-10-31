@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2](https://github.com/KarpelesLab/fstool/compare/v0.5.1...v0.5.2) - 2026-10-31
+
+### Added
+
+- *(hybrid)* UDF view for hybrid images (ISO 9660 / Joliet / HFS+ / UDF)
+- *(udf)* UDF read (1.02-2.60) and write (1.02/1.50/2.01/2.50) with a planner-facing layout API
+- *(hybrid)* typed ISO 9660 / Joliet / HFS+ hybrid layout API and makehybrid
+- *(dmg)* write ULFO (LZFSE) images — compcol 0.7.8
+- bounded fs verification and typed HFS+ / partition resize plans
+- *(dmg)* streaming conversion, checksums, segments, resources and container resize
+- *(dmg)* certificate recovery records and multi-passphrase encrcdsa images
+- *(sparse)* filesystem-aware reclaim, CLI and crash-order tests
+- *(dmg)* UFBI, UDRW, MD5 checksums and partition-oriented blkx maps
+- *(hfs+)* kernel-exact name normalisation, HFSX, volume Finder info, alias acceptance
+- *(hfs+)* Finder info, resource forks, xattrs, stable identities and name normalisation
+- *(block)* sparseimage and sparsebundle backends
+- *(dmg)* UDIF writer (UDRO/UDCO/UDZO/UDBZ/ULMO)
+- *(dmg)* create encrcdsa v2 images and rotate passphrases
+
+### Fixed
+
+- *(dmg)* keep DmgBackend Sync and unwind-safe
+- *(udf)* find the VAT when the image extends past the session
+- *(cli)* run on a 16 MiB stack so Windows doesn't overflow
+- *(hfs+)* mark in-volume journals with kJIJournalInFSMask
+- *(zip)* report a wrong ZipCrypto passphrase when the decoder trips
+- *(apfs)* make formatted containers mount natively on macOS
+- *(sparse)* ride out momentary lock contention
+- *(zip)* verify each member's CRC-32 when reading it
+- *(dmg)* read ULFO (LZFSE) images — bump compcol to 0.7.6
+
+### Other
+
+- Linux UDF mounts as the test user; detach cleanup never panics
+- *(hybrid)* isoinfo prints non-Latin-1 Joliet characters as _
+- *(hybrid)* mask non-ASCII in isoinfo's Joliet listing
+- *(hybrid)* ask isoinfo for UTF-8 Joliet names
+- *(hybrid, udf)* allow macOS-only helpers to go unused elsewhere
+- *(hfs+)* serialize resize tests and retry hdiutil EAGAIN
+- *(sparse)* run hdiutil tests one at a time and wait out detach locks
+- *(sparse)* fix the library-only build and a detach race
+- share one MD5 between the UDIF writer and HFS+ volume UUIDs
+- *(sparse)* read the image through the backend's handle on Windows
+
 ## [0.5.1](https://github.com/KarpelesLab/fstool/compare/v0.5.0...v0.5.1) - 2026-10-29
 
 ### Added
