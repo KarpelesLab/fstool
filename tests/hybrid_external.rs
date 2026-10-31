@@ -650,15 +650,15 @@ fn isoinfo_lists_every_iso_view() {
         .keys()
         .cloned()
         .collect();
-    // genisoimage's isoinfo has no UTF-8 output charset: it prints one
-    // substitute byte per character outside the locale's. Compare with
-    // every non-ASCII character masked as `?` on both sides.
+    // genisoimage's isoinfo has no UTF-8 output charset: it prints
+    // Latin-1 characters as raw bytes and others as `_`. Compare with
+    // every non-ASCII character (and `_`) masked as `?` on both sides.
     let mask = |v: Vec<String>| -> Vec<String> {
         let mut v: Vec<String> = v
             .into_iter()
             .map(|p| {
                 p.chars()
-                    .map(|c| if c.is_ascii() { c } else { '?' })
+                    .map(|c| if c.is_ascii() && c != '_' { c } else { '?' })
                     .collect()
             })
             .collect();
