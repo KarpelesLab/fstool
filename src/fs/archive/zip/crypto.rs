@@ -413,8 +413,16 @@ mod tests {
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, plain);
-        let err = ZipCryptoReader::new(&buf[..], b"nope", 0xab).err().unwrap();
-        assert!(matches!(err, Error::InvalidArgument(_)));
+        // The check is one byte, so about one wrong passphrase in 256
+        // passes it (the header is random); nearly all must be refused.
+        let mut passed = 0;
+        for i in 0..1000 {
+            match ZipCryptoReader::new(&buf[..], format!("nope{i}").as_bytes(), 0xab) {
+                Ok(_) => passed += 1,
+                Err(e) => assert!(matches!(e, Error::InvalidArgument(_)), "{e:?}"),
+            }
+        }
+        assert!(passed < 30, "{passed} of 1000 wrong passphrases passed");
     }
 
     #[cfg(feature = "zip-aes")]

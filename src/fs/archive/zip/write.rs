@@ -1303,6 +1303,38 @@ mod tests {
     /// ZipCrypto checks a passphrase against one byte, so about one wrong
     /// passphrase in 256 gets through it. Reading such a member must then
     /// fail on its CRC-32 instead of returning garbage.
+    /// Same, for a deflated member: the decoder usually trips over the
+    /// garbage before the CRC is reached, and must still name the likely
+    /// cause.
+    #[test]
+    fn zipcrypto_wrong_passphrase_on_deflate_says_so() {
+        let (arc, _) = build_with(
+            ZipFormatOpts {
+                password: Some("secret".into()),
+                encryption: Encryption::ZipCrypto,
+                ..ZipFormatOpts::default()
+            },
+            4096,
+        );
+        let mut slipped = 0;
+        for i in 0..20_000 {
+            let pw = format!("wrong{i}");
+            match read_back_pw(&arc, "/d/text.txt", Some(&pw)) {
+                Ok((got, _)) => panic!("{pw:?} read {} bytes of garbage", got.len()),
+                Err(e) => {
+                    assert!(e.to_string().contains("wrong passphrase"), "{pw:?}: {e:?}");
+                    if !matches!(e, Error::InvalidArgument(_)) {
+                        slipped += 1;
+                        if slipped == 3 {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        panic!("no wrong passphrase got past the check byte in 20 000 tries");
+    }
+
     #[test]
     fn zipcrypto_wrong_passphrase_past_check_byte_fails_on_crc() {
         let (arc, _) = build_with(

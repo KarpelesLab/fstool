@@ -77,7 +77,14 @@ pub fn open_with_password<'a>(
             aes_reader(raw, pw, key_bits, loc.compressed_len)?
         }
     };
-    let decoded = decode(body, &loc)?;
+    let encrypted = loc.crypto != Crypto::None;
+    let decoded = decode(body, &loc).map_err(|e| {
+        if encrypted {
+            wrong_pass_or_corrupt(e)
+        } else {
+            e
+        }
+    })?;
     Ok(match loc.crc32 {
         Some(crc) => Box::new(CrcCheckReader {
             inner: decoded,
@@ -85,10 +92,19 @@ pub fn open_with_password<'a>(
             want_len: loc.uncompressed_len,
             crc: 0,
             len: 0,
-            encrypted: loc.crypto != Crypto::None,
+            encrypted,
         }),
         None => decoded,
     })
+}
+
+/// A decoder that failed to start on a decrypted body: with a weak
+/// passphrase check this is most likely a wrong passphrase.
+fn wrong_pass_or_corrupt(e: crate::Error) -> crate::Error {
+    crate::Error::Io(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("zip: wrong passphrase or corrupt member ({e})"),
+    ))
 }
 
 /// Checks a member's CRC-32 and length once its decoded stream ends.
@@ -108,7 +124,18 @@ struct CrcCheckReader<'a> {
 
 impl Read for CrcCheckReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
+        // ZipCrypto checks a passphrase against one byte, so a wrong one
+        // gets past it about 1 time in 256 and the decoder then trips
+        // over garbage before the CRC is reached: say what likely happened.
+        let n = match self.inner.read(buf) {
+            Err(e) if self.encrypted && e.kind() != io::ErrorKind::Interrupted => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("zip: wrong passphrase or corrupt member ({e})"),
+                ));
+            }
+            r => r?,
+        };
         if n > 0 {
             self.crc = crate::crc::crc32_append(self.crc, &buf[..n]);
             self.len += n as u64;
