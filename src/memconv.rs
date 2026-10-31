@@ -42,6 +42,7 @@ use crate::repack::TarStreamSink;
     feature = "cramfs",
     feature = "squashfs",
     feature = "iso9660",
+    feature = "udf",
     feature = "grf",
     feature = "archive"
 ))]
@@ -59,6 +60,7 @@ use crate::{Error, Result};
     feature = "cramfs",
     feature = "squashfs",
     feature = "iso9660",
+    feature = "udf",
     feature = "grf",
     feature = "archive"
 ))]
@@ -82,6 +84,7 @@ use crate::{
     feature = "cramfs",
     feature = "squashfs",
     feature = "iso9660",
+    feature = "udf",
     feature = "grf",
     feature = "archive"
 ))]
@@ -455,6 +458,25 @@ impl MemImage {
                 let sz = self.archive_size(32 << 20)?;
                 self.build_generic::<crate::fs::iso9660::Iso9660>(&opts, sz)
             }
+            #[cfg(feature = "udf")]
+            "udf" => {
+                let opts = crate::fs::udf::FormatOpts {
+                    volume_id: "FSTOOL".into(),
+                    application_id: "fstool".into(),
+                    ..crate::fs::udf::FormatOpts::default()
+                };
+                // Payload plus a File Entry per file; the buffer is
+                // truncated to the volume afterwards.
+                let a = crate::analyze::analyze_fs(&mut self.fs, &mut self.dev, PLAN_BLOCK_SIZE)?;
+                let entries = a.files + a.dirs + a.symlinks + a.devices + a.hardlinks;
+                let sz = round_up(
+                    a.total_file_bytes
+                        .saturating_add(entries.saturating_mul(4096))
+                        .saturating_add(32 << 20),
+                    512,
+                );
+                self.build_generic::<crate::fs::udf::Udf>(&opts, sz)
+            }
             #[cfg(feature = "grf")]
             "grf" => {
                 let sz = self.archive_size(64 << 10)?;
@@ -579,6 +601,7 @@ impl MemImage {
         feature = "cramfs",
         feature = "squashfs",
         feature = "iso9660",
+        feature = "udf",
         feature = "grf",
         feature = "archive"
     ))]
@@ -849,6 +872,13 @@ pub fn supported_targets() -> Vec<TargetInfo> {
             ext: "iso",
             streaming: true,
         },
+        #[cfg(feature = "udf")]
+        TargetInfo {
+            id: "udf",
+            label: "UDF",
+            ext: "udf",
+            streaming: true,
+        },
         #[cfg(feature = "grf")]
         TargetInfo {
             id: "grf",
@@ -913,6 +943,7 @@ fn target_feature(id: &str) -> Option<&'static str> {
         "squashfs" => "squashfs",
         "cramfs" => "cramfs",
         "iso" | "iso9660" => "iso9660",
+        "udf" => "udf",
         "grf" => "grf",
         "zip" | "cpio" | "ar" => "archive",
         _ => return None,
@@ -959,6 +990,7 @@ fn tar_codec(name: &str) -> Option<Algo> {
     feature = "cramfs",
     feature = "squashfs",
     feature = "iso9660",
+    feature = "udf",
     feature = "grf",
     feature = "archive"
 ))]

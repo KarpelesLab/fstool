@@ -78,6 +78,7 @@ compile_error!(
         feature = "cramfs",
         feature = "squashfs",
         feature = "tar",
+        feature = "udf",
         feature = "xfs",
     ))
 ))]

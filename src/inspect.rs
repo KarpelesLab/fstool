@@ -161,6 +161,10 @@ pub enum FsKind {
     /// cramfs — read + write via `create` / `repack` (zlib, build-once).
     #[cfg(feature = "cramfs")]
     Cramfs,
+    /// UDF (ECMA-167 / OSTA UDF, revisions 1.02–2.60) — read + write via
+    /// `create` / `repack` (build-once).
+    #[cfg(feature = "udf")]
+    Udf,
 }
 
 /// The error for a format whose on-disk signature was recognised (or whose
@@ -311,6 +315,17 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
         detected!("tar", Tar, "tar");
     }
 
+    // UDF: a volume recognition sequence at byte 32768 holding BEA01 then
+    // NSR02 / NSR03. Checked before ISO 9660 so a UDF bridge disc (an ISO
+    // PVD followed by the UDF descriptors) opens through its richer UDF
+    // view, as blkid and the kernels do. Without the `udf` feature such a
+    // bridge still opens as ISO 9660 below; only a pure-UDF volume reports
+    // the missing feature (after the ISO probe).
+    #[cfg(feature = "udf")]
+    if crate::fs::udf::probe(dev) {
+        return Ok(FsKind::Udf);
+    }
+
     // ISO 9660: PVD at LBA 16 (byte 32768) starts with type=0x01,
     // standard identifier "CD001", version=0x01. The PVD is the
     // canonical entry point regardless of Joliet / Rock Ridge / boot
@@ -321,6 +336,11 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
         if &iso[1..6] == b"CD001" {
             detected!("iso9660", Iso9660, "ISO 9660");
         }
+    }
+
+    #[cfg(not(feature = "udf"))]
+    if has_udf_recognition_sequence(dev) {
+        return Err(missing_feature("UDF", "udf"));
     }
 
     // APFS: container superblock magic "NXSB" at offset 32 of block 0.
@@ -384,6 +404,27 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
     Err(crate::Error::InvalidImage(
         "inspect: no recognised filesystem or archive on this image".into(),
     ))
+}
+
+/// Whether the volume recognition sequence at byte 32768 names an
+/// `NSR02` / `NSR03` descriptor — the UDF signature, probed even in a
+/// build without the `udf` backend so the error can say which feature
+/// is missing.
+#[cfg(not(feature = "udf"))]
+fn has_udf_recognition_sequence(dev: &mut dyn BlockDevice) -> bool {
+    for i in 0..64u64 {
+        let off = 32768 + i * 2048;
+        let mut b = [0u8; 6];
+        if off + 6 > dev.total_size() || dev.read_at(off, &mut b).is_err() {
+            return false;
+        }
+        match &b[1..6] {
+            b"NSR02" | b"NSR03" => return true,
+            b"BEA01" | b"CD001" | b"CDW02" | b"BOOT2" => {}
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// True when `head` (at least 32 bytes) opens with a cramfs superblock:
@@ -460,6 +501,10 @@ pub enum AnyFs {
     /// via [`AnyFs::new_ramfs`] / [`AnyFs::new_ramfs_from`].
     #[cfg(feature = "ramfs")]
     Ramfs(Box<Ramfs>),
+    // New variants go last.
+    /// UDF — read (1.02–2.60) + write via `create` / `repack`.
+    #[cfg(feature = "udf")]
+    Udf(Box<crate::fs::udf::Udf>),
 }
 
 impl AnyFs {
@@ -544,6 +589,8 @@ impl AnyFs {
             FsKind::Iso9660 => Ok(Self::Iso9660(Box::new(crate::fs::iso9660::Iso9660::open(
                 dev,
             )?))),
+            #[cfg(feature = "udf")]
+            FsKind::Udf => Ok(Self::Udf(Box::new(crate::fs::udf::Udf::open(dev)?))),
             #[cfg(feature = "grf")]
             FsKind::Grf => Ok(Self::Grf(Box::new(crate::fs::grf::Grf::open_dev(dev)?))),
             #[cfg(feature = "archive")]
@@ -677,6 +724,8 @@ impl AnyFs {
             Self::Squashfs(_) => FsKind::Squashfs,
             #[cfg(feature = "iso9660")]
             Self::Iso9660(_) => FsKind::Iso9660,
+            #[cfg(feature = "udf")]
+            Self::Udf(_) => FsKind::Udf,
             #[cfg(feature = "grf")]
             Self::Grf(_) => FsKind::Grf,
             #[cfg(feature = "archive")]
@@ -736,6 +785,11 @@ impl AnyFs {
             Self::Squashfs(sq) => sq.list_path(dev, path),
             #[cfg(feature = "iso9660")]
             Self::Iso9660(iso) => iso.list_path(dev, path),
+            #[cfg(feature = "udf")]
+            Self::Udf(u) => {
+                use crate::fs::Filesystem;
+                u.list(dev, std::path::Path::new(path))
+            }
             #[cfg(feature = "grf")]
             Self::Grf(grf) => {
                 use crate::fs::Filesystem;
@@ -888,6 +942,12 @@ impl AnyFs {
                 let mut r = iso.open_file_reader(dev, path)?;
                 pump(&mut r, out, &mut buf)
             }
+            #[cfg(feature = "udf")]
+            Self::Udf(u) => {
+                use crate::fs::Filesystem;
+                let mut r = u.read_file(dev, std::path::Path::new(path))?;
+                pump(&mut r, out, &mut buf)
+            }
             #[cfg(feature = "grf")]
             Self::Grf(grf) => {
                 // GRF entries are full-buffer inflated; stream the
@@ -965,6 +1025,11 @@ impl AnyFs {
             Self::Squashfs(sq) => Ok(Box::new(sq.open_file_reader(dev, path)?)),
             #[cfg(feature = "iso9660")]
             Self::Iso9660(iso) => Ok(Box::new(iso.open_file_reader(dev, path)?)),
+            #[cfg(feature = "udf")]
+            Self::Udf(u) => {
+                use crate::fs::Filesystem;
+                u.read_file(dev, std::path::Path::new(path))
+            }
             #[cfg(feature = "grf")]
             Self::Grf(grf) => {
                 let key = path.trim_start_matches('/').to_string();
@@ -1018,6 +1083,7 @@ impl AnyFs {
                 feature = "grf",
                 feature = "archive",
                 feature = "ramfs",
+                feature = "udf",
             ))]
             _ => Err(crate::Error::Unsupported(
                 "resource forks are only supported on HFS / HFS+".into(),
@@ -1152,6 +1218,8 @@ impl AnyFs {
             Self::Apfs(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
             #[cfg(feature = "exfat")]
             Self::Exfat(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
+            #[cfg(feature = "udf")]
+            Self::Udf(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
             #[cfg(feature = "grf")]
             Self::Grf(f) => crate::fs::Filesystem::access_mode(f.as_ref()),
             #[cfg(feature = "archive")]
@@ -1193,6 +1261,8 @@ impl AnyFs {
             Self::Apfs(a) => crate::fs::Filesystem::mutation_capability(a.as_ref()),
             #[cfg(feature = "exfat")]
             Self::Exfat(e) => crate::fs::Filesystem::mutation_capability(e.as_ref()),
+            #[cfg(feature = "udf")]
+            Self::Udf(g) => crate::fs::Filesystem::mutation_capability(g.as_ref()),
             #[cfg(feature = "grf")]
             Self::Grf(g) => crate::fs::Filesystem::mutation_capability(g.as_ref()),
             #[cfg(feature = "archive")]
@@ -1241,6 +1311,8 @@ impl AnyFs {
             Self::Apfs(a) => crate::fs::Filesystem::clone_capability(a.as_ref()),
             #[cfg(feature = "exfat")]
             Self::Exfat(e) => crate::fs::Filesystem::clone_capability(e.as_ref()),
+            #[cfg(feature = "udf")]
+            Self::Udf(g) => crate::fs::Filesystem::clone_capability(g.as_ref()),
             #[cfg(feature = "grf")]
             Self::Grf(g) => crate::fs::Filesystem::clone_capability(g.as_ref()),
             #[cfg(feature = "archive")]
@@ -1343,6 +1415,8 @@ impl AnyFs {
             Self::Exfat(e) => f(e.as_mut()),
             #[cfg(feature = "iso9660")]
             Self::Iso9660(iso) => f(iso.as_mut()),
+            #[cfg(feature = "udf")]
+            Self::Udf(g) => f(g.as_mut()),
             #[cfg(feature = "grf")]
             Self::Grf(g) => f(g.as_mut()),
             #[cfg(feature = "archive")]
@@ -1444,6 +1518,8 @@ impl AnyFs {
             Self::Squashfs(_) => "squashfs",
             #[cfg(feature = "iso9660")]
             Self::Iso9660(_) => "iso9660",
+            #[cfg(feature = "udf")]
+            Self::Udf(_) => "udf",
             #[cfg(feature = "grf")]
             Self::Grf(_) => "grf",
             #[cfg(feature = "archive")]
@@ -1560,6 +1636,8 @@ impl AnyFs {
             Self::Squashfs(b) => b,
             #[cfg(feature = "iso9660")]
             Self::Iso9660(b) => b,
+            #[cfg(feature = "udf")]
+            Self::Udf(b) => b,
             #[cfg(feature = "grf")]
             Self::Grf(b) => b,
             #[cfg(feature = "archive")]

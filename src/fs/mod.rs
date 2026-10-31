@@ -78,6 +78,8 @@ pub mod rootdevs;
 pub mod squashfs;
 #[cfg(all(feature = "alloc", feature = "tar"))]
 pub mod tar;
+#[cfg(all(feature = "alloc", feature = "udf"))]
+pub mod udf;
 // Bounded, structured verification diagnostics shared by the verifiers.
 #[cfg(feature = "std")]
 pub mod verify;

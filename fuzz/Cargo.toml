@@ -68,3 +68,10 @@ path = "fuzz_targets/volume_mount.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "udf_open"
+path = "fuzz_targets/udf_open.rs"
+test = false
+doc = false
+bench = false

@@ -78,6 +78,7 @@ See [web/README.md](web/README.md) for the build and local-dev steps.
 | SquashFS   | ✅    | ✅     | —              | gzip / xz / lz4 / zstd / lzo / lzma via Cargo features; writer round-trips via `unsquashfs`; repack-only           |
 | cramfs     | ✅    | ✅     | —              | Linux compressed ROM FS: zlib blocks, either byte order on read, superblock at byte 0 or 512; `create -t cramfs` / `repack` write little-endian v2 images (sorted dirs, CRC). Format limits: 16 MiB per file, every file must start within the first 256 MiB, uid 16-bit / gid 8-bit (truncated like `mkfs.cramfs`), device major/minor ≤ 255, no timestamps; repack-only |
 | ISO 9660   | ✅    | ✅     | —              | PVD + Joliet (UCS-2) + Rock Ridge (PX/NM/SL/TF) + El Torito boot catalog; repack-only                              |
+| UDF        | ✅    | ✅     | —              | **Read**: UDF 1.02–2.60 on 512/1024/2048/4096-byte blocks — physical, sparable, virtual (VAT, write-once media) and metadata (2.50+, mirror fallback) partitions; FE/EFE, ICB strategy 4/4096, short/long/extended/embedded ADs + AED chains, sparse extents, CS0 8/16-bit names, symlinks, hard links, devices, permissions, timestamps; every tag checksum + CRC verified, hostile input bounded. **Write**: 1.02 / 1.50 / 2.01 / 2.50 (metadata partition + duplicated mirror), each validated with `fsck_udf` and a macOS kernel mount; >4 GiB and sparse files, labels; xattrs are reported as unsupported. `fstool::fs::udf::layout` records a UDF view over payload a hybrid-image planner already placed; repack-only |
 | GRF        | ✅    | ✅     | ✅              | Gravity Ragnarok Online archive — v0x102 / v0x103 / v0x200; permutation cipher (`MIXCRYPT` / `DES`); CP949 filenames |
 | zip        | ✅    | ✅     | —              | central-directory index, ZIP64, Unix mode/symlinks, uid/gid + Unix timestamps (`UT` / `ux` / NTFS extras), UTF-8/Shift-JIS/EUC-JP filename detection (+ Unicode-path extra); every method id recognised — Stored always, Deflate / Deflate64 / bzip2 / LZMA / XZ / Zstandard read **and** written, the PKZIP 1.x methods (Shrink / Reduce / Implode) read, each behind its codec feature; PPMd lists but has no decoder; encrypted members (traditional PKWARE, WinZip AES) read and written with `--password`; split archives (`.z01`…, `.001`…) read as a set and written with `-O split=`; repack-only writer |
 | cpio       | ✅    | ✅     | —              | newc / newc-crc / odc read; newc write; repack-only                                                              |
@@ -815,7 +816,7 @@ none of the other 130 000 lines.
 | `exfat` | exFAT | needs neither `std` nor `alloc`: on its own it is the heapless driver ([below](#no-allocator-at-all)), and `alloc` adds the hosted one beside it. Implies `fat`, whose `SectorDriver` it shares |
 | `littlefs` | littlefs 2.0 / 2.1 | needs neither `std` nor `alloc`: on its own it is the heapless flash driver ([below](#no-allocator-at-all)), and `alloc` adds the hosted one beside it |
 | `ext` | ext2 / ext3 / ext4 | |
-| `xfs`, `ntfs`, `f2fs`, `affs`, `iso9660`, `squashfs` | as named | |
+| `xfs`, `ntfs`, `f2fs`, `affs`, `iso9660`, `udf`, `squashfs` | as named | |
 | `cramfs` | cramfs | implies `gzip` (every block is zlib-compressed) |
 | `hfs` | classic HFS | |
 | `hfs-plus` | HFS+ / HFSX | pulls `intl` for HFS+ name normalisation (decomposition) |

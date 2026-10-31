@@ -223,6 +223,7 @@ fn build_bare_fs(fs: &FilesystemSpec, output: &Path) -> Result<()> {
         feature = "squashfs",
         feature = "xfs",
         feature = "iso9660",
+        feature = "udf",
         feature = "grf",
         feature = "archive"
     )))]
@@ -272,6 +273,8 @@ fn build_bare_fs(fs: &FilesystemSpec, output: &Path) -> Result<()> {
             output,
             iso9660_format_opts(fs)?,
         ),
+        #[cfg(feature = "udf")]
+        "udf" => build_bare_via_trait::<crate::fs::udf::Udf>(fs, output, udf_format_opts(fs)?),
         #[cfg(feature = "grf")]
         "grf" => build_bare_via_trait::<crate::fs::grf::Grf>(fs, output, grf_format_opts(fs)?),
         #[cfg(feature = "archive")]
@@ -321,6 +324,8 @@ const COMPILED_OUT_FS: &[(&[&str], &str)] = &[
     (&["xfs"], "xfs"),
     #[cfg(not(feature = "iso9660"))]
     (&["iso", "iso9660"], "iso9660"),
+    #[cfg(not(feature = "udf"))]
+    (&["udf"], "udf"),
     #[cfg(not(feature = "grf"))]
     (&["grf"], "grf"),
     #[cfg(not(feature = "archive"))]
@@ -395,6 +400,7 @@ fn ar_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::archive::ar::ArForma
         feature = "squashfs",
         feature = "xfs",
         feature = "iso9660",
+        feature = "udf",
         feature = "grf",
         feature = "archive"
     )
@@ -432,6 +438,19 @@ fn iso9660_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::iso9660::Format
     Ok(opts)
 }
 
+#[cfg(all(feature = "spec", feature = "udf"))]
+fn udf_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::udf::FormatOpts> {
+    let mut bag = options_bag_for(fs)?;
+    let mut opts = crate::fs::udf::FormatOpts {
+        volume_id: "FSTOOL".into(),
+        application_id: "fstool".into(),
+        ..crate::fs::udf::FormatOpts::default()
+    };
+    opts.apply_options(&mut bag)?;
+    bag.check_empty("udf")?;
+    Ok(opts)
+}
+
 /// Generic "create the backing file, format `F`, populate from
 /// `source`, flush" pipeline. Used for every writable FS whose
 /// destination size doesn't have to be derived from the source tree
@@ -449,6 +468,7 @@ fn iso9660_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::iso9660::Format
         feature = "squashfs",
         feature = "xfs",
         feature = "iso9660",
+        feature = "udf",
         feature = "grf",
         feature = "archive"
     )
@@ -497,6 +517,7 @@ fn build_bare_via_trait<F: crate::fs::FilesystemFactory>(
         feature = "squashfs",
         feature = "xfs",
         feature = "iso9660",
+        feature = "udf",
         feature = "grf",
         feature = "archive"
     )
@@ -805,6 +826,7 @@ fn format_fat_into(
         feature = "squashfs",
         feature = "xfs",
         feature = "iso9660",
+        feature = "udf",
         feature = "grf",
         feature = "archive"
     )

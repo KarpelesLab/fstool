@@ -159,6 +159,7 @@ filesystems = [
     "ramfs",
     "squashfs",
     "tar",
+    "udf",
     "xfs",
 ]
 # FAT12 / FAT16 / FAT32, in both configurations — one of the two backends
@@ -228,6 +229,10 @@ iso9660 = ["std"]
 # partition, laid out the way `hdiutil makehybrid` does. Library-only;
 # the `makehybrid` subcommand comes with `cli`.
 hybrid = ["iso9660", "hfs-plus"]
+# UDF (ECMA-167 / OSTA UDF): reads 1.02-2.60 (VAT, sparable and metadata
+# partitions), writes 1.02 / 1.50 / 2.01 / 2.50, plus a planner-facing
+# layout API for hybrid optical images.
+udf = ["std"]
 # SquashFS (reads decode through the codec features).
 squashfs = ["std"]
 # cramfs (Linux compressed ROM filesystem). Every block is zlib, so it

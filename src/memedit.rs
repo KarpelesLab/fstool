@@ -49,7 +49,8 @@ use crate::block::MemoryBackend;
     feature = "affs",
     feature = "littlefs",
     feature = "f2fs",
-    feature = "grf"
+    feature = "grf",
+    feature = "udf"
 ))]
 use crate::format_opts::OptionMap;
 #[cfg(any(feature = "xfs", feature = "grf"))]
@@ -237,6 +238,15 @@ pub fn creatable_filesystems() -> Vec<FsTypeInfo> {
             editable: true,
             options: "",
         },
+        #[cfg(feature = "udf")]
+        FsTypeInfo {
+            id: "udf",
+            label: "UDF",
+            min_size: 1 << 20,
+            default_size: 64 << 20,
+            editable: false,
+            options: "revision,volume_label,logical_volume_id,file_set_id,block_size,access",
+        },
     ]
 }
 
@@ -286,7 +296,8 @@ fn canonical_fs_id(fs_type: &str) -> String {
     feature = "affs",
     feature = "littlefs",
     feature = "f2fs",
-    feature = "grf"
+    feature = "grf",
+    feature = "udf"
 ))]
 fn format_blank(fs_type: &str, dev: &mut MemoryBackend, options: &str) -> Result<AnyFs> {
     let id = canonical_fs_id(fs_type);
@@ -302,7 +313,8 @@ fn format_blank(fs_type: &str, dev: &mut MemoryBackend, options: &str) -> Result
             feature = "hfs",
             feature = "affs",
             feature = "littlefs",
-            feature = "grf"
+            feature = "grf",
+            feature = "udf"
         )),
         allow(unused_mut)
     )]
@@ -483,6 +495,18 @@ fn format_blank(fs_type: &str, dev: &mut MemoryBackend, options: &str) -> Result
             bag.check_empty(&id)?;
             AnyFs::Grf(Box::new(Grf::format(dev, &opts)?))
         }
+        #[cfg(feature = "udf")]
+        "udf" => {
+            use crate::fs::udf::{FormatOpts, Udf};
+            // The workspace is a whole disk: cover it.
+            let mut opts = FormatOpts {
+                fill_device: true,
+                ..FormatOpts::default()
+            };
+            opts.apply_options(&mut bag)?;
+            bag.check_empty(&id)?;
+            AnyFs::Udf(Box::new(Udf::format(dev, &opts)?))
+        }
         other => return Err(cannot_create(other)),
     };
     Ok(fs)
@@ -501,7 +525,8 @@ fn format_blank(fs_type: &str, dev: &mut MemoryBackend, options: &str) -> Result
     feature = "affs",
     feature = "littlefs",
     feature = "f2fs",
-    feature = "grf"
+    feature = "grf",
+    feature = "udf"
 )))]
 fn format_blank(fs_type: &str, _dev: &mut MemoryBackend, _options: &str) -> Result<AnyFs> {
     Err(cannot_create(&canonical_fs_id(fs_type)))
@@ -523,6 +548,7 @@ fn fs_feature(id: &str) -> Option<&'static str> {
         "littlefs" => "littlefs",
         "f2fs" => "f2fs",
         "grf" => "grf",
+        "udf" => "udf",
         _ => return None,
     })
 }

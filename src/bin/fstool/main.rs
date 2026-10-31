@@ -180,6 +180,7 @@ enum Command {
         feature = "hfs",
         feature = "hfs-plus",
         feature = "iso9660",
+        feature = "udf",
         feature = "littlefs",
         feature = "ntfs",
         feature = "cramfs",
@@ -189,7 +190,7 @@ enum Command {
     Create {
         /// Filesystem type to format: ext2 / ext3 / ext4 / fat12 / fat16 /
         /// fat32 / vfat / exfat / hfs+ / hfsplus / ntfs / f2fs / squashfs /
-        /// cramfs / xfs / iso / iso9660 / grf / apfs.
+        /// cramfs / xfs / iso / iso9660 / udf / grf / apfs.
         #[arg(short = 't', long = "type", value_name = "TYPE")]
         fs_type: String,
         /// Optional source directory on the host. Omit to create an
@@ -640,8 +641,8 @@ enum Command {
         /// Destination filesystem type. Defaults to the source's type
         /// (ext2/3/4 → matching ext flavour; FAT32 → FAT32). Pass an
         /// explicit value to convert filesystem types (loses
-        /// per-inode metadata on ext → FAT32).
-        #[arg(long, value_name = "TYPE")]
+        /// per-inode metadata on ext → FAT32). `-t` is accepted as for `create`.
+        #[arg(short = 't', long, value_name = "TYPE")]
         fs_type: Option<String>,
         /// ext block size (1024/2048/4096); ignored for FAT32 output.
         #[arg(long, default_value_t = 1024)]
@@ -843,6 +844,7 @@ fn output_path_of(cmd: &Command) -> &std::path::Path {
             feature = "hfs",
             feature = "hfs-plus",
             feature = "iso9660",
+            feature = "udf",
             feature = "littlefs",
             feature = "ntfs",
             feature = "cramfs",
@@ -926,6 +928,7 @@ fn missing_fs_feature(name: &str) -> Option<&'static str> {
         "cramfs" => ("cramfs", cfg!(feature = "cramfs")),
         "xfs" => ("xfs", cfg!(feature = "xfs")),
         "iso" | "iso9660" => ("iso9660", cfg!(feature = "iso9660")),
+        "udf" => ("udf", cfg!(feature = "udf")),
         "grf" => ("grf", cfg!(feature = "grf")),
         "apfs" => ("apfs", cfg!(feature = "apfs")),
         "zip" | "cpio" | "ar" => ("archive", cfg!(feature = "archive")),
@@ -981,6 +984,7 @@ fn run(cli: Cli) -> fstool::Result<()> {
             feature = "hfs",
             feature = "hfs-plus",
             feature = "iso9660",
+            feature = "udf",
             feature = "littlefs",
             feature = "ntfs",
             feature = "cramfs",
@@ -1508,6 +1512,10 @@ fn mount_cmd(image: Option<&str>, mountpoint: Option<&std::path::Path>) -> fstoo
             Box::new(fstool::fs::iso9660::Iso9660::open(dev.as_mut())?),
             "iso9660",
         ),
+        #[cfg(feature = "udf")]
+        fstool::inspect::FsKind::Udf => {
+            (Box::new(fstool::fs::udf::Udf::open(dev.as_mut())?), "udf")
+        }
         #[cfg(feature = "tar")]
         fstool::inspect::FsKind::Tar => {
             (Box::new(fstool::fs::tar::Tar::open(dev.as_mut())?), "tar")
@@ -2047,6 +2055,17 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
                     let bytes = sum_source_file_bytes(src_dev, src_fs)?;
                     bytes.saturating_add(32 * 1024 * 1024)
                 }
+                #[cfg(feature = "udf")]
+                "udf" => {
+                    // The UDF size plan counts data blocks, File Entries
+                    // and directory streams; the writer truncates the
+                    // backing file to the real length after flush.
+                    let opts = fstool::fs::udf::FormatOpts::default();
+                    let mut plan =
+                        <fstool::fs::udf::Udf as fstool::fs::FilesystemFactory>::size_plan(&opts)
+                            .expect("udf has a size plan");
+                    fstool::analyze::plan_size_fs(src_fs, src_dev, plan.as_mut())?
+                }
                 #[cfg(feature = "grf")]
                 "grf" => {
                     // GRF stores zlib-compressed bodies — sum_source
@@ -2086,6 +2105,14 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
                     // unused tail of the backing file alone.
                     let bytes = sum_source_file_bytes(src_dev, src_fs).unwrap_or(0);
                     bytes.saturating_add(32 * 1024 * 1024)
+                }
+                #[cfg(feature = "udf")]
+                "udf" => {
+                    let opts = fstool::fs::udf::FormatOpts::default();
+                    let mut plan =
+                        <fstool::fs::udf::Udf as fstool::fs::FilesystemFactory>::size_plan(&opts)
+                            .expect("udf has a size plan");
+                    fstool::analyze::plan_size_fs(src_fs, src_dev, plan.as_mut())?
                 }
                 #[cfg(feature = "grf")]
                 "grf" => {
@@ -2277,6 +2304,19 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
                     false,
                 )?
             }
+            #[cfg(feature = "udf")]
+            "udf" => {
+                let mut opts = fstool::fs::udf::FormatOpts::default();
+                opts.volume_id = "FSTOOL".into();
+                opts.application_id = "fstool".into();
+                repack_via_trait::<fstool::fs::udf::Udf>(
+                    dst_dev.as_mut(),
+                    &opts,
+                    src_fs,
+                    src_dev,
+                    false,
+                )?
+            }
             #[cfg(feature = "grf")]
             "grf" => repack_via_trait::<fstool::fs::grf::Grf>(
                 dst_dev.as_mut(),
@@ -2349,6 +2389,7 @@ fn repack_cmd(args: RepackArgs<'_>) -> fstool::Result<()> {
     feature = "squashfs",
     feature = "xfs",
     feature = "iso9660",
+    feature = "udf",
     feature = "grf",
     feature = "archive"
 ))]
@@ -2386,6 +2427,7 @@ fn repack_via_trait<F: fstool::fs::FilesystemFactory>(
         feature = "squashfs",
         feature = "xfs",
         feature = "iso9660",
+        feature = "udf",
         feature = "grf",
         feature = "archive"
     )
@@ -2675,6 +2717,19 @@ fn repack_layered_to_dst(
                 false,
             )?
         }
+        #[cfg(feature = "udf")]
+        "udf" => {
+            let mut opts = fstool::fs::udf::FormatOpts::default();
+            opts.volume_id = "FSTOOL".into();
+            opts.application_id = "fstool".into();
+            repack_layered_via_trait::<fstool::fs::udf::Udf>(
+                dst_dev.as_mut(),
+                &opts,
+                &model,
+                &layers,
+                false,
+            )?
+        }
         #[cfg(feature = "grf")]
         "grf" => repack_layered_via_trait::<fstool::fs::grf::Grf>(
             dst_dev.as_mut(),
@@ -2737,6 +2792,7 @@ fn repack_layered_to_dst(
     feature = "squashfs",
     feature = "xfs",
     feature = "iso9660",
+    feature = "udf",
     feature = "grf",
     feature = "archive"
 ))]
@@ -2965,6 +3021,19 @@ fn repack_tar_stream_to_fs(
                 false,
             )?
         }
+        #[cfg(feature = "udf")]
+        "udf" => {
+            let mut opts = fstool::fs::udf::FormatOpts::default();
+            opts.volume_id = "FSTOOL".into();
+            opts.application_id = "fstool".into();
+            repack_stream_via_trait::<fstool::fs::udf::Udf>(
+                dst_dev.as_mut(),
+                &opts,
+                tar_path,
+                codec,
+                false,
+            )?
+        }
         #[cfg(feature = "grf")]
         "grf" => repack_stream_via_trait::<fstool::fs::grf::Grf>(
             dst_dev.as_mut(),
@@ -3041,6 +3110,8 @@ fn is_stream_repack_target(fs: &str) -> bool {
         "cramfs" => true,
         #[cfg(feature = "iso9660")]
         "iso" | "iso9660" => true,
+        #[cfg(feature = "udf")]
+        "udf" => true,
         #[cfg(feature = "grf")]
         "grf" => true,
         #[cfg(feature = "archive")]
@@ -3605,6 +3676,7 @@ fn build(spec_path: &std::path::Path, output: &std::path::Path) -> fstool::Resul
     feature = "hfs",
     feature = "hfs-plus",
     feature = "iso9660",
+    feature = "udf",
     feature = "littlefs",
     feature = "ntfs",
     feature = "cramfs",
@@ -3644,6 +3716,7 @@ struct CreateArgs<'a> {
     feature = "hfs",
     feature = "hfs-plus",
     feature = "iso9660",
+    feature = "udf",
     feature = "littlefs",
     feature = "ntfs",
     feature = "cramfs",
@@ -3906,6 +3979,23 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             |o, m| o.apply_options(m),
             DEFAULT_MIN_SIZE,
         )?,
+        #[cfg(feature = "udf")]
+        "udf" => create_via_factory::<fstool::fs::udf::Udf>(
+            "udf",
+            source.as_ref(),
+            args.output,
+            args.size,
+            opts,
+            is_device,
+            create_opts,
+            fstool::fs::udf::FormatOpts::default(),
+            |o, m| {
+                // A block device is formatted across its whole capacity.
+                o.fill_device = is_device;
+                o.apply_options(m)
+            },
+            DEFAULT_MIN_SIZE,
+        )?,
         #[cfg(feature = "grf")]
         "grf" => create_via_factory::<fstool::fs::grf::Grf>(
             "grf",
@@ -3978,7 +4068,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
         // compile every arm above out, and the code below must stay reachable.
         other => Err(fstool::Error::InvalidArgument(format!(
             "create: unknown --type {other:?} (try ext4, fat32, exfat, hfs+, ntfs, \
-             f2fs, littlefs, squashfs, cramfs, xfs, iso, grf, apfs, zip, cpio, ar)"
+             f2fs, littlefs, squashfs, cramfs, xfs, iso, udf, grf, apfs, zip, cpio, ar)"
         )))?,
     }
     Ok(())
@@ -3995,6 +4085,7 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
     feature = "hfs",
     feature = "hfs-plus",
     feature = "iso9660",
+    feature = "udf",
     feature = "littlefs",
     feature = "cramfs",
     feature = "squashfs"
@@ -4210,6 +4301,7 @@ fn create_exfat(
     feature = "hfs",
     feature = "hfs-plus",
     feature = "iso9660",
+    feature = "udf",
     feature = "littlefs",
     feature = "ntfs",
     feature = "cramfs",
@@ -4337,6 +4429,7 @@ where
     feature = "hfs",
     feature = "hfs-plus",
     feature = "iso9660",
+    feature = "udf",
     feature = "littlefs",
     feature = "ntfs",
     feature = "cramfs",
@@ -4414,6 +4507,7 @@ fn truncate_output_file(output: &std::path::Path, len: u64) -> fstool::Result<()
     feature = "hfs",
     feature = "hfs-plus",
     feature = "iso9660",
+    feature = "udf",
     feature = "littlefs",
     feature = "ntfs",
     feature = "cramfs",
@@ -4484,6 +4578,7 @@ fn parse_cluster_size(s: &str) -> fstool::Result<u32> {
     feature = "hfs",
     feature = "hfs-plus",
     feature = "iso9660",
+    feature = "udf",
     feature = "littlefs",
     feature = "ntfs",
     feature = "cramfs",
@@ -5007,6 +5102,7 @@ fn print_fs_info(dev: &mut dyn fstool::block::BlockDevice, fs: &mut fstool::insp
         feature = "hfs",
         feature = "hfs-plus",
         feature = "iso9660",
+        feature = "udf",
         feature = "littlefs",
         feature = "ntfs",
         feature = "ramfs",
@@ -5046,6 +5142,8 @@ fn print_fs_info(dev: &mut dyn fstool::block::BlockDevice, fs: &mut fstool::insp
         fstool::inspect::AnyFs::Squashfs(sq) => print_squashfs_info(sq),
         #[cfg(feature = "iso9660")]
         fstool::inspect::AnyFs::Iso9660(iso) => print_iso9660_info(iso),
+        #[cfg(feature = "udf")]
+        fstool::inspect::AnyFs::Udf(udf) => print_udf_info(udf),
         #[cfg(feature = "grf")]
         fstool::inspect::AnyFs::Grf(grf) => print_grf_info(grf),
         // Archive backends carry no extra summary beyond the kind line
@@ -5295,6 +5393,50 @@ fn print_iso9660_info(iso: &fstool::fs::iso9660::Iso9660) {
         println!("  boot platform:   0x{:02x}", boot.default_entry.platform);
         println!("  boot lba:        {}", boot.default_entry.load_rba);
         println!("  boot sectors:    {}", boot.default_entry.sector_count);
+    }
+}
+
+#[cfg(feature = "udf")]
+fn print_udf_info(udf: &fstool::fs::udf::Udf) {
+    let Some(info) = udf.info() else { return };
+    println!("udf revision:      {}", info.revision_string());
+    let rev = |r: Option<u16>| {
+        r.map(fstool::fs::udf::format_rev)
+            .unwrap_or_else(|| "-".into())
+    };
+    println!(
+        "read/write revs:   min read {}, min write {}, max write {}",
+        rev(info.min_read_revision),
+        rev(info.min_write_revision),
+        rev(info.max_write_revision)
+    );
+    println!("nsr version:       {}", info.nsr_version);
+    println!("block size:        {}", info.block_size);
+    println!("total blocks:      {}", info.total_blocks);
+    println!("logical volume id: {}", info.logical_volume_id);
+    println!("volume id:         {}", info.volume_id);
+    println!("volume set id:     {}", info.volume_set_id);
+    println!("file set id:       {}", info.file_set_id);
+    println!("implementation:    {}", info.implementation_id);
+    if let (Some(f), Some(d)) = (info.num_files, info.num_dirs) {
+        println!("files / dirs:      {f} / {d}");
+    }
+    println!(
+        "integrity:         {}",
+        if info.integrity_open {
+            "open"
+        } else {
+            "closed"
+        }
+    );
+    for p in &info.partitions {
+        println!(
+            "partition {}:       {:?} number {} start {} length {} access {}",
+            p.reference, p.kind, p.number, p.start, p.length, p.access_type
+        );
+    }
+    for w in &info.warnings {
+        println!("warning:           {w}");
     }
 }
 
