@@ -571,7 +571,9 @@ fn rewrite_lvd(dev: &mut MemoryBackend, f: impl FnOnce(&mut Vec<u8>)) {
 
 #[test]
 fn reads_through_a_vat() {
-    for vat20 in [true, false] {
+    // `blank_tail`: the session ends well before the medium does (a
+    // pre-sized image file), so the VAT is followed by blank blocks.
+    for (vat20, blank_tail) in [(true, false), (false, false), (true, true), (false, true)] {
         let (mut dev, fsd, start, plen) = spare_room_image();
         // Virtual block 0 → the FSD; the rest unmapped.
         let mut entries: Vec<u32> = vec![fsd];
@@ -593,8 +595,13 @@ fn reads_through_a_vat() {
             body.extend_from_slice(&ecma::entity_id("*UDF Virtual Alloc Tbl", [0; 8]));
             body.extend_from_slice(&u32::MAX.to_le_bytes());
         }
-        // The VAT File Entry, data embedded, in the last partition block.
-        let vat_lbn = (plen - 1) as u32;
+        // The VAT File Entry, data embedded, in the last partition block
+        // (or the last written one, far before it).
+        let vat_lbn = if blank_tail {
+            plen - 1 - 1000
+        } else {
+            plen - 1
+        } as u32;
         let mut fe = vec![0u8; 176 + body.len()];
         ecma::put_u16(&mut fe, 20, 4);
         ecma::put_u16(&mut fe, 24, 1);

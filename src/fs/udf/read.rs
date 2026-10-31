@@ -1455,6 +1455,52 @@ fn find_vat(
     };
     let last = (dev.total_size() / u64::from(bs)).saturating_sub(1);
     let last = last.min(pstart + plen.saturating_sub(1));
+    // The VAT is the last thing the session wrote. A drive reports that
+    // block; an image file can't, and one sized past the session (as
+    // `mkudffs --media-type=cdr` leaves a pre-sized file) ends in blank
+    // blocks — so search back from the end, then from the last written one.
+    if let Some(found) = search_vat(dev, &vol, pstart, last, under)? {
+        return Ok(found);
+    }
+    if let Some(end) = last_written_block(dev, bs, pstart, last)?
+        && end + VAT_SEARCH_BLOCKS <= last
+        && let Some(found) = search_vat(dev, &vol, pstart, end, under)?
+    {
+        return Ok(found);
+    }
+    push_warning(warnings, "no VAT found near the end of the medium".into());
+    Err(crate::Error::InvalidImage(
+        "udf: virtual partition without a readable VAT".into(),
+    ))
+}
+
+/// The last block in `lo..=hi` holding a nonzero byte.
+fn last_written_block(dev: &mut dyn BlockDevice, bs: u32, lo: u64, hi: u64) -> Result<Option<u64>> {
+    const CHUNK: u64 = 64;
+    let bs = u64::from(bs);
+    let mut buf = vec![0u8; (CHUNK * bs) as usize];
+    let mut end = hi + 1;
+    while end > lo {
+        let start = end.saturating_sub(CHUNK).max(lo);
+        let n = ((end - start) * bs) as usize;
+        dev.read_at(start * bs, &mut buf[..n])?;
+        if let Some(i) = buf[..n].iter().rposition(|&b| b != 0) {
+            return Ok(Some(start + i as u64 / bs));
+        }
+        end = start;
+    }
+    Ok(None)
+}
+
+/// Look for a VAT File Entry in the [`VAT_SEARCH_BLOCKS`] blocks ending
+/// at `last`.
+fn search_vat(
+    dev: &mut dyn BlockDevice,
+    vol: &Volume,
+    pstart: u64,
+    last: u64,
+    under: usize,
+) -> Result<Option<(Vec<u32>, VatInfo)>> {
     for back in 0..VAT_SEARCH_BLOCKS {
         let Some(abs) = last.checked_sub(back) else {
             break;
@@ -1490,7 +1536,7 @@ fn find_vat(
                 .iter()
                 .map(|c| u32::from_le_bytes(*c))
                 .collect();
-            return Ok((vat, info));
+            return Ok(Some((vat, info)));
         }
         if ino.file_type == 0 && ino.size >= 36 {
             let body = vol.read_all(dev, &ino, MAX_VAT_BYTES)?;
@@ -1502,14 +1548,11 @@ fn find_vat(
                     .iter()
                     .map(|c| u32::from_le_bytes(*c))
                     .collect();
-                return Ok((vat, VatInfo::default()));
+                return Ok(Some((vat, VatInfo::default())));
             }
         }
     }
-    push_warning(warnings, "no VAT found near the end of the medium".into());
-    Err(crate::Error::InvalidImage(
-        "udf: virtual partition without a readable VAT".into(),
-    ))
+    Ok(None)
 }
 
 /// Walk the integrity sequence and record the prevailing LVID's contents.
