@@ -952,15 +952,28 @@ fn require_fs_feature(verb: &str, name: &str) -> fstool::Result<()> {
     }
 }
 
+/// Stack for the thread that runs the CLI. Windows gives the main thread
+/// only 1 MiB, which the argument parser (a large subcommand enum) and
+/// the deeper filesystem paths overflow.
+const MAIN_STACK: usize = 16 << 20;
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    match run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("fstool: {e}");
-            ExitCode::from(1)
-        }
-    }
+    let worker = std::thread::Builder::new()
+        .name("fstool".into())
+        .stack_size(MAIN_STACK)
+        .spawn(|| {
+            let cli = Cli::parse();
+            match run(cli) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("fstool: {e}");
+                    ExitCode::from(1)
+                }
+            }
+        })
+        .expect("spawn the fstool thread");
+    // A panic in the worker has already printed its message.
+    worker.join().unwrap_or(ExitCode::from(101))
 }
 
 fn run(cli: Cli) -> fstool::Result<()> {
