@@ -1,4 +1,6 @@
 #![cfg(all(unix, feature = "udf"))]
+// Some helpers and imports serve only the macOS (hdiutil) tests.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 //! Native validation of the UDF backend against independent
 //! implementations.
 //!

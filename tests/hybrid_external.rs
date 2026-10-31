@@ -1,4 +1,6 @@
 #![cfg(feature = "hybrid")]
+// Some helpers and imports serve only the macOS (hdiutil) tests.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 //! Native validation of ISO 9660 / Joliet / HFS+ hybrids: independent
 //! readers must see the same intended tree and the same payload bytes
 //! through every advertised view.
