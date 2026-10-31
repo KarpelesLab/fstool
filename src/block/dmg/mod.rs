@@ -22,6 +22,17 @@
 //! sink, with a whole-device or partition-oriented (GPT / APM / MBR)
 //! `blkx` map.
 //!
+//! Container-level inspection and editing, all without decoding or
+//! re-encoding a chunk: [`inspect_udif`] (trailers, segments, `blkx`
+//! tables, resources, code signature), [`verify_udif`] (the embedded
+//! checksums, as `hdiutil verify`), the resource map ([`UdifResources`],
+//! in `hdiutil udifderez -xml` form) and, with `dmg-write`,
+//! `edit_udif_resources`, `segment_udif` / `join_udif` and
+//! `remove_code_signature`. Segmented images (`name.dmg`,
+//! `name.002.dmgpart`, …) open through [`DmgBackend::open`] from their
+//! first file. Re-encoding operations (conversion, container resize) are
+//! in [`crate::block::imageops`].
+//!
 //! ## File layout (recap)
 //!
 //! ```text
@@ -47,11 +58,18 @@
 //! source / SDK was consulted.
 
 mod codec;
+mod container;
 pub mod encrypted;
 #[cfg(feature = "dmg-write")]
 mod layout;
 mod mish;
+#[cfg(feature = "dmg-write")]
+mod ops;
 mod plist;
+mod policy;
+mod pvalue;
+mod resources;
+mod verify;
 #[cfg(feature = "dmg-write")]
 mod writer;
 
@@ -60,14 +78,25 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::Result;
-use crate::base64;
 use crate::block::BlockDevice;
 
+pub use container::{
+    BlkxEntry, CodeSignature, MAX_SEGMENTS, StoredChecksum, UdifInfo, UdifSegment, inspect_udif,
+    read_legacy_resource_fork, udif_segment_path,
+};
 pub use encrypted::{
     ENCRCDSA_MAGIC, ENCRCDSA_V2_HEADER_MIN_BYTES, EncryptedDmgBackend, EncryptedDmgHeader,
     probe as probe_encrypted,
 };
 pub use mish::{Chunk, ChunkType, Mish};
+#[cfg(feature = "dmg-write")]
+pub use ops::{
+    JoinOptions, ResourceEdit, SegmentOptions, SegmentReport, edit_udif_resources, join_udif,
+    remove_code_signature, segment_udif,
+};
+pub use policy::{LegacyForkPolicy, SignaturePolicy, UdifRewritePolicy};
+pub use resources::{BLKX_RESOURCE, UdifResource, UdifResources};
+pub use verify::{ChecksumCheck, ChecksumStatus, UdifVerifyReport, verify_udif};
 #[cfg(feature = "dmg-write")]
 pub use writer::{
     MAX_MAP_ENTRIES, MAX_WRITE_CHUNK_SECTORS, UdifChecksum, UdifFormat, UdifLayout, UdifMapEntry,
@@ -255,19 +284,20 @@ const MAX_CHUNK_SECTORS: u64 = 1 << 24;
 
 /// Read-only DMG backend.
 ///
-/// Holds the source file, the decoded koly trailer, and all per-partition
-/// mish blocks recovered from the resource-fork plist. [`read_at`]
-/// walks the virtual byte range, locates each chunk it intersects in a
-/// flat list sorted by virtual-sector start, and emits zero / raw /
-/// zlib-decompressed bytes. The other compressed chunk kinds are
-/// recognised but error out as [`crate::Error::Unsupported`] — this
-/// matches the README's "Limitations" entry.
+/// Holds the image's open segment file(s), the decoded trailer and
+/// resource plist, and all per-partition mish blocks. [`read_at`] walks
+/// the virtual byte range, locates each chunk it intersects in a flat list
+/// sorted by virtual-sector start, and emits zero / raw / decompressed
+/// bytes. A chunk kind whose codec is compiled out reads as
+/// [`crate::Error::Unsupported`].
+///
+/// A segmented image (`name.dmg`, `name.002.dmgpart`, …) is opened from
+/// its first file; the others are found and validated (see
+/// [`udif_segment_path`]).
 ///
 /// [`read_at`]: BlockDevice::read_at
-#[derive(Debug)]
 pub struct DmgBackend {
-    file: File,
-    trailer: KolyTrailer,
+    container: container::Container,
     /// Cached virtual size in bytes (`sector_count * 512`).
     virtual_size: u64,
     /// Position of the implicit `Seek` cursor — kept so the `Seek`
@@ -284,124 +314,47 @@ pub struct DmgBackend {
     decoded: Option<(usize, Vec<u8>)>,
 }
 
+impl std::fmt::Debug for DmgBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DmgBackend")
+            .field("trailer", self.trailer())
+            .field("segments", &self.container.segs.len())
+            .field("virtual_size", &self.virtual_size)
+            .field("chunks", &self.chunks.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl DmgBackend {
     /// Open a DMG file. Validates the koly trailer, the version field
     /// (must be 4), and loads the resource-fork plist + every mish
-    /// block it references. Errors out for multi-segment images
-    /// (segment_count > 1) and for plists that carry no `blkx` array.
+    /// block it references. A segmented image is opened from its first
+    /// file, and its other segments are found beside it and checked
+    /// (same segment ID and count, consecutive numbers, contiguous data
+    /// fork). Plists that carry no `blkx` array are refused.
     pub fn open(path: &Path) -> Result<Self> {
-        let meta = std::fs::metadata(path)?;
-        if meta.len() < KOLY_SIZE {
-            return Err(crate::Error::InvalidImage(
-                "dmg: file smaller than the 512-byte koly trailer".into(),
-            ));
-        }
-        let mut file = File::open(path)?;
-        let trailer_offset = meta.len() - KOLY_SIZE;
-        file.seek(SeekFrom::Start(trailer_offset))?;
-        let mut buf = vec![0u8; KOLY_SIZE as usize];
-        file.read_exact(&mut buf)?;
-        let trailer = KolyTrailer::decode(&buf)?;
-        if trailer.segment_count > 1 {
-            return Err(crate::Error::Unsupported(format!(
-                "dmg: multi-segment images not supported (segment_count = {})",
-                trailer.segment_count
-            )));
-        }
-        let virtual_size = trailer
+        Self::from_container(container::Container::open(path)?)
+    }
+
+    /// Open a single-file UDIF image held in any seekable source of `len`
+    /// bytes — the plaintext of an [`EncryptedDmgBackend`], an image in
+    /// memory, … The source is read on demand.
+    pub fn from_reader<R: Read + Seek + Send + 'static>(src: R, len: u64) -> Result<Self> {
+        Self::from_container(container::Container::from_source(Box::new(src), len)?)
+    }
+
+    fn from_container(container: container::Container) -> Result<Self> {
+        let virtual_size = container
+            .info
             .sector_count
             .checked_mul(512)
             .ok_or_else(|| crate::Error::InvalidImage("dmg: sector_count overflows u64".into()))?;
-
-        // The data fork has to lie inside the file. Every per-chunk bound
-        // below is relative to `data_fork_length`, so without this a
-        // descriptor could declare an exabyte fork and have a chunk's
-        // `compressed_length` size an allocation the file can never back.
-        let fork_end = trailer
-            .data_fork_offset
-            .checked_add(trailer.data_fork_length)
-            .ok_or_else(|| {
-                crate::Error::InvalidImage("dmg: data fork extent overflows u64".into())
-            })?;
-        if fork_end > meta.len() {
-            return Err(crate::Error::InvalidImage(format!(
-                "dmg: data fork (offset {} + length {} = {fork_end}) exceeds file length {}",
-                trailer.data_fork_offset,
-                trailer.data_fork_length,
-                meta.len()
-            )));
-        }
-
-        // Pull the XML plist out of the resource-fork window.
-        if trailer.xml_length == 0 {
-            return Err(crate::Error::InvalidImage(
-                "dmg: koly trailer has empty XML resource fork (xml_length = 0)".into(),
-            ));
-        }
-        // The plist can be up to ~megabytes for huge images; that's
-        // still fine to hold in RAM (it's a tiny fraction of the
-        // image and we need random access to all of it to parse).
-        // Cap it at 128 MiB to keep hostile inputs from OOMing.
-        const MAX_PLIST_BYTES: u64 = 128 * 1024 * 1024;
-        if trailer.xml_length > MAX_PLIST_BYTES {
-            return Err(crate::Error::InvalidImage(format!(
-                "dmg: resource-fork plist is implausibly large ({} bytes)",
-                trailer.xml_length
-            )));
-        }
-        file.seek(SeekFrom::Start(trailer.xml_offset))?;
-        let mut plist_bytes = vec![0u8; trailer.xml_length as usize];
-        file.read_exact(&mut plist_bytes)?;
-        let plist_str = std::str::from_utf8(&plist_bytes).map_err(|e| {
-            crate::Error::InvalidImage(format!("dmg: resource-fork plist isn't UTF-8: {e}"))
-        })?;
-
-        let data_entries = plist::extract_blkx_data_entries(plist_str)?;
-        if data_entries.is_empty() {
-            return Err(crate::Error::InvalidImage(
-                "dmg: blkx array is empty — no chunks to map".into(),
-            ));
-        }
-
-        let mut chunks: Vec<Chunk> = Vec::new();
-        for entry in &data_entries {
-            let raw = base64::decode(entry)?;
-            let m = mish::decode_mish(&raw)?;
-            chunks.extend(m.chunks);
-        }
-
-        // Bound every chunk against the declared geometry before any read so
-        // a hostile descriptor can't later drive an unbounded allocation:
-        //
-        // - `sector_count` (uncompressed span) must stay within the cap that
-        //   `decode_chunk` enforces, so the plaintext buffer is bounded.
-        // - the compressed payload `[offset, offset+length)` must lie inside
-        //   the data fork, so `read_compressed_payload` can't be asked to
-        //   allocate and read a ~TiB-sized buffer from a tiny file.
-        for c in &chunks {
-            if c.sector_count > MAX_CHUNK_SECTORS {
-                return Err(crate::Error::InvalidImage(format!(
-                    "dmg: chunk sector_count {} exceeds maximum {MAX_CHUNK_SECTORS}",
-                    c.sector_count
-                )));
-            }
-            let comp_end = c
-                .compressed_offset_in_fork
-                .checked_add(c.compressed_length)
-                .ok_or_else(|| {
-                    crate::Error::InvalidImage("dmg: chunk compressed extent overflows u64".into())
-                })?;
-            if comp_end > trailer.data_fork_length {
-                return Err(crate::Error::InvalidImage(format!(
-                    "dmg: chunk compressed extent (offset {} + length {} = {}) exceeds \
-                     data fork length {}",
-                    c.compressed_offset_in_fork,
-                    c.compressed_length,
-                    comp_end,
-                    trailer.data_fork_length
-                )));
-            }
-        }
+        let mut chunks: Vec<Chunk> = container
+            .info
+            .blkx
+            .iter()
+            .flat_map(|b| b.chunks.iter().copied())
+            .collect();
 
         // Zero-length chunks map nothing, and one that shares its start
         // sector with a real chunk would win the "last chunk starting at or
@@ -429,8 +382,7 @@ impl DmgBackend {
         }
 
         Ok(Self {
-            file,
-            trailer,
+            container,
             virtual_size,
             cursor: 0,
             chunks,
@@ -438,9 +390,15 @@ impl DmgBackend {
         })
     }
 
-    /// Borrow the decoded trailer for diagnostics.
+    /// Borrow the decoded trailer (of the first segment) for diagnostics.
     pub fn trailer(&self) -> &KolyTrailer {
-        &self.trailer
+        self.container.info.trailer()
+    }
+
+    /// Everything the image's trailers and plist say: segments, `blkx`
+    /// entries, resources, checksums, code signature.
+    pub fn info(&self) -> &UdifInfo {
+        &self.container.info
     }
 
     /// Number of chunks discovered across all mish blocks. Useful
@@ -449,23 +407,21 @@ impl DmgBackend {
         self.chunks.len()
     }
 
+    /// Read bytes of the logical data fork (across segments).
+    pub(crate) fn read_fork(&mut self, off: u64, buf: &mut [u8]) -> Result<()> {
+        self.container.read_fork(off, buf)
+    }
+
     /// Read the raw on-disk bytes of a single chunk's compressed
     /// payload. Splits out of [`read_chunk_into`] so the latter can
     /// hand the buffer to a codec without re-reading.
     fn read_compressed_payload(&mut self, chunk: &Chunk) -> Result<Vec<u8>> {
-        let abs_offset = self
-            .trailer
-            .data_fork_offset
-            .checked_add(chunk.compressed_offset_in_fork)
-            .ok_or_else(|| {
-                crate::Error::InvalidImage(
-                    "dmg: chunk absolute offset overflows the data fork".into(),
-                )
-            })?;
-        let len = chunk.compressed_length as usize;
-        self.file.seek(SeekFrom::Start(abs_offset))?;
+        let len = usize::try_from(chunk.compressed_length).map_err(|_| {
+            crate::Error::InvalidImage("dmg: chunk compressed length overflows usize".into())
+        })?;
         let mut buf = vec![0u8; len];
-        self.file.read_exact(&mut buf)?;
+        self.container
+            .read_fork(chunk.compressed_offset_in_fork, &mut buf)?;
         Ok(buf)
     }
 
@@ -476,7 +432,7 @@ impl DmgBackend {
     /// small (typically 2 MiB / 4096 sectors at most) — peeking into
     /// arbitrary byte ranges of a deflate stream isn't possible without
     /// running the inflate state machine to that point anyway.
-    fn decode_chunk(&mut self, chunk: &Chunk) -> Result<Vec<u8>> {
+    pub(crate) fn decode_chunk(&mut self, chunk: &Chunk) -> Result<Vec<u8>> {
         // `sector_count` is attacker-controlled with no magnitude bound in the
         // on-disk format. A single tiny chunk could otherwise request a ~512
         // TiB allocation on the first read. Real chunks are small (typically
@@ -919,20 +875,31 @@ mod tests {
     }
 
     #[test]
-    fn open_rejects_multi_segment() {
+    fn open_rejects_a_segment_set_with_missing_parts() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("img.dmg");
         let mut t = fake_trailer(0, 4, 0, 0, 0, 0);
-        // segment_count at 0x03C
+        // segment_number at 0x038, segment_count at 0x03C
+        t[0x038..0x03C].copy_from_slice(&1u32.to_be_bytes());
         t[0x03C..0x040].copy_from_slice(&3u32.to_be_bytes());
         let mut content = vec![0u8; 8192];
         content.extend_from_slice(&t);
         std::fs::write(&p, &content).unwrap();
         let err = DmgBackend::open(&p).unwrap_err();
         match err {
-            crate::Error::Unsupported(_) => {}
-            _ => panic!("expected Unsupported, got {err:?}"),
+            crate::Error::InvalidImage(m) => assert!(m.contains("img.002.dmgpart"), "{m}"),
+            _ => panic!("expected InvalidImage, got {err:?}"),
         }
+        // A later segment opened on its own points at the first.
+        let q = dir.path().join("img.002.dmgpart");
+        t[0x038..0x03C].copy_from_slice(&2u32.to_be_bytes());
+        let mut content = vec![0u8; 8192];
+        content.extend_from_slice(&t);
+        std::fs::write(&q, &content).unwrap();
+        assert!(matches!(
+            DmgBackend::open(&q),
+            Err(crate::Error::InvalidArgument(_))
+        ));
     }
 
     /// End-to-end: build a one-chunk raw DMG, open it, read the bytes

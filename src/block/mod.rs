@@ -47,6 +47,8 @@ pub mod diskcopy;
 pub mod dmg;
 #[cfg(feature = "std")]
 pub mod file;
+#[cfg(feature = "std")]
+pub mod imageops;
 #[cfg(feature = "luks")]
 pub mod luks;
 pub mod memory;

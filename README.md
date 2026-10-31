@@ -281,7 +281,7 @@ Every format passes `hdiutil verify`, attach + raw readback and a real
 mount on macOS, whole-device and over GPT / APM / MBR disks, with the
 same `blkx` map `hdiutil convert` writes (`tests/dmg_write_external.rs`).
 From the CLI: `fstool convert disk.img out.dmg [--dmg-format UDBZ]
-[--dmg-level 9] [--dmg-checksum md5] [--dmg-layout auto|whole]`.
+[--dmg-level 9] [--dmg-checksum md5] [--dmg-layout preserve|auto|whole]`.
 
 ```rust
 use fstool::block::dmg::{UdifFormat, UdifWriteOptions, write_udif};
@@ -293,6 +293,29 @@ let tmp = std::fs::File::create("out.dmg.partial")?;
 let (tmp, summary) = write_udif(&mut volume, tmp, &opts)?;
 tmp.sync_all()?; // then sign / rename — the caller's call
 ```
+
+### Container operations
+
+`block::imageops` and `block::dmg` work on images *as containers*,
+streaming sectors through `BlockDevice` without touching the filesystem
+inside. Outputs are built beside the destination and renamed on success,
+so a failure never clobbers an existing file; credentials, checksum
+algorithms and anything that loses data (a shrink over data, a code
+signature, resources a target can't hold) are explicit options.
+
+| Operation | Library | CLI |
+|---|---|---|
+| Convert raw / UDIF (any format, segmented too) / sparse / qcow2 / encrypted `.dmg` → raw / UDIF / sparse / qcow2, logical sectors exact; a partitioned `.dmg` keeps its `blkx` map, other resources (SLA…) carried | `imageops::convert_image` | `fstool convert` |
+| CRC-32 / MD5 over logical sectors (= `hdiutil checksum`) or stored bytes; others are `Unsupported` | `imageops::image_checksum` | `fstool checksum` |
+| Verify embedded partition, data-fork (per segment) and master checksums (= `hdiutil verify`) | `dmg::verify_udif` | `fstool verify` |
+| Resize the **container only** (raw, sparse, UDIF): grow with zeros, shrink only over zeros unless `ShrinkData::Discard`; filesystem and partition table untouched | `imageops::resize_container` | `fstool resize` |
+| Segment (`out.dmg`, `out.002.dmgpart`, …) / join, validating segment IDs, numbers, ranges and checksums; segmented images also open directly | `dmg::segment_udif`, `dmg::join_udif` | `fstool segment`, `fstool join` |
+| Export / import resources (`udifderez -xml` form); `blkx` is protected | `dmg::UdifResources`, `dmg::edit_udif_resources` | `fstool udif-derez`, `fstool udif-rez` |
+| Code-signed images: rewrites refuse unless `SignaturePolicy::Remove` (re-signing is out of scope — use `codesign`) | `dmg::UdifRewritePolicy`, `dmg::remove_code_signature` | `--remove-signature`, `fstool unsign` |
+
+Cross-checked against `hdiutil verify` / `attach` / `checksum` / `segment`
+/ `udifrez` / `udifderez` / `imageinfo` and `codesign` in
+`tests/dmg_ops_external.rs`.
 
 ### Backing files
 

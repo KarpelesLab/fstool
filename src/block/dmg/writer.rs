@@ -379,6 +379,11 @@ pub struct UdifWriteOptions {
     /// How the device is split into `blkx` entries. Default
     /// [`UdifLayout::WholeDevice`].
     pub layout: UdifLayout,
+    /// Further resources for the plist beside `blkx` — a licence
+    /// agreement (`LPic`, `TEXT`, `STR#`, …), carried-over resources of a
+    /// converted image. Must not contain `blkx`. A `plst` here replaces
+    /// the constant one `hdiutil` writes. Default none. Ignored for UDRW.
+    pub resources: super::UdifResources,
 }
 
 impl Default for UdifWriteOptions {
@@ -392,6 +397,7 @@ impl Default for UdifWriteOptions {
             partition_name: "whole disk (Apple_HFS : 0)".into(),
             segment_id: None,
             layout: UdifLayout::default(),
+            resources: super::UdifResources::default(),
         }
     }
 }
@@ -442,6 +448,16 @@ impl UdifWriteOptions {
         check_name("partition_name", &self.partition_name)?;
         if let UdifLayout::Map(map) = &self.layout {
             check_map(map)?;
+        }
+        for r in &self.resources.entries {
+            super::resources::check_kind(&r.kind)?;
+            if r.kind == super::BLKX_RESOURCE {
+                return Err(crate::Error::InvalidArgument(
+                    "dmg: UdifWriteOptions::resources must not contain blkx — the writer \
+                     builds the chunk tables itself"
+                        .into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -1000,7 +1016,11 @@ impl<W: Write + Seek> UdifWriter<W> {
         let master = master.finish();
         let fork = std::mem::replace(&mut self.fork_sum, Digest::None).finish();
 
-        let plist = build_plist(&self.done);
+        let plist = if self.opts.resources.entries.is_empty() {
+            build_plist(&self.done)
+        } else {
+            build_plist_with(&self.done, &self.opts.resources)
+        };
         self.out.write_all(plist.as_bytes())?;
 
         let data_fork_offset = self.base;
@@ -1251,6 +1271,36 @@ fn push_data(out: &mut String, bytes: &[u8]) {
         out.push('\n');
     }
     out.push_str("\t\t\t\t</data>\n");
+}
+
+/// The constant `plst` resource `hdiutil` writes.
+pub(crate) fn plst_resource() -> super::UdifResource {
+    let mut plst = vec![0u8; PLST_LEN];
+    plst[PLST_ONES_AT..PLST_ONES_AT + 4].copy_from_slice(&[0, 1, 0, 1]);
+    let mut r = super::UdifResource::new("plst", 0, plst);
+    r.attributes = 0x0050;
+    r
+}
+
+/// The plist with caller resources beside `blkx`, through the generic
+/// serialiser.
+fn build_plist_with(blkx: &[Blkx], extra: &super::UdifResources) -> String {
+    let mut res = super::UdifResources::new();
+    for b in blkx {
+        let mut r = super::UdifResource::new(super::BLKX_RESOURCE, b.id, b.mish.clone());
+        r.name = b.name.clone();
+        r.cf_name = Some(b.name.clone());
+        r.attributes = 0x0050;
+        res.entries.push(r);
+    }
+    if extra.of_kind("plst").next().is_none() {
+        res.entries.push(plst_resource());
+    }
+    res.entries.extend(extra.entries.iter().cloned());
+    super::pvalue::write_document(&super::pvalue::Value::Dict(vec![(
+        "resource-fork".into(),
+        res.to_value(),
+    )]))
 }
 
 /// The resource-fork plist, in the shape `hdiutil` writes: the `blkx`

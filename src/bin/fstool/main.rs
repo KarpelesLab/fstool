@@ -15,6 +15,7 @@
 //!   on supported filesystems.
 
 mod dd;
+mod imgops;
 mod safety;
 mod shell;
 
@@ -392,11 +393,13 @@ enum Command {
         with_cache: bool,
     },
 
-    /// Convert an image between container formats (raw ↔ qcow2, or to a
-    /// read-only UDIF `.dmg`). Streams every byte from SRC to DST; no
-    /// filesystem awareness, so this works on partitioned disks just as
-    /// well as bare filesystems. Use `repack` instead if you want to
-    /// shrink the image — `convert` can only grow it.
+    /// Convert an image between container formats (raw, qcow2, UDIF
+    /// `.dmg` of any format, `.sparseimage`, `.sparsebundle`). Streams
+    /// every logical sector from SRC to DST; no filesystem awareness, so
+    /// this works on partitioned disks just as well as bare filesystems.
+    /// From a partitioned `.dmg` to `.dmg` the blkx map is kept. Use
+    /// `repack` instead if you want to shrink the filesystem — `convert`
+    /// can only grow it (and `resize` changes only the container).
     Convert {
         /// Source image (raw, qcow2, dmg, or block device).
         #[arg(value_name = "SRC")]
@@ -422,12 +425,28 @@ enum Command {
         #[cfg(feature = "dmg-write")]
         #[arg(long, value_name = "KIND")]
         dmg_checksum: Option<String>,
-        /// UDIF blkx map: `auto` (the default — one entry per partition
-        /// region when SRC has a GPT / APM / MBR, as hdiutil does) or
-        /// `whole` (one whole-device entry).
+        /// UDIF blkx map: `preserve` (the default for a .dmg source — keep
+        /// its map), `auto` (the default otherwise — one entry per
+        /// partition region when SRC has a GPT / APM / MBR, as hdiutil
+        /// does) or `whole` (one whole-device entry).
         #[cfg(feature = "dmg-write")]
         #[arg(long, value_name = "LAYOUT")]
         dmg_layout: Option<String>,
+        /// Discard the source .dmg's resources (licence agreement, …)
+        /// instead of carrying them — required when DST cannot hold them.
+        #[cfg(feature = "dmg")]
+        #[arg(long)]
+        drop_resources: bool,
+        /// Allow a code-signed source .dmg; the output is unsigned (re-sign
+        /// it with codesign).
+        #[cfg(feature = "dmg")]
+        #[arg(long)]
+        remove_signature: bool,
+        /// Allow a source .dmg with a legacy binary resource fork, which the
+        /// output cannot keep.
+        #[cfg(feature = "dmg")]
+        #[arg(long)]
+        discard_legacy_resource_fork: bool,
         /// Destination size. Defaults to the source's virtual size. May
         /// be larger (grows the image with all-zero tail) but not smaller.
         #[arg(long, value_name = "SIZE")]
@@ -481,13 +500,14 @@ enum Command {
         dry_run: bool,
     },
 
-    /// Change the virtual size of an Apple `.sparseimage` /
-    /// `.sparsebundle` (the disk, not the filesystem on it). Shrinking is
-    /// refused when any byte past the new end is nonzero, unless
-    /// `--discard` says to drop it.
-    #[cfg(feature = "sparse-image")]
+    /// Change the virtual size of an image *container* — a raw file, an
+    /// Apple `.sparseimage` / `.sparsebundle` or a single-file UDIF
+    /// `.dmg`. Container only: the filesystem and the partition table on
+    /// it are NOT resized (grow them afterwards with their own tools).
+    /// Growing appends zero sectors; shrinking is refused when any byte
+    /// past the new end is nonzero, unless `--discard` says to drop it.
     Resize {
-        /// The `.sparseimage` file or `.sparsebundle` directory.
+        /// The image file (or `.sparsebundle` directory).
         #[arg(value_name = "IMAGE")]
         image: PathBuf,
         /// New size, e.g. "2GiB" — a multiple of 512 bytes.
@@ -496,7 +516,44 @@ enum Command {
         /// Allow a shrink to discard nonzero data past the new end.
         #[arg(long)]
         discard: bool,
+        /// Allow resizing a code-signed .dmg; the result is unsigned.
+        #[arg(long)]
+        remove_signature: bool,
     },
+
+    /// Checksum an image: CRC-32 or MD5 over its logical sectors (the
+    /// decoded disk, as `hdiutil checksum -type CRC32|MD5`) or over its
+    /// stored bytes (a .dmg's data fork, any other image's file).
+    Checksum(imgops::ChecksumArgs),
+
+    /// Verify a UDIF image's embedded checksums (per-partition, data fork
+    /// of every segment, master), as `hdiutil verify`. Exits non-zero
+    /// when any mismatches or cannot be computed.
+    #[cfg(feature = "dmg")]
+    Verify(imgops::VerifyArgs),
+
+    /// Split a UDIF image into segments (`out.dmg`, `out.002.dmgpart`, …)
+    /// as `hdiutil segment` does.
+    #[cfg(feature = "dmg-write")]
+    Segment(imgops::SegmentArgs),
+
+    /// Join a segmented UDIF image back into one file, validating the
+    /// segment IDs, numbers, ranges and checksums.
+    #[cfg(feature = "dmg-write")]
+    Join(imgops::JoinArgs),
+
+    /// Print a UDIF image's resources (in `hdiutil udifderez -xml` form).
+    #[cfg(feature = "dmg")]
+    UdifDerez(imgops::UdifDerezArgs),
+
+    /// Add, replace or remove a UDIF image's resources (as `hdiutil
+    /// udifrez`); `blkx` is never touched.
+    #[cfg(feature = "dmg-write")]
+    UdifRez(imgops::UdifRezArgs),
+
+    /// Remove a UDIF image's embedded code signature.
+    #[cfg(feature = "dmg-write")]
+    Unsign(imgops::UnsignArgs),
 
     /// Repack an image into a fresh filesystem at a (possibly different)
     /// size. Walks SRC's filesystem, stages each file into a host
@@ -1012,6 +1069,12 @@ fn run(cli: Cli) -> fstool::Result<()> {
             dmg_checksum,
             #[cfg(feature = "dmg-write")]
             dmg_layout,
+            #[cfg(feature = "dmg")]
+            drop_resources,
+            #[cfg(feature = "dmg")]
+            remove_signature,
+            #[cfg(feature = "dmg")]
+            discard_legacy_resource_fork,
             size,
             force,
             #[cfg(feature = "qcow2")]
@@ -1019,35 +1082,87 @@ fn run(cli: Cli) -> fstool::Result<()> {
             #[cfg(feature = "qcow2")]
             compress,
         } => {
-            #[cfg(feature = "dmg-write")]
-            if dmg_format.is_some()
-                || dmg_checksum.is_some()
-                || dmg_layout.is_some()
-                || is_dmg_path(&dst)
+            #[cfg(feature = "dmg")]
             {
+                #[cfg(feature = "dmg-write")]
+                let to_dmg = dmg_format.is_some()
+                    || dmg_checksum.is_some()
+                    || dmg_layout.is_some()
+                    || is_dmg_path(&dst);
+                #[cfg(not(feature = "dmg-write"))]
+                let to_dmg = false;
                 #[cfg(feature = "qcow2")]
-                if compress.is_some() {
-                    return Err(fstool::Error::InvalidArgument(
-                        "convert: --compress applies to qcow2; use --dmg-format / --dmg-level \
-                         for a .dmg destination"
-                            .into(),
-                    ));
-                }
-                #[cfg(feature = "qcow2")]
-                let create_opts = container.create_opts(&cluster_size)?;
+                let compressing = compress.is_some();
                 #[cfg(not(feature = "qcow2"))]
-                let create_opts = container.create_opts()?;
-                return convert_to_dmg(DmgConvertArgs {
-                    src: &src,
-                    dst: &dst,
-                    size_arg: size.as_deref(),
-                    password: password.as_deref(),
-                    format: dmg_format.as_deref(),
-                    level: dmg_level,
-                    checksum: dmg_checksum.as_deref(),
-                    layout: dmg_layout.as_deref(),
-                    create_opts: &create_opts,
-                });
+                let compressing = false;
+                // A UDIF image, or a passphrase-protected (`encrcdsa`) one,
+                // which the byte-copy path would copy as ciphertext.
+                let from_dmg = src.is_file()
+                    && (fstool::block::dmg::probe(&src).unwrap_or(false)
+                        || fstool::block::dmg::probe_encrypted(&src).unwrap_or(false));
+                // The library converter covers every .dmg source or target;
+                // a .dmg source into a block device, a compressed qcow2 or a
+                // grown raw image keeps the byte-copy path below.
+                let lib_path = to_dmg
+                    || (from_dmg
+                        && size.is_none()
+                        && !compressing
+                        && !fstool::block::file::is_block_device(&dst)
+                        && !fstool::block::is_qcow2_path(&dst));
+                if lib_path {
+                    if to_dmg && compressing {
+                        return Err(fstool::Error::InvalidArgument(
+                            "convert: --compress applies to qcow2; use --dmg-format / \
+                             --dmg-level for a .dmg destination"
+                                .into(),
+                        ));
+                    }
+                    #[cfg(feature = "qcow2")]
+                    let create_opts = container.create_opts(&cluster_size)?;
+                    #[cfg(not(feature = "qcow2"))]
+                    let create_opts = container.create_opts()?;
+                    if create_opts.encrypt.is_some() || create_opts.backing.is_some() {
+                        return Err(fstool::Error::Unsupported(
+                            "convert: encrypted or backed output is not supported for a .dmg \
+                             source or destination"
+                                .into(),
+                        ));
+                    }
+                    if let Some(sz) = &size {
+                        let src_size = imgops_size(&src, password.as_deref())?;
+                        if fstool::spec::parse_size(sz)? != src_size {
+                            return Err(fstool::Error::Unsupported(
+                                "convert: --size is not supported for a .dmg destination; \
+                                 convert, then `fstool resize` the container"
+                                    .into(),
+                            ));
+                        }
+                    }
+                    return imgops::lib_convert(imgops::LibConvert {
+                        src: &src,
+                        dst: &dst,
+                        password: password.as_deref(),
+                        #[cfg(feature = "dmg-write")]
+                        format: dmg_format.as_deref(),
+                        #[cfg(not(feature = "dmg-write"))]
+                        format: None,
+                        #[cfg(feature = "dmg-write")]
+                        level: dmg_level,
+                        #[cfg(not(feature = "dmg-write"))]
+                        level: None,
+                        #[cfg(feature = "dmg-write")]
+                        checksum: dmg_checksum.as_deref(),
+                        #[cfg(not(feature = "dmg-write"))]
+                        checksum: None,
+                        #[cfg(feature = "dmg-write")]
+                        layout: dmg_layout.as_deref(),
+                        #[cfg(not(feature = "dmg-write"))]
+                        layout: None,
+                        drop_resources,
+                        remove_signature,
+                        discard_legacy_fork: discard_legacy_resource_fork,
+                    });
+                }
             }
             #[cfg(feature = "qcow2")]
             let comp = parse_compress(compress.as_deref())?;
@@ -1134,12 +1249,25 @@ fn run(cli: Cli) -> fstool::Result<()> {
             zero_free,
             dry_run,
         } => sparse_reclaim_cmd(&image, zero_free, dry_run),
-        #[cfg(feature = "sparse-image")]
         Command::Resize {
             image,
             size,
             discard,
-        } => sparse_resize_cmd(&image, &size, discard),
+            remove_signature,
+        } => imgops::resize_cmd(&image, &size, discard, remove_signature),
+        Command::Checksum(a) => imgops::checksum_cmd(&a, password.as_deref()),
+        #[cfg(feature = "dmg")]
+        Command::Verify(a) => imgops::verify_cmd(&a),
+        #[cfg(feature = "dmg-write")]
+        Command::Segment(a) => imgops::segment_cmd(&a),
+        #[cfg(feature = "dmg-write")]
+        Command::Join(a) => imgops::join_cmd(&a),
+        #[cfg(feature = "dmg")]
+        Command::UdifDerez(a) => imgops::udif_derez_cmd(&a),
+        #[cfg(feature = "dmg-write")]
+        Command::UdifRez(a) => imgops::udif_rez_cmd(&a),
+        #[cfg(feature = "dmg-write")]
+        Command::Unsign(a) => imgops::unsign_cmd(&a),
         Command::Dd {
             src,
             dst,
@@ -1530,37 +1658,6 @@ fn sparse_reclaim_cmd(image: &str, zero_free: bool, dry_run: bool) -> fstool::Re
     Ok(())
 }
 
-/// `fstool resize`: change a sparse image's virtual size.
-#[cfg(feature = "sparse-image")]
-fn sparse_resize_cmd(image: &std::path::Path, size: &str, discard: bool) -> fstool::Result<()> {
-    use fstool::block::ShrinkPolicy;
-    let new_size = fstool::spec::parse_size(size)?;
-    let mut dev = fstool::block::sparse::SparseBackend::open(image)?;
-    let old = dev.as_block_device().total_size();
-    let policy = if discard {
-        ShrinkPolicy::Discard
-    } else {
-        ShrinkPolicy::RequireZero
-    };
-    dev.resize(new_size, policy).map_err(|e| match e {
-        fstool::Error::InvalidArgument(m) if !discard && m.contains("nonzero") => {
-            fstool::Error::InvalidArgument(format!(
-                "{m} (pass --discard to drop it — a filesystem living there will be truncated)"
-            ))
-        }
-        e => e,
-    })?;
-    dev.as_block_device().sync()?;
-    println!(
-        "{}: {} → {} ({} bands allocated)",
-        image.display(),
-        human_size(old),
-        human_size(new_size),
-        dev.allocated_bands()
-    );
-    Ok(())
-}
-
 fn convert_cmd(
     src: &std::path::Path,
     dst: &std::path::Path,
@@ -1620,130 +1717,10 @@ fn is_dmg_path(p: &std::path::Path) -> bool {
     p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dmg"))
 }
 
-/// What `fstool convert` needs to write a UDIF destination.
-#[cfg(feature = "dmg-write")]
-struct DmgConvertArgs<'a> {
-    src: &'a std::path::Path,
-    dst: &'a std::path::Path,
-    size_arg: Option<&'a str>,
-    password: Option<&'a str>,
-    format: Option<&'a str>,
-    level: Option<u8>,
-    checksum: Option<&'a str>,
-    layout: Option<&'a str>,
-    create_opts: &'a fstool::block::CreateOpts,
-}
-
-/// `convert SRC out.dmg`: encode SRC's sectors as a read-only UDIF image.
-///
-/// The library encoder only fills a caller-owned file; publishing is the
-/// CLI's job. It writes a hidden sibling temp file, syncs it, and moves
-/// it over DST only once the image is complete, so a failure never leaves
-/// a truncated `.dmg` behind.
-#[cfg(feature = "dmg-write")]
-fn convert_to_dmg(args: DmgConvertArgs<'_>) -> fstool::Result<()> {
-    use fstool::block::dmg::{UdifChecksum, UdifFormat, UdifLayout, UdifWriteOptions, write_udif};
-    let DmgConvertArgs {
-        src,
-        dst,
-        size_arg,
-        password,
-        format,
-        level,
-        checksum,
-        layout,
-        create_opts,
-    } = args;
-    if safety::same_file(src, dst) {
-        return Err(fstool::Error::InvalidArgument(
-            "convert: source and destination are the same file".into(),
-        ));
-    }
-    if fstool::block::file::is_block_device(dst) {
-        return Err(fstool::Error::InvalidArgument(
-            "convert: a .dmg destination must be a regular file, not a block device".into(),
-        ));
-    }
-    if create_opts.encrypt.is_some() || create_opts.backing.is_some() {
-        return Err(fstool::Error::Unsupported(
-            "convert: encrypted or backed .dmg output is not supported".into(),
-        ));
-    }
-    let mut opts = UdifWriteOptions::default();
-    if let Some(f) = format {
-        opts.format = UdifFormat::from_name(f).ok_or_else(|| {
-            fstool::Error::InvalidArgument(format!(
-                "convert: unknown --dmg-format {f:?} \
-                 (expected UDRO, UDCO, UDZO, UDBZ, ULMO, UFBI or UDRW)"
-            ))
-        })?;
-    }
-    opts.level = level;
-    if let Some(c) = checksum {
-        opts.checksum = match c.to_ascii_lowercase().as_str() {
-            "crc32" | "crc" => UdifChecksum::Crc32,
-            "md5" => UdifChecksum::Md5,
-            "none" => UdifChecksum::None,
-            _ => {
-                return Err(fstool::Error::InvalidArgument(format!(
-                    "convert: unknown --dmg-checksum {c:?} (expected crc32, md5 or none)"
-                )));
-            }
-        };
-    }
-    opts.layout = match layout.map(str::to_ascii_lowercase).as_deref() {
-        None | Some("auto") => UdifLayout::Auto,
-        Some("whole") | Some("none") => UdifLayout::WholeDevice,
-        Some(other) => {
-            return Err(fstool::Error::InvalidArgument(format!(
-                "convert: unknown --dmg-layout {other:?} (expected auto or whole)"
-            )));
-        }
-    };
-    opts.validate()?;
-
-    let mut src_dev = fstool::block::open_image_with_password(src, password)?;
-    let src_size = src_dev.total_size();
-    if let Some(s) = size_arg
-        && fstool::spec::parse_size(s)? != src_size
-    {
-        return Err(fstool::Error::Unsupported(
-            "convert: --size is not supported for a .dmg destination".into(),
-        ));
-    }
-
-    let name = dst
-        .file_name()
-        .ok_or_else(|| fstool::Error::InvalidArgument("convert: DST has no file name".into()))?;
-    let mut tmp_name = std::ffi::OsString::from(".");
-    tmp_name.push(name);
-    tmp_name.push(format!(".{}.partial", std::process::id()));
-    let tmp = dst.with_file_name(tmp_name);
-    let result = (|| {
-        let file = std::fs::File::create(&tmp)?;
-        let (file, summary) = write_udif(src_dev.as_mut(), file, &opts)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, dst)?;
-        Ok(summary)
-    })();
-    let summary = match result {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-    };
-    eprintln!(
-        "converted {} → {} ({}, {} → {} bytes, {} chunks)",
-        src.display(),
-        dst.display(),
-        opts.format.name(),
-        src_size,
-        summary.bytes_written,
-        summary.chunk_count
-    );
-    Ok(())
+/// The virtual size of the image at `path`.
+#[cfg(feature = "dmg")]
+fn imgops_size(path: &std::path::Path, password: Option<&str>) -> fstool::Result<u64> {
+    Ok(fstool::block::open_image_read_only_with_password(path, password)?.total_size())
 }
 
 /// Everything `fstool repack` was told, gathered so the entry point
