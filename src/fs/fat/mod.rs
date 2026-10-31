@@ -59,3 +59,7 @@ mod hosted;
 pub use hosted::size_plan::FatSizePlan;
 #[cfg(feature = "alloc")]
 pub use hosted::*;
+
+// Read-only, bounded consistency check (`fsck.fat -n`).
+#[cfg(feature = "std")]
+pub mod verify;

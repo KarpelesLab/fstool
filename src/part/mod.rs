@@ -19,6 +19,8 @@ use crate::block::{BlockDevice, SlicedBackend};
 pub mod apm;
 pub mod gpt;
 pub mod mbr;
+#[cfg(feature = "std")]
+pub mod resize;
 
 pub use apm::Apm;
 pub use gpt::Gpt;

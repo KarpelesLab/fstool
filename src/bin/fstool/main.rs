@@ -15,6 +15,8 @@
 //!   on supported filesystems.
 
 mod dd;
+#[cfg(any(feature = "hfs-plus", feature = "fat"))]
+mod fscheck;
 mod imgops;
 mod safety;
 mod shell;
@@ -554,6 +556,51 @@ enum Command {
     /// Remove a UDIF image's embedded code signature.
     #[cfg(feature = "dmg-write")]
     Unsign(imgops::UnsignArgs),
+
+    /// Check a filesystem's metadata without changing anything (like
+    /// `fsck -n`): volume headers, allocation bitmap against what files
+    /// own, B-tree / directory structure, catalog consistency, counts.
+    /// Prints one line per finding and exits nonzero when errors are
+    /// found. Supports HFS+, HFSX and FAT12/16/32. `IMAGE:N` checks
+    /// partition N. (Filesystem metadata; `verify` checks container
+    /// checksums instead.)
+    #[cfg(any(feature = "hfs-plus", feature = "fat"))]
+    Check {
+        /// The image, optionally with `:N` to select partition N.
+        #[arg(value_name = "IMAGE[:N]")]
+        image: String,
+        /// Findings to print at most (the rest are counted).
+        #[arg(long, value_name = "N", default_value_t = 200)]
+        max_diagnostics: usize,
+        /// Print errors only.
+        #[arg(long, short = 'q')]
+        quiet: bool,
+    },
+
+    /// Grow or shrink the filesystem itself (HFS+ / HFSX) — and, with
+    /// `IMAGE:N`, its partition (GPT / APM / MBR) along with it, keeping
+    /// the other partitions, the disk and partition GUIDs. Plans first and
+    /// prints the plan (with the reason when it is refused); `--dry-run`
+    /// stops there. A raw image file is grown or cut as needed; other
+    /// containers must be resized separately (with `resize`, which
+    /// changes the container's size and knows nothing of the filesystem).
+    #[cfg(feature = "hfs-plus")]
+    ResizeFs {
+        /// The image, optionally with `:N` to select partition N.
+        #[arg(value_name = "IMAGE[:N]")]
+        image: String,
+        /// New filesystem (and partition) size, e.g. "2GiB" — a multiple
+        /// of the allocation block size.
+        #[arg(value_name = "SIZE")]
+        size: String,
+        /// Print the plan, change nothing.
+        #[arg(long, short = 'n')]
+        dry_run: bool,
+        /// After shrinking the last partition, also cut the disk image to
+        /// end right after it (moving a GPT's backup header).
+        #[arg(long)]
+        shrink_disk: bool,
+    },
 
     /// Repack an image into a fresh filesystem at a (possibly different)
     /// size. Walks SRC's filesystem, stages each file into a host
@@ -1268,6 +1315,19 @@ fn run(cli: Cli) -> fstool::Result<()> {
         Command::UdifRez(a) => imgops::udif_rez_cmd(&a),
         #[cfg(feature = "dmg-write")]
         Command::Unsign(a) => imgops::unsign_cmd(&a),
+        #[cfg(any(feature = "hfs-plus", feature = "fat"))]
+        Command::Check {
+            image,
+            max_diagnostics,
+            quiet,
+        } => fscheck::check_cmd(&image, max_diagnostics, quiet),
+        #[cfg(feature = "hfs-plus")]
+        Command::ResizeFs {
+            image,
+            size,
+            dry_run,
+            shrink_disk,
+        } => fscheck::resize_fs_cmd(&image, &size, dry_run, shrink_disk),
         Command::Dd {
             src,
             dst,

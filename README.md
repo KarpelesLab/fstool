@@ -139,6 +139,8 @@ through xattrs under `user.ntfs.*` and `system.ntfs_security`.
 | `rm`          | Unlink a file, symlink, device, or empty directory.                     |
 | `shell`       | SFTP-style REPL — `ls cd pwd cat put get rm mkdir info` (`get` copies a file/dir out of the image to the host — the inverse of `put`), plus `find` (name/type/mtime filters, `-sort`/`-limit` for e.g. the N newest files) and `grep` (`-i`/`-n`/`-r`/`-v`/`-l`/`-c`; binary matches print as `hexdump -C`). Ctrl-C cancels a running `find`/`grep` without leaving the shell. `--with-cache` preloads all inodes into RAM so `find`/`ls` are instant; `--ro` browses read-only (incl. tar/ISO/SquashFS). On a TTY it has line editing + ↑/↓ command history (rustyline). |
 | `convert`     | Byte-level raw ↔ qcow2 conversion with optional grow.                   |
+| `check`       | Read-only filesystem check (`fsck -n`) with structured, bounded diagnostics; exits nonzero on errors. HFS+ / HFSX / FAT12/16/32. |
+| `resize-fs`   | Grow or shrink an HFS+ / HFSX filesystem — and with `IMG:N` its GPT / MBR / APM partition, keeping neighbours and GUIDs. Plans first (typed refusal reasons), `--dry-run` stops there. |
 | `repack`      | Walk one or more source FSes, merge bottom→top with whiteouts, rebuild into a fresh image. |
 | `dd`          | Resilient raw block copy (file/device → file/device), `ddrescue`-style: reads in 1 MiB blocks that halve on error down to the source sector and skip unreadable spots. Threaded reader/writer pipeline with a live progress bar (%, ETA, separate read/write speed, buffer occupancy, current block, bytes skipped). Ctrl-C cancels cleanly. |
 

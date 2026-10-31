@@ -59,6 +59,8 @@
 //! * [`extents`] — extents-overflow B-tree walker for spilled extents.
 //! * [`attributes`] — extended-attribute B-tree walker.
 //! * [`decmpfs`] — HFSCompression header / block decoder.
+//! * [`verify`] — read-only, bounded consistency check (`fsck_hfs -n`).
+//! * [`resize`] — typed grow / shrink plans and their application.
 
 pub mod attributes;
 pub mod btree;
@@ -70,9 +72,11 @@ pub mod finder;
 pub mod handle;
 pub(crate) mod journal;
 mod meta;
+pub mod resize;
 pub mod size_plan;
 pub mod unicode;
 mod unicode_tables;
+pub mod verify;
 pub mod volume_header;
 pub mod writer;
 

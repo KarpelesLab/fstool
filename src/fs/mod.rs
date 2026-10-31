@@ -67,12 +67,18 @@ pub mod littlefs;
 pub mod ntfs;
 #[cfg(all(feature = "alloc", feature = "ramfs"))]
 pub mod ramfs;
+// Typed resize plans shared by the filesystems that can change size.
+#[cfg(feature = "std")]
+pub mod resize;
 #[cfg(all(feature = "alloc", feature = "std"))]
 pub mod rootdevs;
 #[cfg(all(feature = "alloc", feature = "squashfs"))]
 pub mod squashfs;
 #[cfg(all(feature = "alloc", feature = "tar"))]
 pub mod tar;
+// Bounded, structured verification diagnostics shared by the verifiers.
+#[cfg(feature = "std")]
+pub mod verify;
 // The interface every allocator-free driver implements, and the mount that
 // picks one. Compiled whenever one of those drivers is (`exfat` implies
 // `fat`), with or without a heap, like the drivers themselves.
