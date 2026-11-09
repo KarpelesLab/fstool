@@ -886,21 +886,15 @@ impl<'a> Read for TarFileReader<'a> {
 /// end marker.
 pub struct TarWriter<'a> {
     dev: &'a mut dyn BlockDevice,
+    /// Bytes written so far. Bounds are left to the device: a
+    /// fixed-capacity one rejects an overrun with `OutOfBounds`, a
+    /// growable `MemoryBackend` (which starts at 0 bytes) extends.
     cursor: u64,
-    /// We grow the underlying device on demand. For a `FileBackend` this
-    /// works because the backing file's `set_len` was called by the
-    /// factory; we just track our own cursor against `total_size`.
-    capacity: u64,
 }
 
 impl<'a> TarWriter<'a> {
     pub fn new(dev: &'a mut dyn BlockDevice) -> Self {
-        let capacity = dev.total_size();
-        Self {
-            dev,
-            cursor: 0,
-            capacity,
-        }
+        Self { dev, cursor: 0 }
     }
 
     pub fn add_file(
@@ -1049,13 +1043,6 @@ impl<'a> TarWriter<'a> {
     }
 
     fn write_at_cursor(&mut self, buf: &[u8]) -> Result<()> {
-        if self.cursor + buf.len() as u64 > self.capacity {
-            return Err(crate::Error::OutOfBounds {
-                offset: self.cursor,
-                len: buf.len() as u64,
-                size: self.capacity,
-            });
-        }
         self.dev.write_at(self.cursor, buf)?;
         self.cursor += buf.len() as u64;
         Ok(())
@@ -1415,6 +1402,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(Header::decode(&h.encode().unwrap()).unwrap().size, 0);
+    }
+
+    /// A growable device starts at 0 bytes and must extend under the
+    /// writer rather than fail on the first header.
+    #[test]
+    fn writes_into_a_growable_device() {
+        let mut dev = MemoryBackend::growable();
+        let meta = TarEntryMeta {
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            uname: String::new(),
+            gname: String::new(),
+        };
+        let content = vec![0x41u8; 3 * BLOCK_SIZE + 7];
+        {
+            let mut w = TarWriter::new(&mut dev);
+            let mut r: &[u8] = &content;
+            w.add_file("/a.bin", &mut r, content.len() as u64, meta, &[])
+                .unwrap();
+            w.finish().unwrap();
+        }
+        // Header block + 4 data blocks + the two-block end marker.
+        assert_eq!(dev.total_size(), 7 * BLOCK_SIZE as u64);
+        let tar = Tar::open(&mut dev).unwrap();
+        let mut r = tar.open_file_reader(&mut dev, "/a.bin").unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, content);
     }
 
     #[test]

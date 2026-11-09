@@ -1431,4 +1431,39 @@ mod tests {
         // are volume-relative, so this must fail cleanly, not misread.
         assert!(super::super::ZipFs::open(&mut dev_of(&arc)).is_err());
     }
+
+    /// A growable device starts at 0 bytes and extends under the
+    /// writer; the archive is exactly as long as the writer reports.
+    /// (A fixed device still refuses an overrun, through its own check.)
+    #[test]
+    fn writes_into_a_growable_device() {
+        let mut dev = MemoryBackend::growable();
+        let mut fs = super::super::ZipFs::format(&mut dev, &ZipFormatOpts::default()).unwrap();
+        let text = text();
+        fs.create_file_streaming(
+            &mut dev,
+            Path::new("/text.txt"),
+            &mut &text[..],
+            text.len() as u64,
+            meta(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+        assert_eq!(fs.image_len(), Some(dev.total_size()));
+        let (got, _) = read_back(dev.as_slice(), "/text.txt");
+        assert_eq!(got, text);
+
+        let mut small = MemoryBackend::new(64);
+        let mut fs = super::super::ZipFs::format(&mut small, &ZipFormatOpts::default()).unwrap();
+        let err = fs
+            .create_file_streaming(
+                &mut small,
+                Path::new("/text.txt"),
+                &mut &text[..],
+                text.len() as u64,
+                meta(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::OutOfBounds { .. }), "{err:?}");
+    }
 }
