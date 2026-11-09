@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3](https://github.com/KarpelesLab/fstool/compare/v0.5.2...v0.5.3) - 2026-11-09
+
+### Fixed
+
+- *(archive)* write into a growable device that starts empty
+
+### Other
+
+- pin the Ubuntu job to 24.04 and free runner disk space
+
 ## [0.5.2](https://github.com/KarpelesLab/fstool/compare/v0.5.1...v0.5.2) - 2026-10-31
 
 ### Added
