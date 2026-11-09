@@ -15,9 +15,28 @@ jobs:
   # …) only fire here because they need apt-supplied tools.
   test-linux:
     name: test (ubuntu)
-    runs-on: ubuntu-latest
+    # Pinned, not `ubuntu-latest`: the 26.04 image ships hfsprogs
+    # 540.1.linux3-6build1, whose fsck.hfsplus rejects every HFS+ primary
+    # volume header ("invalid primary VHB at 2 result 35" → "Volume header
+    # needs minor repair", exit 8) — including volumes Apple's hdiutil
+    # wrote, and with output identical for a clean and a corrupt volume.
+    # The 24.04 build (-5build3) is correct, so the HFS+ fsck tests keep
+    # their teeth here. Revisit when a fixed hfsprogs lands.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
+
+      # The format cross-validation tests build several 256 MiB–4 GiB
+      # card images (dirtied for their first GiB) and copy partitions out
+      # of them, in parallel, next to a ~10 GB all-features debug build.
+      # That has filled the runner's disk before (ENOSPC in
+      # tests/format_external.rs). Drop the preinstalled toolchains we
+      # never use — a quick 15–25 GB — and log what is left.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h / /tmp
 
       - name: Install system tools
         run: |
