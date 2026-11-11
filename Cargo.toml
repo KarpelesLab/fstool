@@ -393,6 +393,10 @@ dmg-lzfse = ["dmg", "dep:compcol", "compcol/lzfse"]
 # (bzip2), ULMO (LZMA, XZ-framed), ULFO (LZFSE).
 dmg-write = ["dmg"]
 dmg-write-zlib = ["dmg-write", "gzip"]
+# Use the pure-Rust sirocco encoder for UDZO instead of compcol. Decoding
+# stays on compcol, so the output is ordinary zlib and either build can read
+# it. Opt-in: `codecs` keeps compcol as the default encoder.
+dmg-write-zlib-sirocco = ["dmg-write-zlib", "dep:sirocco"]
 dmg-write-bzip2 = ["dmg-write", "dmg-bzip2"]
 dmg-write-lzma = ["dmg-write", "xz"]
 dmg-write-lzfse = ["dmg-write", "dmg-lzfse"]
@@ -479,6 +483,13 @@ charcode = { version = "0.1.3", optional = true, default-features = false, featu
 # /lz4/lzo plus the CAB codecs. `std` is always on (for the `io` Read/Write
 # adapters); per-algorithm features are added by fstool's feature flags.
 compcol = { version = "0.7.8", optional = true, default-features = false, features = ["std", "checksum"] }
+
+# UDZO (DMG zlib) encoder alternative. sirocco is a pure-Rust DEFLATE/zlib
+# implementation whose greedy levels are substantially faster than compcol's
+# on the independent 1 MiB chunks a UDIF image uses. Opt in with
+# `dmg-write-zlib-sirocco`; compcol still supplies the read side and every
+# other zlib consumer, so images written either way re-open.
+sirocco = { version = "0.3", optional = true, default-features = false, features = ["std"] }
 
 # Line editing + persistent history for the interactive shell. Optional, behind
 # the `readline` feature; the bin enables it by default. Pure-Rust line editor.
