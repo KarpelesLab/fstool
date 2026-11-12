@@ -70,7 +70,7 @@ fn block_device_size(file: &File) -> io::Result<u64> {
         // here, regardless of the running arch's actual size_t width.
         const BLKGETSIZE64: libc::c_ulong = 0x8008_1272;
         let mut size: u64 = 0;
-        let r = unsafe { libc::ioctl(fd, BLKGETSIZE64, &mut size as *mut u64) };
+        let r = unsafe { libc::ioctl(fd, BLKGETSIZE64 as libc::Ioctl, &mut size as *mut u64) };
         if r < 0 {
             return Err(io::Error::last_os_error());
         }
