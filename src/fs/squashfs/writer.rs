@@ -1028,9 +1028,20 @@ impl WriteState {
         let mut dir_disk_payload: Vec<u8> = Vec::new();
         const MAX_META_ITERS: usize = 16;
         let mut converged = false;
-        for _iter in 0..MAX_META_ITERS {
+        // The compression the inode and directory metablocks get. Patching
+        // the directory inodes changes how well their metablocks compress,
+        // which moves the offsets the next patch writes: on a big tree (a
+        // stock Ubuntu root) they creep a byte per round and don't settle in
+        // the budget. Past half of it the metablocks are stored uncompressed:
+        // their sizes then don't depend on what's in them, and the next round
+        // settles.
+        let mut meta_compression = self.compression;
+        for iter in 0..MAX_META_ITERS {
+            if iter == MAX_META_ITERS / 2 {
+                meta_compression = Compression::Unknown(0);
+            }
             let (inode_block_rel_map, _) =
-                chunk_raw_to_metablocks(&inode_table_raw, self.compression)?;
+                chunk_raw_to_metablocks(&inode_table_raw, meta_compression)?;
             let raw_to_pos = |raw_off: usize| -> (u32, u16) {
                 (inode_block_rel_map[raw_off / 8192], (raw_off % 8192) as u16)
             };
@@ -1122,7 +1133,7 @@ impl WriteState {
 
             // ---- 9) Chunk directory raw into metablocks. ----
             let (dir_block_rel_map, payload) =
-                chunk_raw_to_metablocks(&dir_table_raw, self.compression)?;
+                chunk_raw_to_metablocks(&dir_table_raw, meta_compression)?;
             dir_disk_payload = payload;
             let dir_raw_to_pos = |raw_off: usize| -> (u32, u16) {
                 // An image whose every directory is empty has no directory
@@ -1217,7 +1228,7 @@ impl WriteState {
         // `inode_table_raw` is now the converged content (the last fixpoint
         // round rewrote nothing), so this chunking reproduces exactly the
         // `block_rel` offsets baked into `inode_positions` above.
-        let (_, inode_disk_payload) = chunk_raw_to_metablocks(&inode_table_raw, self.compression)?;
+        let (_, inode_disk_payload) = chunk_raw_to_metablocks(&inode_table_raw, meta_compression)?;
         let inode_table_start = next_disk_offset;
         ensure_size(dev, next_disk_offset + inode_disk_payload.len() as u64)?;
         dev.write_at(inode_table_start, &inode_disk_payload)?;
@@ -2063,6 +2074,47 @@ mod tests {
             let mut buf = Vec::new();
             std::io::Read::read_to_end(&mut r, &mut buf).unwrap();
             assert_eq!(buf, body(i), "file f{i:04} read back wrong");
+        }
+    }
+
+    /// A tree of many small directories (a distro's `/usr/share/doc`): the
+    /// directory inodes' listing offsets feed back into how well their
+    /// metablocks compress, and on a tree this size the offsets used to creep
+    /// a byte per round past the fixpoint budget ("did not converge").
+    #[test]
+    fn many_small_directories_converge() {
+        let mut dev = MemoryBackend::new(32 * 1024 * 1024);
+        let mut state = WriteState::new(DEFAULT_BLOCK_SIZE, Compression::Gzip);
+        let n = 3000;
+        for i in 0..n {
+            let d = format!("/usr/share/doc/package-{i:04}-{}", "x".repeat(i % 23));
+            state.create_dir(&d, EntryMeta::default(), Vec::new()).unwrap();
+            for f in ["copyright", "changelog.Debian.gz"] {
+                let body = format!("{d}/{f} {}", i * 7919).into_bytes();
+                let len = body.len() as u64;
+                state
+                    .create_file(
+                        &mut dev,
+                        &format!("{d}/{f}"),
+                        FileSource::Reader {
+                            reader: Box::new(std::io::Cursor::new(body)),
+                            len,
+                        },
+                        EntryMeta::default(),
+                        Vec::new(),
+                    )
+                    .unwrap();
+            }
+        }
+        state.flush(&mut dev).unwrap();
+        let s = super::super::Squashfs::open(&mut dev).unwrap();
+        assert_eq!(s.list_path(&mut dev, "/usr/share/doc").unwrap().len(), n);
+        for i in [0usize, 1, n / 2, n - 1] {
+            let d = format!("/usr/share/doc/package-{i:04}-{}", "x".repeat(i % 23));
+            let mut r = s.open_file_reader(&mut dev, &format!("{d}/copyright")).unwrap();
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut r, &mut buf).unwrap();
+            assert_eq!(buf, format!("{d}/copyright {}", i * 7919).into_bytes());
         }
     }
 
