@@ -273,7 +273,7 @@ MBR, one entry per region with `hdiutil`'s names and IDs
 |--------|-------------|---------|
 | `UDRO` | raw | `dmg-write` |
 | `UDCO` | ADC (built in) | `dmg-write` |
-| `UDZO` | zlib, level 1–9 | `dmg-write-zlib` |
+| `UDZO` | zlib, level 1–9 | `dmg-write-zlib`; add `dmg-write-zlib-sirocco` for the faster pure-Rust encoder |
 | `UDBZ` | bzip2, level 1–9 | `dmg-write-bzip2` |
 | `ULMO` | LZMA (XZ-framed, as `hdiutil`), level 0–9 | `dmg-write-lzma` |
 | `UFBI` | raw, every sector, MD5 checksums | `dmg-write` |
@@ -833,7 +833,7 @@ none of the other 130 000 lines.
 | `tar` | tar (streaming reader / writer, tar-as-filesystem) | |
 | `archive` | zip / cpio / ar, plus the per-format readers | pulls `charcode`; `cab`, `lha`, `arc`, `sit`, `sevenz`, `rar`, `amiga-lzx` each imply it. On its own zip handles Stored members (and PKWARE-encrypted ones, and split sets); each compression method is a codec feature (`gzip` for Deflate, then `deflate64`, `bzip2`, `lzma`, `xz`, `zstd`, `zip-legacy`) and WinZip AES is `zip-aes` (pulls `purecrypto`), so `--features archive,gzip` is the slim everyday zip build |
 | `ramfs` | the in-memory scratch filesystem `repack` / `merge` / FUSE build on | |
-| `qcow2`, `dmg`, `diskcopy` | disk-image containers | `qcow2-crypto` implies `qcow2`; `dmg-encrypted` / `dmg-bzip2` / `dmg-lzfse` / `dmg-write` imply `dmg`; `dmg-write-zlib` / `-bzip2` / `-lzma` / `-lzfse` add one write codec each to `dmg-write`; `dmg-encrypted-write` and `dmg-encrypted-recovery` imply `dmg-encrypted` |
+| `qcow2`, `dmg`, `diskcopy` | disk-image containers | `qcow2-crypto` implies `qcow2`; `dmg-encrypted` / `dmg-bzip2` / `dmg-lzfse` / `dmg-write` imply `dmg`; `dmg-write-zlib` / `-bzip2` / `-lzma` / `-lzfse` add one write codec each to `dmg-write` (`dmg-write-zlib-sirocco` swaps UDZO's encoder to pure-Rust sirocco, which is much faster on 1 MiB chunks; it is opt-in and `codecs` keeps compcol); `dmg-encrypted-write` and `dmg-encrypted-recovery` imply `dmg-encrypted` |
 | `sparse-image` | Apple `.sparseimage` / `.sparsebundle` | |
 | `luks` | LUKS1 / LUKS2 | pulls `purecrypto`; implies `json` (LUKS2 metadata is JSON) |
 

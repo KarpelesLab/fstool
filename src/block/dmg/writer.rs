@@ -1156,14 +1156,21 @@ fn encode_chunk(
         UdifFormat::Udco => Some((ChunkType::Adc, super::codec::encode_adc(plain))),
         #[cfg(feature = "dmg-write-zlib")]
         UdifFormat::Udzo => {
-            let mut cfg = compcol::zlib::EncoderConfig::default();
-            if let Some(l) = level {
-                cfg.level = l;
-            }
-            Some((
-                ChunkType::Zlib,
-                cc_encode::<compcol::zlib::Zlib>(plain, cfg)?,
-            ))
+            #[cfg(feature = "dmg-write-zlib-sirocco")]
+            let encoded = sirocco::compress(
+                sirocco::Format::Zlib,
+                sirocco::deflate::Level::new(level.unwrap_or(6).min(9)),
+                plain,
+            );
+            #[cfg(not(feature = "dmg-write-zlib-sirocco"))]
+            let encoded = {
+                let mut cfg = compcol::zlib::EncoderConfig::default();
+                if let Some(l) = level {
+                    cfg.level = l;
+                }
+                cc_encode::<compcol::zlib::Zlib>(plain, cfg)?
+            };
+            Some((ChunkType::Zlib, encoded))
         }
         #[cfg(feature = "dmg-write-bzip2")]
         UdifFormat::Udbz => {
@@ -1204,6 +1211,12 @@ fn encode_chunk(
     feature = "dmg-write-bzip2",
     feature = "dmg-write-lzma",
     feature = "dmg-write-lzfse"
+))]
+#[cfg(any(
+    feature = "dmg-write-bzip2",
+    feature = "dmg-write-lzma",
+    feature = "dmg-write-lzfse",
+    all(feature = "dmg-write-zlib", not(feature = "dmg-write-zlib-sirocco"))
 ))]
 fn cc_encode<A: compcol::Algorithm>(plain: &[u8], cfg: A::EncoderConfig) -> Result<Vec<u8>> {
     compcol::vec::compress_to_vec_with::<A>(plain, cfg).map_err(|e| {
