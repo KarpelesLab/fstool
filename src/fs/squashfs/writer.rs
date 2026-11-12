@@ -2088,7 +2088,9 @@ mod tests {
         let n = 3000;
         for i in 0..n {
             let d = format!("/usr/share/doc/package-{i:04}-{}", "x".repeat(i % 23));
-            state.create_dir(&d, EntryMeta::default(), Vec::new()).unwrap();
+            state
+                .create_dir(&d, EntryMeta::default(), Vec::new())
+                .unwrap();
             for f in ["copyright", "changelog.Debian.gz"] {
                 let body = format!("{d}/{f} {}", i * 7919).into_bytes();
                 let len = body.len() as u64;
@@ -2111,7 +2113,9 @@ mod tests {
         assert_eq!(s.list_path(&mut dev, "/usr/share/doc").unwrap().len(), n);
         for i in [0usize, 1, n / 2, n - 1] {
             let d = format!("/usr/share/doc/package-{i:04}-{}", "x".repeat(i % 23));
-            let mut r = s.open_file_reader(&mut dev, &format!("{d}/copyright")).unwrap();
+            let mut r = s
+                .open_file_reader(&mut dev, &format!("{d}/copyright"))
+                .unwrap();
             let mut buf = Vec::new();
             std::io::Read::read_to_end(&mut r, &mut buf).unwrap();
             assert_eq!(buf, format!("{d}/copyright {}", i * 7919).into_bytes());
