@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.4](https://github.com/KarpelesLab/fstool/compare/v0.5.3...v0.5.4) - 2026-11-12
+
+### Fixed
+
+- *(squashfs)* settle the metadata fixpoint on big trees
+
+### Other
+
+- rustfmt the squashfs fixpoint test
+
 ## [0.5.3](https://github.com/KarpelesLab/fstool/compare/v0.5.2...v0.5.3) - 2026-11-09
 
 ### Fixed
